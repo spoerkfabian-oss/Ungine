@@ -40,6 +40,8 @@ public:
     void Write(const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
     // For callers writing through Mapped() directly.
     void Flush(VkDeviceSize offset, VkDeviceSize size);
+    // Before reading GPU writes through Mapped() (no-op on HOST_COHERENT memory).
+    void Invalidate(VkDeviceSize offset, VkDeviceSize size);
 
     [[nodiscard]] VkBuffer        Handle()  const { return m_Buffer; }
     [[nodiscard]] VkDeviceSize    Size()    const { return m_Size; }

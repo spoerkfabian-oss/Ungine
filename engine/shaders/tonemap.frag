@@ -1,13 +1,19 @@
 #version 460
+#extension GL_EXT_buffer_reference : require
 #extension GL_EXT_nonuniform_qualifier : require
 #include "bindless.glsl"
+#include "exposure.glsl"
 
 layout(push_constant) uniform TonemapPush {
-    uint  hdrTexture;
-    uint  tonemapper; // Engine::Tonemapper: 0 PBR Neutral, 1 ACES (fitted), 2 none (clamp)
-    float exposure;
-    uint  bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
-    float bloomStrength; // 0 = bloom off (the texture is not read)
+    ExposureState state;         // auto exposure result of this frame
+    uint          hdrTexture;
+    uint          tonemapper;    // Engine::Tonemapper: 0 PBR Neutral, 1 ACES (fitted), 2 none (clamp)
+    float         exposure;      // manual exposure, or compensation already folded into `state`
+    uint          bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
+    float         bloomStrength; // 0 = bloom off (the texture is not read)
+    uint          autoExposure;
+    uint          debugView;     // Engine::DebugView: 0 off, 1 ambient occlusion, 2 normals
+    uint          debugTexture;  // slot shown by the debug view
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -57,7 +63,13 @@ void main()
         const vec3 bloom = SampleTexture(pc.bloomTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size).rgb;
         hdr              = mix(hdr, bloom, pc.bloomStrength);
     }
-    hdr *= pc.exposure;
+    if (pc.debugView != 0u) {
+        const vec3 v = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                  pixel, 0).rgb;
+        outColor = vec4(pc.debugView == 1u ? v.rrr : v * 0.5 + 0.5, 1.0);
+        return;
+    }
+    hdr *= pc.autoExposure != 0u ? pc.state.exposure : pc.exposure;
     vec3 ldr;
     switch (pc.tonemapper) {
     case 0u: ldr = PbrNeutral(hdr); break;

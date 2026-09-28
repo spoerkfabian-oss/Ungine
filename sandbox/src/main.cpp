@@ -71,10 +71,12 @@ protected:
             const auto& post   = m_SceneRenderer->post;
             const char* status = m_LoadFailed ? " | load failed" : (m_LoadDone ? "" : " | loading...");
             GetWindow().SetTitle(std::format(
-                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {} x{:.2f}{}{}",
+                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {} x{:.2f}{}{}{} | "
+                "debug {}{}",
                 m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.shadowDraws,
-                stats.triangles, Engine::ToString(post.tonemapper), post.exposure, post.bloom ? " | bloom" : "",
-                status));
+                stats.triangles, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
+                post.bloom ? " | bloom" : "", m_SceneRenderer->ao.enabled ? " | AO" : "",
+                Engine::ToString(post.debugView), status));
             m_FpsTimer   = 0.0;
             m_FrameCount = 0;
         }
@@ -94,7 +96,8 @@ protected:
     }
 
 private:
-    // T: next tone mapper, -/=: exposure, B: bloom, P: shadows, C: cascade colors,
+    // T: next tone mapper, -/=: exposure (compensation with auto exposure), X: auto exposure,
+    // B: bloom, P: shadows, C: cascade colors, O: ambient occlusion, V: debug view (AO, normals),
     // arrow keys: rotate the sun (regenerates the IBL maps).
     void UpdateLookControls(float dt)
     {
@@ -111,6 +114,15 @@ private:
             post.exposure *= 1.25f;
         if (input.WasKeyPressed(Engine::Key::B))
             post.bloom = !post.bloom;
+        if (input.WasKeyPressed(Engine::Key::X))
+            post.autoExposure = !post.autoExposure;
+        if (input.WasKeyPressed(Engine::Key::V)) {
+            const auto next = (static_cast<std::uint32_t>(post.debugView) + 1) %
+                              static_cast<std::uint32_t>(Engine::DebugView::Count);
+            post.debugView = static_cast<Engine::DebugView>(next);
+        }
+        if (input.WasKeyPressed(Engine::Key::O))
+            m_SceneRenderer->ao.enabled = !m_SceneRenderer->ao.enabled;
         auto& shadows = m_SceneRenderer->shadows;
         if (input.WasKeyPressed(Engine::Key::P))
             shadows.enabled = !shadows.enabled;
@@ -155,6 +167,7 @@ private:
         m_Ground       = GetAssets().CreateModel(Engine::MakePlane("Ground", radius * 12.0f, ground));
         m_GroundHeight = model->boundsMin.y;
         m_SceneRenderer->shadows.maxDistance = radius * 10.0f;
+        m_SceneRenderer->ao.radius           = radius * 0.2f;
     }
 
     void OnGroundLoaded()

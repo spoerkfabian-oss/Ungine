@@ -50,23 +50,30 @@ set_target_properties(Engine PROPERTIES FOLDER "Engine")
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE
 set(ENGINE_SHADER_INCLUDES
     shaders/include/bindless.glsl
+    shaders/include/exposure.glsl
     shaders/include/frame.glsl
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
     shaders/include/pbr.glsl
     shaders/include/shadow.glsl
-    shaders/include/sky.glsl)
+    shaders/include/sky.glsl
+    shaders/include/surface.glsl)
 target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
 set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 engine_add_shaders(Engine SOURCES
     shaders/bloom_downsample.comp
     shaders/bloom_upsample.comp
+    shaders/depth_normal.frag
+    shaders/exposure_average.comp
     shaders/fullscreen.vert
+    shaders/gtao.comp
+    shaders/gtao_denoise.comp
     shaders/ibl_brdf.comp
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
     shaders/ibl_sky.comp
+    shaders/luminance_histogram.comp
     shaders/mesh.frag
     shaders/mesh.vert
     shaders/shadow.vert

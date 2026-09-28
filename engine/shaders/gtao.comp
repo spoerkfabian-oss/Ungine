@@ -1,0 +1,119 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform GtaoPush {
+    uint  depth;        // reverse-Z infinite depth (sampled)
+    uint  normals;      // view-space normals (sampled)
+    uint  dst;          // storage, visibility in .r
+    uint  sliceCount;
+    vec2  invSize;
+    vec2  tanHalfFov;   // x: tan(fovX / 2), y: tan(fovY / 2)
+    float nearPlane;
+    float radius;       // world units
+    float falloff;      // fraction of the radius over which occluders fade out
+    float power;        // final contrast
+    uint  stepsPerSide;
+} pc;
+
+const float PI      = 3.14159265359;
+const float HALF_PI = 1.57079632679;
+
+float FetchDepth(ivec2 p)
+{
+    return texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depth)], uSamplers[SAMPLER_NEAREST_CLAMP]), p, 0).r;
+}
+
+// View space: x right, y up, camera looks down -z. Pixel rows grow downwards.
+vec3 ViewPosition(vec2 pixelCenter, float depth)
+{
+    const float dist = pc.nearPlane / max(depth, 1e-7); // reverse-Z infinite: depth = near / distance
+    const vec2  uv   = pixelCenter * pc.invSize;
+    const vec2  ndc  = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    return vec3(ndc * pc.tanHalfFov * dist, -dist);
+}
+
+float Noise(vec2 pixel, float offset) // interleaved gradient noise
+{
+    pixel += offset * 5.588238;
+    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+// Ground-Truth Ambient Occlusion (Jimenez et al. 2016), slice formulation following XeGTAO.
+void main()
+{
+    const ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(round(1.0 / pc.invSize));
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    const float depth = FetchDepth(id);
+    float       visibility = 1.0;
+    if (depth > 0.0) { // depth 0: sky
+        const vec3 P = ViewPosition(vec2(id) + 0.5, depth);
+        const vec3 V = normalize(-P);
+        const vec3 N = normalize(texelFetch(sampler2D(uTextures[nonuniformEXT(pc.normals)],
+                                                      uSamplers[SAMPLER_NEAREST_CLAMP]), id, 0).xyz);
+
+        // World radius -> pixels at this distance.
+        const float screenRadius = pc.radius / (-P.z * pc.tanHalfFov.y) * (0.5 * float(size.y));
+        if (screenRadius >= 1.0) {
+            const float falloffRange = pc.falloff * pc.radius;
+            const float falloffMul   = -1.0 / falloffRange;
+            const float falloffAdd   = (pc.radius - falloffRange) / falloffRange + 1.0;
+            const float sliceNoise   = Noise(vec2(id), 0.0);
+            const float stepNoise    = Noise(vec2(id), 1.0);
+
+            visibility = 0.0;
+            for (uint slice = 0u; slice < pc.sliceCount; ++slice) {
+                const float phi       = (float(slice) + sliceNoise) * PI / float(pc.sliceCount);
+                const vec2  omega     = vec2(cos(phi), -sin(phi)); // screen direction (rows grow down)
+                const vec3  direction = vec3(cos(phi), sin(phi), 0.0);
+
+                // Project the normal into the slice plane spanned by V and the direction.
+                const vec3  orthoDirection = direction - dot(direction, V) * V;
+                const vec3  axis           = normalize(cross(orthoDirection, V));
+                const vec3  projectedN     = N - axis * dot(N, axis);
+                const float projectedLen   = length(projectedN);
+                const float cosN = clamp(dot(projectedN, V) / max(projectedLen, 1e-5), 0.0, 1.0);
+                const float n    = sign(dot(orthoDirection, projectedN)) * acos(cosN);
+
+                const float lowCos0 = cos(n + HALF_PI);
+                const float lowCos1 = cos(n - HALF_PI);
+                float       horizonCos0 = lowCos0; // +omega side
+                float       horizonCos1 = lowCos1; // -omega side
+
+                for (uint s = 0u; s < pc.stepsPerSide; ++s) {
+                    float t = (float(s) + stepNoise) / float(pc.stepsPerSide);
+                    t *= t; // denser close to the pixel
+                    const vec2 offset = omega * max(t * screenRadius, float(s) + 1.0);
+                    for (int side = 0; side < 2; ++side) {
+                        const vec2  samplePx = vec2(id) + 0.5 + (side == 0 ? offset : -offset);
+                        const ivec2 texel    = ivec2(floor(samplePx));
+                        if (any(lessThan(texel, ivec2(0))) || any(greaterThanEqual(texel, size)))
+                            continue; // off screen: no information
+                        const vec3  delta = ViewPosition(vec2(texel) + 0.5, FetchDepth(texel)) - P;
+                        const float dist  = length(delta);
+                        const float w     = clamp(dist * falloffMul + falloffAdd, 0.0, 1.0);
+                        if (side == 0)
+                            horizonCos0 = max(horizonCos0, mix(lowCos0, dot(delta / dist, V), w));
+                        else
+                            horizonCos1 = max(horizonCos1, mix(lowCos1, dot(delta / dist, V), w));
+                    }
+                }
+
+                float h0 = -acos(clamp(horizonCos1, -1.0, 1.0));
+                float h1 = acos(clamp(horizonCos0, -1.0, 1.0));
+                h0       = n + clamp(h0 - n, -HALF_PI, HALF_PI);
+                h1       = n + clamp(h1 - n, -HALF_PI, HALF_PI);
+                const float arc0 = (cosN + 2.0 * h0 * sin(n) - cos(2.0 * h0 - n)) * 0.25;
+                const float arc1 = (cosN + 2.0 * h1 * sin(n) - cos(2.0 * h1 - n)) * 0.25;
+                visibility += projectedLen * (arc0 + arc1);
+            }
+            visibility = max(pow(clamp(visibility / float(pc.sliceCount), 0.0, 1.0), pc.power), 0.03);
+        }
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.dst)], id, vec4(visibility, 0.0, 0.0, 1.0));
+}

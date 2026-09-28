@@ -56,6 +56,11 @@ void Buffer::Write(const void* data, VkDeviceSize size, VkDeviceSize offset)
     VK_CHECK(vmaFlushAllocation(m_Allocator, m_Allocation, offset, size));
 }
 
+void Buffer::Invalidate(VkDeviceSize offset, VkDeviceSize size)
+{
+    VK_CHECK(vmaInvalidateAllocation(m_Allocator, m_Allocation, offset, size));
+}
+
 void Buffer::Flush(VkDeviceSize offset, VkDeviceSize size)
 {
     VK_CHECK(vmaFlushAllocation(m_Allocator, m_Allocation, offset, size));

@@ -253,6 +253,21 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     const SceneRenderStats facing = renderTowards(center);
     CHECK(facing.drawCalls > 0 && facing.culled == 0 && facing.triangles > 0);
     CHECK(facing.shadowDraws >= facing.drawCalls); // at least one cascade sees every caster
+    // Auto exposure (default on) reached the CPU through the per-frame-slot readback.
+    CHECK(std::isfinite(facing.exposure) && facing.exposure > 0.0f && facing.averageLuminance > 0.0f);
+
+    // Debug views and AO / auto exposure toggles.
+    for (DebugView view : {DebugView::AmbientOcclusion, DebugView::Normals, DebugView::None}) {
+        renderer.post.debugView = view;
+        CHECK(renderTowards(center).drawCalls == facing.drawCalls);
+    }
+    renderer.ao.enabled        = false;
+    renderer.post.autoExposure = false;
+    renderer.post.exposure     = 2.0f;
+    CHECK(renderTowards(center).exposure == 2.0f);
+    renderer.ao.enabled        = true;
+    renderer.post.autoExposure = true;
+    renderer.post.exposure     = 1.0f;
 
     // Feature toggles and runtime resolution changes (map recreation while frames are in flight).
     renderer.post.bloom            = false;

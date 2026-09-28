@@ -48,6 +48,7 @@ struct FrameContext {
     std::uint32_t   imageIndex = 0; // swapchain image index
     VkImage         depthImage = VK_NULL_HANDLE;
     VkImageView     depthView  = VK_NULL_HANDLE;
+    std::uint32_t   depthTexture = 0; // bindless slot of depthView, sampled in DEPTH_READ_ONLY_OPTIMAL
     VkFormat        depthFormat = kDepthFormat;
 };
 
@@ -127,6 +128,7 @@ private:
     std::unique_ptr<BindlessRegistry> m_Bindless;
     std::unique_ptr<UploadQueue>      m_Upload;
     Image                             m_Depth;
+    std::uint32_t                     m_DepthSlot = 0;
 
     static constexpr std::size_t kDefaultTextureCount = static_cast<std::size_t>(DefaultTexture::Count);
     std::array<Image, kDefaultTextureCount>         m_DefaultTextures;

@@ -7,6 +7,9 @@ layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
 layout(location = 3) out vec4 outTangent;
 
+// The depth prepass and the main pass (depth test EQUAL) must produce bit-identical depth.
+invariant gl_Position;
+
 void main()
 {
     Vertex v     = pc.vertices.v[gl_VertexIndex]; // vertexOffset already applied by DrawIndexed

@@ -122,10 +122,12 @@ std::optional<FrameContext> Renderer::BeginFrame()
     // depth writes after the previous frame's (same queue, submission order).
     constexpr VkPipelineStageFlags2 kDepthStages =
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    // Earlier frames may also have sampled it (compute: ambient occlusion) -> WAR on those too.
     CmdImageBarrier(f.cmd, {.image     = m_Depth.Handle(),
                             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                             .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                            .srcStage  = kDepthStages,
+                            .srcStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                             .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                             .dstStage  = kDepthStages,
                             .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
@@ -142,6 +144,7 @@ std::optional<FrameContext> Renderer::BeginFrame()
                         .imageIndex  = imageIndex,
                         .depthImage  = m_Depth.Handle(),
                         .depthView   = m_Depth.View(),
+                        .depthTexture = m_DepthSlot,
                         .depthFormat = kDepthFormat};
 }
 
@@ -230,11 +233,14 @@ TransientAllocation Renderer::AllocateTransient(VkDeviceSize size, VkDeviceSize 
 
 void Renderer::CreateDepthBuffer()
 {
+    if (m_Depth) // resize: the device is idle, the old slot can be reused right away
+        m_Bindless->RemoveSampledImage(m_DepthSlot);
     const VkExtent2D extent = m_Swapchain->Extent();
     m_Depth = Image(m_Ctx, {.extent    = {extent.width, extent.height, 1},
                             .format    = kDepthFormat,
                             .usage     = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             .debugName = "DepthBuffer"});
+    m_DepthSlot = m_Bindless->AddSampledImage(m_Depth.View(), VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
 }
 
 void Renderer::CreateDefaultTextures()

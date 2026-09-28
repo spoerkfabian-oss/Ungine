@@ -21,6 +21,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     uvec4 shadowMaps;     // bindless texture2D slot per cascade
     vec4  shadowParams;   // x: cascade count (0 = shadows off), y: normal bias, z: PCF radius (texels), w: blend
     uvec4 shadowInfo;     // x: resolution, y: debug cascade tint
+
+    uvec4 aoInfo;         // x: AO texture slot (full resolution), y: enabled
 };
 
 #endif

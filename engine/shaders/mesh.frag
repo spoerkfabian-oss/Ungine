@@ -5,6 +5,7 @@
 #include "mesh_common.glsl"
 #include "pbr.glsl"
 #include "shadow.glsl"
+#include "surface.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -12,30 +13,6 @@ layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inTangent;
 
 layout(location = 0) out vec4 outColor;
-
-// Tangent frame from screen-space derivatives (Schueler, "Normal Mapping Without Precomputed
-// Tangents"). Scaled by sign(det) so it is independent of screen handedness (flipped viewport).
-// Returns (grad u, -grad v, N): glTF's bitangent cross(N, T) * w points towards decreasing v
-// (image up), for mirrored UVs as well.
-mat3 CotangentFrame(vec3 N, vec3 p, vec2 uv)
-{
-    const vec3 dp1 = dFdx(p);
-    const vec3 dp2 = dFdy(p);
-    const vec2 duv1 = dFdx(uv);
-    const vec2 duv2 = dFdy(uv);
-
-    const vec3 dp2perp = cross(dp2, N);
-    const vec3 dp1perp = cross(N, dp1);
-    vec3       T       = dp2perp * duv1.x + dp1perp * duv2.x;
-    vec3       B       = dp2perp * duv1.y + dp1perp * duv2.y;
-
-    const float lenSq = max(dot(T, T), dot(B, B));
-    if (lenSq < 1e-20) // no UVs: any frame works, the normal map is flat anyway
-        return BasisFromNormal(N);
-    const float s = dot(N, cross(dp1, dp2)) < 0.0 ? -1.0 : 1.0;
-    const float k = s * inversesqrt(lenSq);
-    return mat3(T * k, -B * k, N);
-}
 
 void main()
 {
@@ -46,20 +23,8 @@ void main()
         discard;
 
     // --- Normal ---
-    const vec3 ng = normalize(inNormal);
-    mat3       tbn;
-    if (abs(inTangent.w) > 0.5) {
-        const vec3 t = normalize(inTangent.xyz - ng * dot(ng, inTangent.xyz));
-        tbn          = mat3(t, cross(ng, t) * inTangent.w, ng);
-    } else {
-        tbn = CotangentFrame(ng, inWorldPos, inUV);
-    }
-    if (!gl_FrontFacing)
-        tbn = -tbn; // back side of a double-sided surface: mirror the whole frame
-
-    vec3 tn = SampleTexture(m.normalTexture, m.samplerIndex, inUV).xyz * 2.0 - 1.0;
-    tn.xy *= m.normalScale;
-    const vec3 N = normalize(tbn * tn);
+    const mat3 tbn = SurfaceFrame(inNormal, inTangent, inWorldPos, inUV);
+    const vec3 N   = PerturbedNormal(m, tbn, inUV);
 
     // --- Material ---
     const vec4  mr        = SampleTexture(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
@@ -105,9 +70,15 @@ void main()
     const vec3  radiance   = SampleCube(frame.ibl.y, SAMPLER_LINEAR_CLAMP, R, roughness * maxLod).rgb;
     const vec3  irradiance = SampleCube(frame.ibl.x, SAMPLER_LINEAR_CLAMP, N, 0.0).rgb;
 
+    // Ambient occlusion (indirect light only): material AO and screen-space GTAO combined by min.
     const float occlusion = SampleTexture(m.occlusionTexture, m.samplerIndex, inUV).r;
-    const float ao        = 1.0 + m.occlusionStrength * (occlusion - 1.0);
-    const vec3  indirect = (FssEss * radiance + (FmsEms + kD) * irradiance) * ao * frame.sky.y;
+    float       ao        = 1.0 + m.occlusionStrength * (occlusion - 1.0);
+    if (frame.aoInfo.y != 0u)
+        ao = min(ao, texelFetch(sampler2D(uTextures[nonuniformEXT(frame.aoInfo.x)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                ivec2(gl_FragCoord.xy), 0).r);
+    // Specular occlusion from AO (Lagarde & de Rousiers 2014).
+    const float specAO   = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
+    const vec3  indirect = (FssEss * radiance * specAO + (FmsEms + kD) * irradiance * ao) * frame.sky.y;
 
     const vec3 emissive = m.emissiveFactor.rgb * SampleTexture(m.emissiveTexture, m.samplerIndex, inUV).rgb;
     vec3       color    = direct + indirect + emissive;
