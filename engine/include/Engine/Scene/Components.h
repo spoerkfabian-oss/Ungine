@@ -55,6 +55,7 @@ struct Light {
     float     range          = 0.0f; // world units; 0 = derived from the intensity (see EffectiveRange)
     float     innerConeAngle = 0.0f; // spot, radians from the axis: full intensity inside
     float     outerConeAngle = glm::quarter_pi<float>(); // spot: zero outside
+    bool      castShadows    = true; // candidate for the shadow atlas (the renderer picks the most important)
 };
 
 // Illuminance below which a light without explicit range is cut off (lights need a finite range

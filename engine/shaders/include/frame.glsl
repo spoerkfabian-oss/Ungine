@@ -29,8 +29,14 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     vec4          clusterParams; // x: slice scale, y: slice bias, zw: clusters per pixel (x, y)
     vec4          clusterDepth;  // x: near, y: far (view distance covered by the slices)
     uvec4         lightInfo;     // x: light count (0 = no punctual lights this frame)
-    LightBuffer   lights;
-    ClusterBuffer clusters;
+
+    // Local light shadows (atlas)
+    uvec4         localShadowInfo;   // x: atlas slot, y: atlas size (texels)
+    vec4          localShadowParams; // x: normal bias (texels), y: PCF radius (texels)
+
+    LightBuffer      lights;
+    ClusterBuffer    clusters;
+    ShadowViewBuffer shadowViews;
 };
 
 #endif

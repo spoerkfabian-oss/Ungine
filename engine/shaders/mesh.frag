@@ -77,9 +77,12 @@ void main()
             const float    NdotLl     = dot(N, Ll);
             if (NdotLl <= 0.0)
                 continue;
-            const float attenuation = DistanceAttenuation(distanceSq, light.range) * SpotAttenuation(-Ll, light);
-            if (attenuation > 0.0)
-                direct += DirectBrdf(N, V, Ll, NdotV, NdotLl, cDiff, f0, a) * light.color * attenuation;
+            float attenuation = DistanceAttenuation(distanceSq, light.range) * SpotAttenuation(-Ll, light);
+            if (attenuation <= 0.0)
+                continue;
+            if (light.shadow != NO_SHADOW)
+                attenuation *= LocalShadow(frame, light, inWorldPos, tbn[2], gl_FragCoord.xy);
+            direct += DirectBrdf(N, V, Ll, NdotV, NdotLl, cDiff, f0, a) * light.color * attenuation;
         }
     }
 

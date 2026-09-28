@@ -3,6 +3,7 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/ThreadPool.h"
+#include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Frustum.h"
@@ -294,4 +295,46 @@ TEST_CASE(Gltf_LightsPunctual)
     const float range = EffectiveRange(*spot->light);
     CHECK(std::abs(100.0f / (range * range) - kLightCutoffIlluminance) < 1e-4f);
     CHECK(EffectiveRange(*lamp->light) == 5.0f);
+}
+
+TEST_CASE(ShadowAtlas_PackingIsTightAndDisjoint)
+{
+    std::vector<std::uint32_t> sizes{1024};
+    sizes.insert(sizes.end(), 6, 512);
+    sizes.insert(sizes.end(), 10, 256);
+    sizes.insert(sizes.end(), 4, 128);
+    const auto packed = PackShadowTiles(sizes, 4096, 128);
+    CHECK(packed.has_value());
+    if (!packed)
+        return;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+        const glm::uvec2 a = (*packed)[i];
+        CHECK(a.x % sizes[i] == 0 && a.y % sizes[i] == 0); // aligned to its own size
+        CHECK(a.x + sizes[i] <= 4096 && a.y + sizes[i] <= 4096);
+        for (std::size_t j = i + 1; j < sizes.size(); ++j) {
+            const glm::uvec2 b       = (*packed)[j];
+            const bool       overlap = a.x < b.x + sizes[j] && b.x < a.x + sizes[i] && a.y < b.y + sizes[j] &&
+                                 b.y < a.y + sizes[i];
+            CHECK(!overlap);
+        }
+    }
+    // Exactly full, then one tile too many.
+    const std::vector<std::uint32_t> full(16, 1024);
+    CHECK(PackShadowTiles(full, 4096, 128).has_value());
+    const std::vector<std::uint32_t> over(17, 1024);
+    CHECK(!PackShadowTiles(over, 4096, 128).has_value());
+}
+
+TEST_CASE(ShadowAtlas_CubeFacesAndBorder)
+{
+    // Face order +X, -X, +Y, -Y, +Z, -Z: the face axis maps to the view direction (-Z).
+    const glm::vec3 light{1.0f, 2.0f, 3.0f};
+    const glm::vec3 axes[kCubeFaces] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (std::uint32_t f = 0; f < kCubeFaces; ++f) {
+        const glm::vec3 v = glm::vec3(CubeFaceView(light, f) * glm::vec4(light + axes[f] * 2.0f, 1.0f));
+        CHECK(glm::all(glm::epsilonEqual(v, glm::vec3(0.0f, 0.0f, -2.0f), 1e-5f)));
+    }
+    // 90 degrees plus a 4-texel border on a 256 tile: the face edge lands 4 texels inside.
+    const float t = ShadowTanHalfWithBorder(1.0f, 256, 4.0f);
+    CHECK(std::abs(1.0f / t - (1.0f - 8.0f / 256.0f)) < 1e-6f);
 }

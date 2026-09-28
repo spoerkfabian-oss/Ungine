@@ -12,6 +12,7 @@ add_library(Engine STATIC
     src/Renderer/GpuProfiler.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
+    src/Renderer/ShadowAtlas.cpp
     src/Renderer/ShadowCascades.cpp
     src/Renderer/Vulkan/Bindless.cpp
     src/Renderer/Vulkan/Buffer.cpp

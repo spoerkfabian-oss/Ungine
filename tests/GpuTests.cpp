@@ -359,6 +359,29 @@ TEST_CASE(Render_ClusteredLights)
     CHECK(render().lights == 2);
     renderer.post.debugView = DebugView::None;
 
+    // Local shadows: spot = 1 atlas tile, point = 6; budget, per-light flag, runtime atlas resize.
+    CHECK(stats.shadowedLights == 2 && stats.shadowTiles == 7 && stats.localShadowDraws > 0);
+    bool shadowScope = false;
+    for (const GpuTiming& t : F().renderer->Profiler().Results())
+        shadowScope |= std::string_view{t.name} == "Local shadows";
+    CHECK(!F().renderer->Profiler().Supported() || shadowScope);
+    renderer.post.debugView = DebugView::ShadowAtlas;
+    CHECK(render().shadowTiles == 7);
+    renderer.post.debugView        = DebugView::None;
+    renderer.localShadows.maxLights = 1;
+    CHECK(render().shadowedLights == 1);
+    renderer.localShadows.maxLights = 8;
+    renderer.localShadows.atlasSize = 1024; // recreated while earlier frames may still sample the old one
+    stats = render();
+    CHECK(stats.shadowedLights == 2 && stats.shadowTiles == 7);
+    registry.Get<Light>(spot).castShadows = false;
+    CHECK(render().shadowTiles == 6);
+    registry.Get<Light>(spot).castShadows = true;
+    renderer.localShadows.enabled = false;
+    stats                         = render();
+    CHECK(stats.shadowedLights == 0 && stats.lights == 2);
+    renderer.localShadows.enabled = true;
+
     // More lights than a cluster holds: the list is truncated, nothing breaks.
     for (int i = 0; i < 300; ++i)
         addLight({0.01f * static_cast<float>(i % 17), 0.5f, 0.01f * static_cast<float>(i / 17)},

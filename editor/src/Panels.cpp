@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <initializer_list>
 #include <numeric>
 
 namespace Engine {
@@ -357,6 +358,7 @@ void Editor::DrawInspector()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("0 = derived from the intensity (illuminance cutoff %.3f)", kLightCutoffIlluminance);
         ImGui::PopID();
+        CheckboxRow("Cast shadows", &light->castShadows);
         if (light->type == LightType::Spot) {
             PropertyRow("Outer cone");
             ImGui::SliderAngle("##v", &light->outerConeAngle, 1.0f, 90.0f);
@@ -455,7 +457,41 @@ void Editor::DrawRendererSettings()
                             kClusterGridY, kClusterGridZ, kClusterMaxLights);
     }
 
-    if (ImGui::CollapsingHeader("Shadows") && BeginProperties("shadows")) {
+    if (ImGui::CollapsingHeader("Local light shadows") && BeginProperties("localShadows")) {
+        LocalShadowSettings& s = sr.localShadows;
+        CheckboxRow("Enabled", &s.enabled);
+        const auto powerOfTwoCombo = [](const char* label, std::uint32_t* value, std::initializer_list<std::uint32_t> options) {
+            PropertyRow(label);
+            char current[16];
+            std::snprintf(current, sizeof(current), "%u", *value);
+            if (ImGui::BeginCombo("##v", current)) {
+                for (std::uint32_t option : options) {
+                    char text[16];
+                    std::snprintf(text, sizeof(text), "%u", option);
+                    if (ImGui::Selectable(text, option == *value))
+                        *value = option;
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        };
+        powerOfTwoCombo("Atlas size", &s.atlasSize, {1024, 2048, 4096, 8192});
+        SliderUintRow("Max lights", &s.maxLights, 0, 64);
+        powerOfTwoCombo("Max tile", &s.maxTileSize, {128, 256, 512, 1024, 2048});
+        powerOfTwoCombo("Min tile", &s.minTileSize, {32, 64, 128, 256});
+        SliderFloatRow("Depth bias", &s.depthBias, 0.0f, 10.0f, "%.2f");
+        SliderFloatRow("Slope bias", &s.slopeBias, 0.0f, 10.0f, "%.2f");
+        SliderFloatRow("Normal bias", &s.normalBias, 0.0f, 5.0f, "%.2f");
+        SliderFloatRow("Filter radius", &s.filterRadius, 0.0f, 5.0f, "%.2f");
+        PropertyRow("This frame");
+        ImGui::Text("%u lights, %u tiles, %u draws", sr.Stats().shadowedLights, sr.Stats().shadowTiles,
+                    sr.Stats().localShadowDraws);
+        ImGui::PopID();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Point light = 6 tiles. Debug view: Shadow atlas.");
+    }
+
+    if (ImGui::CollapsingHeader("Sun shadows") && BeginProperties("shadows")) {
         ShadowSettings& s = sr.shadows;
         CheckboxRow("Enabled", &s.enabled);
         SliderUintRow("Cascades", &s.cascadeCount, 1, kMaxCascades);
@@ -574,6 +610,8 @@ void Editor::DrawStats()
         ImGui::Text("Shadow draws   %u", stats.shadowDraws);
         ImGui::Text("Triangles      %llu", static_cast<unsigned long long>(stats.triangles));
         ImGui::Text("Lights         %u / %u", stats.lights, stats.lightsTotal);
+        ImGui::Text("Shadowed       %u (%u tiles, %u draws)", stats.shadowedLights, stats.shadowTiles,
+                    stats.localShadowDraws);
         ImGui::Text("Entities       %zu", m_Ctx.scene.GetRegistry().AliveCount());
         ImGui::Text("Exposure       %.3f", stats.exposure);
         if (m_Ctx.sceneRenderer.post.autoExposure)

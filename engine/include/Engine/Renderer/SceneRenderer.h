@@ -24,7 +24,7 @@ struct Model;
 
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
 
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, Count }; // mirrors tonemap.frag
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, Count }; // tonemap.frag
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -71,6 +71,28 @@ struct LightSettings {
     float clusterFar = 300.0f; // view distance covered by the depth slices; farther pixels use the last one
 };
 
+// Shadows of point and spot lights: one D32 atlas, re-rendered every frame. The most important
+// shadow-casting lights (screen size of their range) get tiles: spot = 1, point = 6 (cube faces).
+struct LocalShadowSettings {
+    bool          enabled      = true;
+    std::uint32_t atlasSize    = 4096; // power of two; changing it recreates the atlas
+    std::uint32_t maxLights    = 8;    // shadowed lights per frame
+    std::uint32_t maxTileSize  = 1024; // tile of a light that fills the screen (point lights: half per face)
+    std::uint32_t minTileSize  = 128;
+    float         depthBias    = 1.0f; // rasterizer constant bias
+    float         slopeBias    = 2.0f; // rasterizer slope-scaled bias
+    float         normalBias   = 1.5f; // receiver offset along its normal, in shadow texels
+    float         filterRadius = 1.5f; // PCF radius, in shadow texels
+};
+
+// Mirrors GpuShadowView in lights.glsl.
+struct GpuShadowView {
+    glm::mat4 viewProj{1.0f};
+    glm::vec4 rect{0.0f};   // atlas UV offset + size
+    glm::vec4 params{0.0f}; // x: texel world size per unit distance
+};
+static_assert(sizeof(GpuShadowView) == 96);
+
 // Mirrors GpuLight in lights.glsl.
 struct GpuLight {
     glm::vec3     position{0.0f};
@@ -82,7 +104,7 @@ struct GpuLight {
     float         cosOuter   = -1.0f;
     float         sinOuter   = 0.0f;
     std::uint32_t type       = 0;
-    float         pad        = 0.0f;
+    std::uint32_t shadow     = ~0u; // first GpuShadowView, ~0u: unshadowed
 };
 static_assert(sizeof(GpuLight) == 64);
 
@@ -93,6 +115,9 @@ struct SceneRenderStats {
     std::uint64_t triangles   = 0;
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
     std::uint32_t lightsTotal = 0; // Light components in the scene
+    std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
+    std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
+    std::uint32_t localShadowDraws = 0;
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
     float         averageLuminance = 0.0f; // adapted scene luminance (auto exposure only)
 };
@@ -110,6 +135,7 @@ struct RenderOutput {
 // Per frame:
 //   (IBL regeneration if the sky changed, compute)
 //   cascaded shadow maps: depth-only per cascade, culled against each cascade
+//   local light shadows: atlas tiles for the most important spot / point lights
 //   depth + view-normal prepass (frustum-culled per submesh)
 //   GTAO + depth-aware denoise (compute)
 //   clustered light assignment (compute, 16 x 9 x 24 froxels)
@@ -134,6 +160,7 @@ public:
     ShadowSettings                        shadows;
     AoSettings                            ao;
     LightSettings                         lights;
+    LocalShadowSettings                   localShadows;
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
 
 private:
@@ -151,6 +178,11 @@ private:
     void CollectDrawItems(Scene& scene);
     void CollectLights(Scene& scene, const Frustum& frustum);
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
+    [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
+    void EnsureShadowAtlas();
+    void ReleaseShadowAtlas();
+    void AssignLocalShadows(const CameraData& camera);
+    void RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     void RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
                        const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount);
     void DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress, bool countStats);
@@ -203,6 +235,23 @@ private:
 
     std::vector<DrawItem> m_DrawItems;
     std::vector<GpuLight> m_Lights; // this frame's visible lights
+    std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
+
+    // Local light shadow atlas. Views are chosen and packed every frame.
+    struct ShadowTile {
+        glm::mat4     viewProj{1.0f};
+        glm::uvec2    offset{0};   // texels
+        std::uint32_t size = 0;
+        glm::vec3     lightPosition{0.0f};
+        float         lightRange = 0.0f;
+        float         texelScale = 0.0f; // texel world size per unit distance
+    };
+    Image                      m_ShadowAtlas;
+    std::uint32_t              m_ShadowAtlasSlot = 0;
+    bool                       m_ShadowAtlasWritten = false; // has left UNDEFINED (debug view)
+    Pipeline                   m_LocalShadow, m_LocalShadowMasked;
+    std::vector<ShadowTile>    m_ShadowTiles;
+    std::vector<GpuShadowView> m_ShadowViewData;
     SceneRenderStats      m_Stats;
 };
 

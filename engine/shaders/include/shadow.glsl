@@ -67,4 +67,56 @@ float SunShadow(FrameData frame, vec3 worldPos, vec3 normal, float viewDepth, ve
     return shadow;
 }
 
+// Local light shadow from the atlas: the light's view (point lights: the cube face of the major
+// axis), normal offset scaled with the texel size at this distance, 16 rotated Poisson taps kept
+// inside the tile. 1 = lit.
+float LocalShadow(FrameData frame, GpuLight light, vec3 worldPos, vec3 normal, vec2 pixel)
+{
+    const vec3 d     = worldPos - light.position;
+    uint       index = light.shadow;
+    float      axisDistance;
+    if (light.type == LIGHT_POINT) {
+        const vec3 a = abs(d);
+        if (a.x >= a.y && a.x >= a.z) {
+            index += d.x > 0.0 ? 0u : 1u;
+            axisDistance = a.x;
+        } else if (a.y >= a.z) {
+            index += d.y > 0.0 ? 2u : 3u;
+            axisDistance = a.y;
+        } else {
+            index += d.z > 0.0 ? 4u : 5u;
+            axisDistance = a.z;
+        }
+    } else {
+        axisDistance = dot(d, light.direction);
+    }
+
+    ShadowViewBuffer    views = frame.shadowViews;
+    const GpuShadowView view  = views.v[index];
+    const vec3 offsetPos = worldPos + normal * (frame.localShadowParams.x * view.params.x * max(axisDistance, 0.0));
+    const vec4 clip      = view.viewProj * vec4(offsetPos, 1.0);
+    if (clip.w <= 0.0)
+        return 1.0;
+    const vec3 ndc = clip.xyz / clip.w;
+    const vec2 uv  = ndc.xy * 0.5 + 0.5; // shadow views are rendered without the Y flip
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        return 1.0;
+
+    const float texel    = 1.0 / float(frame.localShadowInfo.y);
+    const vec2  lo       = view.rect.xy + 0.5 * texel;
+    const vec2  hi       = view.rect.xy + view.rect.zw - 0.5 * texel;
+    const vec2  center   = view.rect.xy + uv * view.rect.zw;
+    const float radius   = frame.localShadowParams.y * texel;
+    const float rotation = 6.2831853 * InterleavedGradientNoise(pixel);
+    const mat2  rot      = mat2(cos(rotation), sin(rotation), -sin(rotation), cos(rotation));
+
+    float lit = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        const vec2 tap = clamp(center + rot * kPoisson16[i] * radius, lo, hi);
+        lit += texture(sampler2DShadow(uTextures[nonuniformEXT(frame.localShadowInfo.x)], uSamplers[SAMPLER_SHADOW]),
+                       vec3(tap, ndc.z));
+    }
+    return lit / 16.0;
+}
+
 #endif

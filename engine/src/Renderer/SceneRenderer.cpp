@@ -1,6 +1,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
+#include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
@@ -8,7 +9,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cassert>
 #include <cstring>
+#include <functional>
+#include <numeric>
 #include <utility>
 
 namespace Engine {
@@ -38,8 +42,11 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::vec4  clusterParams; // x: slice scale, y: slice bias, zw: clusters per pixel
     glm::vec4  clusterDepth;  // x: near, y: far
     glm::uvec4 lightInfo;     // x: light count
+    glm::uvec4 localShadowInfo;   // x: atlas slot, y: atlas size
+    glm::vec4  localShadowParams; // x: normal bias (texels), y: PCF radius (texels)
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
+    VkDeviceAddress shadowViews;
 };
 
 struct DrawData { // mirrors DrawData in mesh_common.glsl
@@ -191,6 +198,7 @@ const char* ToString(DebugView v)
     case DebugView::AmbientOcclusion: return "AO";
     case DebugView::Normals:          return "Normals";
     case DebugView::LightClusters:    return "Light clusters";
+    case DebugView::ShadowAtlas:      return "Shadow atlas";
     default:                          return "?";
     }
 }
@@ -254,6 +262,19 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                          .SetDebugName("ShadowDepthMasked")
                          .Build(device, layout);
 
+    // Local lights: perspective views, no depth clamp (casters behind the light must not pancake
+    // onto its near plane).
+    GraphicsPipelineBuilder localShadow;
+    localShadow.SetShaders(ShaderPath("shadow.vert.spv"))
+        .SetDepthFormat(kShadowFormat)
+        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+        .SetDynamicDepthBias(true)
+        .SetDebugName("LocalShadowDepth");
+    m_LocalShadow       = localShadow.Build(device, layout);
+    m_LocalShadowMasked = localShadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
+                              .SetDebugName("LocalShadowDepthMasked")
+                              .Build(device, layout);
+
     const auto compute = [&](const char* spv, const char* name) {
         return CreateComputePipeline(device, layout, ShaderPath(spv), name);
     };
@@ -281,10 +302,12 @@ SceneRenderer::~SceneRenderer()
 {
     ReleaseTargets();
     ReleaseShadowMap();
+    ReleaseShadowAtlas();
     for (auto& [format, pipeline] : m_Tonemap)
         m_Renderer.DeferRelease(std::move(pipeline));
     for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp,
-                        &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull})
+                        &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull,
+                        &m_LocalShadow, &m_LocalShadowMasked})
         m_Renderer.DeferRelease(std::move(*p));
     m_Renderer.DeferRelease(std::move(m_Clusters));
     m_Renderer.DeferRelease(std::move(m_LuminanceHistogram));
@@ -409,6 +432,33 @@ void SceneRenderer::EnsureShadowMap()
     }
 }
 
+void SceneRenderer::EnsureShadowAtlas()
+{
+    const std::uint32_t maxSize = m_Renderer.GetContext().Properties().limits.maxImageDimension2D;
+    const std::uint32_t size    = std::bit_floor(std::clamp(localShadows.atlasSize, 256u, maxSize));
+    if (m_ShadowAtlas && m_ShadowAtlas.Extent().width == size)
+        return;
+    ReleaseShadowAtlas();
+    m_ShadowAtlas        = Image(m_Renderer.GetContext(), {.extent    = {size, size, 1},
+                                                           .format    = kShadowFormat,
+                                                           .usage     = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                           .debugName = "LocalShadowAtlas"});
+    m_ShadowAtlasSlot    = m_Renderer.GetBindless().AddSampledImage(m_ShadowAtlas.View());
+    m_ShadowAtlasWritten = false;
+}
+
+void SceneRenderer::ReleaseShadowAtlas()
+{
+    if (!m_ShadowAtlas)
+        return;
+    Renderer* r = &m_Renderer;
+    r->DeferCall([r, slot = m_ShadowAtlasSlot] { r->GetBindless().RemoveSampledImage(slot); });
+    r->DeferRelease(std::move(m_ShadowAtlas));
+    m_ShadowAtlas        = {};
+    m_ShadowAtlasWritten = false;
+}
+
 void SceneRenderer::CollectDrawItems(Scene& scene)
 {
     m_DrawItems.clear();
@@ -485,12 +535,16 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const glm::mat4 viewProj = camera.projection * camera.view;
     const Frustum   frustum  = Frustum::FromViewProjection(viewProj);
     CollectLights(scene, frustum);
-    const VkDeviceAddress lightAddress =
-        m_Lights.empty() ? 0 : [&] {
-            const TransientAllocation a = m_Renderer.AllocateTransient(m_Lights.size() * sizeof(GpuLight), 16);
-            std::memcpy(a.cpu, m_Lights.data(), m_Lights.size() * sizeof(GpuLight));
-            return a.gpu;
-        }();
+    AssignLocalShadows(camera); // sets GpuLight::shadow
+    const auto pushArray = [&]<class T>(const std::vector<T>& values) -> VkDeviceAddress {
+        if (values.empty())
+            return 0;
+        const TransientAllocation a = m_Renderer.AllocateTransient(values.size() * sizeof(T), 16);
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(T));
+        return a.gpu;
+    };
+    const VkDeviceAddress lightAddress      = pushArray(m_Lights);
+    const VkDeviceAddress shadowViewAddress = pushArray(m_ShadowViewData);
     // Logarithmic slices between the near plane and clusterFar: slice = log(z) * scale + bias.
     const float clusterNear  = camera.nearPlane;
     const float clusterFar   = std::max(lights.clusterFar, clusterNear * 2.0f);
@@ -520,8 +574,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
                                        static_cast<float>(kClusterGridY) / static_cast<float>(extent.height)),
           .clusterDepth    = glm::vec4(clusterNear, clusterFar, 0.0f, 0.0f),
           .lightInfo       = glm::uvec4(static_cast<std::uint32_t>(m_Lights.size()), 0u, 0u, 0u),
+          .localShadowInfo = glm::uvec4(m_ShadowAtlasSlot, m_ShadowAtlas ? m_ShadowAtlas.Extent().width : 0u, 0u, 0u),
+          .localShadowParams = glm::vec4(localShadows.normalBias, localShadows.filterRadius, 0.0f, 0.0f),
           .lights          = lightAddress,
-          .clusters        = m_Clusters.Address()};
+          .clusters        = m_Clusters.Address(),
+          .shadowViews     = shadowViewAddress};
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
         uniforms.cascadeSplits[c]   = cascades[c].splitFar;
@@ -532,6 +589,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     if (cascadeCount > 0) {
         GpuScope scope(profiler, cmd, "Shadows");
         RenderShadows(cmd, frameAddress, cascades, cascadeCount);
+    }
+    if (!m_ShadowTiles.empty()) {
+        GpuScope scope(profiler, cmd, "Local shadows");
+        RenderLocalShadows(cmd, frameAddress);
     }
 
     {
@@ -585,9 +646,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
                               .bloomStrength = bloom ? post.bloomStrength : 0.0f,
                               .autoExposure  = post.autoExposure ? 1u : 0u,
                               .debugView     = static_cast<std::uint32_t>(post.debugView),
-                              .debugTexture  = post.debugView == DebugView::Normals         ? m_NormalSlot
-                                               : post.debugView == DebugView::LightClusters ? m_DepthSlot
-                                                                                            : m_AoSampled,
+                              .debugTexture  = DebugTexture(),
                               .frame         = frameAddress};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, TonemapPipeline(output.format).Handle());
     vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(tonemap), &tonemap);
@@ -595,9 +654,211 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     vkCmdEndRendering(cmd);
 }
 
+std::uint32_t SceneRenderer::DebugTexture() const
+{
+    switch (post.debugView) {
+    case DebugView::Normals:       return m_NormalSlot;
+    case DebugView::LightClusters: return m_DepthSlot;
+    case DebugView::ShadowAtlas:
+        return m_ShadowAtlasWritten ? m_ShadowAtlasSlot : m_Renderer.DefaultTextureIndex(DefaultTexture::Black);
+    default:                       return m_AoSampled;
+    }
+}
+
+void SceneRenderer::AssignLocalShadows(const CameraData& camera)
+{
+    m_ShadowTiles.clear();
+    m_ShadowViewData.clear();
+    if (!localShadows.enabled) {
+        ReleaseShadowAtlas(); // 64 MB at 4096^2
+        return;
+    }
+    if (localShadows.maxLights == 0 || m_Lights.empty())
+        return;
+    EnsureShadowAtlas();
+    const std::uint32_t atlasSize = m_ShadowAtlas.Extent().width;
+    const std::uint32_t minTile   = std::clamp(std::bit_floor(std::max(localShadows.minTileSize, 16u)), 16u, atlasSize);
+    const std::uint32_t maxTile   = std::clamp(std::bit_floor(std::max(localShadows.maxTileSize, minTile)), minTile, atlasSize);
+
+    // Importance: screen size of the light's range sphere (fraction of the viewport height).
+    struct Candidate {
+        std::uint32_t light;
+        float         importance;
+    };
+    std::vector<Candidate> candidates;
+    for (std::uint32_t i = 0; i < m_Lights.size(); ++i) {
+        if (!m_LightCastsShadows[i])
+            continue;
+        const GpuLight& l = m_Lights[i];
+        const float     d = glm::distance(l.position, camera.position);
+        const float     importance =
+            d <= l.range ? 1.0f
+                         : std::min(1.0f, l.range / std::sqrt(d * d - l.range * l.range) * camera.projection[1][1] * 0.5f);
+        candidates.push_back({i, importance});
+    }
+    std::ranges::stable_sort(candidates, std::greater{}, &Candidate::importance);
+    if (candidates.size() > localShadows.maxLights)
+        candidates.resize(localShadows.maxLights);
+
+    // Tile size from the importance; halved (then dropped) when the atlas is full.
+    const std::uint64_t cellsPerSide = atlasSize / minTile;
+    const std::uint64_t capacity     = cellsPerSide * cellsPerSide;
+    std::uint64_t       used         = 0;
+    const float         border       = std::ceil(localShadows.filterRadius) + 2.0f; // PCF taps stay in the tile
+    for (const Candidate& c : candidates) {
+        GpuLight&           l     = m_Lights[c.light];
+        const bool          point = l.type == 0;
+        const std::uint32_t views = point ? kCubeFaces : 1u;
+        std::uint32_t       size  = std::clamp(
+            std::bit_floor(std::max(static_cast<std::uint32_t>(c.importance * static_cast<float>(maxTile)), 1u)), minTile,
+            maxTile);
+        if (point)
+            size = std::max(size / 2, minTile);
+        const auto cells = [&](std::uint32_t s) {
+            const std::uint64_t side = s / minTile;
+            return side * side * views;
+        };
+        while (used + cells(size) > capacity && size > minTile)
+            size /= 2;
+        if (used + cells(size) > capacity)
+            continue;
+        used += cells(size);
+
+        // Reverse-Z perspective with an infinite far plane; the range bounds the casters instead.
+        const float nearPlane = std::max(l.range * 0.005f, 1e-4f);
+        l.shadow              = static_cast<std::uint32_t>(m_ShadowTiles.size());
+        const auto addTile    = [&](const glm::mat4& view, float tanHalf) {
+            m_ShadowTiles.push_back({.viewProj      = PerspectiveReverseZ(2.0f * std::atan(tanHalf), 1.0f, nearPlane) * view,
+                                     .offset        = glm::uvec2(0),
+                                     .size          = size,
+                                     .lightPosition = l.position,
+                                     .lightRange    = l.range,
+                                     .texelScale    = 2.0f * tanHalf / static_cast<float>(size)});
+        };
+        if (point) {
+            const float tanHalf = ShadowTanHalfWithBorder(1.0f, size, border);
+            for (std::uint32_t face = 0; face < kCubeFaces; ++face)
+                addTile(CubeFaceView(l.position, face), tanHalf);
+        } else {
+            // Wide cones (> 85 degrees) are only shadowed up to 85 degrees.
+            const float     outer = std::acos(std::clamp(l.cosOuter, 0.0f, 1.0f));
+            const float     tanHalf = ShadowTanHalfWithBorder(std::tan(std::min(outer, glm::radians(85.0f))), size, border);
+            const glm::vec3 up = std::abs(l.direction.y) > 0.99f ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+            addTile(glm::lookAt(l.position, l.position + l.direction, up), tanHalf);
+        }
+        ++m_Stats.shadowedLights;
+    }
+
+    // Pack largest first; GpuShadowView order stays the lights' order (GpuLight::shadow).
+    std::vector<std::uint32_t> order(m_ShadowTiles.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::ranges::stable_sort(order, std::greater{}, [&](std::uint32_t i) { return m_ShadowTiles[i].size; });
+    std::vector<std::uint32_t> sizes;
+    for (std::uint32_t i : order)
+        sizes.push_back(m_ShadowTiles[i].size);
+    const auto positions = PackShadowTiles(sizes, atlasSize, minTile);
+    assert(positions && "tile area was checked above");
+    for (std::size_t k = 0; k < order.size(); ++k)
+        m_ShadowTiles[order[k]].offset = (*positions)[k];
+
+    const float invAtlas = 1.0f / static_cast<float>(atlasSize);
+    for (const ShadowTile& tile : m_ShadowTiles)
+        m_ShadowViewData.push_back({.viewProj = tile.viewProj,
+                                    .rect     = glm::vec4(glm::vec2(tile.offset) * invAtlas,
+                                                          glm::vec2(static_cast<float>(tile.size) * invAtlas)),
+                                    .params   = glm::vec4(tile.texelScale, 0.0f, 0.0f, 0.0f)});
+    m_Stats.shadowTiles = static_cast<std::uint32_t>(m_ShadowTiles.size());
+}
+
+void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
+{
+    const auto&            bindless  = m_Renderer.GetBindless();
+    const VkPipelineLayout layout    = bindless.PipelineLayout();
+    const std::uint32_t    atlasSize = m_ShadowAtlas.Extent().width;
+    constexpr VkPipelineStageFlags2 kDepthStages =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+
+    // Earlier frames may still sample the atlas (lighting, debug view): WAR on their fragment shaders.
+    CmdImageBarrier(cmd, {.image     = m_ShadowAtlas.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                          .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstStage  = kDepthStages,
+                          .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
+
+    // Only the used tiles are cleared (to 0 = far), the rest of the atlas is never sampled.
+    const auto depth = Attachment(m_ShadowAtlas.View(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+    BeginRendering(cmd, {atlasSize, atlasSize}, nullptr, &depth);
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    vkCmdSetDepthBias(cmd, -localShadows.depthBias, 0.0f, -localShadows.slopeBias); // reverse-Z
+
+    for (std::uint32_t t = 0; t < m_ShadowTiles.size(); ++t) {
+        const ShadowTile& tile = m_ShadowTiles[t];
+        const VkRect2D    rect{{static_cast<std::int32_t>(tile.offset.x), static_cast<std::int32_t>(tile.offset.y)},
+                               {tile.size, tile.size}};
+        const VkViewport viewport{static_cast<float>(tile.offset.x), static_cast<float>(tile.offset.y),
+                                  static_cast<float>(tile.size), static_cast<float>(tile.size), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &rect);
+        VkClearAttachment clear{};
+        clear.aspectMask                      = VK_IMAGE_ASPECT_DEPTH_BIT;
+        clear.clearValue.depthStencil         = {0.0f, 0};
+        const VkClearRect clearRect{rect, 0, 1};
+        vkCmdClearAttachments(cmd, 1, &clear, 1, &clearRect);
+
+        const Frustum frustum = Frustum::FromViewProjection(tile.viewProj);
+        const float   rangeSq = tile.lightRange * tile.lightRange;
+        VkPipeline    bound   = VK_NULL_HANDLE;
+        const Model*  boundIndices = nullptr;
+        for (const DrawItem& item : m_DrawItems) {
+            for (const Submesh& sm : item.mesh->submeshes) {
+                const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, item.world);
+                const glm::vec3 closest = glm::clamp(tile.lightPosition, box.min, box.max);
+                if (glm::dot(closest - tile.lightPosition, closest - tile.lightPosition) > rangeSq ||
+                    !frustum.Intersects(box))
+                    continue;
+                const bool       masked   = (item.model->materialFlags[sm.material] & kMaterialAlphaMask) != 0;
+                const VkPipeline pipeline = masked ? m_LocalShadowMasked.Handle() : m_LocalShadow.Handle();
+                if (pipeline != bound) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                    bound = pipeline;
+                }
+                if (item.model != boundIndices) {
+                    vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+                    boundIndices = item.model;
+                }
+                const MeshPush push{.frame         = frameAddress,
+                                    .vertices      = item.model->vertexBuffer.Address(),
+                                    .materials     = item.model->materialBuffer.Address(),
+                                    .draw          = item.drawData,
+                                    .materialIndex = sm.material,
+                                    .cascade       = kMaxCascades + t}; // shadow.vert: local view t
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+                vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
+                ++m_Stats.localShadowDraws;
+            }
+        }
+    }
+    vkCmdEndRendering(cmd);
+
+    CmdImageBarrier(cmd, {.image     = m_ShadowAtlas.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          .srcStage  = kDepthStages,
+                          .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                          .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
+    m_ShadowAtlasWritten = true;
+}
+
 void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
 {
     m_Lights.clear();
+    m_LightCastsShadows.clear();
     auto view = scene.GetRegistry().ViewOf<Light, WorldTransform>();
     view.Each([&](Entity, Light& light, WorldTransform& world) {
         ++m_Stats.lightsTotal;
@@ -615,6 +876,7 @@ void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
             return;
         }
 
+        m_LightCastsShadows.push_back(light.castShadows);
         GpuLight& gpu = m_Lights.emplace_back();
         gpu.position  = position;
         gpu.range     = range;

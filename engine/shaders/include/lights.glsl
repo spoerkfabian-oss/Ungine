@@ -11,6 +11,7 @@
 
 #define LIGHT_POINT 0u
 #define LIGHT_SPOT  1u
+#define NO_SHADOW   0xFFFFFFFFu
 
 struct GpuLight {
     vec3  position;   // world space
@@ -22,10 +23,19 @@ struct GpuLight {
     float cosOuter;
     float sinOuter;
     uint  type;
-    float pad;
+    uint  shadow;     // first view in the shadow view buffer (point lights: + cube face); NO_SHADOW
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer LightBuffer { GpuLight l[]; };
+
+// One perspective shadow view in the local light shadow atlas. Mirrors Engine::GpuShadowView.
+struct GpuShadowView {
+    mat4 viewProj; // reverse-Z, infinite far
+    vec4 rect;     // atlas UV: xy offset, zw size
+    vec4 params;   // x: world size of one texel per unit of distance along the view axis
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ShadowViewBuffer { GpuShadowView v[]; };
 
 // counts[c], then CLUSTER_MAX_LIGHTS indices per cluster.
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer ClusterBuffer {

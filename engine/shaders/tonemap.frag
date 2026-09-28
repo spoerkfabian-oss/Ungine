@@ -13,8 +13,8 @@ layout(push_constant) uniform TonemapPush {
     uint          bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
     float         bloomStrength; // 0 = bloom off (the texture is not read)
     uint          autoExposure;
-    uint          debugView;     // Engine::DebugView: 0 off, 1 ambient occlusion, 2 normals, 3 light clusters
-    uint          debugTexture;  // slot shown by the debug view (light clusters: depth)
+    uint          debugView;     // Engine::DebugView: 0 off, 1 AO, 2 normals, 3 light clusters, 4 shadow atlas
+    uint          debugTexture;  // slot shown by the debug view (light clusters: depth; shadow atlas: atlas)
     FrameData     frame;         // light clusters view
 } pc;
 
@@ -94,6 +94,13 @@ void main()
                                                       uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
         const vec3 bloom = SampleTexture(pc.bloomTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size).rgb;
         hdr              = mix(hdr, bloom, pc.bloomStrength);
+    }
+    if (pc.debugView == 4u) { // whole atlas stretched over the screen; reverse-Z: near = bright
+        const vec2  size  = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)],
+                                                       uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
+        const float depth = SampleTextureLod(pc.debugTexture, SAMPLER_NEAREST_CLAMP, gl_FragCoord.xy / size, 0.0).r;
+        outColor          = vec4(vec3(sqrt(sqrt(max(depth, 0.0)))), 1.0);
+        return;
     }
     if (pc.debugView == 1u || pc.debugView == 2u) {
         const vec3 v = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
