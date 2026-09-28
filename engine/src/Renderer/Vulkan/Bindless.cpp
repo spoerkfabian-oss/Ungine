@@ -10,11 +10,15 @@ namespace {
 constexpr std::uint32_t kBindingSampledImages = 0;
 constexpr std::uint32_t kBindingSamplers      = 1;
 constexpr std::uint32_t kBindingStorageImages = 2;
+constexpr std::uint32_t kBindingCubeTextures  = 3;
+constexpr std::uint32_t kBindingStorageArrays = 4;
 
 // Desired sizes; clamped to device limits at runtime.
 constexpr std::uint32_t kMaxSampledImages = 16384;
 constexpr std::uint32_t kMaxSamplers      = 64;
 constexpr std::uint32_t kMaxStorageImages = 4096;
+constexpr std::uint32_t kMaxCubeTextures  = 256;  // share the sampled-image limit with binding 0
+constexpr std::uint32_t kMaxStorageArrays = 256;  // share the storage-image limit with binding 2
 
 VkSampler CreateSampler(VkDevice device, VkFilter filter, VkSamplerAddressMode address, float maxAnisotropy)
 {
@@ -63,23 +67,30 @@ BindlessRegistry::BindlessRegistry(const VulkanContext& ctx)
     props.pNext = &p12;
     vkGetPhysicalDeviceProperties2(ctx.PhysicalDevice(), &props);
 
-    m_SampledImages.capacity = std::min({kMaxSampledImages, p12.maxDescriptorSetUpdateAfterBindSampledImages,
-                                         p12.maxPerStageDescriptorUpdateAfterBindSampledImages});
+    // Limits count every binding of a descriptor type together: the cube/array bindings come off the top.
+    m_CubeTextures.capacity  = kMaxCubeTextures;
+    m_StorageArrays.capacity = kMaxStorageArrays;
+    m_SampledImages.capacity = std::min({kMaxSampledImages,
+                                         p12.maxDescriptorSetUpdateAfterBindSampledImages - kMaxCubeTextures,
+                                         p12.maxPerStageDescriptorUpdateAfterBindSampledImages - kMaxCubeTextures});
     m_Samplers.capacity      = std::min({kMaxSamplers, p12.maxDescriptorSetUpdateAfterBindSamplers,
                                          p12.maxPerStageDescriptorUpdateAfterBindSamplers});
-    m_StorageImages.capacity = std::min({kMaxStorageImages, p12.maxDescriptorSetUpdateAfterBindStorageImages,
-                                         p12.maxPerStageDescriptorUpdateAfterBindStorageImages});
+    m_StorageImages.capacity = std::min({kMaxStorageImages,
+                                         p12.maxDescriptorSetUpdateAfterBindStorageImages - kMaxStorageArrays,
+                                         p12.maxPerStageDescriptorUpdateAfterBindStorageImages - kMaxStorageArrays});
 
     // --- Layout ---
-    const std::array<VkDescriptorSetLayoutBinding, 3> bindings{{
+    const std::array<VkDescriptorSetLayoutBinding, 5> bindings{{
         {kBindingSampledImages, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, m_SampledImages.capacity, VK_SHADER_STAGE_ALL, nullptr},
         {kBindingSamplers, VK_DESCRIPTOR_TYPE_SAMPLER, m_Samplers.capacity, VK_SHADER_STAGE_ALL, nullptr},
         {kBindingStorageImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, m_StorageImages.capacity, VK_SHADER_STAGE_ALL, nullptr},
+        {kBindingCubeTextures, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, m_CubeTextures.capacity, VK_SHADER_STAGE_ALL, nullptr},
+        {kBindingStorageArrays, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, m_StorageArrays.capacity, VK_SHADER_STAGE_ALL, nullptr},
     }};
     constexpr VkDescriptorBindingFlags kFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
                                                 VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
                                                 VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    const std::array<VkDescriptorBindingFlags, 3> bindingFlags{kFlags, kFlags, kFlags};
+    const std::array<VkDescriptorBindingFlags, 5> bindingFlags{kFlags, kFlags, kFlags, kFlags, kFlags};
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -96,9 +107,9 @@ BindlessRegistry::BindlessRegistry(const VulkanContext& ctx)
 
     // --- Pool + the one set ---
     const std::array<VkDescriptorPoolSize, 3> poolSizes{{
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, m_SampledImages.capacity},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, m_SampledImages.capacity + m_CubeTextures.capacity},
         {VK_DESCRIPTOR_TYPE_SAMPLER, m_Samplers.capacity},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, m_StorageImages.capacity},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, m_StorageImages.capacity + m_StorageArrays.capacity},
     }};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -161,6 +172,24 @@ std::uint32_t BindlessRegistry::AddStorageImage(VkImageView view)
     std::scoped_lock    lock{m_Mutex};
     const std::uint32_t index = m_StorageImages.Allocate();
     WriteImage(kBindingStorageImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, index,
+               {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
+    return index;
+}
+
+std::uint32_t BindlessRegistry::AddCubeTexture(VkImageView view)
+{
+    std::scoped_lock    lock{m_Mutex};
+    const std::uint32_t index = m_CubeTextures.Allocate();
+    WriteImage(kBindingCubeTextures, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, index,
+               {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    return index;
+}
+
+std::uint32_t BindlessRegistry::AddStorageImageArray(VkImageView view)
+{
+    std::scoped_lock    lock{m_Mutex};
+    const std::uint32_t index = m_StorageArrays.Allocate();
+    WriteImage(kBindingStorageArrays, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, index,
                {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
     return index;
 }

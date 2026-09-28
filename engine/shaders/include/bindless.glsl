@@ -7,6 +7,8 @@
 layout(set = 0, binding = 0) uniform texture2D uTextures[];
 layout(set = 0, binding = 1) uniform sampler   uSamplers[];
 layout(set = 0, binding = 2, rgba16f) uniform image2D uStorageImages[]; // HDR targets
+layout(set = 0, binding = 3) uniform textureCube uCubeTextures[];
+layout(set = 0, binding = 4, rgba16f) uniform image2DArray uStorageArrays[]; // cube faces as layers
 
 // Must match Engine::DefaultSampler
 #define SAMPLER_LINEAR_REPEAT 0u
@@ -17,6 +19,12 @@ layout(set = 0, binding = 2, rgba16f) uniform image2D uStorageImages[]; // HDR t
 vec4 SampleTexture(uint texIndex, uint samplerIndex, vec2 uv)
 {
     return texture(sampler2D(uTextures[nonuniformEXT(texIndex)], uSamplers[nonuniformEXT(samplerIndex)]), uv);
+}
+
+vec4 SampleCube(uint cubeIndex, uint samplerIndex, vec3 dir, float lod)
+{
+    return textureLod(samplerCube(uCubeTextures[nonuniformEXT(cubeIndex)], uSamplers[nonuniformEXT(samplerIndex)]),
+                      dir, lod);
 }
 
 #endif

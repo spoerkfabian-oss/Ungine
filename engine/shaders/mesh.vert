@@ -10,14 +10,11 @@ layout(location = 3) out vec4 outTangent;
 void main()
 {
     Vertex v     = pc.vertices.v[gl_VertexIndex]; // vertexOffset already applied by DrawIndexed
-    vec4   world = pc.model * vec4(v.position, 1.0);
-
-    // Inverse-transpose handles non-uniform scale. (Precompute per object once it shows up in profiles.)
-    mat3 normalMatrix = transpose(inverse(mat3(pc.model)));
+    vec4   world = pc.draw.model * vec4(v.position, 1.0);
 
     outWorldPos = world.xyz;
-    outNormal   = normalize(normalMatrix * v.normal);
-    outTangent  = vec4(normalize(mat3(pc.model) * v.tangent.xyz), v.tangent.w);
+    outNormal   = mat3(pc.draw.normalMatrix) * v.normal;
+    outTangent  = vec4(mat3(pc.draw.model) * v.tangent.xyz, v.tangent.w); // w == 0 passes through
     outUV       = vec2(v.uvX, v.uvY);
     gl_Position = pc.frame.viewProj * world;
 }

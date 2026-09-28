@@ -1,4 +1,4 @@
-# Kontext: C++20/Vulkan Game Engine (Stand nach Phase 5)
+# Kontext: C++20/Vulkan Game Engine (Stand nach Phase 6)
 
 Übergabe-/Gedächtnisdokument. Nach jeder Phase aktualisieren.
 
@@ -23,9 +23,11 @@ engine/include/Engine/
   ECS/       Entity, Registry (header-only)
   Scene/     Components, Scene, Camera
   Assets/    AssetHandle, AssetManager, Model, GltfLoader
-  Renderer/  Renderer, SceneRenderer, Vulkan/{VkCommon,VkUtils,VulkanContext,Swapchain,Buffer,Image,Upload,Bindless,Pipeline}
-engine/src/...   engine/shaders/ (mesh.vert/.frag, include/)
-sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}   assets/models/BoxTextured.glb
+  Scene/     + Frustum (Aabb, TransformAabb)
+  Renderer/  Renderer, SceneRenderer, Environment, Vulkan/{VkCommon,VkUtils,VulkanContext,Swapchain,Buffer,Image,Upload,Bindless,Pipeline}
+engine/src/...   engine/shaders/ (mesh.*, fullscreen.vert, sky.frag, tonemap.frag, ibl_*.comp, include/{bindless,frame,mesh_common,pbr,sky,ibl_common}.glsl)
+sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}
+assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENSE.md (CC0 / CC-BY 4.0; kein NC-Material ins Repo)
 ```
 
 ## Architektur & Konventionen
@@ -35,7 +37,7 @@ sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}   assets/models
 - **Vulkan-Context:** 1.3 dynamicRendering + sync2; 1.2 BDA, Descriptor Indexing (UpdateAfterBind, UpdateUnusedWhilePending), Timeline-Semaphores, hostQueryReset; 1.0 Anisotropie, depthClamp, fillModeNonSolid, MDI. Dedizierte Transfer-Queue, sonst Fallback = Graphics-Queue. `ValidationErrorCount()` zählt Validation-Errors (Smoke-Tests).
 - **Frames:** `kFramesInFlight = 2`; pro Frame Pool, Fence, Image-Acquired-Semaphore; Render-Finished-Semaphores pro Swapchain-Image. Fence-Reset erst nach erfolgreichem Acquire. Resize → `vkDeviceWaitIdle` + Recreate. Present-Barriere: dstStage = COLOR_ATTACHMENT_OUTPUT (muss im Signal-Stage-Mask liegen).
 - **Koordinaten:** negativer Viewport-Y-Flip (+Y oben, glTF-CCW bleibt), Reverse-Z (Clear 0, `GREATER_OR_EQUAL`), `D32_SFLOAT`, Swapchain sRGB BGRA8.
-- **Bindless:** Set 0: `0` texture2D[], `1` sampler[], `2` image2D[] (rgba16f). Eine Pipeline-Layout, 128 B Push-Constants (`STAGE_ALL`). Default-Sampler 0 LinearRepeat, 1 LinearClamp, 2 NearestClamp. **Add/Remove threadsicher (Mutex).**
+- **Bindless:** Set 0: `0` texture2D[], `1` sampler[], `2` image2D[] (rgba16f), `3` textureCube[] (256), `4` image2DArray[] (rgba16f, 256; Cube-Faces für Compute). Eine Pipeline-Layout, 128 B Push-Constants (`STAGE_ALL`). Default-Sampler 0 LinearRepeat, 1 LinearClamp, 2 NearestClamp. **Add/Remove threadsicher (Mutex).**
 - **Buffer-Zugriff:** Vertex Pulling per BDA, kein Vertex-Input-State.
 - **Deferred Destruction:** `DeferRelease`/`DeferCall` (nur Main-Thread) → frei, wenn der Frame-Slot nach Fence-Wait wieder dran ist. UploadQueue-Ressourcen erst nach `IsReady(ticket)` freigeben.
 - **Transient-Allocator:** 8 MB/Frame, host-visible + BDA (`PushTransient<T>`).
@@ -49,12 +51,14 @@ sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}   assets/models
   - `AssetManager` (Main-Thread): `LoadModel(path)` cached nach normalisiertem absolutem Pfad (Refcount+1), Job auf ThreadPool: `LoadGltf` + `BuildModel` (GPU-Ressourcen, Bindless-Slots, Upload). `Update()` pro Frame: Ergebnisse → Uploading → Ready (bei `IsReady`), Events `AssetLoadedEvent<Model>`/`AssetFailedEvent<Model>` (nach den Schleifen publiziert). `Release` bei 0: freigeben (Graveyard, falls Upload noch läuft; Orphan, falls Job noch läuft). Dtor: Jobs abwarten, `Flush()`, alles freigeben.
   - `MeshRenderer{ModelHandle, meshIndex}`; `SceneRenderer` löst Handles über den AssetManager auf (nullptr → nicht zeichnen).
   - `InstantiateModel(scene, handle, model)` – eine Entity pro Node (Eltern vor Kindern).
-- **Datenlayouts (C++ ↔ GLSL):** `Vertex` 48 B, `GpuMaterial` 80 B, `FrameUniforms`, `MeshPush` (≤128 B).
-- **SceneRenderer:** ein Forward-Pass, 2 Pipelines (Backface/Double-Sided), Lambert + Ambient/AO/Emissive, Alpha-Mask per discard. `Stats()`.
+- **Datenlayouts (C++ ↔ GLSL):** `Vertex` 48 B (tangent.w = 0 → keine Tangente, Shader leitet Frame per Derivaten ab), `GpuMaterial` 80 B (inkl. normalScale, occlusionStrength), `FrameUniforms` (frame.glsl: viewProj/view/proj/invViewProj, Kamera, Sonne, sky.xy = Sky-/IBL-Intensität, ibl = Slots + Mip-Anzahl), `DrawData` (model + normalMatrix, per Transient, 16-B-aligned), `MeshPush` (4 BDA-Adressen + materialIndex).
+- **SceneRenderer (Phase 6):** `Environment::Update` (Compute, nur bei geänderten SkySettings) → PBR-Forward in HDR-Target (RGBA16F, eigenes Image, Resize → DeferRelease) + Depth → Sky-Pass (Fullscreen-Dreieck bei Depth 0, analytischer Himmel + Sonnenscheibe) → Tonemap-Pass (texelFetch, PBR Neutral / ACES fitted / None, Exposure) in die Swapchain. Eine Mesh-Pipeline mit dynamischem Cull-Mode/Front-Face (Double-Sided, negative Determinante → CW). Frustum Culling pro Submesh (CPU, AABB-Weltbox nach Arvo). `lighting` (SkySettings + iblIntensity), `post` (exposure, tonemapper), `Stats()` (draws, culled, tris).
+- **PBR (mesh.frag):** glTF-Metallic-Roughness, GGX + höhenkorreliertes Smith + Schlick, Lambert, Roughness-Floor 0,045; IBL Split-Sum + Multiple-Scattering (Fdez-Agüera); AO nur auf indirektes Licht.
+- **Environment (IBL):** Env-Cube 256² (9 Mips per Blit) → Irradiance 32² (512 Cos-Samples) + Prefiltered 128² (5 Mips = Roughness 0…1, 256 GGX-Samples, Filtered Importance Sampling) + BRDF-LUT 256² (einmalig). Sky-Funktion in `sky.glsl` für Skybox und IBL identisch (IBL ohne Sonnenscheibe). WAR-Barrieren gegen noch laufende Frames.
 - **ECS/Scene:** Entity 64 Bit, Sparse-Set-Pools; jede Entity hat Name/Transform/WorldTransform/Hierarchy; `UpdateTransforms` iterativ ohne Dirty-Flags.
 
 ## Build & Test
-- Windows: VS-Generator, Startprojekt Sandbox. `Sandbox [model.glb] [--frames N]` (Default `assets/models/BoxTextured.glb`; Exit 0 ok / 1 Ladefehler / 2 Validation-Errors).
+- Windows: VS-Generator, Startprojekt Sandbox. `Sandbox [model.glb] [--frames N]` (Default `assets/models/WaterBottle.glb`; Exit 0 ok / 1 Ladefehler / 2 Validation-Errors). Tasten: RMB+WASD/QE Kamera, T Tonemapper, −/= Exposure, Pfeile Sonne.
 - Tests: `EngineTests` (CPU), `EngineGpuTests` (echtes Vulkan-Device + Fenster). CTest: `-DENGINE_GPU_TESTS=ON` registriert GPU-Tests + `SandboxSmoke`.
 - Headless (Linux-Container): `apt install glslc libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev mesa-vulkan-drivers vulkan-validationlayers xvfb`; `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DGLFW_BUILD_WAYLAND=OFF`; Lauf mit `xvfb-run -a` (lavapipe), Sync-Validation via `VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`.
 
@@ -64,10 +68,11 @@ sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}   assets/models
 3. Buffer, Image, Upload (Mips), Bindless, Pipeline-Builder, Shader-CMake, Deferred Release.
 4. Depth, Input, FlyCamera, ECS, Scene-Graph, glTF-Loader, SceneRenderer, Transient-Allocator.
 5. ThreadPool, UploadQueue (Transfer-Queue, Timeline, QFOT, Mips auf Graphics), threadsichere Bindless-Registry, AssetManager (Handles, Cache, Refcount, Events), Tests + Smoke-Test, Present-Barrier-Fix.
+6. PBR (Cook-Torrance, Normal Maps inkl. Derivative-TBN), IBL aus prozeduralem Himmel (Compute), HDR-Target + Tone Mapping (PBR Neutral/ACES), Skybox, Frustum Culling, Normal-Matrix auf CPU, dynamisches Culling/Front-Face, Test-Modelle (CC0).
 
-## Verifikation (Stand Phase 5)
+## Verifikation (Stand Phase 6)
 - GCC 13 und Clang: `-Wall -Wextra -Wpedantic` ohne Warnungen im Engine-Code.
-- lavapipe (Mesa, Vulkan 1.4) + Khronos-Validation 1.3.275 inkl. Synchronization-Validation: Sandbox, EngineGpuTests → 0 Errors. Screenshot geprüft (texturierte Box).
+- lavapipe (Mesa, Vulkan 1.4) + Khronos-Validation 1.3.275 inkl. Synchronization-Validation: Sandbox (3 Modelle), EngineGpuTests (inkl. Render-Pfad, IBL-Regeneration bei Sonnenänderung, Culling) → 0 Errors. Screenshots geprüft (WaterBottle, Spheres vs. Khronos-Referenz, PBR Neutral vs. ACES).
 - ASan/UBSan: alle Tests grün (einzige Leak-Meldung aus llvmpipe-JIT-Threads). TSan: 0 Races im Engine-Code (2 Meldungen intern in `libvulkan_lvp.so`).
 - **Nicht getestet:** MSVC-Build; echte GPU; **QFOT-Pfad** (lavapipe hat nur eine Queue-Family).
 
@@ -81,9 +86,11 @@ sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}   assets/models
 7. Texturen nur RGBA8 (kein BCn/KTX2); Storage-Images im GLSL fest `rgba16f`.
 8. Kein `VkPipelineCache`; Shader über absoluten Build-Pfad (kein Asset-Packaging).
 9. glTF: Blend unsortiert/opak; ignoriert COLOR_0, Sampler, UV-Sets > 0, Skins, Animationen, Morph-Targets, basisu/webp; externe `.bin` per `fopen` (Nicht-ASCII-Pfade unter Windows).
-10. Kein Frustum Culling, `inverse()` pro Vertex, kein HDR/Tone Mapping.
-11. `UpdateTransforms` ohne Dirty-Flags.
+10. Kein Shadowing (CSM = Phase 7); Sonne beleuchtet auch verdeckte Flächen. Kein Auto-Exposure/Bloom.
+11. `UpdateTransforms` ohne Dirty-Flags. Culling auf der CPU, linear über alle Entities (kein BVH, kein GPU-Culling).
+12. IBL-Regeneration bei jeder Sonnenänderung komplett (auf GPU ~ms; auf lavapipe langsam). Himmel ist ein einfaches analytisches Modell (kein Hosek/Bruneton).
+13. Blend-Materialien weiterhin opak; Specular-/Clearcoat-/Transmission-Extensions nicht unterstützt.
 
 ## Nächste Schritte (Vorschlag)
-- **Phase 6:** PBR (Cook-Torrance, Normal Maps mit Derivative-TBN-Fallback, IBL), HDR-Target + Tone Mapping, Frustum Culling (AABBs pro Submesh vorhanden), danach CSM.
-- Später: Bloom, SSAO, Forward+/Deferred, BVH/Octree, Jolt, ImGui-Editor (Frame-Diagnostik, Asset-Status).
+- **Phase 7:** Cascaded Shadow Maps (depthClamp + dynamischer Depth-Bias im Pipeline-Builder vorbereitet), danach Bloom/SSAO.
+- Später: Forward+/Deferred, BVH/Octree, Jolt, ImGui-Editor (Frame-Diagnostik, Asset-Status, Licht-/Tonemap-Regler).

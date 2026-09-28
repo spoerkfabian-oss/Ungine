@@ -14,7 +14,8 @@ enum class DefaultSampler : std::uint32_t { LinearRepeat = 0, LinearClamp = 1, N
 inline constexpr std::uint32_t kPushConstantSize = 128; // guaranteed minimum on every device
 
 // One global descriptor set (set 0) shared by every pipeline:
-//   binding 0: texture2D[]  binding 1: sampler[]  binding 2: image2D[] (storage)
+//   binding 0: texture2D[]    binding 1: sampler[]   binding 2: image2D[] (storage, rgba16f)
+//   binding 3: textureCube[]  binding 4: image2DArray[] (storage, rgba16f; cube faces from compute)
 // Buffers are accessed through buffer device addresses in push constants, not descriptors.
 class BindlessRegistry {
 public:
@@ -29,11 +30,19 @@ public:
                                                 VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     [[nodiscard]] std::uint32_t AddStorageImage(VkImageView view);
     [[nodiscard]] std::uint32_t AddSampler(VkSampler sampler);
+    [[nodiscard]] std::uint32_t AddCubeTexture(VkImageView cubeView);       // SHADER_READ_ONLY layout
+    [[nodiscard]] std::uint32_t AddStorageImageArray(VkImageView arrayView); // GENERAL layout
 
     // Frees the slot for reuse. The GPU may still read it: call through Renderer::DeferCall.
     void RemoveSampledImage(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_SampledImages.Release(index); }
     void RemoveStorageImage(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_StorageImages.Release(index); }
     void RemoveSampler(std::uint32_t index)      { std::scoped_lock lock{m_Mutex}; m_Samplers.Release(index); }
+    void RemoveCubeTexture(std::uint32_t index)  { std::scoped_lock lock{m_Mutex}; m_CubeTextures.Release(index); }
+    void RemoveStorageImageArray(std::uint32_t index)
+    {
+        std::scoped_lock lock{m_Mutex};
+        m_StorageArrays.Release(index);
+    }
 
     void Bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) const;
 
@@ -61,7 +70,7 @@ private:
     // Guards the slot allocators and descriptor writes (the set is externally synchronized).
     // Binding the set while another thread writes unused slots is allowed (UPDATE_AFTER_BIND).
     std::mutex    m_Mutex;
-    SlotAllocator m_SampledImages, m_Samplers, m_StorageImages;
+    SlotAllocator m_SampledImages, m_Samplers, m_StorageImages, m_CubeTextures, m_StorageArrays;
     std::array<VkSampler, static_cast<std::size_t>(DefaultSampler::Count)> m_DefaultSamplers{};
 };
 

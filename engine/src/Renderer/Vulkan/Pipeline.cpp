@@ -54,6 +54,7 @@ GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDepth(bool test, bool write
 }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDepthClamp(bool e) { m_DepthClamp = e; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDynamicDepthBias(bool e) { m_DynamicDepthBias = e; return *this; }
+GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDynamicCulling(bool e) { m_DynamicCulling = e; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetBlend(BlendMode m) { m_Blend = m; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::AddColorAttachment(VkFormat f) { m_ColorFormats.push_back(f); return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDepthFormat(VkFormat f) { m_DepthFormat = f; return *this; }
@@ -88,6 +89,26 @@ struct ShaderModuleGuard {
     }
 };
 } // namespace
+
+Pipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout, const std::filesystem::path& shader,
+                               const char* debugName)
+{
+    const ShaderModuleGuard cs{device, LoadShaderModule(device, shader)};
+
+    VkComputePipelineCreateInfo info{};
+    info.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    info.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = cs.module;
+    info.stage.pName  = "main";
+    info.layout       = layout;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline));
+    if (debugName)
+        Engine::SetDebugName(device, VK_OBJECT_TYPE_PIPELINE, pipeline, debugName);
+    return Pipeline{device, pipeline};
+}
 
 Pipeline GraphicsPipelineBuilder::Build(VkDevice device, VkPipelineLayout layout) const
 {
@@ -153,6 +174,10 @@ Pipeline GraphicsPipelineBuilder::Build(VkDevice device, VkPipelineLayout layout
     std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     if (m_DynamicDepthBias)
         dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+    if (m_DynamicCulling) {
+        dynamicStates.push_back(VK_DYNAMIC_STATE_CULL_MODE);
+        dynamicStates.push_back(VK_DYNAMIC_STATE_FRONT_FACE);
+    }
     VkPipelineDynamicStateCreateInfo dynamic{};
     dynamic.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());

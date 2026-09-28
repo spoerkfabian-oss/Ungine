@@ -65,6 +65,7 @@ public:
 
     // Threading: bindless registry, upload queue (see its docs) and DefaultTextureIndex may be
     // used from worker threads. Everything else, DeferRelease/DeferCall included: main thread.
+    [[nodiscard]] const VulkanContext& GetContext() const { return m_Ctx; }
     [[nodiscard]] const Swapchain&   GetSwapchain() const { return *m_Swapchain; }
     [[nodiscard]] BindlessRegistry&  GetBindless()        { return *m_Bindless; }
     [[nodiscard]] UploadQueue&       GetUploader()        { return *m_Upload; }
@@ -83,9 +84,9 @@ public:
 
     template <class T>
         requires std::is_trivially_copyable_v<T>
-    [[nodiscard]] VkDeviceAddress PushTransient(const T& value)
+    [[nodiscard]] VkDeviceAddress PushTransient(const T& value, VkDeviceSize alignment = 256)
     {
-        const TransientAllocation a = AllocateTransient(sizeof(T));
+        const TransientAllocation a = AllocateTransient(sizeof(T), alignment);
         std::memcpy(a.cpu, &value, sizeof(T));
         return a.gpu;
     }

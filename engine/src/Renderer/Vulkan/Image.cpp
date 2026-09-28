@@ -60,6 +60,24 @@ Image::Image(const VulkanContext& ctx, const ImageDesc& desc)
     }
 }
 
+ImageView Image::CreateView(VkImageViewType type, std::uint32_t baseMip, std::uint32_t mipCount,
+                            std::uint32_t baseLayer, std::uint32_t layerCount, const char* debugName) const
+{
+    assert(baseMip + mipCount <= m_MipLevels && baseLayer + layerCount <= m_ArrayLayers);
+    VkImageViewCreateInfo info{};
+    info.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    info.image            = m_Image;
+    info.viewType         = type;
+    info.format           = m_Format;
+    info.subresourceRange = {m_Aspect & ~VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT}, baseMip, mipCount,
+                             baseLayer, layerCount};
+    VkImageView view = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateImageView(m_Device, &info, nullptr, &view));
+    if (debugName)
+        SetDebugName(m_Device, VK_OBJECT_TYPE_IMAGE_VIEW, view, debugName);
+    return ImageView{m_Device, view};
+}
+
 void Image::Release() noexcept
 {
     if (m_View)

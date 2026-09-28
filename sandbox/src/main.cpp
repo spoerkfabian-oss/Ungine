@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -55,6 +56,7 @@ protected:
     {
         m_Camera.Update(GetInput(), GetWindow(), static_cast<float>(dt));
         m_Scene.UpdateTransforms();
+        UpdateLookControls(static_cast<float>(dt));
 
         if (m_LoadDone && m_ExitAfterFrames > 0 && ++m_FramesSinceLoad >= m_ExitAfterFrames)
             GetWindow().RequestClose();
@@ -63,10 +65,12 @@ protected:
         ++m_FrameCount;
         if (m_FpsTimer >= 1.0) {
             const auto& stats  = m_SceneRenderer->Stats();
+            const auto& post   = m_SceneRenderer->post;
             const char* status = m_LoadFailed ? " | load failed" : (m_LoadDone ? "" : " | loading...");
-            GetWindow().SetTitle(std::format("Sandbox | {} FPS | {:.2f} ms | {} draws | {} tris{}", m_FrameCount,
-                                             1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.triangles,
-                                             status));
+            GetWindow().SetTitle(std::format(
+                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled) | {} tris | {} x{:.2f}{}", m_FrameCount,
+                1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.triangles,
+                Engine::ToString(post.tonemapper), post.exposure, status));
             m_FpsTimer   = 0.0;
             m_FrameCount = 0;
         }
@@ -81,6 +85,35 @@ protected:
     void OnShutdown() override { GetAssets().Release(m_Model); }
 
 private:
+    // T: next tone mapper, -/=: exposure, arrow keys: rotate the sun (regenerates the IBL maps).
+    void UpdateLookControls(float dt)
+    {
+        const Engine::Input& input = GetInput();
+        auto&                post  = m_SceneRenderer->post;
+        if (input.WasKeyPressed(Engine::Key::T)) {
+            const auto next = (static_cast<std::uint32_t>(post.tonemapper) + 1) %
+                              static_cast<std::uint32_t>(Engine::Tonemapper::Count);
+            post.tonemapper = static_cast<Engine::Tonemapper>(next);
+        }
+        if (input.WasKeyPressed(Engine::Key::Minus))
+            post.exposure /= 1.25f;
+        if (input.WasKeyPressed(Engine::Key::Equal))
+            post.exposure *= 1.25f;
+
+        const auto  axis  = [&](int positive, int negative) {
+            return (input.IsKeyDown(positive) ? 1.0f : 0.0f) - (input.IsKeyDown(negative) ? 1.0f : 0.0f);
+        };
+        const float yaw   = axis(Engine::Key::Right, Engine::Key::Left);
+        const float pitch = axis(Engine::Key::Up, Engine::Key::Down);
+        if (yaw != 0.0f || pitch != 0.0f) {
+            m_SunYaw += yaw * dt;
+            m_SunElevation = std::clamp(m_SunElevation + pitch * dt, -0.1f, 1.5f);
+            const glm::vec3 toSun{std::cos(m_SunElevation) * std::sin(m_SunYaw), std::sin(m_SunElevation),
+                                  std::cos(m_SunElevation) * std::cos(m_SunYaw)};
+            m_SceneRenderer->lighting.sky.sunDirection = -toSun;
+        }
+    }
+
     void OnModelLoaded()
     {
         const Engine::Model* model = GetAssets().Get(m_Model);
@@ -112,6 +145,8 @@ private:
     bool                                  m_LoadDone        = false;
     bool                                  m_LoadFailed      = false;
     std::uint32_t                         m_FramesSinceLoad = 0;
+    float                                 m_SunYaw          = 0.73f; // matches SkySettings' default direction
+    float                                 m_SunElevation    = 0.85f;
 
     double        m_FpsTimer   = 0.0;
     std::uint32_t m_FrameCount = 0;
@@ -120,7 +155,7 @@ private:
 int main(int argc, char** argv)
 {
     // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N]
-    std::filesystem::path modelPath = "assets/models/BoxTextured.glb";
+    std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];

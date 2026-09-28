@@ -6,8 +6,13 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Scene/Scene.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <cmath>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -67,6 +72,7 @@ struct Fixture {
 
 Fixture*        g_Fixture = nullptr;
 const fs::path  kBox      = fs::path(ENGINE_ASSET_DIR) / "models" / "BoxTextured.glb";
+const fs::path  kSpheres  = fs::path(ENGINE_ASSET_DIR) / "models" / "MetalRoughSpheresNoTextures.glb";
 
 Fixture& F() { return *g_Fixture; }
 
@@ -189,6 +195,53 @@ TEST_CASE(Asset_ShutdownWithLoadsInFlight)
             (void)local.LoadModel(kBox);
     }
     F().Pump([] { return false; }, 4);
+}
+
+TEST_CASE(Render_PbrFrameAndFrustumCulling)
+{
+    // Full SceneRenderer path (IBL generation, PBR, sky, tone mapping) under validation.
+    const ModelHandle h = F().assets->LoadModel(kSpheres);
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+
+    Scene scene;
+    InstantiateModel(scene, h, *model);
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+
+    const glm::vec3 center = (model->boundsMin + model->boundsMax) * 0.5f;
+    const float     radius = glm::length(model->boundsMax - model->boundsMin) * 0.5f;
+    const glm::vec3 eye    = center + glm::vec3(0.0f, 0.0f, radius * 3.0f);
+    const auto renderTowards = [&](glm::vec3 target) {
+        const CameraData camera{.view       = glm::lookAt(eye, target, glm::vec3(0.0f, 1.0f, 0.0f)),
+                                .projection = PerspectiveReverseZ(glm::radians(60.0f), 320.0f / 240.0f, 0.01f),
+                                .position   = eye};
+        SceneRenderStats stats;
+        for (int i = 0; i < 3; ++i) { // skipped frames (swapchain out of date) are fine
+            if (auto frame = F().renderer->BeginFrame()) {
+                renderer.Render(*frame, scene, camera);
+                F().renderer->EndFrame(*frame);
+                stats = renderer.Stats();
+            }
+        }
+        return stats;
+    };
+
+    const SceneRenderStats facing = renderTowards(center);
+    CHECK(facing.drawCalls > 0 && facing.culled == 0 && facing.triangles > 0);
+    // Moving the sun regenerates the IBL maps while earlier frames may still sample them.
+    for (float angle : {0.3f, 1.2f, 2.5f}) {
+        renderer.lighting.sky.sunDirection = glm::vec3(std::sin(angle), -0.6f, std::cos(angle));
+        CHECK(renderTowards(center).drawCalls == facing.drawCalls);
+    }
+
+    const SceneRenderStats away = renderTowards(eye + (eye - center)); // model behind the camera
+    CHECK(away.drawCalls == 0 && away.culled == facing.drawCalls);
+
+    F().assets->Release(h);
 }
 
 int main(int argc, char** argv)

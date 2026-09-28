@@ -59,8 +59,9 @@ void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTic
                              .metallicRoughnessTexture = slot(m.metallicRoughnessTexture, DefaultTexture::White),
                              .emissiveTexture          = slot(m.emissiveTexture, DefaultTexture::White),
                              .occlusionTexture         = slot(m.occlusionTexture, DefaultTexture::White),
-                             .samplerIndex = static_cast<std::uint32_t>(DefaultSampler::LinearRepeat),
-                             .padding      = {}});
+                             .samplerIndex             = static_cast<std::uint32_t>(DefaultSampler::LinearRepeat),
+                             .normalScale              = m.normalScale,
+                             .occlusionStrength        = m.occlusionStrength});
         out.materialFlags.push_back(flags);
     }
     out.materialBuffer = uploader.CreateBuffer(std::as_bytes(std::span{materials}),

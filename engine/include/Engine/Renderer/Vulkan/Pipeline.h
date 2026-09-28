@@ -52,6 +52,10 @@ private:
     VkPipeline m_Pipeline = VK_NULL_HANDLE;
 };
 
+// Compute pipeline on the shared bindless layout.
+[[nodiscard]] Pipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout,
+                                             const std::filesystem::path& shader, const char* debugName = nullptr);
+
 enum class BlendMode { Opaque, Alpha, Additive };
 
 // Dynamic-rendering graphics pipeline. No vertex input state: vertices are pulled via BDA.
@@ -62,6 +66,8 @@ public:
     GraphicsPipelineBuilder& SetTopology(VkPrimitiveTopology topology);
     GraphicsPipelineBuilder& SetPolygonMode(VkPolygonMode mode);
     GraphicsPipelineBuilder& SetCulling(VkCullModeFlags cull, VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    // Cull mode + front face set per draw (vkCmdSetCullMode/FrontFace, core 1.3).
+    GraphicsPipelineBuilder& SetDynamicCulling(bool enable);
     // Reverse-Z is the engine convention: clear depth to 0, compare GREATER_OR_EQUAL.
     GraphicsPipelineBuilder& SetDepth(bool test, bool write, VkCompareOp op = VK_COMPARE_OP_GREATER_OR_EQUAL);
     GraphicsPipelineBuilder& SetDepthClamp(bool enable);       // shadow maps
@@ -84,6 +90,7 @@ private:
     VkCompareOp           m_DepthCompare     = VK_COMPARE_OP_GREATER_OR_EQUAL;
     bool                  m_DepthClamp       = false;
     bool                  m_DynamicDepthBias = false;
+    bool                  m_DynamicCulling   = false;
     BlendMode             m_Blend            = BlendMode::Opaque;
     std::vector<VkFormat> m_ColorFormats;
     VkFormat              m_DepthFormat      = VK_FORMAT_UNDEFINED;

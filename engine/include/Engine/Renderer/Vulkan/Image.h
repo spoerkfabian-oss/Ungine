@@ -2,6 +2,7 @@
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <cstdint>
+#include <utility>
 
 namespace Engine {
 
@@ -14,6 +15,40 @@ struct ImageDesc {
     VkImageViewType       viewType    = VK_IMAGE_VIEW_TYPE_2D;
     VkSampleCountFlagBits samples     = VK_SAMPLE_COUNT_1_BIT;
     const char*           debugName   = nullptr;
+};
+
+// Move-only RAII view onto part of an Image (e.g. one mip of a cube map as a 2D array).
+class ImageView {
+public:
+    ImageView() = default;
+    ImageView(VkDevice device, VkImageView view) : m_Device(device), m_View(view) {}
+    ~ImageView() { Release(); }
+
+    ImageView(ImageView&& o) noexcept : m_Device(o.m_Device), m_View(std::exchange(o.m_View, VK_NULL_HANDLE)) {}
+    ImageView& operator=(ImageView&& o) noexcept
+    {
+        if (this != &o) {
+            Release();
+            m_Device = o.m_Device;
+            m_View   = std::exchange(o.m_View, VK_NULL_HANDLE);
+        }
+        return *this;
+    }
+    ImageView(const ImageView&)            = delete;
+    ImageView& operator=(const ImageView&) = delete;
+
+    [[nodiscard]] VkImageView Handle() const { return m_View; }
+
+private:
+    void Release() noexcept
+    {
+        if (m_View)
+            vkDestroyImageView(m_Device, m_View, nullptr);
+        m_View = VK_NULL_HANDLE;
+    }
+
+    VkDevice    m_Device = VK_NULL_HANDLE;
+    VkImageView m_View   = VK_NULL_HANDLE;
 };
 
 // Move-only RAII image + default view covering all mips/layers.
@@ -45,6 +80,11 @@ public:
     [[nodiscard]] std::uint32_t      ArrayLayers() const { return m_ArrayLayers; }
     [[nodiscard]] VkImageAspectFlags Aspect()      const { return m_Aspect; } // full aspect, for barriers
     [[nodiscard]] explicit operator bool()         const { return m_Image != VK_NULL_HANDLE; }
+
+    // Additional view; destroy it (or hand it to DeferRelease) before the image.
+    [[nodiscard]] ImageView CreateView(VkImageViewType type, std::uint32_t baseMip, std::uint32_t mipCount,
+                                       std::uint32_t baseLayer, std::uint32_t layerCount,
+                                       const char* debugName = nullptr) const;
 
 private:
     void Release() noexcept;

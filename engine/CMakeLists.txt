@@ -7,6 +7,7 @@ add_library(Engine STATIC
     src/Core/ThreadPool.cpp
     src/Core/Window.cpp
     src/Events/EventBus.cpp
+    src/Renderer/Environment.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
     src/Renderer/Vulkan/Bindless.cpp
@@ -19,6 +20,7 @@ add_library(Engine STATIC
     src/Renderer/Vulkan/VulkanContext.cpp
     src/Renderer/Vulkan/VmaImpl.cpp
     src/Scene/Camera.cpp
+    src/Scene/Frustum.cpp
     src/Scene/Scene.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
@@ -44,10 +46,23 @@ engine_set_warnings(Engine)
 set_target_properties(Engine PROPERTIES FOLDER "Engine")
 
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE
-target_sources(Engine PRIVATE shaders/include/bindless.glsl shaders/include/mesh_common.glsl)
-set_source_files_properties(shaders/include/bindless.glsl shaders/include/mesh_common.glsl
-                            PROPERTIES HEADER_FILE_ONLY TRUE)
+set(ENGINE_SHADER_INCLUDES
+    shaders/include/bindless.glsl
+    shaders/include/frame.glsl
+    shaders/include/ibl_common.glsl
+    shaders/include/mesh_common.glsl
+    shaders/include/pbr.glsl
+    shaders/include/sky.glsl)
+target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
+set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 engine_add_shaders(Engine SOURCES
+    shaders/fullscreen.vert
+    shaders/ibl_brdf.comp
+    shaders/ibl_irradiance.comp
+    shaders/ibl_prefilter.comp
+    shaders/ibl_sky.comp
+    shaders/mesh.frag
     shaders/mesh.vert
-    shaders/mesh.frag)
+    shaders/sky.frag
+    shaders/tonemap.frag)

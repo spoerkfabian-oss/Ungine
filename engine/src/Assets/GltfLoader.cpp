@@ -175,8 +175,10 @@ private:
                 md.baseColorTexture         = Texture(pbr.base_color_texture, true);
                 md.metallicRoughnessTexture = Texture(pbr.metallic_roughness_texture, false);
             }
-            md.normalTexture    = Texture(m.normal_texture, false);
-            md.occlusionTexture = Texture(m.occlusion_texture, false);
+            md.normalTexture     = Texture(m.normal_texture, false);
+            md.occlusionTexture  = Texture(m.occlusion_texture, false);
+            md.normalScale       = m.normal_texture.texture ? m.normal_texture.scale : 1.0f;
+            md.occlusionStrength = m.occlusion_texture.texture ? m.occlusion_texture.scale : 1.0f;
             md.emissiveTexture  = Texture(m.emissive_texture, true);
             md.emissiveFactor   = glm::make_vec3(m.emissive_factor);
             if (m.has_emissive_strength)

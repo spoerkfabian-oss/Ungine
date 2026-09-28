@@ -23,7 +23,7 @@ struct Vertex {
     float     uvX = 0.0f;
     glm::vec3 normal{0.0f, 0.0f, 1.0f};
     float     uvY = 0.0f;
-    glm::vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f}; // w = bitangent sign
+    glm::vec4 tangent{0.0f}; // w = bitangent sign; w == 0: none, the shader derives a frame
 };
 static_assert(sizeof(Vertex) == 48);
 
@@ -55,12 +55,14 @@ struct MaterialData {
     std::string  name;
     glm::vec4    baseColorFactor{1.0f};
     glm::vec3    emissiveFactor{0.0f};
-    float        metallic    = 1.0f;
-    float        roughness   = 1.0f;
-    float        alphaCutoff = 0.5f;
-    bool         alphaMask   = false;
-    bool         alphaBlend  = false;
-    bool         doubleSided = false;
+    float        metallic          = 1.0f;
+    float        roughness         = 1.0f;
+    float        alphaCutoff       = 0.5f;
+    float        normalScale       = 1.0f; // normalTexture.scale
+    float        occlusionStrength = 1.0f; // occlusionTexture.strength
+    bool         alphaMask         = false;
+    bool         alphaBlend        = false;
+    bool         doubleSided       = false;
     std::int32_t baseColorTexture         = kNoTexture; // indices into ModelData::textures
     std::int32_t normalTexture            = kNoTexture;
     std::int32_t metallicRoughnessTexture = kNoTexture;
@@ -103,7 +105,8 @@ struct GpuMaterial {
     std::uint32_t emissiveTexture;
     std::uint32_t occlusionTexture;
     std::uint32_t samplerIndex;
-    std::uint32_t padding[2];
+    float         normalScale;
+    float         occlusionStrength;
 };
 static_assert(sizeof(GpuMaterial) == 80);
 
