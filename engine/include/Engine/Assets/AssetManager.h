@@ -33,6 +33,14 @@ struct AssetFailedEvent {
     std::string    error;
 };
 
+struct ModelInfo {
+    ModelHandle   handle;
+    AssetState    state    = AssetState::Invalid;
+    std::uint32_t refCount = 0;
+    std::string   path;  // UTF-8 file path, or the name of a generated model
+    std::string   error; // Failed only
+};
+
 // Asynchronous, path-cached asset loading. Main thread only, except the worker jobs it spawns.
 //
 //   Load(path)  cache hit: same handle, refcount + 1. Miss: new handle in state Loading; a
@@ -63,6 +71,9 @@ public:
     [[nodiscard]] AssetState    State(ModelHandle handle) const;
     [[nodiscard]] std::string   Error(ModelHandle handle) const; // empty unless Failed
     [[nodiscard]] std::uint32_t RefCount(ModelHandle handle) const;
+
+    // Every model that has not been released (tools, diagnostics).
+    [[nodiscard]] std::vector<ModelInfo> Models() const;
 
     // Distinct paths currently held (any state except released).
     [[nodiscard]] std::size_t CachedCount() const { return m_Cache.size(); }

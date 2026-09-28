@@ -1,3 +1,4 @@
+#include "Editor/Editor.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Core/Application.h"
@@ -20,11 +21,15 @@
 class Sandbox final : public Engine::Application {
 public:
     // exitAfterFrames > 0: close that many frames after the model finished loading (smoke tests).
-    Sandbox(const Engine::ApplicationDesc& desc, std::filesystem::path modelPath, std::uint32_t exitAfterFrames)
-        : Application(desc), m_ModelPath(std::move(modelPath)), m_ExitAfterFrames(exitAfterFrames)
+    Sandbox(const Engine::ApplicationDesc& desc, std::filesystem::path modelPath, std::uint32_t exitAfterFrames,
+            bool startWithEditor)
+        : Application(desc), m_ModelPath(std::move(modelPath)), m_ExitAfterFrames(exitAfterFrames),
+          m_StartWithEditor(startWithEditor)
     {
         m_KeySub = GetEvents().Subscribe<Engine::KeyEvent>([this](const Engine::KeyEvent& e) {
-            if (e.key == Engine::Key::Escape && e.action == Engine::InputAction::Press)
+            // Escape leaves an editor text field first.
+            if (e.key == Engine::Key::Escape && e.action == Engine::InputAction::Press &&
+                !(m_Editor && m_Editor->WantsKeyboard()))
                 GetWindow().RequestClose();
         });
     }
@@ -35,6 +40,7 @@ protected:
     void OnInit() override
     {
         m_SceneRenderer = std::make_unique<Engine::SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
+        SetEditorEnabled(m_StartWithEditor);
 
         m_LoadStart = std::chrono::steady_clock::now();
         m_Model     = GetAssets().LoadModel(m_ModelPath); // returns immediately; loads on a worker
@@ -57,9 +63,17 @@ protected:
 
     void OnUpdate(double dt) override
     {
-        m_Camera.Update(GetInput(), GetWindow(), static_cast<float>(dt));
+        if (GetInput().WasKeyPressed(Engine::Key::F1))
+            SetEditorEnabled(!m_Editor);
+
+        // With the editor, the camera only reacts to the viewport (or while it is looking around).
+        if (!m_Editor || m_Editor->ViewportHovered() || m_Camera.IsCaptured())
+            m_Camera.Update(GetInput(), GetWindow(), static_cast<float>(dt));
         m_Scene.UpdateTransforms();
-        UpdateLookControls(static_cast<float>(dt));
+        if (!m_Editor || !m_Editor->WantsKeyboard())
+            UpdateLookControls(static_cast<float>(dt));
+        if (m_Editor)
+            m_Editor->Update(static_cast<float>(dt));
 
         if (m_LoadDone && m_ExitAfterFrames > 0 && ++m_FramesSinceLoad >= m_ExitAfterFrames)
             GetWindow().RequestClose();
@@ -84,18 +98,40 @@ protected:
 
     void OnRender(const Engine::FrameContext& frame, double) override
     {
+        if (m_Editor) {
+            m_Editor->Render(frame);
+            return;
+        }
         const float aspect = static_cast<float>(frame.extent.width) / static_cast<float>(frame.extent.height);
         m_SceneRenderer->Render(frame, m_Scene, m_Camera.GetData(aspect));
     }
 
     void OnShutdown() override
     {
+        m_Editor.reset();
         GetAssets().Release(m_Model);
         if (m_Ground)
             GetAssets().Release(m_Ground);
     }
 
 private:
+    // F1 toggles between the editor (dockable panels, scene in a viewport) and the plain game view.
+    void SetEditorEnabled(bool enabled)
+    {
+        if (enabled == static_cast<bool>(m_Editor))
+            return;
+        if (enabled)
+            m_Editor = std::make_unique<Engine::Editor>(Engine::EditorContext{
+                .window        = GetWindow(),
+                .renderer      = GetRenderer(),
+                .scene         = m_Scene,
+                .assets        = GetAssets(),
+                .sceneRenderer = *m_SceneRenderer,
+                .camera        = m_Camera});
+        else
+            m_Editor.reset(); // waits for the GPU once
+    }
+
     // T: next tone mapper, -/=: exposure (compensation with auto exposure), X: auto exposure,
     // B: bloom, P: shadows, C: cascade colors, O: ambient occlusion, V: debug view (AO, normals),
     // arrow keys: rotate the sun (regenerates the IBL maps).
@@ -135,19 +171,24 @@ private:
         const float yaw   = axis(Engine::Key::Right, Engine::Key::Left);
         const float pitch = axis(Engine::Key::Up, Engine::Key::Down);
         if (yaw != 0.0f || pitch != 0.0f) {
-            m_SunYaw += yaw * dt;
-            m_SunElevation = std::clamp(m_SunElevation + pitch * dt, -0.1f, 1.5f);
-            const glm::vec3 toSun{std::cos(m_SunElevation) * std::sin(m_SunYaw), std::sin(m_SunElevation),
-                                  std::cos(m_SunElevation) * std::cos(m_SunYaw)};
-            m_SceneRenderer->lighting.sky.sunDirection = -toSun;
+            // From the current direction: the editor may have changed it.
+            glm::vec3&  sunDirection = m_SceneRenderer->lighting.sky.sunDirection;
+            const glm::vec3 current  = -glm::normalize(sunDirection);
+            const float sunYaw       = std::atan2(current.x, current.z) + yaw * dt;
+            const float sunElevation = std::clamp(std::asin(std::clamp(current.y, -1.0f, 1.0f)) + pitch * dt, -0.1f, 1.5f);
+            const glm::vec3 toSun{std::cos(sunElevation) * std::sin(sunYaw), std::sin(sunElevation),
+                                  std::cos(sunElevation) * std::cos(sunYaw)};
+            sunDirection = -toSun;
         }
     }
 
     void OnModelLoaded()
     {
         const Engine::Model* model = GetAssets().Get(m_Model);
-        Engine::InstantiateModel(m_Scene, m_Model, *model);
-        m_LoadDone = true;
+        const Engine::Entity root = Engine::InstantiateModel(m_Scene, m_Model, *model);
+        m_LoadDone                = true;
+        if (m_Editor)
+            m_Editor->Select(root);
 
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_LoadStart).count();
@@ -178,6 +219,7 @@ private:
 
     std::filesystem::path                  m_ModelPath;
     std::uint32_t                          m_ExitAfterFrames = 0;
+    bool                                   m_StartWithEditor = false;
     Engine::Subscription                   m_KeySub, m_LoadedSub, m_FailedSub;
     Engine::Scene                          m_Scene;
     Engine::ModelHandle                    m_Model;
@@ -185,13 +227,12 @@ private:
     float                                  m_GroundHeight = 0.0f;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     Engine::FlyCamera                      m_Camera;
+    std::unique_ptr<Engine::Editor>        m_Editor; // references the members above: declared after them
 
     std::chrono::steady_clock::time_point m_LoadStart;
     bool                                  m_LoadDone        = false;
     bool                                  m_LoadFailed      = false;
     std::uint32_t                         m_FramesSinceLoad = 0;
-    float                                 m_SunYaw          = 0.73f; // matches SkySettings' default direction
-    float                                 m_SunElevation    = 0.85f;
 
     double        m_FpsTimer   = 0.0;
     std::uint32_t m_FrameCount = 0;
@@ -199,18 +240,21 @@ private:
 
 int main(int argc, char** argv)
 {
-    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N]
+    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor]
     std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
+    bool                  editor    = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--frames" && i + 1 < argc)
             frames = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--editor")
+            editor = true;
         else
             modelPath = arg;
     }
     if (!std::filesystem::exists(modelPath)) {
-        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N]",
+        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor]",
                      modelPath.string());
         return 1;
     }
@@ -218,7 +262,7 @@ int main(int argc, char** argv)
     // Exit code: 0 ok, 1 fatal error or model failed to load, 2 validation errors (incl. teardown).
     bool loadFailed = false;
     try {
-        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames);
+        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames, editor);
         app.Run();
         loadFailed = app.LoadFailed();
     } catch (const std::exception& e) {

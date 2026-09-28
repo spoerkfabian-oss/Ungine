@@ -1,4 +1,4 @@
-# Kontext: C++20/Vulkan Game Engine (Stand nach Phase 8)
+# Kontext: C++20/Vulkan Game Engine (Stand nach Phase 9)
 
 Übergabe-/Gedächtnisdokument. Nach jeder Phase aktualisieren.
 
@@ -9,7 +9,7 @@
 - Entwicklungs-Branch laut Session-Vorgabe; nie auf andere Branches pushen.
 
 ## Ziel & Rahmen
-- Modulare 3D-Engine: C++20, Vulkan 1.3 (volk, vk-bootstrap, VMA), GLFW, GLM, cgltf, stb_image; ImGui folgt.
+- Modulare 3D-Engine: C++20, Vulkan 1.3 (volk, vk-bootstrap, VMA), GLFW, GLM, cgltf, stb_image; Dear ImGui (docking) + ImGuizmo nur in `editor/`.
 - Ziel: Windows/MSVC, Deps per CMake FetchContent (gepinnt in `cmake/Dependencies.cmake`, alle `SYSTEM`, CMake ≥ 3.25).
 - Ziel-GPU: GTX 1070 Ti (Pascal, hat dedizierte Transfer-Queue). Keine Mesh-Shader.
 - Originalauftrag: Core (Plattform, Events, ECS, async Resource Manager), Vulkan (PBR, CSM, Tone Mapping, Bloom, SSAO, Forward+/Deferred, Frustum Culling), Physik/Scene (BVH/Octree, Jolt), Tooling (ImGui-Editor).
@@ -24,8 +24,9 @@ engine/include/Engine/
   Scene/     Components, Scene, Camera
   Assets/    AssetHandle, AssetManager, Model, GltfLoader, Primitives (MakePlane)
   Scene/     + Frustum (Aabb, TransformAabb)
-  Renderer/  Renderer, SceneRenderer, Environment, ShadowCascades, Vulkan/{VkCommon,VkUtils,VulkanContext,Swapchain,Buffer,Image,Upload,Bindless,Pipeline}
+  Renderer/  Renderer, SceneRenderer, GpuProfiler, Environment, ShadowCascades, Vulkan/{VkCommon,VkUtils,VulkanContext,Swapchain,Buffer,Image,Upload,Bindless,Pipeline}
 engine/src/...   engine/shaders/ (mesh.*, depth_normal.frag, shadow.vert, shadow_mask.frag, fullscreen.vert, sky.frag, tonemap.frag, ibl_*.comp, bloom_*.comp, gtao*.comp, luminance_histogram.comp, exposure_average.comp, include/{bindless,frame,mesh_common,pbr,sky,ibl_common,shadow,surface,exposure}.glsl)
+editor/include/Editor/Editor.h   editor/src/{ImGuiLayer,Editor,Panels}.cpp   (Bibliothek `Editor`)
 sandbox/src/main.cpp   tests/{Test.h,CoreTests.cpp,GpuTests.cpp}
 assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENSE.md (CC0 / CC-BY 4.0; kein NC-Material ins Repo)
 ```
@@ -35,7 +36,7 @@ assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENS
 - **Events:** typisiertes Pub/Sub, RAII-`Subscription`, `true` = konsumiert, re-entrancy-sicher, `Enqueue` threadsicher (Zustellung bei `Flush`).
 - **ThreadPool:** feste Worker (hw−1), FIFO, `Submit → future` (Exceptions via future), `Enqueue` fire-and-forget (Exceptions geloggt); Dtor arbeitet Queue ab, dann Join.
 - **Vulkan-Context:** 1.3 dynamicRendering + sync2; 1.2 BDA, Descriptor Indexing (UpdateAfterBind, UpdateUnusedWhilePending), Timeline-Semaphores, hostQueryReset; 1.0 Anisotropie, depthClamp, fillModeNonSolid, MDI. Dedizierte Transfer-Queue, sonst Fallback = Graphics-Queue. `ValidationErrorCount()` zählt Validation-Errors (Smoke-Tests).
-- **Frames:** `kFramesInFlight = 2`; `FrameContext.depthTexture` = Bindless-Slot des Renderer-Depth-Buffers (gesampelt in DEPTH_READ_ONLY_OPTIMAL; Barrier am Frame-Start wartet auch auf Compute/Fragment-Reads des Vorframes); pro Frame Pool, Fence, Image-Acquired-Semaphore; Render-Finished-Semaphores pro Swapchain-Image. Fence-Reset erst nach erfolgreichem Acquire. Resize → `vkDeviceWaitIdle` + Recreate. Present-Barriere: dstStage = COLOR_ATTACHMENT_OUTPUT (muss im Signal-Stage-Mask liegen).
+- **Frames:** `kFramesInFlight = 2`; `FrameContext {cmd, image, view, format, extent, frameIndex, imageIndex}` (Swapchain-Image in COLOR_ATTACHMENT_OPTIMAL). Der Renderer besitzt **kein** Depth mehr (seit Phase 9 im SceneRenderer, pro Ausgabegröße); pro Frame Pool, Fence, Image-Acquired-Semaphore; Render-Finished-Semaphores pro Swapchain-Image. Fence-Reset erst nach erfolgreichem Acquire. Resize → `vkDeviceWaitIdle` + Recreate. Present-Barriere: dstStage = COLOR_ATTACHMENT_OUTPUT (muss im Signal-Stage-Mask liegen).
 - **Koordinaten:** negativer Viewport-Y-Flip (+Y oben, glTF-CCW bleibt), Reverse-Z (Clear 0, `GREATER_OR_EQUAL`), `D32_SFLOAT`, Swapchain sRGB BGRA8.
 - **Bindless:** Set 0: `0` texture2D[], `1` sampler[], `2` image2D[] (rgba16f), `3` textureCube[] (256), `4` image2DArray[] (rgba16f, 256; Cube-Faces für Compute). Eine Pipeline-Layout, 128 B Push-Constants (`STAGE_ALL`). Default-Sampler 0 LinearRepeat, 1 LinearClamp, 2 NearestClamp, 3 ShadowCompare (GREATER_OR_EQUAL, Border = Tiefe 0 = beleuchtet). In Compute nur `SampleTextureLod` (keine impliziten Ableitungen). **Add/Remove threadsicher (Mutex).**
 - **Buffer-Zugriff:** Vertex Pulling per BDA, kein Vertex-Input-State.
@@ -60,11 +61,14 @@ assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENS
 - **Bloom (Phase 7):** halbe Auflösung, bis 6 Mips, RGBA16F in GENERAL (Sampled-Slots mit GENERAL registriert). 13-Tap-Downsample (erste Stufe Karis-Average), 3×3-Tent-Upsample additiv; Compute mit globalen Memory-Barrieren. Tonemap: `mix(hdr, bloom, strength)` vor Exposure. `PostSettings`: bloom, bloomStrength 0,04, bloomRadius 0,005.
 - **PBR (mesh.frag):** glTF-Metallic-Roughness, GGX + höhenkorreliertes Smith + Schlick, Lambert, Roughness-Floor 0,045; IBL Split-Sum + Multiple-Scattering (Fdez-Agüera); AO nur auf indirektes Licht.
 - **Environment (IBL):** Env-Cube 256² (9 Mips per Blit) → Irradiance 32² (512 Cos-Samples) + Prefiltered 128² (5 Mips = Roughness 0…1, 256 GGX-Samples, Filtered Importance Sampling) + BRDF-LUT 256² (einmalig). Sky-Funktion in `sky.glsl` für Skybox und IBL identisch (IBL ohne Sonnenscheibe). WAR-Barrieren gegen noch laufende Frames.
+- **GPU-Profiler (Phase 9):** `Renderer::Profiler()`; Timestamp-Query-Pool pro Frame-Slot (max. 48 Scopes, Host-Reset), `GpuScope` (RAII, verschachtelt, Tiefe), Begin = TOP_OF_PIPE, End = ALL_COMMANDS. Ergebnisse beim Wiederbetreten des Slots (nach Fence-Wait) gelesen → `Results()` ist kFramesInFlight Frames alt, kein Stall. Scope "Frame" umfasst den ganzen Command-Buffer; SceneRenderer: Environment, Shadows, Depth + normals, GTAO, Forward, Sky, Bloom, Exposure, Tonemap; Editor: "Editor UI".
+- **RenderOutput (Phase 9):** `SceneRenderer::Render(frame, scene, camera, RenderOutput{image, view, format, extent})` rendert in beliebiges Ziel (COLOR_ATTACHMENT_OPTIMAL rein/raus); alle Scene-Targets (Depth, HDR, AO, Bloom) auf `extent`; Tonemap-Pipeline pro Ausgabeformat (lazy). Ohne `RenderOutput` → Swapchain.
+- **Editor (Phase 9, `editor/`):** Engine-Kern bleibt ImGui-frei. `ImGuiLayer` (privat): ImGui 1.92.9-docking, GLFW-Backend (verkettet die Engine-Callbacks), Vulkan-Backend mit Dynamic Rendering + eigenem Descriptor-Pool, Style auf sRGB-Swapchain linearisiert, keine Keyboard-Navigation (Tasten bleiben Engine-Hotkeys), `editor.ini` im Arbeitsverzeichnis (gitignored). Viewport-Texturen (RGBA8_SRGB) werden nach kFramesInFlight+1 **gerenderten** Frames freigegeben (eigene Liste, nicht Renderer-Deferred-Queue, weil sie das Backend nicht überleben darf). `Editor` (EditorContext = Window/Renderer/Scene/AssetManager/SceneRenderer/FlyCamera): Dockspace + Default-Layout (DockBuilder), Viewport (Szene → Textur, Größe = Panel, Toolbar), ImGuizmo (Translate/Rotate/Scale, Local/World; Reverse-Z + Infinite-Far werden von ImGuizmo unterstützt; Ergebnis → lokale TRS relativ zum Eltern-World), Hierarchy (Baum, Auswahl, Drag & Drop-Reparenting mit Erhalt der Weltposition, Kontextmenü Create child/Focus/Delete, Änderungen verzögert nach dem Zeichnen), Inspector (Name, TRS mit Euler-Cache gegen Flips, MeshRenderer-Info), Renderer (Licht/Sonne Az./Elev., Post, Schatten, AO, Kamera), Stats (CPU-Frame-Graph, GPU-Timings, Draw-/Cull-Stats, VMA-Heap-Budgets, Validation-Errors), Assets (`AssetManager::Models()` mit Status/Refcount/Fehler, Laden per Pfad, Instantiate, Release nur für im Editor geladene). Hotkeys nur bei gehovertem/fokussiertem Viewport: W/E/R, F Fokus, Entf. `FlyCamera::moveRequiresLook` (Editor: WASD nur mit RMB).
 - **ECS/Scene:** Entity 64 Bit, Sparse-Set-Pools; jede Entity hat Name/Transform/WorldTransform/Hierarchy; `UpdateTransforms` iterativ ohne Dirty-Flags.
 
 ## Build & Test
-- Windows: VS-Generator, Startprojekt Sandbox. `Sandbox [model.glb] [--frames N]` (Default `assets/models/WaterBottle.glb`; Exit 0 ok / 1 Ladefehler / 2 Validation-Errors). Tasten: RMB+WASD/QE Kamera, T Tonemapper, −/= Exposure, Pfeile Sonne, B Bloom, P Schatten, C Kaskaden-Farben, O AO, V Debug-Ansicht (AO/Normalen), X Auto-Exposure. Sandbox erzeugt eine Bodenplatte (12 r) und setzt shadows.maxDistance = 10 r, ao.radius = 0,2 r.
-- Tests: `EngineTests` (CPU), `EngineGpuTests` (echtes Vulkan-Device + Fenster). CTest: `-DENGINE_GPU_TESTS=ON` registriert GPU-Tests + `SandboxSmoke`.
+- Windows: VS-Generator, Startprojekt Sandbox. `Sandbox [model.glb] [--frames N] [--editor]` (Default `assets/models/WaterBottle.glb`; Exit 0 ok / 1 Ladefehler / 2 Validation-Errors). Tasten: RMB+WASD/QE Kamera, T Tonemapper, −/= Exposure, Pfeile Sonne, B Bloom, P Schatten, C Kaskaden-Farben, O AO, V Debug-Ansicht (AO/Normalen), X Auto-Exposure, **F1 Editor an/aus** (Editor wird erzeugt/zerstört; Kamera nur bei gehovertem Viewport oder aktivem Umsehen; Sandbox-Hotkeys gesperrt, solange ein Widget die Tastatur will). Sandbox erzeugt eine Bodenplatte (12 r) und setzt shadows.maxDistance = 10 r, ao.radius = 0,2 r.
+- Tests: `EngineTests` (CPU), `EngineGpuTests` (echtes Vulkan-Device + Fenster). CTest: `-DENGINE_GPU_TESTS=ON` registriert GPU-Tests + `SandboxSmoke` + `SandboxEditorSmoke`.
 - Headless (Linux-Container): `apt install glslc libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev mesa-vulkan-drivers vulkan-validationlayers xvfb`; `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DGLFW_BUILD_WAYLAND=OFF`; Lauf mit `xvfb-run -a` (lavapipe), Sync-Validation via `VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`.
 
 ## Phasenhistorie
@@ -76,12 +80,13 @@ assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENS
 6. PBR (Cook-Torrance, Normal Maps inkl. Derivative-TBN), IBL aus prozeduralem Himmel (Compute), HDR-Target + Tone Mapping (PBR Neutral/ACES), Skybox, Frustum Culling, Normal-Matrix auf CPU, dynamisches Culling/Front-Face, Test-Modelle (CC0).
 7. Cascaded Shadow Maps (stabil, PCF, Blend, Debug), Bloom (Compute), Primitives + `AssetManager::CreateModel`, Fix Bitangenten-Vorzeichen im Derivative-TBN.
 8. Depth-Normal-Prepass (Hauptpass EQUAL), GTAO + Bilateral-Denoise, spekulare Okklusion, Histogramm-Auto-Exposure mit Adaption + Readback, Debug-Views.
+9. ImGui-Editor (`editor/`-Bibliothek): Docking, Viewport-Textur, ImGuizmo, Hierarchy/Inspector/Renderer/Stats/Assets; GPU-Profiler (Timestamps); SceneRenderer rendert in beliebige `RenderOutput`s und besitzt das Depth; `AssetManager::Models()`; Sandbox F1/`--editor`.
 
-## Verifikation (Stand Phase 8)
+## Verifikation (Stand Phase 9)
 - GCC 13 und Clang: `-Wall -Wextra -Wpedantic` ohne Warnungen im Engine-Code.
-- lavapipe (Mesa, Vulkan 1.4) + Khronos-Validation 1.3.275 inkl. Synchronization-Validation: Sandbox (3 Modelle), EngineGpuTests (inkl. Render-Pfad, IBL-Regeneration bei Sonnenänderung, Culling, Schatten-/Bloom-Toggles, Shadow-Map-Neuanlage zur Laufzeit, generierte Modelle, AO/Auto-Exposure-Toggles, Debug-Views, Exposure-Readback) → 0 Errors. Screenshots geprüft (WaterBottle, Spheres vs. Khronos-Referenz, PBR Neutral vs. ACES, Schatten, Kaskaden-Debug, Bloom an/aus, AO-Debug-Ansicht, Exposure-Key 0,18 vs. 0,3). CPU-Tests: Kaskaden-Splits, Ortho, Slice-Abdeckung, Stabilität (Texel-Snapping).
+- lavapipe (Mesa, Vulkan 1.4) + Khronos-Validation 1.3.275 inkl. Synchronization-Validation: Sandbox (3 Modelle), EngineGpuTests (inkl. Render-Pfad, IBL-Regeneration bei Sonnenänderung, Culling, Schatten-/Bloom-Toggles, Shadow-Map-Neuanlage zur Laufzeit, generierte Modelle, AO/Auto-Exposure-Toggles, Debug-Views, Exposure-Readback, GPU-Timings, Editor-Frames + Neuanlage wie F1-Toggle, Auswahl gelöschter Entities) und Sandbox `--editor` (3 Modelle) → 0 Errors. Screenshots geprüft (WaterBottle, Spheres vs. Khronos-Referenz, PBR Neutral vs. ACES, Schatten, Kaskaden-Debug, Bloom an/aus, AO-Debug-Ansicht, Exposure-Key 0,18 vs. 0,3, Editor-Layout mit Viewport/Gizmo/Panels, Stats-Panel). CPU-Tests: Kaskaden-Splits, Ortho, Slice-Abdeckung, Stabilität (Texel-Snapping).
 - ASan/UBSan: alle Tests grün (einzige Leak-Meldung aus llvmpipe-JIT-Threads). TSan: 0 Races im Engine-Code (3 Meldungen zwischen lavapipe-internen Threads).
-- **Nicht getestet:** MSVC-Build; echte GPU; **QFOT-Pfad** (lavapipe hat nur eine Queue-Family).
+- **Nicht getestet:** MSVC-Build; echte GPU; **QFOT-Pfad** (lavapipe hat nur eine Queue-Family); Editor-Interaktion per Maus (Gizmo-Ziehen, Drag & Drop, Panel-Resize) nur manuell möglich – headless nicht automatisiert.
 
 ## Offene Punkte / Einschränkungen
 1. **Auf der GTX 1070 Ti mit Validation (+ Sync-Validation) laufen lassen** – prüft den QFOT-Pfad (höchste Priorität). MSVC `/W4` prüfen.
@@ -97,7 +102,8 @@ assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENS
 11. `UpdateTransforms` ohne Dirty-Flags. Culling auf der CPU, linear über alle Entities (kein BVH, kein GPU-Culling).
 12. IBL-Regeneration bei jeder Sonnenänderung komplett (auf GPU ~ms; auf lavapipe langsam). Himmel ist ein einfaches analytisches Modell (kein Hosek/Bruneton).
 13. Blend-Materialien weiterhin opak; Specular-/Clearcoat-/Transmission-Extensions nicht unterstützt.
+14. Editor: kein Maus-Picking im Viewport (Auswahl nur über Hierarchy), kein Undo/Redo, keine Szenen-Serialisierung (Speichern/Laden), keine Multi-Selection, kein Datei-Dialog (Pfad per Texteingabe), keine ImGui-Multi-Viewports (Fenster außerhalb des Hauptfensters). Viewport wird auch gerendert, wenn sein Tab verdeckt ist. Editor-Toggle (F1) wartet einmal auf GPU-Idle. Fokus (F) nutzt nur den Pivot, nicht die Bounds.
 
 ## Nächste Schritte (Vorschlag)
-- **Phase 9 (Vorschlag):** ImGui-Editor-Grundlage (Frame-Diagnostik mit GPU-Timestamps, Regler für Licht/Post/Schatten/AO, Asset-Status) – oder Forward+ (Clustered Lights, Punkt-/Spotlights).
-- Später: Forward+/Deferred, BVH/Octree, Jolt, ImGui-Editor (Frame-Diagnostik, Asset-Status, Licht-/Tonemap-Regler).
+- **Phase 10 (Vorschlag):** Forward+ (Clustered Lights, Punkt-/Spotlights inkl. Editor-Komponenten) – oder Editor-Ausbau (Maus-Picking per ID-Buffer, Undo/Redo, Szenen-Serialisierung).
+- Später: BVH/Octree (Culling + Picking), Jolt, Deferred-Variante, Texture-Assets/KTX2.

@@ -1,6 +1,7 @@
 // Integration tests on a real Vulkan device (needs a display; CI: Xvfb + lavapipe).
 #include "Test.h"
 
+#include "Editor/Editor.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Core/ThreadPool.h"
@@ -8,12 +9,14 @@
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <cmath>
+#include <string_view>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -253,6 +256,13 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     const SceneRenderStats facing = renderTowards(center);
     CHECK(facing.drawCalls > 0 && facing.culled == 0 && facing.triangles > 0);
     CHECK(facing.shadowDraws >= facing.drawCalls); // at least one cascade sees every caster
+    // GPU timestamps of the passes (frames in flight old, collected after the fence wait).
+    const auto timings = F().renderer->Profiler().Results();
+    CHECK(!F().renderer->Profiler().Supported() || timings.size() >= 6);
+    for (const GpuTiming& t : timings)
+        CHECK(t.name && t.milliseconds >= 0.0 && t.milliseconds < 60'000.0);
+    CHECK(timings.empty() || std::string_view{timings.front().name} == "Frame");
+
     // Auto exposure (default on) reached the CPU through the per-frame-slot readback.
     CHECK(std::isfinite(facing.exposure) && facing.exposure > 0.0f && facing.averageLuminance > 0.0f);
 
@@ -288,6 +298,68 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     const SceneRenderStats away = renderTowards(eye + (eye - center)); // model behind the camera
     CHECK(away.drawCalls == 0 && away.culled == facing.drawCalls);
 
+    F().assets->Release(h);
+}
+
+TEST_CASE(Editor_FramesSelectionAndToggle)
+{
+    // Editor frame flow (viewport texture + UI into the swapchain) under validation, recreated
+    // like the Sandbox's F1 toggle.
+    const ModelHandle h = F().assets->LoadModel(kBox);
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+
+    Scene         scene;
+    const Entity  root = InstantiateModel(scene, h, *model);
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera camera;
+    camera.position = glm::vec3(0.0f, 1.0f, 4.0f);
+
+    const EditorContext context{.window        = *F().window,
+                                .renderer      = *F().renderer,
+                                .scene         = scene,
+                                .assets        = *F().assets,
+                                .sceneRenderer = sceneRenderer,
+                                .camera        = camera};
+    const auto runFrames = [&](Editor& editor, int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+
+    for (int round = 0; round < 2; ++round) {
+        Editor editor(context);
+        CHECK(camera.moveRequiresLook);
+        editor.Select(root);
+        runFrames(editor, 6);
+        CHECK(editor.Selected() == root);
+        CHECK(editor.ViewportAspect() > 0.0f);
+        CHECK(!editor.WantsKeyboard());
+
+        bool uiScope = false;
+        for (const GpuTiming& t : F().renderer->Profiler().Results())
+            uiScope |= std::string_view{t.name} == "Editor UI";
+        CHECK(!F().renderer->Profiler().Supported() || uiScope);
+        CHECK(sceneRenderer.Stats().drawCalls > 0); // the scene went into the viewport texture
+
+        if (round == 1) { // selection of a destroyed entity is dropped
+            scene.DestroyEntity(root);
+            runFrames(editor, 2);
+            CHECK(editor.Selected() == NullEntity);
+        }
+    }
+    CHECK(!camera.moveRequiresLook); // restored by the editor
     F().assets->Release(h);
 }
 

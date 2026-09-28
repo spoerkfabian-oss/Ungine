@@ -15,7 +15,7 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
     m_Swapchain = std::make_unique<Swapchain>(ctx, window.FramebufferExtent(), SwapchainDesc{.vsync = desc.vsync});
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
     m_Upload    = std::make_unique<UploadQueue>(ctx);
-    CreateDepthBuffer();
+    m_Profiler  = std::make_unique<GpuProfiler>(ctx, kFramesInFlight);
     CreateDefaultTextures();
 
     const VkDevice dev = ctx.Device();
@@ -51,6 +51,7 @@ Renderer::~Renderer()
     m_Ctx.WaitIdle();
     for (FrameData& f : m_Frames)
         CollectGarbage(f); // may reference the bindless registry -> run first
+    m_Profiler.reset();
     m_Upload.reset();
     m_Bindless.reset();
 
@@ -75,6 +76,7 @@ std::optional<FrameContext> Renderer::BeginFrame()
     VK_CHECK(vkWaitForFences(dev, 1, &f.inFlight, VK_TRUE, UINT64_MAX));
     CollectGarbage(f); // everything this slot's last submission could touch is now free
     f.transientOffset = 0;
+    m_Profiler->BeginFrame(m_FrameIndex); // this slot's timestamps are complete now
 
     // Hand everything workers recorded since the last frame to the transfer queue.
     m_Upload->Submit();
@@ -104,6 +106,7 @@ std::optional<FrameContext> Renderer::BeginFrame()
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(f.cmd, &begin));
+    f.frameScope = m_Profiler->Begin(f.cmd, "Frame");
 
     // Finished uploads: queue-family acquire + mip generation, before any pass can use them.
     f.uploadWait = m_Upload->RecordAcquires(f.cmd);
@@ -118,22 +121,6 @@ std::optional<FrameContext> Renderer::BeginFrame()
                             .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                             .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
 
-    // One depth buffer shared by all frames in flight: the barrier orders this frame's
-    // depth writes after the previous frame's (same queue, submission order).
-    constexpr VkPipelineStageFlags2 kDepthStages =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    // Earlier frames may also have sampled it (compute: ambient occlusion) -> WAR on those too.
-    CmdImageBarrier(f.cmd, {.image     = m_Depth.Handle(),
-                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                            .srcStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                            .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                            .dstStage  = kDepthStages,
-                            .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                            .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
-
     m_FrameActive = true;
     return FrameContext{.cmd        = f.cmd,
                         .image      = image,
@@ -141,11 +128,7 @@ std::optional<FrameContext> Renderer::BeginFrame()
                         .format     = m_Swapchain->Format(),
                         .extent     = m_Swapchain->Extent(),
                         .frameIndex = m_FrameIndex,
-                        .imageIndex  = imageIndex,
-                        .depthImage  = m_Depth.Handle(),
-                        .depthView   = m_Depth.View(),
-                        .depthTexture = m_DepthSlot,
-                        .depthFormat = kDepthFormat};
+                        .imageIndex = imageIndex};
 }
 
 void Renderer::EndFrame(const FrameContext& frame)
@@ -162,6 +145,7 @@ void Renderer::EndFrame(const FrameContext& frame)
                             // to the render-finished semaphore (NONE would leave it unordered).
                             .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                             .dstAccess = VK_ACCESS_2_NONE});
+    m_Profiler->End(f.cmd, f.frameScope);
     VK_CHECK(vkEndCommandBuffer(f.cmd));
 
     if (f.transientOffset > 0) // no-op on HOST_COHERENT memory
@@ -231,18 +215,6 @@ TransientAllocation Renderer::AllocateTransient(VkDeviceSize size, VkDeviceSize 
     return {static_cast<std::byte*>(f.transient.Mapped()) + offset, f.transient.Address() + offset};
 }
 
-void Renderer::CreateDepthBuffer()
-{
-    if (m_Depth) // resize: the device is idle, the old slot can be reused right away
-        m_Bindless->RemoveSampledImage(m_DepthSlot);
-    const VkExtent2D extent = m_Swapchain->Extent();
-    m_Depth = Image(m_Ctx, {.extent    = {extent.width, extent.height, 1},
-                            .format    = kDepthFormat,
-                            .usage     = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            .debugName = "DepthBuffer"});
-    m_DepthSlot = m_Bindless->AddSampledImage(m_Depth.View(), VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
-}
-
 void Renderer::CreateDefaultTextures()
 {
     // RGBA8 little-endian (0xAABBGGRR). Flat normal = (0.5, 0.5, 1.0).
@@ -286,7 +258,6 @@ void Renderer::RecreateSwapchain()
 
     m_Ctx.WaitIdle(); // simple + safe; VK_EXT_swapchain_maintenance1 could avoid the stall
     m_Swapchain->Recreate(extent);
-    CreateDepthBuffer(); // device is idle: the old one can go immediately
     GrowRenderFinishedSemaphores();
     m_ResizePending = false;
 }

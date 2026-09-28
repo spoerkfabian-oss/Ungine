@@ -1,5 +1,5 @@
 add_executable(Sandbox src/main.cpp)
-target_link_libraries(Sandbox PRIVATE Engine)
+target_link_libraries(Sandbox PRIVATE Engine Editor)
 engine_set_warnings(Sandbox)
 set_target_properties(Sandbox PROPERTIES
     FOLDER "Apps"

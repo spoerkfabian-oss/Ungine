@@ -50,6 +50,9 @@ void FlyCamera::Update(Input& input, const Window& window, float dt)
     if (input.ScrollDelta() != 0.0f)
         moveSpeed = std::clamp(moveSpeed * std::pow(1.2f, input.ScrollDelta()), 0.05f, 500.0f);
 
+    if (moveRequiresLook && !m_Captured)
+        return;
+
     const glm::vec3 up{0.0f, 1.0f, 0.0f};
     const glm::vec3 forward = Forward();
     const glm::vec3 right   = glm::normalize(glm::cross(forward, up));

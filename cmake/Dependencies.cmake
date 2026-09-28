@@ -76,3 +76,39 @@ FetchContent_Declare(stb
 FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)
 target_include_directories(stb SYSTEM INTERFACE "${stb_SOURCE_DIR}")
+
+# --- Dear ImGui (docking branch) + GLFW/Vulkan backends: editor only ---
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.92.9-docking
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _none) # no CMake project upstream
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+    ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp) # InputText with std::string
+target_include_directories(imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+                           ${imgui_SOURCE_DIR}/misc/cpp)
+target_compile_definitions(imgui PUBLIC
+    IMGUI_IMPL_VULKAN_USE_VOLK        # backend calls through volk's function pointers
+    IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    GLFW_INCLUDE_NONE)
+target_link_libraries(imgui PUBLIC glfw volk)
+set_target_properties(imgui PROPERTIES FOLDER "ThirdParty")
+
+# --- ImGuizmo (no release tags for current ImGui: pinned commit) ---
+FetchContent_Declare(imguizmo
+    GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+    GIT_TAG        18cef5e031d8c6973d80284c67f60549fafd78c1
+    SOURCE_SUBDIR  _none)
+FetchContent_MakeAvailable(imguizmo)
+add_library(imguizmo STATIC ${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp)
+target_include_directories(imguizmo SYSTEM PUBLIC ${imguizmo_SOURCE_DIR}/src)
+target_link_libraries(imguizmo PUBLIC imgui)
+set_target_properties(imguizmo PROPERTIES FOLDER "ThirdParty")

@@ -201,6 +201,21 @@ std::uint32_t AssetManager::RefCount(ModelHandle handle) const
     return e ? e->refCount : 0;
 }
 
+std::vector<ModelInfo> AssetManager::Models() const
+{
+    std::vector<ModelInfo> models;
+    for (std::uint32_t i = 0; i < m_Entries.size(); ++i) {
+        const Entry& e = m_Entries[i];
+        if (e.alive && !e.orphaned)
+            models.push_back({.handle   = {i, e.generation},
+                              .state    = e.state,
+                              .refCount = e.refCount,
+                              .path     = ToUtf8(e.path),
+                              .error    = e.error});
+    }
+    return models;
+}
+
 AssetManager::Entry* AssetManager::Find(ModelHandle handle)
 {
     return const_cast<Entry*>(std::as_const(*this).Find(handle));

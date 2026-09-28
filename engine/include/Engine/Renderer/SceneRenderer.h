@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace Engine {
@@ -67,6 +68,16 @@ struct SceneRenderStats {
     float         averageLuminance = 0.0f; // adapted scene luminance (auto exposure only)
 };
 
+// Where the final, tone mapped image goes: the swapchain image or an editor viewport texture.
+// Must be in COLOR_ATTACHMENT_OPTIMAL on entry and is left in it. All scene targets (depth, HDR,
+// AO, bloom, ...) are sized to `extent`.
+struct RenderOutput {
+    VkImage     image  = VK_NULL_HANDLE;
+    VkImageView view   = VK_NULL_HANDLE;
+    VkFormat    format = VK_FORMAT_UNDEFINED;
+    VkExtent2D  extent{};
+};
+
 // Per frame:
 //   (IBL regeneration if the sky changed, compute)
 //   cascaded shadow maps: depth-only per cascade, culled against each cascade
@@ -85,7 +96,8 @@ public:
     SceneRenderer(const SceneRenderer&)            = delete;
     SceneRenderer& operator=(const SceneRenderer&) = delete;
 
-    void Render(const FrameContext& frame, Scene& scene, const CameraData& camera);
+    void Render(const FrameContext& frame, Scene& scene, const CameraData& camera); // into the swapchain image
+    void Render(const FrameContext& frame, Scene& scene, const CameraData& camera, const RenderOutput& output);
 
     SceneLighting                         lighting;
     PostSettings                          post;
@@ -109,11 +121,10 @@ private:
     void RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
                        const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount);
     void DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress, bool countStats);
-    void RenderPrepass(VkCommandBuffer cmd, const FrameContext& frame, const Frustum& frustum,
-                       VkDeviceAddress frameAddress);
-    void RenderAmbientOcclusion(VkCommandBuffer cmd, const FrameContext& frame, const CameraData& camera);
-    void RenderMain(VkCommandBuffer cmd, const FrameContext& frame, const Frustum& frustum,
-                    VkDeviceAddress frameAddress);
+    void RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress);
+    void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
+    void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress);
+    const Pipeline& TonemapPipeline(VkFormat outputFormat);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
     void ReadExposure(std::uint32_t frameIndex);
@@ -125,12 +136,14 @@ private:
     Environment         m_Environment;
     Pipeline            m_Mesh; // cull mode + front face are dynamic
     Pipeline            m_Sky;
-    Pipeline            m_Tonemap;
+    std::vector<std::pair<VkFormat, Pipeline>> m_Tonemap; // one per output format, built on demand
     Pipeline            m_Shadow, m_ShadowMasked; // depth only / alpha-tested
     Pipeline            m_BloomDown, m_BloomUp;
     Pipeline            m_Prepass, m_Gtao, m_GtaoDenoise, m_Histogram, m_ExposureAverage;
 
     // Frame targets (recreated on resize).
+    Image                      m_Depth; // reverse-Z D32, sampled by GTAO in DEPTH_READ_ONLY_OPTIMAL
+    std::uint32_t              m_DepthSlot = 0;
     Image                      m_Hdr;
     std::uint32_t              m_HdrSlot = 0;
     Image                      m_Bloom; // half resolution, one level per mip

@@ -5,3 +5,4 @@ out/
 .idea/
 CMakeUserPresets.json
 *.user
+editor.ini

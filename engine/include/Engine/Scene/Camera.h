@@ -27,12 +27,14 @@ public:
     float     nearPlane   = 0.05f;
     float     moveSpeed   = 3.0f;  // m/s
     float     sensitivity = 0.0025f;
+    bool      moveRequiresLook = false; // editor style: WASD/QE only while RMB is held
 
     void Update(Input& input, const Window& window, float dt);
     void LookAt(const glm::vec3& target);
 
     [[nodiscard]] glm::vec3  Forward() const;
     [[nodiscard]] CameraData GetData(float aspect) const;
+    [[nodiscard]] bool       IsCaptured() const { return m_Captured; } // mouse look active (cursor hidden)
 
 private:
     bool m_Captured = false;

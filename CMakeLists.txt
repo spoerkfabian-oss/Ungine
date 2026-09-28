@@ -23,6 +23,7 @@ include(cmake/Dependencies.cmake)
 include(cmake/Shaders.cmake)
 
 add_subdirectory(engine)
+add_subdirectory(editor)
 add_subdirectory(sandbox)
 
 option(ENGINE_BUILD_TESTS "Build the test executables" ${PROJECT_IS_TOP_LEVEL})

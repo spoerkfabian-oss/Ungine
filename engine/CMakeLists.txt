@@ -9,6 +9,7 @@ add_library(Engine STATIC
     src/Core/Window.cpp
     src/Events/EventBus.cpp
     src/Renderer/Environment.cpp
+    src/Renderer/GpuProfiler.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
     src/Renderer/ShadowCascades.cpp
