@@ -53,6 +53,7 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/bindless.glsl
     shaders/include/exposure.glsl
     shaders/include/frame.glsl
+    shaders/include/lights.glsl
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
     shaders/include/pbr.glsl
@@ -74,6 +75,7 @@ engine_add_shaders(Engine SOURCES
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
     shaders/ibl_sky.comp
+    shaders/light_cull.comp
     shaders/luminance_histogram.comp
     shaders/mesh.frag
     shaders/mesh.vert

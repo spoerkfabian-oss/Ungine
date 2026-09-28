@@ -354,6 +354,8 @@ private:
             }
             if (node->skin)
                 m_HasSkins = true;
+            if (node->light)
+                mn.light = ConvertLight(*node->light);
 
             const auto index = static_cast<std::int32_t>(m_Out->nodes.size());
             m_Out->nodes.push_back(std::move(mn));
@@ -367,6 +369,27 @@ private:
         }
         if (m_HasSkins || m_Data.animations_count)
             ENGINE_WARN("glTF: skins/animations are not supported yet - rendering bind pose");
+        if (m_IgnoredDirectional)
+            ENGINE_WARN("glTF: directional lights ignored (the sky's sun is the only directional light)");
+    }
+
+    // KHR_lights_punctual: same conventions (candela, local -Z, cone half-angles, range 0 = unbounded).
+    std::optional<Light> ConvertLight(const cgltf_light& light)
+    {
+        Light out{.color = glm::make_vec3(light.color), .intensity = light.intensity, .range = light.range};
+        switch (light.type) {
+        case cgltf_light_type_point:
+            out.type = LightType::Point;
+            return out;
+        case cgltf_light_type_spot:
+            out.type           = LightType::Spot;
+            out.outerConeAngle = std::clamp(light.spot_outer_cone_angle, 0.0f, glm::half_pi<float>());
+            out.innerConeAngle = std::clamp(light.spot_inner_cone_angle, 0.0f, out.outerConeAngle);
+            return out;
+        default:
+            m_IgnoredDirectional = true;
+            return std::nullopt;
+        }
     }
 
     std::filesystem::path                     m_BaseDir;
@@ -379,6 +402,7 @@ private:
     std::size_t                               m_MissingNormals  = 0;
     std::size_t                               m_MissingTangents = 0;
     bool                                      m_HasSkins        = false;
+    bool                                      m_IgnoredDirectional = false;
 };
 
 } // namespace

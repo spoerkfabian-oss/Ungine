@@ -96,6 +96,8 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
         registry.Get<Transform>(e) = node.local;
         if (node.mesh >= 0)
             registry.Emplace<MeshRenderer>(e, handle, static_cast<std::uint32_t>(node.mesh));
+        if (node.light)
+            registry.Emplace<Light>(e, *node.light);
         entities[i] = e;
     }
     return root;

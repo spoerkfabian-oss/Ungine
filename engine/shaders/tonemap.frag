@@ -3,6 +3,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #include "bindless.glsl"
 #include "exposure.glsl"
+#include "frame.glsl"
 
 layout(push_constant) uniform TonemapPush {
     ExposureState state;         // auto exposure result of this frame
@@ -12,8 +13,9 @@ layout(push_constant) uniform TonemapPush {
     uint          bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
     float         bloomStrength; // 0 = bloom off (the texture is not read)
     uint          autoExposure;
-    uint          debugView;     // Engine::DebugView: 0 off, 1 ambient occlusion, 2 normals
-    uint          debugTexture;  // slot shown by the debug view
+    uint          debugView;     // Engine::DebugView: 0 off, 1 ambient occlusion, 2 normals, 3 light clusters
+    uint          debugTexture;  // slot shown by the debug view (light clusters: depth)
+    FrameData     frame;         // light clusters view
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -51,6 +53,36 @@ vec3 AcesFitted(vec3 color)
     return clamp(outputMat * (a / b), 0.0, 1.0);
 }
 
+// Blue -> cyan -> green -> yellow -> red for t in [0, 1].
+vec3 Heat(float t)
+{
+    return clamp(vec3(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)), 0.0, 1.0);
+}
+
+// Lights per cluster over a gray version of the image; white = cluster list full.
+vec3 LightClusterOverlay(vec3 ldr, ivec2 pixel)
+{
+    const vec3  gray  = vec3(dot(ldr, vec3(0.2126, 0.7152, 0.0722)) * 0.5);
+    const float depth = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                   pixel, 0).r;
+    FrameData frame = pc.frame;
+    if (depth <= 0.0 || frame.lightInfo.x == 0u)
+        return gray;
+    const float viewDepth = frame.clusterDepth.x / depth; // reverse-Z, infinite far
+    const uint  cluster   = ClusterIndex(gl_FragCoord.xy, viewDepth, frame.clusterParams.zw, frame.clusterParams.x,
+                                         frame.clusterParams.y);
+    const uint  count     = frame.clusters.counts[cluster];
+    vec3        color     = count == 0u ? gray
+                          : count >= CLUSTER_MAX_LIGHTS ? vec3(1.0)
+                                                         : mix(gray, Heat(min(float(count) / 32.0, 1.0)), 0.75);
+    // Tile borders.
+    const vec2 f = fract(gl_FragCoord.xy * frame.clusterParams.zw);
+    const vec2 w = frame.clusterParams.zw * 1.5;
+    if (f.x < w.x || f.y < w.y)
+        color *= 0.5;
+    return color;
+}
+
 void main()
 {
     // Same size as the swapchain: fetch the texel under this pixel.
@@ -63,7 +95,7 @@ void main()
         const vec3 bloom = SampleTexture(pc.bloomTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size).rgb;
         hdr              = mix(hdr, bloom, pc.bloomStrength);
     }
-    if (pc.debugView != 0u) {
+    if (pc.debugView == 1u || pc.debugView == 2u) {
         const vec3 v = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
                                   pixel, 0).rgb;
         outColor = vec4(pc.debugView == 1u ? v.rrr : v * 0.5 + 0.5, 1.0);
@@ -76,5 +108,7 @@ void main()
     case 1u: ldr = AcesFitted(hdr); break;
     default: ldr = clamp(hdr, 0.0, 1.0); break;
     }
+    if (pc.debugView == 3u)
+        ldr = LightClusterOverlay(ldr, pixel);
     outColor = vec4(ldr, 1.0); // sRGB swapchain encodes
 }

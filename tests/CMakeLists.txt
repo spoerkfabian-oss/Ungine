@@ -17,6 +17,8 @@ if(ENGINE_GPU_TESTS)
     add_test(NAME EngineGpuTests COMMAND EngineGpuTests)
     add_test(NAME SandboxSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 120
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(NAME SandboxEditorSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 120 --editor
+    add_test(NAME SandboxEditorSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 120 --editor --lights 64
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(NAME SandboxLightsSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 60 --lights 1024
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

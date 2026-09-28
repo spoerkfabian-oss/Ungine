@@ -160,8 +160,17 @@ void Editor::DrawHierarchy()
     }
     Registry& registry = m_Ctx.scene.GetRegistry();
 
-    if (ImGui::Button("+ Entity"))
-        m_Selected = m_Ctx.scene.CreateEntity("Entity");
+    if (ImGui::Button("+ Add"))
+        ImGui::OpenPopup("add");
+    if (ImGui::BeginPopup("add")) {
+        if (ImGui::MenuItem("Entity"))
+            m_Selected = m_Ctx.scene.CreateEntity("Entity");
+        if (ImGui::MenuItem("Point Light"))
+            m_Selected = CreateLight(LightType::Point, NullEntity);
+        if (ImGui::MenuItem("Spot Light"))
+            m_Selected = CreateLight(LightType::Spot, NullEntity);
+        ImGui::EndPopup();
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu entities", registry.AliveCount());
     ImGui::Separator();
@@ -205,10 +214,12 @@ void Editor::DrawHierarchyNode(Entity entity)
         flags |= ImGuiTreeNodeFlags_Leaf;
     if (entity == m_Selected)
         flags |= ImGuiTreeNodeFlags_Selected;
-    if (registry.Has<MeshRenderer>(entity))
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
+    const bool tinted = registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
+    if (tinted)
+        ImGui::PushStyleColor(ImGuiCol_Text, registry.Has<Light>(entity) ? ImVec4(1.0f, 0.85f, 0.4f, 1.0f)
+                                                                        : ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
     const bool open = ImGui::TreeNodeEx(EntityId(entity), flags, "%s", name.empty() ? "(unnamed)" : name.c_str());
-    if (registry.Has<MeshRenderer>(entity))
+    if (tinted)
         ImGui::PopStyleColor();
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
@@ -231,6 +242,10 @@ void Editor::DrawHierarchyNode(Entity entity)
         m_Selected = entity;
         if (ImGui::MenuItem("Create child"))
             m_Selected = m_Ctx.scene.CreateEntity("Entity", entity);
+        if (ImGui::MenuItem("Create point light"))
+            m_Selected = CreateLight(LightType::Point, entity);
+        if (ImGui::MenuItem("Create spot light"))
+            m_Selected = CreateLight(LightType::Spot, entity);
         if (ImGui::MenuItem("Focus", "F"))
             FocusSelected();
         if (ImGui::MenuItem("Delete", "Del"))
@@ -319,6 +334,53 @@ void Editor::DrawInspector()
         if (ImGui::Button("Remove component"))
             registry.Remove<MeshRenderer>(e);
     }
+
+    if (Light* light = registry.TryGet<Light>(e);
+        light && ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("light")) {
+        PropertyRow("Type");
+        int type = static_cast<int>(light->type);
+        if (ImGui::Combo("##v", &type, "Point\0Spot\0"))
+            light->type = static_cast<LightType>(type);
+        ImGui::PopID();
+        PropertyRow("Color");
+        ImGui::ColorEdit3("##v", &light->color.x, ImGuiColorEditFlags_Float);
+        ImGui::PopID();
+        PropertyRow("Intensity");
+        ImGui::DragFloat("##v", &light->intensity, 0.01f, 0.0f, 1e6f, "%.4g cd",
+                         ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+        ImGui::PopID();
+        PropertyRow("Range");
+        char rangeFormat[48];
+        std::snprintf(rangeFormat, sizeof(rangeFormat), light->range > 0.0f ? "%%.3f" : "auto (%.3f)",
+                      EffectiveRange(*light));
+        ImGui::DragFloat("##v", &light->range, 0.01f, 0.0f, 1e5f, rangeFormat, ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0 = derived from the intensity (illuminance cutoff %.3f)", kLightCutoffIlluminance);
+        ImGui::PopID();
+        if (light->type == LightType::Spot) {
+            PropertyRow("Outer cone");
+            ImGui::SliderAngle("##v", &light->outerConeAngle, 1.0f, 90.0f);
+            ImGui::PopID();
+            PropertyRow("Inner cone");
+            ImGui::SliderAngle("##v", &light->innerConeAngle, 0.0f, glm::degrees(light->outerConeAngle));
+            ImGui::PopID();
+            light->innerConeAngle = std::min(light->innerConeAngle, light->outerConeAngle);
+        }
+        ImGui::EndTable();
+        if (ImGui::Button("Remove light"))
+            registry.Remove<Light>(e);
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Add component"))
+        ImGui::OpenPopup("add component");
+    if (ImGui::BeginPopup("add component")) {
+        if (ImGui::MenuItem("Point Light", nullptr, false, !registry.Has<Light>(e)))
+            registry.Emplace<Light>(e, Light{.type = LightType::Point});
+        if (ImGui::MenuItem("Spot Light", nullptr, false, !registry.Has<Light>(e)))
+            registry.Emplace<Light>(e, Light{.type = LightType::Spot});
+        ImGui::EndPopup();
+    }
     ImGui::End();
 }
 
@@ -380,6 +442,17 @@ void Editor::DrawRendererSettings()
         }
         EnumComboRow("Debug view", &post.debugView);
         ImGui::EndTable();
+    }
+
+    if (ImGui::CollapsingHeader("Lights (clustered)") && BeginProperties("lights")) {
+        CheckboxRow("Enabled", &sr.lights.enabled);
+        DragFloatRow("Cluster far", &sr.lights.clusterFar, 1.0f, 1.0f, 100000.0f, "%.0f");
+        PropertyRow("Visible");
+        ImGui::Text("%u / %u (max %u)", sr.Stats().lights, sr.Stats().lightsTotal, kMaxVisibleLights);
+        ImGui::PopID();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Grid %ux%ux%u, %u lights per cluster. Debug view: Light clusters.", kClusterGridX,
+                            kClusterGridY, kClusterGridZ, kClusterMaxLights);
     }
 
     if (ImGui::CollapsingHeader("Shadows") && BeginProperties("shadows")) {
@@ -500,6 +573,7 @@ void Editor::DrawStats()
         ImGui::Text("Culled         %u", stats.culled);
         ImGui::Text("Shadow draws   %u", stats.shadowDraws);
         ImGui::Text("Triangles      %llu", static_cast<unsigned long long>(stats.triangles));
+        ImGui::Text("Lights         %u / %u", stats.lights, stats.lightsTotal);
         ImGui::Text("Entities       %zu", m_Ctx.scene.GetRegistry().AliveCount());
         ImGui::Text("Exposure       %.3f", stats.exposure);
         if (m_Ctx.sceneRenderer.post.autoExposure)

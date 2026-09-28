@@ -44,6 +44,7 @@ ImGuiLayer::ImGuiLayer(Window& window, Renderer& renderer)
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // no keyboard nav: arrows and letters stay engine hotkeys
     io.IniFilename = "editor.ini"; // layout, next to the working directory
+    io.ConfigWindowsMoveFromTitleBarOnly = true; // dragging in the viewport must not move the window
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style      = ImGui::GetStyle();

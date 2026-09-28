@@ -21,6 +21,7 @@ class ImGuiLayer;
 class Scene;
 class SceneRenderer;
 class Window;
+enum class LightType : std::uint8_t;
 
 struct EditorContext {
     Window&        window;
@@ -62,6 +63,9 @@ private:
     void DrawMenuBar();
     void DrawViewport();
     void DrawGizmo(float x, float y, float width, float height);
+    // Light icons (click selects), range sphere / spot cone of the selected light.
+    void DrawLightOverlay(float x, float y, float width, float height, bool clicked);
+    Entity CreateLight(LightType type, Entity parent);
     void DrawHierarchy();
     void DrawHierarchyNode(Entity entity);
     void DrawInspector();
@@ -89,6 +93,7 @@ private:
     Entity         m_ReparentTo    = NullEntity; // NullEntity: make it a root
     GizmoOperation m_GizmoOperation = GizmoOperation::Translate;
     bool           m_GizmoLocal     = true;
+    bool           m_ShowLightIcons = true;
 
     // Euler angles shown in the inspector: kept while the rotation is only edited through them, so
     // dragging past +-90 degrees does not flip (quaternion -> Euler is not unique).

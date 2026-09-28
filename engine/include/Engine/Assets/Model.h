@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,10 +44,11 @@ struct Mesh {
 
 // Nodes are stored parents-before-children (topological order).
 struct ModelNode {
-    std::string  name;
-    Transform    local;
-    std::int32_t mesh   = -1;
-    std::int32_t parent = -1;
+    std::string          name;
+    Transform            local;
+    std::int32_t         mesh   = -1;
+    std::int32_t         parent = -1;
+    std::optional<Light> light; // KHR_lights_punctual (point / spot)
 };
 
 inline constexpr std::int32_t kNoTexture = -1;

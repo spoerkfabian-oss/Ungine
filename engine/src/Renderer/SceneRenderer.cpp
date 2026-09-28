@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace Engine {
 
@@ -34,6 +35,11 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::vec4  shadowParams;
     glm::uvec4 shadowInfo;
     glm::uvec4 aoInfo;
+    glm::vec4  clusterParams; // x: slice scale, y: slice bias, zw: clusters per pixel
+    glm::vec4  clusterDepth;  // x: near, y: far
+    glm::uvec4 lightInfo;     // x: light count
+    VkDeviceAddress lights;
+    VkDeviceAddress clusters;
 };
 
 struct DrawData { // mirrors DrawData in mesh_common.glsl
@@ -61,7 +67,17 @@ struct TonemapPush { // mirrors TonemapPush in tonemap.frag
     std::uint32_t   autoExposure;
     std::uint32_t   debugView;
     std::uint32_t   debugTexture;
+    VkDeviceAddress frame; // light clusters view
 };
+
+struct LightCullPush { // mirrors CullPush in light_cull.comp
+    VkDeviceAddress frame;
+    VkDeviceAddress clusters;
+};
+
+constexpr std::uint32_t kClusterCount = kClusterGridX * kClusterGridY * kClusterGridZ;
+constexpr std::uint32_t kLightCullGroupSize = 128; // light_cull.comp
+static_assert(kClusterCount % kLightCullGroupSize == 0);
 
 struct GtaoPush { // mirrors GtaoPush in gtao.comp
     std::uint32_t depth;
@@ -174,6 +190,7 @@ const char* ToString(DebugView v)
     case DebugView::None:             return "Off";
     case DebugView::AmbientOcclusion: return "AO";
     case DebugView::Normals:          return "Normals";
+    case DebugView::LightClusters:    return "Light clusters";
     default:                          return "?";
     }
 }
@@ -246,12 +263,15 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
     m_GtaoDenoise     = compute("gtao_denoise.comp.spv", "GtaoDenoise");
     m_Histogram       = compute("luminance_histogram.comp.spv", "LuminanceHistogram");
     m_ExposureAverage = compute("exposure_average.comp.spv", "ExposureAverage");
+    m_LightCull       = compute("light_cull.comp.spv", "LightCull");
 
     constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m_LuminanceHistogram = Buffer(ctx, {.size = 256 * sizeof(std::uint32_t), .usage = kStorage,
                                         .debugName = "LuminanceHistogram"});
     m_ExposureState      = Buffer(ctx, {.size = 16, .usage = kStorage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                         .debugName = "ExposureState"});
+    m_Clusters           = Buffer(ctx, {.size  = std::uint64_t{kClusterCount} * (1 + kClusterMaxLights) * sizeof(std::uint32_t),
+                                        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .debugName = "LightClusters"});
     for (Buffer& b : m_ExposureReadback)
         b = Buffer(ctx, {.size = 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .memory = MemoryUsage::Readback,
                          .debugName = "ExposureReadback"});
@@ -264,8 +284,9 @@ SceneRenderer::~SceneRenderer()
     for (auto& [format, pipeline] : m_Tonemap)
         m_Renderer.DeferRelease(std::move(pipeline));
     for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp,
-                        &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage})
+                        &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull})
         m_Renderer.DeferRelease(std::move(*p));
+    m_Renderer.DeferRelease(std::move(m_Clusters));
     m_Renderer.DeferRelease(std::move(m_LuminanceHistogram));
     m_Renderer.DeferRelease(std::move(m_ExposureState));
     m_Renderer.DeferRelease(std::move(m_ExposureReadback));
@@ -462,6 +483,20 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const auto          cascades     = ComputeCascades(camera, sky.sunDirection, shadows);
 
     const glm::mat4 viewProj = camera.projection * camera.view;
+    const Frustum   frustum  = Frustum::FromViewProjection(viewProj);
+    CollectLights(scene, frustum);
+    const VkDeviceAddress lightAddress =
+        m_Lights.empty() ? 0 : [&] {
+            const TransientAllocation a = m_Renderer.AllocateTransient(m_Lights.size() * sizeof(GpuLight), 16);
+            std::memcpy(a.cpu, m_Lights.data(), m_Lights.size() * sizeof(GpuLight));
+            return a.gpu;
+        }();
+    // Logarithmic slices between the near plane and clusterFar: slice = log(z) * scale + bias.
+    const float clusterNear  = camera.nearPlane;
+    const float clusterFar   = std::max(lights.clusterFar, clusterNear * 2.0f);
+    const float sliceScale   = static_cast<float>(kClusterGridZ) / std::log(clusterFar / clusterNear);
+    const float sliceBias    = -std::log(clusterNear) * sliceScale;
+
     FrameUniforms   uniforms{
           .viewProj       = viewProj,
           .view           = camera.view,
@@ -480,7 +515,13 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .shadowParams    = glm::vec4(static_cast<float>(cascadeCount), shadows.normalBias, shadows.filterRadius,
                                        shadows.cascadeBlend),
           .shadowInfo      = glm::uvec4(m_ShadowMap.Extent().width, shadows.debugCascades ? 1u : 0u, 0u, 0u),
-          .aoInfo          = glm::uvec4(m_AoSampled, ao.enabled ? 1u : 0u, 0u, 0u)};
+          .aoInfo          = glm::uvec4(m_AoSampled, ao.enabled ? 1u : 0u, 0u, 0u),
+          .clusterParams   = glm::vec4(sliceScale, sliceBias, static_cast<float>(kClusterGridX) / static_cast<float>(extent.width),
+                                       static_cast<float>(kClusterGridY) / static_cast<float>(extent.height)),
+          .clusterDepth    = glm::vec4(clusterNear, clusterFar, 0.0f, 0.0f),
+          .lightInfo       = glm::uvec4(static_cast<std::uint32_t>(m_Lights.size()), 0u, 0u, 0u),
+          .lights          = lightAddress,
+          .clusters        = m_Clusters.Address()};
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
         uniforms.cascadeSplits[c]   = cascades[c].splitFar;
@@ -493,7 +534,6 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         RenderShadows(cmd, frameAddress, cascades, cascadeCount);
     }
 
-    const Frustum frustum = Frustum::FromViewProjection(viewProj);
     {
         GpuScope scope(profiler, cmd, "Depth + normals");
         RenderPrepass(cmd, extent, frustum, frameAddress);
@@ -501,6 +541,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     if (ao.enabled) {
         GpuScope scope(profiler, cmd, "GTAO");
         RenderAmbientOcclusion(cmd, extent, camera);
+    }
+    if (!m_Lights.empty()) {
+        GpuScope scope(profiler, cmd, "Light culling");
+        CullLights(cmd, frameAddress);
     }
     {
         GpuScope scope(profiler, cmd, "Lighting + sky");
@@ -541,11 +585,70 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
                               .bloomStrength = bloom ? post.bloomStrength : 0.0f,
                               .autoExposure  = post.autoExposure ? 1u : 0u,
                               .debugView     = static_cast<std::uint32_t>(post.debugView),
-                              .debugTexture  = post.debugView == DebugView::Normals ? m_NormalSlot : m_AoSampled};
+                              .debugTexture  = post.debugView == DebugView::Normals         ? m_NormalSlot
+                                               : post.debugView == DebugView::LightClusters ? m_DepthSlot
+                                                                                            : m_AoSampled,
+                              .frame         = frameAddress};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, TonemapPipeline(output.format).Handle());
     vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(tonemap), &tonemap);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRendering(cmd);
+}
+
+void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
+{
+    m_Lights.clear();
+    auto view = scene.GetRegistry().ViewOf<Light, WorldTransform>();
+    view.Each([&](Entity, Light& light, WorldTransform& world) {
+        ++m_Stats.lightsTotal;
+        const float range = EffectiveRange(light);
+        const glm::vec3 radiance = light.color * light.intensity;
+        if (!lights.enabled || range <= 0.0f || std::max({radiance.r, radiance.g, radiance.b}) <= 0.0f)
+            return;
+        const glm::vec3 position = world.matrix[3];
+        if (!frustum.Intersects({position - glm::vec3(range), position + glm::vec3(range)}))
+            return;
+        if (m_Lights.size() >= kMaxVisibleLights) {
+            static bool warned = false;
+            if (!std::exchange(warned, true))
+                ENGINE_WARN("More than {} visible lights: the rest is dropped", kMaxVisibleLights);
+            return;
+        }
+
+        GpuLight& gpu = m_Lights.emplace_back();
+        gpu.position  = position;
+        gpu.range     = range;
+        gpu.color     = radiance;
+        gpu.direction = glm::normalize(-glm::vec3(world.matrix[2])); // local -Z (glTF)
+        if (light.type == LightType::Spot) {
+            const float outer = std::clamp(light.outerConeAngle, 1e-3f, glm::half_pi<float>());
+            const float inner = std::clamp(light.innerConeAngle, 0.0f, outer);
+            const float cosOuter = std::cos(outer);
+            gpu.spotScale  = 1.0f / std::max(std::cos(inner) - cosOuter, 1e-4f);
+            gpu.spotOffset = -cosOuter * gpu.spotScale;
+            gpu.cosOuter   = cosOuter;
+            gpu.sinOuter   = std::sin(outer);
+            gpu.type       = 1;
+        }
+    });
+    m_Stats.lights = static_cast<std::uint32_t>(m_Lights.size());
+}
+
+void SceneRenderer::CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
+{
+    const auto& bindless = m_Renderer.GetBindless();
+    // Shared by all frames in flight: the previous frame's shading / debug view reads (WAR) and its
+    // culling writes (WAW) come first.
+    MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_LightCull.Handle());
+    const LightCullPush push{.frame = frameAddress, .clusters = m_Clusters.Address()};
+    vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, kClusterCount / kLightCullGroupSize, 1, 1);
+    MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 }
 
 void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
@@ -680,18 +783,20 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const 
     CmdImageBarrier(cmd, {.image     = m_Depth.Handle(),
                           .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                           .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                          .srcStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          .srcStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, // + tone mapping debug views
                           .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                           .dstStage  = kDepthStages,
                           .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
 
-    // Normals are shared by all frames in flight: the previous frame's GTAO may still read them.
+    // Normals are shared by all frames in flight: the previous frame's GTAO (and the normals debug
+    // view) may still read them.
     CmdImageBarrier(cmd, {.image     = m_Normals.Handle(),
                           .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                           .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          .srcStage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          .srcStage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                           .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                           .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
 
@@ -714,7 +819,8 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const 
                           .newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
                           .srcStage  = kDepthStages,
                           .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                          .dstStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          .dstStage  = kDepthStages | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                           .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT}),

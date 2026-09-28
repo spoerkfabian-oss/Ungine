@@ -1,6 +1,7 @@
 #include "Test.h"
 
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
@@ -12,6 +13,8 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <latch>
 #include <numeric>
 #include <stdexcept>
@@ -238,4 +241,57 @@ TEST_CASE(Cascades_StableUnderCameraMotion)
 int main(int argc, char** argv)
 {
     return Test::RunAll(argc > 1 ? argv[1] : "");
+}
+
+TEST_CASE(Gltf_LightsPunctual)
+{
+    // Point + spot are imported per node, directional lights are skipped.
+    const auto path = std::filesystem::temp_directory_path() / "engine_lights_test.gltf";
+    {
+        std::ofstream file(path);
+        file << R"({
+  "asset": {"version": "2.0"},
+  "extensionsUsed": ["KHR_lights_punctual"],
+  "extensions": {"KHR_lights_punctual": {"lights": [
+    {"type": "point", "color": [1.0, 0.5, 0.25], "intensity": 20.0, "range": 5.0},
+    {"type": "spot", "intensity": 100.0, "spot": {"innerConeAngle": 0.2, "outerConeAngle": 0.5}},
+    {"type": "directional"}]}},
+  "scene": 0,
+  "scenes": [{"nodes": [0]}],
+  "nodes": [
+    {"name": "Root", "children": [1, 2, 3]},
+    {"name": "Lamp", "translation": [1.0, 2.0, 3.0], "extensions": {"KHR_lights_punctual": {"light": 0}}},
+    {"name": "Spot", "extensions": {"KHR_lights_punctual": {"light": 1}}},
+    {"name": "Sun", "extensions": {"KHR_lights_punctual": {"light": 2}}}]
+})";
+    }
+    const ModelData data = LoadGltf(path);
+    std::filesystem::remove(path);
+
+    CHECK(data.nodes.size() == 4);
+    const auto find = [&](const char* name) -> const ModelNode* {
+        for (const ModelNode& n : data.nodes)
+            if (n.name == name)
+                return &n;
+        return nullptr;
+    };
+    const ModelNode* lamp = find("Lamp");
+    const ModelNode* spot = find("Spot");
+    const ModelNode* sun  = find("Sun");
+    CHECK(lamp && spot && sun);
+    if (!lamp || !spot || !sun)
+        return;
+    CHECK(lamp->light && lamp->light->type == LightType::Point);
+    CHECK(lamp->light && lamp->light->intensity == 20.0f && lamp->light->range == 5.0f);
+    CHECK(lamp->light && lamp->light->color == glm::vec3(1.0f, 0.5f, 0.25f));
+    CHECK(lamp->local.position == glm::vec3(1.0f, 2.0f, 3.0f));
+    CHECK(spot->light && spot->light->type == LightType::Spot && spot->light->range == 0.0f);
+    CHECK(spot->light && std::abs(spot->light->innerConeAngle - 0.2f) < 1e-6f &&
+          std::abs(spot->light->outerConeAngle - 0.5f) < 1e-6f);
+    CHECK(!sun->light);
+
+    // Unbounded lights get a finite range where the illuminance falls below the cutoff.
+    const float range = EffectiveRange(*spot->light);
+    CHECK(std::abs(100.0f / (range * range) - kLightCutoffIlluminance) < 1e-4f);
+    CHECK(EffectiveRange(*lamp->light) == 5.0f);
 }

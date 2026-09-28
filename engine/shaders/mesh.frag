@@ -14,6 +14,16 @@ layout(location = 3) in vec4 inTangent;
 
 layout(location = 0) out vec4 outColor;
 
+// Cook-Torrance (GGX, height-correlated Smith, Schlick) + Lambert, times N.L.
+vec3 DirectBrdf(vec3 N, vec3 V, vec3 L, float NdotV, float NdotL, vec3 cDiff, vec3 f0, float a)
+{
+    const vec3  H     = normalize(V + L);
+    const float NdotH = clamp(dot(N, H), 0.0, 1.0);
+    const float VdotH = clamp(dot(V, H), 0.0, 1.0);
+    const vec3  F     = F_Schlick(f0, VdotH);
+    return ((1.0 - F) * cDiff / PI + F * (D_GGX(NdotH, a) * V_SmithGGXCorrelated(NdotV, NdotL, a))) * NdotL;
+}
+
 void main()
 {
     const Material m    = pc.materials.m[pc.materialIndex];
@@ -40,10 +50,7 @@ void main()
 
     // --- Sun (analytic directional light) ---
     const vec3  L     = normalize(-frame.sunDirection.xyz);
-    const vec3  H     = normalize(V + L);
     const float NdotL = clamp(dot(N, L), 0.0, 1.0);
-    const float NdotH = clamp(dot(N, H), 0.0, 1.0);
-    const float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
     // Shadows use the geometric normal (normal maps would drag the offset into the surface).
     const float viewDepth = -(frame.view * vec4(inWorldPos, 1.0)).z;
@@ -51,9 +58,30 @@ void main()
     const float shadow = NdotL > 0.0 ? SunShadow(frame, inWorldPos, tbn[2], viewDepth, gl_FragCoord.xy, cascade)
                                      : 0.0;
 
-    const vec3 F      = F_Schlick(f0, VdotH);
-    const vec3 direct = ((1.0 - F) * cDiff / PI + F * (D_GGX(NdotH, a) * V_SmithGGXCorrelated(NdotV, NdotL, a))) *
-                        frame.sunRadiance.rgb * (NdotL * shadow);
+    vec3 direct = NdotL > 0.0 ? DirectBrdf(N, V, L, NdotV, NdotL, cDiff, f0, a) * frame.sunRadiance.rgb * shadow
+                              : vec3(0.0);
+
+    // --- Punctual lights of this fragment's cluster ---
+    if (frame.lightInfo.x > 0u) {
+        const uint cluster = ClusterIndex(gl_FragCoord.xy, viewDepth, frame.clusterParams.zw, frame.clusterParams.x,
+                                          frame.clusterParams.y);
+        ClusterBuffer clusters = frame.clusters;
+        LightBuffer   lights   = frame.lights;
+        const uint    count    = min(clusters.counts[cluster], CLUSTER_MAX_LIGHTS);
+        const uint    first    = cluster * CLUSTER_MAX_LIGHTS;
+        for (uint i = 0u; i < count; ++i) {
+            const GpuLight light      = lights.l[clusters.indices[first + i]];
+            const vec3     toLight    = light.position - inWorldPos;
+            const float    distanceSq = dot(toLight, toLight);
+            const vec3     Ll         = toLight * inversesqrt(max(distanceSq, 1e-12));
+            const float    NdotLl     = dot(N, Ll);
+            if (NdotLl <= 0.0)
+                continue;
+            const float attenuation = DistanceAttenuation(distanceSq, light.range) * SpotAttenuation(-Ll, light);
+            if (attenuation > 0.0)
+                direct += DirectBrdf(N, V, Ll, NdotV, NdotLl, cDiff, f0, a) * light.color * attenuation;
+        }
+    }
 
     // --- Image-based lighting: split sum + multiple-scattering compensation (Fdez-Aguera 2019) ---
     const vec2  lut      = SampleTexture(frame.ibl.z, SAMPLER_LINEAR_CLAMP, vec2(NdotV, roughness)).rg;

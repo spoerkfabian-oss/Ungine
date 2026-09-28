@@ -2,6 +2,7 @@
 #define ENGINE_FRAME_GLSL
 // Requires: #extension GL_EXT_buffer_reference : require
 // Mirrors Engine::FrameUniforms (SceneRenderer.cpp).
+#include "lights.glsl"
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer FrameData {
     mat4  viewProj;
@@ -23,6 +24,13 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     uvec4 shadowInfo;     // x: resolution, y: debug cascade tint
 
     uvec4 aoInfo;         // x: AO texture slot (full resolution), y: enabled
+
+    // Clustered lights
+    vec4          clusterParams; // x: slice scale, y: slice bias, zw: clusters per pixel (x, y)
+    vec4          clusterDepth;  // x: near, y: far (view distance covered by the slices)
+    uvec4         lightInfo;     // x: light count (0 = no punctual lights this frame)
+    LightBuffer   lights;
+    ClusterBuffer clusters;
 };
 
 #endif

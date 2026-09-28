@@ -30,7 +30,7 @@ ModelData MakePlane(std::string name, float size, const MaterialData& material, 
                                                  .material     = 0,
                                                  .boundsMin    = {-h, 0.0f, -h},
                                                  .boundsMax    = {h, 0.0f, h}}}}};
-    data.nodes     = {ModelNode{.name = data.name, .local = {}, .mesh = 0, .parent = -1}};
+    data.nodes     = {ModelNode{.name = data.name, .local = {}, .mesh = 0, .parent = -1, .light = {}}};
     data.boundsMin = {-h, 0.0f, -h};
     data.boundsMax = {h, 0.0f, h};
     return data;

@@ -301,6 +301,78 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     F().assets->Release(h);
 }
 
+TEST_CASE(Render_ClusteredLights)
+{
+    // Point and spot lights through light culling + shading under validation, CPU light culling,
+    // cluster list overflow and the cluster debug view.
+    MaterialData material{.name = "Floor", .baseColorFactor = glm::vec4(0.8f), .metallic = 0.0f, .roughness = 0.7f};
+    const ModelHandle h = F().assets->CreateModel(MakePlane("Floor", 20.0f, material));
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+
+    Scene scene;
+    InstantiateModel(scene, h, *model);
+    Registry& registry = scene.GetRegistry();
+    const auto addLight = [&](glm::vec3 position, Light light) {
+        const Entity e = scene.CreateEntity("Light");
+        registry.Get<Transform>(e).position = position;
+        registry.Emplace<Light>(e, light);
+        return e;
+    };
+    addLight({0.0f, 1.0f, 0.0f}, {.type = LightType::Point, .color = glm::vec3(1.0f, 0.2f, 0.2f), .intensity = 5.0f, .range = 4.0f});
+    const Entity spot = addLight({2.0f, 2.0f, 0.0f}, {.type = LightType::Spot, .intensity = 20.0f, .range = 6.0f,
+                                                      .innerConeAngle = 0.3f, .outerConeAngle = 0.3f}); // hard edge
+    registry.Get<Transform>(spot).rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // down
+    addLight({0.0f, 1.0f, 60.0f}, {.intensity = 5.0f, .range = 2.0f});   // behind the camera: CPU-culled
+    addLight({0.0f, 1.0f, -5.0f}, {.intensity = 0.0f, .range = 2.0f});   // black: skipped
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.shadows.resolution = 512;
+    const glm::vec3 eye{0.0f, 3.0f, 8.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 320.0f / 240.0f, 0.05f),
+                            .position   = eye,
+                            .nearPlane  = 0.05f};
+    const auto render = [&] {
+        SceneRenderStats stats;
+        for (int i = 0; i < 3; ++i)
+            if (auto frame = F().renderer->BeginFrame()) {
+                renderer.Render(*frame, scene, camera);
+                F().renderer->EndFrame(*frame);
+                stats = renderer.Stats();
+            }
+        return stats;
+    };
+
+    SceneRenderStats stats = render();
+    CHECK(stats.lightsTotal == 4 && stats.lights == 2);
+    bool cullScope = false;
+    for (const GpuTiming& t : F().renderer->Profiler().Results())
+        cullScope |= std::string_view{t.name} == "Light culling";
+    CHECK(!F().renderer->Profiler().Supported() || cullScope);
+
+    renderer.post.debugView = DebugView::LightClusters;
+    CHECK(render().lights == 2);
+    renderer.post.debugView = DebugView::None;
+
+    // More lights than a cluster holds: the list is truncated, nothing breaks.
+    for (int i = 0; i < 300; ++i)
+        addLight({0.01f * static_cast<float>(i % 17), 0.5f, 0.01f * static_cast<float>(i / 17)},
+                 {.intensity = 0.05f, .range = 3.0f});
+    scene.UpdateTransforms();
+    CHECK(render().lights == 302);
+
+    renderer.lights.enabled = false;
+    stats                   = render();
+    CHECK(stats.lights == 0 && stats.lightsTotal == 304);
+
+    F().assets->Release(h);
+}
+
 TEST_CASE(Editor_FramesSelectionAndToggle)
 {
     // Editor frame flow (viewport texture + UI into the swapchain) under validation, recreated
@@ -314,6 +386,11 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
 
     Scene         scene;
     const Entity  root = InstantiateModel(scene, h, *model);
+    const Entity  spot = scene.CreateEntity("Spot");
+    scene.GetRegistry().Emplace<Light>(spot, Light{.type = LightType::Spot, .intensity = 5.0f});
+    scene.GetRegistry().Get<Transform>(spot).position = glm::vec3(0.5f, 1.0f, 1.0f);
+    const Entity point = scene.CreateEntity("Point");
+    scene.GetRegistry().Emplace<Light>(point, Light{.intensity = 5.0f, .range = 2.0f});
     SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
     sceneRenderer.shadows.resolution = 512;
     FlyCamera camera;
@@ -352,8 +429,17 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
             uiScope |= std::string_view{t.name} == "Editor UI";
         CHECK(!F().renderer->Profiler().Supported() || uiScope);
         CHECK(sceneRenderer.Stats().drawCalls > 0); // the scene went into the viewport texture
+        CHECK(sceneRenderer.Stats().lightsTotal == 2);
+
+        // Light overlay with a selected spot / point light (cone and range sphere).
+        for (Entity light : {spot, point}) {
+            editor.Select(light);
+            runFrames(editor, 2);
+            CHECK(editor.Selected() == light);
+        }
 
         if (round == 1) { // selection of a destroyed entity is dropped
+            editor.Select(root);
             scene.DestroyEntity(root);
             runFrames(editor, 2);
             CHECK(editor.Selected() == NullEntity);

@@ -24,7 +24,7 @@ struct Model;
 
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
 
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, Count }; // mirrors tonemap.frag
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, Count }; // mirrors tonemap.frag
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -59,11 +59,40 @@ struct AoSettings {
     float         sharpness    = 20.0f; // denoise edge stopping (relative depth difference)
 };
 
+// Clustered forward shading of punctual lights (Light components).
+inline constexpr std::uint32_t kClusterGridX         = 16; // mirrored in lights.glsl
+inline constexpr std::uint32_t kClusterGridY         = 9;
+inline constexpr std::uint32_t kClusterGridZ         = 24; // logarithmic depth slices
+inline constexpr std::uint32_t kClusterMaxLights     = 256; // per cluster; longer lists are truncated
+inline constexpr std::uint32_t kMaxVisibleLights     = 4096; // after CPU frustum culling
+
+struct LightSettings {
+    bool  enabled    = true;
+    float clusterFar = 300.0f; // view distance covered by the depth slices; farther pixels use the last one
+};
+
+// Mirrors GpuLight in lights.glsl.
+struct GpuLight {
+    glm::vec3     position{0.0f};
+    float         range = 0.0f;
+    glm::vec3     color{0.0f};    // color * intensity
+    float         spotScale  = 0.0f;
+    glm::vec3     direction{0.0f, 0.0f, -1.0f};
+    float         spotOffset = 1.0f;
+    float         cosOuter   = -1.0f;
+    float         sinOuter   = 0.0f;
+    std::uint32_t type       = 0;
+    float         pad        = 0.0f;
+};
+static_assert(sizeof(GpuLight) == 64);
+
 struct SceneRenderStats {
     std::uint32_t drawCalls   = 0;
     std::uint32_t culled      = 0; // submeshes rejected by frustum culling (camera)
     std::uint32_t shadowDraws = 0; // over all cascades
     std::uint64_t triangles   = 0;
+    std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
+    std::uint32_t lightsTotal = 0; // Light components in the scene
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
     float         averageLuminance = 0.0f; // adapted scene luminance (auto exposure only)
 };
@@ -83,7 +112,8 @@ struct RenderOutput {
 //   cascaded shadow maps: depth-only per cascade, culled against each cascade
 //   depth + view-normal prepass (frustum-culled per submesh)
 //   GTAO + depth-aware denoise (compute)
-//   forward PBR pass (depth test EQUAL, no overdraw) -> HDR target (RGBA16F)
+//   clustered light assignment (compute, 16 x 9 x 24 froxels)
+//   forward PBR pass (sun + cluster lights, depth test EQUAL, no overdraw) -> HDR target (RGBA16F)
 //   sky pass (analytic sky + sun disk where depth is still at infinity)
 //   bloom: 13-tap downsample chain + tent upsample (compute, half resolution)
 //   auto exposure: luminance histogram + adapted geometric mean (compute)
@@ -103,6 +133,7 @@ public:
     PostSettings                          post;
     ShadowSettings                        shadows;
     AoSettings                            ao;
+    LightSettings                         lights;
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
 
 private:
@@ -118,6 +149,8 @@ private:
     void EnsureTargets(VkExtent2D extent);
     void EnsureShadowMap();
     void CollectDrawItems(Scene& scene);
+    void CollectLights(Scene& scene, const Frustum& frustum);
+    void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     void RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
                        const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount);
     void DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress, bool countStats);
@@ -140,6 +173,8 @@ private:
     Pipeline            m_Shadow, m_ShadowMasked; // depth only / alpha-tested
     Pipeline            m_BloomDown, m_BloomUp;
     Pipeline            m_Prepass, m_Gtao, m_GtaoDenoise, m_Histogram, m_ExposureAverage;
+    Pipeline            m_LightCull;
+    Buffer              m_Clusters; // per-cluster counts + light index lists (written by light_cull.comp)
 
     // Frame targets (recreated on resize).
     Image                      m_Depth; // reverse-Z D32, sampled by GTAO in DEPTH_READ_ONLY_OPTIMAL
@@ -167,6 +202,7 @@ private:
     std::array<std::uint32_t, kMaxCascades> m_ShadowSlots{};
 
     std::vector<DrawItem> m_DrawItems;
+    std::vector<GpuLight> m_Lights; // this frame's visible lights
     SceneRenderStats      m_Stats;
 };
 
