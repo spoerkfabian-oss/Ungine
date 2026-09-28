@@ -311,7 +311,9 @@ void Editor::DrawInspector()
                         static_cast<unsigned long long>(registry.Get<Uuid>(e).value));
 
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("transform")) {
-        Transform& t = registry.Get<Transform>(e);
+        // Edited as a copy: writing back only on change keeps the entity (and its shadow caches) clean.
+        const Transform original = m_Ctx.scene.GetTransform(e);
+        Transform       t        = original;
 
         Vec3Row("Position", &t.position, 0.01f, 0.0f);
 
@@ -325,6 +327,8 @@ void Editor::DrawInspector()
         m_EulerSource = t.rotation;
 
         Vec3Row("Scale", &t.scale, 0.01f, 1.0f);
+        if (t != original)
+            m_Ctx.scene.SetTransform(e, t);
 
         const glm::vec3 world = registry.Get<WorldTransform>(e).matrix[3];
         PropertyRow("World pos");
@@ -414,11 +418,14 @@ void Editor::DrawInspector()
     // text fields when they are released. Detected by comparing the entity's state.
     const std::uint64_t uuid    = registry.Get<Uuid>(e).value;
     const bool          editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
+    const bool          changed = SnapshotEntityState(m_Ctx.scene, e) != frameState;
+    if (changed)
+        m_Ctx.scene.MarkChanged(e); // light / mesh edits: bounds and shadow caches
     if (m_InspectorEdit && m_InspectorEdit->uuid == uuid && editing) {
         // still dragging / typing
     } else if (m_InspectorEdit) {
         PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
-    } else if (SnapshotEntityState(m_Ctx.scene, e) != frameState) {
+    } else if (changed) {
         if (editing)
             m_InspectorEdit = StateEdit{uuid, frameState};
         else
@@ -651,12 +658,29 @@ void Editor::DrawStats()
         ImGui::Text("Shadow draws   %u", stats.shadowDraws);
         ImGui::Text("Triangles      %llu", static_cast<unsigned long long>(stats.triangles));
         ImGui::Text("Lights         %u / %u", stats.lights, stats.lightsTotal);
-        ImGui::Text("Shadowed       %u (%u tiles, %u draws)", stats.shadowedLights, stats.shadowTiles,
-                    stats.localShadowDraws);
+        ImGui::Text("Shadowed       %u (%u tiles, %u re-rendered, %u draws)", stats.shadowedLights, stats.shadowTiles,
+                    stats.shadowTilesRendered, stats.localShadowDraws);
         ImGui::Text("Entities       %zu", m_Ctx.scene.GetRegistry().AliveCount());
         ImGui::Text("Exposure       %.3f", stats.exposure);
         if (m_Ctx.sceneRenderer.post.autoExposure)
             ImGui::Text("Avg luminance  %.4f", stats.averageLuminance);
+
+        ImGui::SeparatorText("CPU (ms)");
+        const TransformUpdateStats& xf      = m_Ctx.scene.FrameTransformUpdate();
+        const SpatialIndex&         spatial = m_Ctx.sceneRenderer.Spatial();
+        ImGui::Text("Transforms     %.3f  (%u subtrees, %u matrices)", xf.milliseconds, xf.dirtyRoots, xf.updated);
+        ImGui::Text("BVH sync       %.3f  (%u changed, %u re-inserted, %u pending)", stats.cpuSpatialMs,
+                    spatial.LastSync().changed, spatial.LastSync().reinserted, spatial.LastSync().pending);
+        ImGui::Text("Culling        %.3f  (%u draw items)", stats.cpuCullingMs, stats.drawItems);
+
+        ImGui::SeparatorText("BVH");
+        ImGui::Text("Meshes         %zu  (height %d, %zu nodes)", spatial.MeshCount(), spatial.MeshTree().Height(),
+                    spatial.MeshTree().NodeCount());
+        ImGui::Text("Lights         %zu  (height %d)", spatial.LightCount(), spatial.LightTree().Height());
+        ImGui::Checkbox("Show in viewport", &m_ShowBvh);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100.0f);
+        ImGui::SliderInt("max depth", &m_BvhDepth, 0, 32);
 
         ImGui::SeparatorText("Memory");
         const VkPhysicalDeviceMemoryProperties* memory = nullptr;

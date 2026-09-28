@@ -22,9 +22,9 @@ class Sandbox final : public Engine::Application {
 public:
     // exitAfterFrames > 0: close that many frames after the model finished loading (smoke tests).
     Sandbox(const Engine::ApplicationDesc& desc, std::filesystem::path modelPath, std::uint32_t exitAfterFrames,
-            bool startWithEditor, std::uint32_t lightCount)
+            bool startWithEditor, std::uint32_t lightCount, std::uint32_t instanceCount)
         : Application(desc), m_ModelPath(std::move(modelPath)), m_ExitAfterFrames(exitAfterFrames),
-          m_StartWithEditor(startWithEditor), m_DemoLightCount(lightCount)
+          m_StartWithEditor(startWithEditor), m_DemoLightCount(lightCount), m_InstanceCount(instanceCount)
     {
         m_KeySub = GetEvents().Subscribe<Engine::KeyEvent>([this](const Engine::KeyEvent& e) {
             // Escape leaves an editor text field first.
@@ -69,14 +69,15 @@ protected:
         // With the editor, the camera only reacts to the viewport (or while it is looking around).
         if (!m_Editor || m_Editor->ViewportHovered() || m_Camera.IsCaptured())
             m_Camera.Update(GetInput(), GetWindow(), static_cast<float>(dt));
-        m_Scene.UpdateTransforms();
         if (!m_Editor || !m_Editor->WantsKeyboard())
             UpdateLookControls(static_cast<float>(dt));
         if (m_LightRoot != Engine::NullEntity && m_Scene.GetRegistry().Valid(m_LightRoot)) {
-            auto& t    = m_Scene.GetRegistry().Get<Engine::Transform>(m_LightRoot);
+            auto& t    = m_Scene.EditTransform(m_LightRoot);
             t.rotation = glm::normalize(glm::angleAxis(static_cast<float>(dt) * 0.25f, glm::vec3(0.0f, 1.0f, 0.0f)) *
                                         t.rotation);
         }
+        AnimateInstances(static_cast<float>(dt));
+        m_Scene.UpdateTransforms(); // only the dirty subtrees
         if (m_Editor)
             m_Editor->Update(static_cast<float>(dt));
 
@@ -90,10 +91,11 @@ protected:
             const auto& post   = m_SceneRenderer->post;
             const char* status = m_LoadFailed ? " | load failed" : (m_LoadDone ? "" : " | loading...");
             GetWindow().SetTitle(std::format(
-                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {}/{} lights | {} x{:.2f}{}{}{} | "
-                "debug {}{}",
+                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {}/{} lights | "
+                "cpu xf {:.2f} bvh {:.2f} cull {:.2f} ms | {} x{:.2f}{}{}{} | debug {}{}",
                 m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.shadowDraws,
-                stats.triangles, stats.lights, stats.lightsTotal, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
+                stats.triangles, stats.lights, stats.lightsTotal, m_Scene.FrameTransformUpdate().milliseconds,
+                stats.cpuSpatialMs, stats.cpuCullingMs, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
                 post.bloom ? " | bloom" : "", m_SceneRenderer->ao.enabled ? " | AO" : "",
                 Engine::ToString(post.debugView), status));
             m_FpsTimer   = 0.0;
@@ -114,6 +116,8 @@ protected:
     void OnShutdown() override
     {
         m_Editor.reset();
+        if (m_InstanceModel)
+            GetAssets().Release(m_InstanceModel);
         GetAssets().Release(m_Model);
         if (m_Ground)
             GetAssets().Release(m_Ground);
@@ -141,6 +145,46 @@ private:
             m_Editor.reset(); // waits for the GPU once
     }
 
+    // Stress scene: a grid of m_InstanceCount boxes on the ground, every tenth one bobbing (dirty
+    // transforms, BVH updates, shadow cache invalidation near lights).
+    void CreateInstances()
+    {
+        const float    r    = m_SceneRadius;
+        const auto     side = static_cast<std::uint32_t>(std::ceil(std::sqrt(static_cast<float>(m_InstanceCount))));
+        const float    spacing = std::min(0.6f * r, 11.0f * r / static_cast<float>(side));
+        const float    size    = spacing * 0.4f;
+        m_InstanceModel        = GetAssets().CreatePrimitive({.shape     = Engine::PrimitiveShape::Box,
+                                                              .size      = size,
+                                                              .baseColor = glm::vec4(0.7f, 0.45f, 0.25f, 1.0f),
+                                                              .metallic  = 0.0f,
+                                                              .roughness = 0.5f});
+        m_InstanceSize         = size;
+        const Engine::Entity root = m_Scene.CreateEntity("Instances");
+        m_Scene.EditTransform(root).position = glm::vec3(m_SceneCenter.x, m_GroundHeight, m_SceneCenter.z);
+        const float half = 0.5f * spacing * static_cast<float>(side - 1);
+        for (std::uint32_t i = 0; i < m_InstanceCount; ++i) {
+            const Engine::Entity e = m_Scene.CreateEntity(std::format("Box {}", i), root);
+            m_Scene.GetRegistry().Emplace<Engine::MeshRenderer>(e, Engine::MeshRenderer{.model = m_InstanceModel, .meshIndex = 0});
+            m_Scene.EditTransform(e).position = glm::vec3(static_cast<float>(i % side) * spacing - half, size * 0.5f,
+                                                          static_cast<float>(i / side) * spacing - half);
+            if (i % 10 == 0)
+                m_AnimatedInstances.push_back(e);
+        }
+    }
+
+    void AnimateInstances(float dt)
+    {
+        m_InstanceTime += dt;
+        const Engine::Registry& registry = m_Scene.GetRegistry();
+        for (std::size_t i = 0; i < m_AnimatedInstances.size(); ++i) {
+            const Engine::Entity e = m_AnimatedInstances[i];
+            if (!registry.Valid(e))
+                continue;
+            m_Scene.EditTransform(e).position.y =
+                m_InstanceSize * (0.5f + 0.5f * (1.0f + std::sin(m_InstanceTime * 2.0f + static_cast<float>(i))));
+        }
+    }
+
     // Stress demo: m_DemoLightCount colored point lights on a disc over the ground (golden-angle
     // spiral) plus four spots aimed at the model, all under one slowly rotating "Lights" entity.
     void SetDemoLights(bool enabled)
@@ -156,7 +200,7 @@ private:
 
         const float r = m_SceneRadius;
         m_LightRoot   = m_Scene.CreateEntity("Lights");
-        registry.Get<Engine::Transform>(m_LightRoot).position = glm::vec3(m_SceneCenter.x, m_GroundHeight, m_SceneCenter.z);
+        m_Scene.EditTransform(m_LightRoot).position = glm::vec3(m_SceneCenter.x, m_GroundHeight, m_SceneCenter.z);
 
         // Illuminance directly below a light about twice the sun's on the ground.
         const float height = 0.25f * r;
@@ -165,7 +209,7 @@ private:
             const float angle = static_cast<float>(i) * 2.39996323f; // golden angle
             const float dist  = 5.0f * r * std::sqrt(t);
             const Engine::Entity e = m_Scene.CreateEntity(std::format("Point {}", i), m_LightRoot);
-            registry.Get<Engine::Transform>(e).position = glm::vec3(std::cos(angle) * dist, height, std::sin(angle) * dist);
+            m_Scene.EditTransform(e).position = glm::vec3(std::cos(angle) * dist, height, std::sin(angle) * dist);
             const float     hue   = glm::fract(static_cast<float>(i) * 0.618034f); // golden ratio: neighbors differ
             const glm::vec3 color = glm::clamp(glm::abs(glm::mod(hue * 6.0f + glm::vec3(0.0f, 4.0f, 2.0f), 6.0f) - 3.0f) - 1.0f,
                                                0.0f, 1.0f);
@@ -179,7 +223,7 @@ private:
             const glm::vec3 pos    = glm::vec3(std::cos(angle), 0.0f, std::sin(angle)) * (2.0f * r) + glm::vec3(0.0f, r, 0.0f);
             const glm::vec3 target = m_SceneCenter - glm::vec3(m_SceneCenter.x, m_GroundHeight, m_SceneCenter.z);
             const Engine::Entity e = m_Scene.CreateEntity(std::format("Spot {}", i), m_LightRoot);
-            auto&                t = registry.Get<Engine::Transform>(e);
+            auto&                t = m_Scene.EditTransform(e);
             t.position             = pos;
             t.rotation             = glm::quatLookAt(glm::normalize(target - pos), glm::vec3(0.0f, 1.0f, 0.0f));
             registry.Emplace<Engine::Light>(e, Engine::Light{.type           = Engine::LightType::Spot,
@@ -275,6 +319,8 @@ private:
         m_SceneCenter  = center;
         m_SceneRadius  = radius;
         SetDemoLights(m_DemoLightCount > 0);
+        if (m_InstanceCount > 0)
+            CreateInstances();
         m_SceneRenderer->shadows.maxDistance = radius * 10.0f;
         m_SceneRenderer->ao.radius           = radius * 0.2f;
     }
@@ -282,7 +328,7 @@ private:
     void OnGroundLoaded()
     {
         const Engine::Entity root = Engine::InstantiateModel(m_Scene, m_Ground, *GetAssets().Get(m_Ground));
-        m_Scene.GetRegistry().Get<Engine::Transform>(root).position.y = m_GroundHeight;
+        m_Scene.EditTransform(root).position.y = m_GroundHeight;
         m_Scene.GetRegistry().Get<Engine::Name>(root).value           = "Ground";
     }
 
@@ -297,6 +343,11 @@ private:
     glm::vec3                              m_SceneCenter{0.0f};
     float                                  m_SceneRadius    = 1.0f;
     std::uint32_t                          m_DemoLightCount = 0; // L toggles the demo (256 if not given)
+    std::uint32_t                          m_InstanceCount  = 0; // --instances
+    Engine::ModelHandle                    m_InstanceModel;
+    float                                  m_InstanceSize   = 0.0f;
+    float                                  m_InstanceTime   = 0.0f;
+    std::vector<Engine::Entity>            m_AnimatedInstances;
     Engine::Entity                         m_LightRoot      = Engine::NullEntity;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     Engine::FlyCamera                      m_Camera;
@@ -314,11 +365,12 @@ private:
 
 int main(int argc, char** argv)
 {
-    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N]
+    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N]
     std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
     bool                  editor    = false;
     std::uint32_t         lights    = 0;
+    std::uint32_t         instances = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--frames" && i + 1 < argc)
@@ -327,11 +379,13 @@ int main(int argc, char** argv)
             editor = true;
         else if (arg == "--lights" && i + 1 < argc)
             lights = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--instances" && i + 1 < argc)
+            instances = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else
             modelPath = arg;
     }
     if (!std::filesystem::exists(modelPath)) {
-        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N]",
+        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N]",
                      modelPath.string());
         return 1;
     }
@@ -339,7 +393,7 @@ int main(int argc, char** argv)
     // Exit code: 0 ok, 1 fatal error or model failed to load, 2 validation errors (incl. teardown).
     bool loadFailed = false;
     try {
-        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames, editor, lights);
+        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames, editor, lights, instances);
         app.Run();
         loadFailed = app.LoadFailed();
     } catch (const std::exception& e) {

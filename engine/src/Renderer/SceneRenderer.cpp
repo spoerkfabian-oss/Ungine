@@ -453,12 +453,12 @@ void SceneRenderer::EnsureShadowMap()
     }
 }
 
-void SceneRenderer::EnsureShadowAtlas()
+bool SceneRenderer::EnsureShadowAtlas()
 {
     const std::uint32_t maxSize = m_Renderer.GetContext().Properties().limits.maxImageDimension2D;
     const std::uint32_t size    = std::bit_floor(std::clamp(localShadows.atlasSize, 256u, maxSize));
     if (m_ShadowAtlas && m_ShadowAtlas.Extent().width == size)
-        return;
+        return false;
     ReleaseShadowAtlas();
     m_ShadowAtlas        = Image(m_Renderer.GetContext(), {.extent    = {size, size, 1},
                                                            .format    = kShadowFormat,
@@ -467,6 +467,7 @@ void SceneRenderer::EnsureShadowAtlas()
                                                            .debugName = "LocalShadowAtlas"});
     m_ShadowAtlasSlot    = m_Renderer.GetBindless().AddSampledImage(m_ShadowAtlas.View());
     m_ShadowAtlasWritten = false;
+    return true;
 }
 
 void SceneRenderer::ReleaseShadowAtlas()
@@ -478,36 +479,60 @@ void SceneRenderer::ReleaseShadowAtlas()
     r->DeferRelease(std::move(m_ShadowAtlas));
     m_ShadowAtlas        = {};
     m_ShadowAtlasWritten = false;
+    m_ShadowCache.clear();
+    m_TileAllocator = {};
 }
 
-void SceneRenderer::CollectDrawItems(Scene& scene)
+void SceneRenderer::ResetDrawItems()
 {
+    for (const DrawItem& item : m_DrawItems)
+        m_DrawItemOf[EntityIndex(item.entity)] = kNoDrawItem;
     m_DrawItems.clear();
-    ModelHandle  lastHandle;
-    const Model* lastModel = nullptr; // entities of one model are usually contiguous
+}
 
-    scene.GetRegistry().ViewOf<WorldTransform, MeshRenderer>().Each(
-        [&](Entity entity, const WorldTransform& world, const MeshRenderer& renderer) {
-            if (renderer.model != lastHandle) {
-                lastHandle = renderer.model;
-                lastModel  = m_Assets.Get(renderer.model); // nullptr while loading or after release
-            }
-            if (!lastModel || renderer.meshIndex >= lastModel->meshes.size())
-                return;
+std::uint32_t SceneRenderer::DrawItemFor(const SpatialIndex::MeshProxy& proxy)
+{
+    const std::uint32_t slot = EntityIndex(proxy.entity);
+    if (slot < m_DrawItemOf.size() && m_DrawItemOf[slot] != kNoDrawItem)
+        return m_DrawItemOf[slot];
 
-            const glm::mat3 linear = glm::mat3(world.matrix);
-            const DrawData  data{.model        = world.matrix,
-                                 .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear))),
-                                 .entityId     = EntityIndex(entity) + 1,
-                                 .pad          = {}};
-            m_DrawItems.push_back({.model     = lastModel,
-                                   .mesh      = &lastModel->meshes[renderer.meshIndex],
-                                   .world     = world.matrix,
-                                   .drawData  = m_Renderer.PushTransient(data, 16),
-                                   // Mirrored transforms flip the winding (glTF: negative determinant).
-                                   .frontFace = glm::determinant(linear) < 0.0f ? VK_FRONT_FACE_CLOCKWISE
-                                                                                : VK_FRONT_FACE_COUNTER_CLOCKWISE});
-        });
+    const Registry&     registry = m_FrameScene->GetRegistry();
+    const MeshRenderer* renderer = registry.Valid(proxy.entity) ? registry.TryGet<MeshRenderer>(proxy.entity) : nullptr;
+    const Model*        model    = renderer ? m_Assets.Get(renderer->model) : nullptr; // released meanwhile
+    if (!model || renderer->meshIndex >= model->meshes.size())
+        return kNoDrawItem;
+
+    const glm::mat4& world  = registry.Get<WorldTransform>(proxy.entity).matrix;
+    const glm::mat3  linear = glm::mat3(world);
+    const DrawData   data{.model        = world,
+                          .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear))),
+                          .entityId     = slot + 1,
+                          .pad          = {}};
+    const auto index = static_cast<std::uint32_t>(m_DrawItems.size());
+    m_DrawItems.push_back({.entity    = proxy.entity,
+                           .model     = model,
+                           .mesh      = &model->meshes[renderer->meshIndex],
+                           .world     = world,
+                           .drawData  = m_Renderer.PushTransient(data, 16),
+                           // Mirrored transforms flip the winding (glTF: negative determinant).
+                           .frontFace = glm::determinant(linear) < 0.0f ? VK_FRONT_FACE_CLOCKWISE
+                                                                        : VK_FRONT_FACE_COUNTER_CLOCKWISE});
+    if (slot >= m_DrawItemOf.size())
+        m_DrawItemOf.resize(std::max<std::size_t>(slot + 1, m_DrawItemOf.size() * 2), kNoDrawItem);
+    m_DrawItemOf[slot] = index;
+    return index;
+}
+
+template <class Keep>
+void SceneRenderer::GatherMeshes(const Frustum& frustum, std::vector<std::uint32_t>& out, Keep&& keep)
+{
+    out.clear();
+    m_Spatial.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& proxy) {
+        if (!keep(proxy))
+            return;
+        if (const std::uint32_t item = DrawItemFor(proxy); item != kNoDrawItem)
+            out.push_back(item);
+    });
 }
 
 const Pipeline& SceneRenderer::TonemapPipeline(VkFormat outputFormat)
@@ -552,14 +577,25 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GpuScope scope(profiler, cmd, "Environment");
         m_Environment.Update(cmd, sky); // compute, only when the sky changed
     }
-    CollectDrawItems(scene);
+    // Scene changes -> BVH; draw items of the last frame are gone (their transient memory too).
+    m_FrameScene = &scene;
+    m_Spatial.Sync(scene, m_Assets);
+    m_Stats.cpuSpatialMs = m_Spatial.LastSync().milliseconds;
+    ResetDrawItems();
 
     const std::uint32_t cascadeCount = shadows.enabled ? std::clamp(shadows.cascadeCount, 1u, kMaxCascades) : 0u;
     const auto          cascades     = ComputeCascades(camera, sky.sunDirection, shadows);
 
     const glm::mat4 viewProj = camera.projection * camera.view;
     const Frustum   frustum  = Frustum::FromViewProjection(viewProj);
+    const auto      cullStart = std::chrono::steady_clock::now();
+    GatherMeshes(frustum, m_CameraItems, [](const SpatialIndex::MeshProxy&) { return true; });
+    std::uint64_t visibleSubmeshes = 0;
+    for (std::uint32_t item : m_CameraItems)
+        visibleSubmeshes += m_DrawItems[item].mesh->submeshes.size();
+    m_Stats.culled = static_cast<std::uint32_t>(m_Spatial.SubmeshCount() - std::min(visibleSubmeshes, m_Spatial.SubmeshCount()));
     CollectLights(scene, frustum);
+    m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
     const auto pushArray = [&]<class T>(const std::vector<T>& values) -> VkDeviceAddress {
         if (values.empty())
@@ -615,7 +651,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GpuScope scope(profiler, cmd, "Shadows");
         RenderShadows(cmd, frameAddress, cascades, cascadeCount);
     }
-    if (!m_ShadowTiles.empty()) {
+    if (std::ranges::any_of(m_ShadowTiles, &ShadowTile::render)) {
         GpuScope scope(profiler, cmd, "Local shadows");
         RenderLocalShadows(cmd, frameAddress);
     }
@@ -655,6 +691,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         RenderExposure(cmd, frame.frameIndex, deltaTime);
     } else
         m_Stats.exposure = post.exposure;
+
+    m_Stats.drawItems = static_cast<std::uint32_t>(m_DrawItems.size());
 
     // --- Tone mapping into the swapchain image ---
     const auto& bindless  = m_Renderer.GetBindless();
@@ -703,19 +741,48 @@ void SceneRenderer::AssignLocalShadows(const CameraData& camera)
         ReleaseShadowAtlas(); // 64 MB at 4096^2
         return;
     }
-    if (localShadows.maxLights == 0 || m_Lights.empty())
+    if (localShadows.maxLights == 0 || m_Lights.empty()) {
+        // Nothing to shadow: cached maps would miss this frame's scene changes, drop them.
+        for (const ShadowCacheEntry& e : m_ShadowCache)
+            for (std::uint32_t v = 0; v < e.views; ++v)
+                m_TileAllocator.Free(e.offsets[v], e.size);
+        m_ShadowCache.clear();
         return;
-    EnsureShadowAtlas();
+    }
+    const bool          recreated = EnsureShadowAtlas();
     const std::uint32_t atlasSize = m_ShadowAtlas.Extent().width;
     const std::uint32_t minTile   = std::clamp(std::bit_floor(std::max(localShadows.minTileSize, 16u)), 16u, atlasSize);
     const std::uint32_t maxTile   = std::clamp(std::bit_floor(std::max(localShadows.maxTileSize, minTile)), minTile, atlasSize);
+    if (recreated || m_TileAllocator.AtlasSize() != atlasSize || m_TileAllocator.MinTile() != minTile) {
+        m_ShadowCache.clear();
+        m_TileAllocator.Reset(atlasSize, minTile);
+    }
+
+    // Invalidation: rasterizer bias is baked into the maps; casters that moved, appeared or
+    // vanished near a light (the spatial index reports their old and new bounds).
+    const glm::vec2 bias{localShadows.depthBias, localShadows.slopeBias};
+    if (bias != m_CachedBias) {
+        for (ShadowCacheEntry& entry : m_ShadowCache)
+            entry.valid.fill(false);
+        m_CachedBias = bias;
+    }
+    for (ShadowCacheEntry& entry : m_ShadowCache)
+        for (const Aabb& region : m_Spatial.ChangedRegions()) {
+            const glm::vec3 closest = glm::clamp(entry.position, region.min, region.max);
+            if (glm::dot(closest - entry.position, closest - entry.position) <= entry.range * entry.range) {
+                entry.valid.fill(false);
+                break;
+            }
+        }
 
     // Importance: screen size of the light's range sphere (fraction of the viewport height).
-    struct Candidate {
+    struct Want {
         std::uint32_t light;
         float         importance;
+        std::uint32_t size  = 0;
+        std::uint32_t views = 1;
     };
-    std::vector<Candidate> candidates;
+    std::vector<Want> wants;
     for (std::uint32_t i = 0; i < m_Lights.size(); ++i) {
         if (!m_LightCastsShadows[i])
             continue;
@@ -724,79 +791,137 @@ void SceneRenderer::AssignLocalShadows(const CameraData& camera)
         const float     importance =
             d <= l.range ? 1.0f
                          : std::min(1.0f, l.range / std::sqrt(d * d - l.range * l.range) * camera.projection[1][1] * 0.5f);
-        candidates.push_back({i, importance});
+        wants.push_back({.light = i, .importance = importance});
     }
-    std::ranges::stable_sort(candidates, std::greater{}, &Candidate::importance);
-    if (candidates.size() > localShadows.maxLights)
-        candidates.resize(localShadows.maxLights);
-
-    // Tile size from the importance; halved (then dropped) when the atlas is full.
-    const std::uint64_t cellsPerSide = atlasSize / minTile;
-    const std::uint64_t capacity     = cellsPerSide * cellsPerSide;
-    std::uint64_t       used         = 0;
-    const float         border       = std::ceil(localShadows.filterRadius) + 2.0f; // PCF taps stay in the tile
-    for (const Candidate& c : candidates) {
-        GpuLight&           l     = m_Lights[c.light];
-        const bool          point = l.type == 0;
-        const std::uint32_t views = point ? kCubeFaces : 1u;
-        std::uint32_t       size  = std::clamp(
-            std::bit_floor(std::max(static_cast<std::uint32_t>(c.importance * static_cast<float>(maxTile)), 1u)), minTile,
-            maxTile);
+    std::ranges::stable_sort(wants, std::greater{}, &Want::importance);
+    if (wants.size() > localShadows.maxLights)
+        wants.resize(localShadows.maxLights);
+    for (Want& w : wants) {
+        const bool point = m_Lights[w.light].type == 0;
+        w.views          = point ? kCubeFaces : 1u;
+        w.size = std::clamp(std::bit_floor(std::max(static_cast<std::uint32_t>(w.importance * static_cast<float>(maxTile)), 1u)),
+                            minTile, maxTile);
         if (point)
-            size = std::max(size / 2, minTile);
-        const auto cells = [&](std::uint32_t s) {
-            const std::uint64_t side = s / minTile;
-            return side * side * views;
-        };
-        while (used + cells(size) > capacity && size > minTile)
-            size /= 2;
-        if (used + cells(size) > capacity)
+            w.size = std::max(w.size / 2, minTile);
+    }
+
+    // Keep the tiles of lights that still want the same size; free everything else.
+    const auto freeEntry = [&](const ShadowCacheEntry& e) {
+        for (std::uint32_t v = 0; v < e.views; ++v)
+            m_TileAllocator.Free(e.offsets[v], e.size);
+    };
+    const auto wantOf = [&](Entity light) {
+        return std::ranges::find_if(wants, [&](const Want& w) { return m_LightEntities[w.light] == light; });
+    };
+    std::erase_if(m_ShadowCache, [&](const ShadowCacheEntry& e) {
+        const auto w    = wantOf(e.light);
+        const bool keep = w != wants.end() && w->size == e.size && w->views == e.views;
+        if (!keep)
+            freeEntry(e);
+        return !keep;
+    });
+    const auto entryOf = [&](Entity light) {
+        return std::ranges::find_if(m_ShadowCache, [&](const ShadowCacheEntry& e) { return e.light == light; });
+    };
+
+    // New tiles in priority order: halve on failure; at the minimum size, evict the least important
+    // light that already has tiles.
+    for (std::size_t wi = 0; wi < wants.size(); ++wi) {
+        Want&        w     = wants[wi];
+        const Entity light = m_LightEntities[w.light];
+        if (entryOf(light) != m_ShadowCache.end())
             continue;
-        used += cells(size);
+        ShadowCacheEntry entry{.light = light, .views = w.views};
+        for (std::uint32_t size = w.size; entry.size == 0;) {
+            std::uint32_t allocated = 0;
+            for (; allocated < w.views; ++allocated) {
+                const auto offset = m_TileAllocator.Allocate(size);
+                if (!offset)
+                    break;
+                entry.offsets[allocated] = *offset;
+            }
+            if (allocated == w.views) {
+                entry.size = size;
+                break;
+            }
+            for (std::uint32_t v = 0; v < allocated; ++v)
+                m_TileAllocator.Free(entry.offsets[v], size);
+            if (size > minTile) {
+                size /= 2;
+                continue;
+            }
+            // Evict the least important other light with tiles, then retry from the wanted size.
+            bool evicted = false;
+            for (std::size_t vi = wants.size(); vi-- > wi + 1;) {
+                if (const auto victim = entryOf(m_LightEntities[wants[vi].light]); victim != m_ShadowCache.end()) {
+                    freeEntry(*victim);
+                    m_ShadowCache.erase(victim);
+                    evicted = true;
+                    break;
+                }
+            }
+            if (!evicted)
+                break;
+            size = w.size;
+        }
+        if (entry.size != 0) {
+            w.size = entry.size;
+            m_ShadowCache.push_back(entry);
+        }
+    }
+
+    // Views of every light with tiles; unchanged matrices keep the cached map.
+    const float border = std::ceil(localShadows.filterRadius) + 2.0f; // PCF taps stay in the tile
+    for (const Want& w : wants) {
+        const auto it = entryOf(m_LightEntities[w.light]);
+        if (it == m_ShadowCache.end())
+            continue;
+        ShadowCacheEntry& entry = *it;
+        GpuLight&         l     = m_Lights[w.light];
+        entry.position          = l.position;
+        entry.range             = l.range;
+        l.shadow                = static_cast<std::uint32_t>(m_ShadowTiles.size());
 
         // Reverse-Z perspective with an infinite far plane; the range bounds the casters instead.
         const float nearPlane = std::max(l.range * 0.005f, 1e-4f);
-        l.shadow              = static_cast<std::uint32_t>(m_ShadowTiles.size());
-        const auto addTile    = [&](const glm::mat4& view, float tanHalf) {
-            m_ShadowTiles.push_back({.viewProj      = PerspectiveReverseZ(2.0f * std::atan(tanHalf), 1.0f, nearPlane) * view,
-                                     .offset        = glm::uvec2(0),
-                                     .size          = size,
+        const auto  addView   = [&](std::uint32_t face, const glm::mat4& view, float tanHalf) {
+            const glm::mat4 viewProj = PerspectiveReverseZ(2.0f * std::atan(tanHalf), 1.0f, nearPlane) * view;
+            if (entry.viewProj[face] != viewProj) {
+                entry.viewProj[face] = viewProj;
+                entry.valid[face]    = false;
+            }
+            m_ShadowTiles.push_back({.viewProj      = viewProj,
+                                     .offset        = entry.offsets[face],
+                                     .size          = entry.size,
                                      .lightPosition = l.position,
                                      .lightRange    = l.range,
-                                     .texelScale    = 2.0f * tanHalf / static_cast<float>(size)});
+                                     .texelScale    = 2.0f * tanHalf / static_cast<float>(entry.size),
+                                     .render        = !entry.valid[face],
+                                     .cacheEntry    = static_cast<std::uint32_t>(it - m_ShadowCache.begin()),
+                                     .face          = face});
         };
-        if (point) {
-            const float tanHalf = ShadowTanHalfWithBorder(1.0f, size, border);
+        if (entry.views == kCubeFaces) {
+            const float tanHalf = ShadowTanHalfWithBorder(1.0f, entry.size, border);
             for (std::uint32_t face = 0; face < kCubeFaces; ++face)
-                addTile(CubeFaceView(l.position, face), tanHalf);
+                addView(face, CubeFaceView(l.position, face), tanHalf);
         } else {
             // Wide cones (> 85 degrees) are only shadowed up to 85 degrees.
-            const float     outer = std::acos(std::clamp(l.cosOuter, 0.0f, 1.0f));
-            const float     tanHalf = ShadowTanHalfWithBorder(std::tan(std::min(outer, glm::radians(85.0f))), size, border);
-            const glm::vec3 up = std::abs(l.direction.y) > 0.99f ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
-            addTile(glm::lookAt(l.position, l.position + l.direction, up), tanHalf);
+            const float     outer   = std::acos(std::clamp(l.cosOuter, 0.0f, 1.0f));
+            const float     tanHalf = ShadowTanHalfWithBorder(std::tan(std::min(outer, glm::radians(85.0f))), entry.size, border);
+            const glm::vec3 up      = std::abs(l.direction.y) > 0.99f ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+            addView(0, glm::lookAt(l.position, l.position + l.direction, up), tanHalf);
         }
         ++m_Stats.shadowedLights;
     }
 
-    // Pack largest first; GpuShadowView order stays the lights' order (GpuLight::shadow).
-    std::vector<std::uint32_t> order(m_ShadowTiles.size());
-    std::iota(order.begin(), order.end(), 0u);
-    std::ranges::stable_sort(order, std::greater{}, [&](std::uint32_t i) { return m_ShadowTiles[i].size; });
-    std::vector<std::uint32_t> sizes;
-    for (std::uint32_t i : order)
-        sizes.push_back(m_ShadowTiles[i].size);
-    const auto positions = PackShadowTiles(sizes, atlasSize, minTile);
-    assert(positions && "tile area was checked above");
-    for (std::size_t k = 0; k < order.size(); ++k)
-        m_ShadowTiles[order[k]].offset = (*positions)[k];
-
     const float invAtlas = 1.0f / static_cast<float>(atlasSize);
-    for (const ShadowTile& tile : m_ShadowTiles)
+    for (const ShadowTile& tile : m_ShadowTiles) {
         m_ShadowViewData.push_back({.viewProj = tile.viewProj,
                                     .rect     = glm::vec4(glm::vec2(tile.offset) * invAtlas,
                                                           glm::vec2(static_cast<float>(tile.size) * invAtlas)),
                                     .params   = glm::vec4(tile.texelScale, 0.0f, 0.0f, 0.0f)});
+        m_Stats.shadowTilesRendered += tile.render ? 1u : 0u;
+    }
     m_Stats.shadowTiles = static_cast<std::uint32_t>(m_ShadowTiles.size());
 }
 
@@ -809,8 +934,10 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 
     // Earlier frames may still sample the atlas (lighting, debug view): WAR on their fragment shaders.
+    // Cached tiles must survive: keep the contents unless the atlas was never written.
     CmdImageBarrier(cmd, {.image     = m_ShadowAtlas.Handle(),
-                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                          .oldLayout = m_ShadowAtlasWritten ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_UNDEFINED,
                           .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                           .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                           .dstStage  = kDepthStages,
@@ -818,15 +945,18 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
 
-    // Only the used tiles are cleared (to 0 = far), the rest of the atlas is never sampled.
+    // Only re-rendered tiles are cleared (to 0 = far); cached ones are loaded as they are.
     const auto depth = Attachment(m_ShadowAtlas.View(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+                                  m_ShadowAtlasWritten ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE);
     BeginRendering(cmd, {atlasSize, atlasSize}, nullptr, &depth);
     bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     vkCmdSetDepthBias(cmd, -localShadows.depthBias, 0.0f, -localShadows.slopeBias); // reverse-Z
 
     for (std::uint32_t t = 0; t < m_ShadowTiles.size(); ++t) {
         const ShadowTile& tile = m_ShadowTiles[t];
+        if (!tile.render)
+            continue;
+        m_ShadowCache[tile.cacheEntry].valid[tile.face] = true;
         const VkRect2D    rect{{static_cast<std::int32_t>(tile.offset.x), static_cast<std::int32_t>(tile.offset.y)},
                                {tile.size, tile.size}};
         const VkViewport viewport{static_cast<float>(tile.offset.x), static_cast<float>(tile.offset.y),
@@ -843,7 +973,13 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
         const float   rangeSq = tile.lightRange * tile.lightRange;
         VkPipeline    bound   = VK_NULL_HANDLE;
         const Model*  boundIndices = nullptr;
-        for (const DrawItem& item : m_DrawItems) {
+        std::vector<std::uint32_t> items;
+        GatherMeshes(frustum, items, [&](const SpatialIndex::MeshProxy& proxy) {
+            const glm::vec3 closest = glm::clamp(tile.lightPosition, proxy.bounds.min, proxy.bounds.max);
+            return glm::dot(closest - tile.lightPosition, closest - tile.lightPosition) <= rangeSq;
+        });
+        for (std::uint32_t index : items) {
+            const DrawItem& item = m_DrawItems[index];
             for (const Submesh& sm : item.mesh->submeshes) {
                 const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, item.world);
                 const glm::vec3 closest = glm::clamp(tile.lightPosition, box.min, box.max);
@@ -889,9 +1025,12 @@ void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
 {
     m_Lights.clear();
     m_LightCastsShadows.clear();
-    auto view = scene.GetRegistry().ViewOf<Light, WorldTransform>();
-    view.Each([&](Entity, Light& light, WorldTransform& world) {
-        ++m_Stats.lightsTotal;
+    m_LightEntities.clear();
+    m_Stats.lightsTotal      = static_cast<std::uint32_t>(m_Spatial.LightCount());
+    const Registry& registry = scene.GetRegistry();
+    m_Spatial.QueryLights(frustum, [&](Entity entity) { // light BVH: only candidates near the view
+        const Light&          light = registry.Get<Light>(entity);
+        const WorldTransform& world = registry.Get<WorldTransform>(entity);
         const float range = EffectiveRange(light);
         const glm::vec3 radiance = light.color * light.intensity;
         if (!lights.enabled || range <= 0.0f || std::max({radiance.r, radiance.g, radiance.b}) <= 0.0f)
@@ -907,6 +1046,7 @@ void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
         }
 
         m_LightCastsShadows.push_back(light.castShadows);
+        m_LightEntities.push_back(entity);
         GpuLight& gpu = m_Lights.emplace_back();
         gpu.position  = position;
         gpu.range     = range;
@@ -980,7 +1120,10 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
         const Frustum frustum      = Frustum::FromViewProjection(cascades[c].viewProj, false);
         VkPipeline    bound        = VK_NULL_HANDLE;
         const Model*  boundIndices = nullptr;
-        for (const DrawItem& item : m_DrawItems) {
+        std::vector<std::uint32_t> items;
+        GatherMeshes(frustum, items, [](const SpatialIndex::MeshProxy&) { return true; });
+        for (std::uint32_t index : items) {
+            const DrawItem& item = m_DrawItems[index];
             for (const Submesh& sm : item.mesh->submeshes) {
                 if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world)))
                     continue;
@@ -1027,9 +1170,12 @@ void SceneRenderer::DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkD
     VkCullModeFlags        cullMode   = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
     VkFrontFace            frontFace  = VK_FRONT_FACE_MAX_ENUM;
 
-    for (const DrawItem& item : m_DrawItems) {
+    for (std::uint32_t index : m_CameraItems) {
+        const DrawItem& item = m_DrawItems[index];
         for (const Submesh& sm : item.mesh->submeshes) {
-            if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world))) {
+            // Whole meshes were culled by the BVH; multi-part meshes also per submesh.
+            if (item.mesh->submeshes.size() > 1 &&
+                !frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world))) {
                 m_Stats.culled += countStats ? 1u : 0u;
                 continue;
             }

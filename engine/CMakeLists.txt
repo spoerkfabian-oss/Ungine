@@ -25,8 +25,10 @@ add_library(Engine STATIC
     src/Renderer/Vulkan/VmaImpl.cpp
     src/Scene/Camera.cpp
     src/Scene/Frustum.cpp
+    src/Scene/AabbTree.cpp
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/SpatialIndex.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
 target_include_directories(Engine PUBLIC include PRIVATE src)

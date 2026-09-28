@@ -107,9 +107,9 @@ Entity Editor::CreateLight(LightType type, Entity parent)
     const float scale = std::max(m_Ctx.camera.moveSpeed, 0.1f);
     const Light light{.type = type, .intensity = 4.0f * scale * scale, .range = 4.0f * scale};
     const Entity e = m_Ctx.scene.CreateEntity(type == LightType::Spot ? "Spot Light" : "Point Light", parent);
-    Transform&   t = m_Ctx.scene.GetRegistry().Get<Transform>(e);
-    if (parent == NullEntity)
-        t.position = m_Ctx.camera.position + m_Ctx.camera.Forward() * (2.0f * scale);
+    Transform&   t = m_Ctx.scene.EditTransform(e);
+    if (parent == NullEntity) // a little in front of the surface in view (BVH raycast)
+        t.position = PlacementPoint(2.0f * scale) - m_Ctx.camera.Forward() * (0.5f * scale);
     if (type == LightType::Spot)
         t.rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // pointing down
     m_Ctx.scene.GetRegistry().Emplace<Light>(e, light);
@@ -124,7 +124,7 @@ Entity Editor::CreatePrimitiveEntity(PrimitiveShape shape)
     const ModelHandle handle = m_Ctx.assets.CreatePrimitive({.shape = shape, .size = scale});
     m_Ctx.modelRefs.push_back(handle); // renders once the (async) upload is done
     const Entity e = m_Ctx.scene.CreateEntity(shape == PrimitiveShape::Box ? "Cube" : "Plane");
-    m_Ctx.scene.GetRegistry().Get<Transform>(e).position = m_Ctx.camera.position + m_Ctx.camera.Forward() * (3.0f * scale);
+    m_Ctx.scene.EditTransform(e).position = PlacementPoint(3.0f * scale) + glm::vec3(0.0f, 0.5f * scale, 0.0f);
     m_Ctx.scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = handle, .meshIndex = 0});
     const Entity roots[] = {e};
     PushCreated(shape == PrimitiveShape::Box ? "Create cube" : "Create plane", roots);
@@ -187,7 +187,7 @@ void Editor::Reparent(Entity child, Entity parent)
     glm::vec4 perspective;
     glm::quat rotation;
     if (glm::decompose(glm::inverse(parentWorld) * childWorld, scale, rotation, translation, skew, perspective)) {
-        Transform& t = registry.Get<Transform>(child);
+        Transform& t = m_Ctx.scene.EditTransform(child);
         t.position   = translation;
         t.rotation   = glm::normalize(rotation);
         t.scale      = scale;

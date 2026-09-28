@@ -3,6 +3,7 @@
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
+#include "Engine/Scene/Frustum.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -101,6 +102,11 @@ private:
     void DrawGizmo(float x, float y, float width, float height);
     // Light icons (click selects), range sphere / spot cone of the selected light. True: an icon was hit.
     bool DrawLightOverlay(float x, float y, float width, float height, bool clicked);
+    void DrawBvhOverlay(float x, float y, float width, float height);
+    // World bounds of the selection (meshes in the selected subtrees); nullopt if there are none.
+    [[nodiscard]] std::optional<Aabb> SelectionBounds() const;
+    // Where new objects go: the surface under the viewport center, else in front of the camera.
+    [[nodiscard]] glm::vec3 PlacementPoint(float distance) const;
     void DrawHierarchy();
     void DrawHierarchyNode(Entity entity);
     void DrawInspector();
@@ -156,6 +162,8 @@ private:
     GizmoOperation      m_GizmoOperation  = GizmoOperation::Translate;
     bool                m_GizmoLocal      = true;
     bool                m_ShowLightIcons  = true;
+    bool                m_ShowBvh         = false; // BVH nodes + selection bounds in the viewport
+    int                 m_BvhDepth        = 8;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
     std::optional<std::vector<StateEdit>> m_GizmoEdit;

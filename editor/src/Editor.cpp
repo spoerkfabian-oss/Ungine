@@ -27,8 +27,9 @@ namespace {
 constexpr VkFormat kViewportFormat = VK_FORMAT_R8G8B8A8_SRGB; // sampled by ImGui, encoded like the swapchain
 
 // Local TRS that puts an entity at `world` under its parent (false: not decomposable, e.g. skew).
-bool SetWorldMatrix(Registry& registry, Entity entity, const glm::mat4& world)
+bool SetWorldMatrix(Scene& scene, Entity entity, const glm::mat4& world)
 {
+    const Registry& registry    = scene.GetRegistry();
     const Entity    parent      = registry.Get<Hierarchy>(entity).parent;
     const glm::mat4 parentWorld = parent != NullEntity ? registry.Get<WorldTransform>(parent).matrix : glm::mat4(1.0f);
     glm::vec3       scale, translation, skew;
@@ -36,7 +37,7 @@ bool SetWorldMatrix(Registry& registry, Entity entity, const glm::mat4& world)
     glm::quat       rotation;
     if (!glm::decompose(glm::inverse(parentWorld) * world, scale, rotation, translation, skew, perspective))
         return false;
-    Transform& t = registry.Get<Transform>(entity);
+    Transform& t = scene.EditTransform(entity);
     t.position   = translation;
     t.rotation   = glm::normalize(rotation);
     t.scale      = scale;
@@ -286,6 +287,8 @@ void Editor::DrawViewport()
     m_ViewportFocused  = ImGui::IsWindowFocused();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
     const bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    if (m_ShowBvh)
+        DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (clicked && !iconHit) {
         // GPU picking: the entity under the cursor arrives a few frames later (Update).
         const ImVec2 mouse = ImGui::GetIO().MousePos;
@@ -318,6 +321,8 @@ void Editor::DrawViewport()
         m_GizmoLocal = !m_GizmoLocal;
     if (toolButton("Lights", m_ShowLightIcons))
         m_ShowLightIcons = !m_ShowLightIcons;
+    if (toolButton("BVH", m_ShowBvh))
+        m_ShowBvh = !m_ShowBvh;
     ImGui::NewLine();
 
     DrawGizmo(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
@@ -360,7 +365,7 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
         // The same world-space delta for all roots: they move / turn / scale about the primary's pivot.
         const glm::mat4 delta = world * glm::inverse(before);
         for (Entity e : roots)
-            SetWorldMatrix(registry, e, e == primary ? world : delta * registry.Get<WorldTransform>(e).matrix);
+            SetWorldMatrix(m_Ctx.scene, e, e == primary ? world : delta * registry.Get<WorldTransform>(e).matrix);
     }
     if (!ImGuizmo::IsUsing() && m_GizmoEdit) {
         const char* label = op == ImGuizmo::TRANSLATE ? "Move" : op == ImGuizmo::ROTATE ? "Rotate" : "Scale";
@@ -495,6 +500,68 @@ bool Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
     return clicked && hit != NullEntity;
 }
 
+void Editor::DrawBvhOverlay(float x, float y, float width, float height)
+{
+    const CameraData        camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+
+    const auto box = [&](const Aabb& b, ImU32 color) {
+        const glm::vec3 c[8] = {{b.min.x, b.min.y, b.min.z}, {b.max.x, b.min.y, b.min.z}, {b.max.x, b.max.y, b.min.z},
+                                {b.min.x, b.max.y, b.min.z}, {b.min.x, b.min.y, b.max.z}, {b.max.x, b.min.y, b.max.z},
+                                {b.max.x, b.max.y, b.max.z}, {b.min.x, b.max.y, b.max.z}};
+        static constexpr int kEdges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                                              {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        for (const auto& e : kEdges)
+            projector.Line(list, c[e[0]], c[e[1]], color);
+    };
+    // Fat node boxes, colored by depth (leaves dimmer).
+    m_Ctx.sceneRenderer.Spatial().MeshTree().ForEachNode([&](const Aabb& b, int depth, bool leaf) {
+        if (depth > m_BvhDepth)
+            return;
+        const float hue = std::fmod(static_cast<float>(depth) * 0.13f, 1.0f);
+        float       r, g, bl;
+        ImGui::ColorConvertHSVtoRGB(hue, 0.7f, 1.0f, r, g, bl);
+        box(b, ImGui::GetColorU32(ImVec4(r, g, bl, leaf ? 0.35f : 0.8f)));
+    });
+    if (const std::optional<Aabb> selection = SelectionBounds())
+        box(*selection, IM_COL32(255, 220, 60, 255));
+    list->PopClipRect();
+}
+
+std::optional<Aabb> Editor::SelectionBounds() const
+{
+    const Registry&     registry = m_Ctx.scene.GetRegistry();
+    const SpatialIndex& spatial  = m_Ctx.sceneRenderer.Spatial();
+    std::optional<Aabb> bounds;
+    std::vector<Entity> stack(m_Selection.begin(), m_Selection.end());
+    while (!stack.empty()) {
+        const Entity e = stack.back();
+        stack.pop_back();
+        std::optional<Aabb> b = registry.Has<MeshRenderer>(e) ? spatial.Bounds(e) : std::nullopt;
+        if (!b && registry.Has<Light>(e)) { // a quarter of the range: the light and its closest surroundings
+            const glm::vec3 p = registry.Get<WorldTransform>(e).matrix[3];
+            const float     r = EffectiveRange(registry.Get<Light>(e)) * 0.25f;
+            b                 = Aabb{p - glm::vec3(r), p + glm::vec3(r)};
+        }
+        if (b)
+            bounds = bounds ? Aabb{glm::min(bounds->min, b->min), glm::max(bounds->max, b->max)} : *b;
+        const auto& children = registry.Get<Hierarchy>(e).children;
+        stack.insert(stack.end(), children.begin(), children.end());
+    }
+    return bounds;
+}
+
+glm::vec3 Editor::PlacementPoint(float distance) const
+{
+    const glm::vec3 origin  = m_Ctx.camera.position;
+    const glm::vec3 forward = m_Ctx.camera.Forward();
+    if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(origin, forward, distance * 4.0f))
+        return origin + forward * hit->distance;
+    return origin + forward * distance;
+}
+
 void Editor::HandleHotkeys()
 {
     const ImGuiIO& io = ImGui::GetIO();
@@ -556,10 +623,16 @@ void Editor::FocusSelected()
     const Entity primary = Selected();
     if (primary == NullEntity)
         return;
-    // Look at the pivot from a comfortable distance, keeping the current viewing direction.
-    const glm::vec3 target   = glm::vec3(m_Ctx.scene.GetRegistry().Get<WorldTransform>(primary).matrix[3]);
-    const float     distance = std::clamp(glm::length(target - m_Ctx.camera.position), 1.0f, 10.0f);
-    m_Ctx.camera.position    = target - m_Ctx.camera.Forward() * distance;
+    // Frame the selection's bounds (keeping the viewing direction); without meshes, the pivot.
+    glm::vec3 target   = glm::vec3(m_Ctx.scene.GetRegistry().Get<WorldTransform>(primary).matrix[3]);
+    float     distance = std::clamp(glm::length(target - m_Ctx.camera.position), 1.0f, 10.0f);
+    if (const std::optional<Aabb> bounds = SelectionBounds()) {
+        target              = (bounds->min + bounds->max) * 0.5f;
+        const float radius  = std::max(glm::length(bounds->max - bounds->min) * 0.5f, 1e-3f);
+        const float halfFov = m_Ctx.camera.fovY * 0.5f;
+        distance            = std::max(radius / std::sin(halfFov) * 1.1f, m_Ctx.camera.nearPlane * 10.0f);
+    }
+    m_Ctx.camera.position = target - m_Ctx.camera.Forward() * distance;
     m_Ctx.camera.LookAt(target);
 }
 

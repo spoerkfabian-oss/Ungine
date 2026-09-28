@@ -196,7 +196,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         Read(*it, "position", t.position);
         Read(*it, "rotation", t.rotation);
         Read(*it, "scale", t.scale);
-        r.Get<Transform>(e) = t;
+        scene.SetTransform(e, t);
     }
     if (const auto it = j.find("mesh"); it != j.end()) {
         MeshRenderer mesh{.model = models.Read(it->at("model")), .meshIndex = 0};
@@ -209,6 +209,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         r.EmplaceOrReplace<Light>(e, LightFromJson(*it));
     else
         r.Remove<Light>(e);
+    scene.MarkChanged(e); // bounds / shadow caches
 }
 
 // Pre-order (parents first) over the subtree of `root`, children in their order.

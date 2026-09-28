@@ -12,6 +12,7 @@
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Scene/SpatialIndex.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -316,19 +317,20 @@ TEST_CASE(Render_ClusteredLights)
     if (!model)
         return;
 
-    Scene scene;
-    InstantiateModel(scene, h, *model);
-    Registry& registry = scene.GetRegistry();
+    Scene        scene;
+    const Entity floor    = InstantiateModel(scene, h, *model);
+    Registry&    registry = scene.GetRegistry();
     const auto addLight = [&](glm::vec3 position, Light light) {
         const Entity e = scene.CreateEntity("Light");
-        registry.Get<Transform>(e).position = position;
+        scene.EditTransform(e).position = position;
         registry.Emplace<Light>(e, light);
         return e;
     };
-    addLight({0.0f, 1.0f, 0.0f}, {.type = LightType::Point, .color = glm::vec3(1.0f, 0.2f, 0.2f), .intensity = 5.0f, .range = 4.0f});
+    const Entity point = addLight({0.0f, 1.0f, 0.0f}, {.type = LightType::Point, .color = glm::vec3(1.0f, 0.2f, 0.2f),
+                                                       .intensity = 5.0f, .range = 4.0f});
     const Entity spot = addLight({2.0f, 2.0f, 0.0f}, {.type = LightType::Spot, .intensity = 20.0f, .range = 6.0f,
                                                       .innerConeAngle = 0.3f, .outerConeAngle = 0.3f}); // hard edge
-    registry.Get<Transform>(spot).rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // down
+    scene.EditTransform(spot).rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // down
     addLight({0.0f, 1.0f, 60.0f}, {.intensity = 5.0f, .range = 2.0f});   // behind the camera: CPU-culled
     addLight({0.0f, 1.0f, -5.0f}, {.intensity = 0.0f, .range = 2.0f});   // black: skipped
     scene.UpdateTransforms();
@@ -362,12 +364,37 @@ TEST_CASE(Render_ClusteredLights)
     CHECK(render().lights == 2);
     renderer.post.debugView = DebugView::None;
 
-    // Local shadows: spot = 1 atlas tile, point = 6; budget, per-light flag, runtime atlas resize.
-    CHECK(stats.shadowedLights == 2 && stats.shadowTiles == 7 && stats.localShadowDraws > 0);
-    bool shadowScope = false;
-    for (const GpuTiming& t : F().renderer->Profiler().Results())
-        shadowScope |= std::string_view{t.name} == "Local shadows";
-    CHECK(!F().renderer->Profiler().Supported() || shadowScope);
+    // Local shadows: spot = 1 atlas tile, point = 6, cached while nothing in range changes.
+    CHECK(stats.shadowedLights == 2 && stats.shadowTiles == 7);
+    const auto renderOne = [&] {
+        for (int attempt = 0; attempt < 10; ++attempt) // skipped frames (swapchain) are retried
+            if (auto frame = F().renderer->BeginFrame()) {
+                renderer.Render(*frame, scene, camera);
+                F().renderer->EndFrame(*frame);
+                return renderer.Stats();
+            }
+        return SceneRenderStats{};
+    };
+    stats = renderOne();
+    CHECK(stats.shadowTiles == 7 && stats.shadowTilesRendered == 0 && stats.localShadowDraws == 0);
+    scene.EditTransform(floor).position.y = -0.1f; // a caster in range of both lights
+    scene.UpdateTransforms();
+    stats = renderOne();
+    CHECK(stats.shadowTilesRendered == 7 && stats.localShadowDraws > 0);
+    CHECK(renderOne().shadowTilesRendered == 0);
+    scene.EditTransform(point).position.x = 0.5f; // only the point light's six views
+    scene.UpdateTransforms();
+    CHECK(renderOne().shadowTilesRendered == 6);
+    const Entity farAway = scene.CreateEntity("Far");
+    registry.Emplace<MeshRenderer>(farAway, MeshRenderer{.model = h, .meshIndex = 0});
+    scene.EditTransform(farAway).position = glm::vec3(0.0f, 0.0f, -100.0f); // out of every light's range
+    scene.UpdateTransforms();
+    CHECK(renderOne().shadowTilesRendered == 0);
+    renderer.localShadows.depthBias += 0.5f; // baked into the maps
+    CHECK(renderOne().shadowTilesRendered == 7);
+    renderer.localShadows.depthBias -= 0.5f;
+
+    // Budget, per-light flag, runtime atlas resize, debug view.
     renderer.post.debugView = DebugView::ShadowAtlas;
     CHECK(render().shadowTiles == 7);
     renderer.post.debugView        = DebugView::None;
@@ -378,8 +405,10 @@ TEST_CASE(Render_ClusteredLights)
     stats = render();
     CHECK(stats.shadowedLights == 2 && stats.shadowTiles == 7);
     registry.Get<Light>(spot).castShadows = false;
+    scene.MarkChanged(spot);
     CHECK(render().shadowTiles == 6);
     registry.Get<Light>(spot).castShadows = true;
+    scene.MarkChanged(spot);
     renderer.localShadows.enabled = false;
     stats                         = render();
     CHECK(stats.shadowedLights == 0 && stats.lights == 2);
@@ -397,6 +426,63 @@ TEST_CASE(Render_ClusteredLights)
     CHECK(stats.lights == 0 && stats.lightsTotal == 304);
 
     F().assets->Release(h);
+}
+
+TEST_CASE(Scene_SpatialIndexSync)
+{
+    // Meshes wait for their model, then follow moves and destruction; queries match brute force.
+    Scene             scene;
+    SpatialIndex      index;
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    std::vector<Entity> boxes;
+    for (int x = 0; x < 10; ++x)
+        for (int z = 0; z < 10; ++z) {
+            const Entity e = scene.CreateEntity("Box");
+            scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+            scene.EditTransform(e).position = glm::vec3(static_cast<float>(x) * 3.0f, 0.0f, static_cast<float>(z) * 3.0f);
+            boxes.push_back(e);
+        }
+    const Entity lamp = scene.CreateEntity("Lamp");
+    scene.GetRegistry().Emplace<Light>(lamp, Light{.intensity = 1.0f, .range = 2.0f});
+    scene.UpdateTransforms();
+    index.Sync(scene, *F().assets);
+    CHECK(index.LightCount() == 1);
+    if (F().assets->State(box) != AssetState::Ready) // usually still loading here
+        CHECK(index.MeshCount() == 0 && index.LastSync().pending == 100);
+    CHECK(F().Pump([&] { return Settled(box); }));
+    index.Sync(scene, *F().assets);
+    CHECK(index.MeshCount() == 100 && index.SubmeshCount() == 100 && index.LastSync().pending == 0);
+    CHECK(index.MeshTree().Validate() && index.MeshTree().Height() <= 16);
+
+    // Raycast straight down onto box (2, 3) at (6, 0, 9).
+    const auto hit = index.Raycast(glm::vec3(6.0f, 10.0f, 9.0f), glm::vec3(0.0f, -1.0f, 0.0f));
+    CHECK(hit.has_value() && hit->entity == boxes[2 * 10 + 3] && std::abs(hit->distance - 9.5f) < 1e-3f);
+    CHECK(!index.Raycast(glm::vec3(1.5f, 10.0f, 1.5f), glm::vec3(0.0f, -1.0f, 0.0f)).has_value()); // between boxes
+
+    // Frustum query == brute force over the tight bounds.
+    const glm::mat4 viewProj = PerspectiveReverseZ(glm::radians(40.0f), 1.0f, 0.1f) *
+                               glm::lookAt(glm::vec3(-5.0f, 8.0f, -5.0f), glm::vec3(10.0f, 0.0f, 10.0f), glm::vec3(0, 1, 0));
+    const Frustum       frustum = Frustum::FromViewProjection(viewProj);
+    std::vector<Entity> found;
+    index.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& p) { found.push_back(p.entity); });
+    std::size_t expected = 0;
+    for (Entity e : boxes) {
+        const bool inside = frustum.Intersects(*index.Bounds(e));
+        expected += inside ? 1 : 0;
+        CHECK(inside == (std::ranges::find(found, e) != found.end()));
+    }
+    CHECK(found.size() == expected && expected > 0 && expected < boxes.size());
+
+    // Move one box far away, destroy another.
+    scene.EditTransform(boxes[0]).position = glm::vec3(500.0f, 0.0f, 0.0f);
+    scene.DestroyEntity(boxes[1]);
+    scene.UpdateTransforms();
+    index.Sync(scene, *F().assets);
+    CHECK(index.MeshCount() == 99 && !index.Bounds(boxes[1]).has_value());
+    CHECK(index.Bounds(boxes[0]).has_value() && index.Bounds(boxes[0])->min.x > 499.0f);
+    CHECK(index.ChangedRegions().size() == 3); // old + new bounds of the moved box, the destroyed one
+    CHECK(index.MeshTree().Validate());
+    F().assets->Release(box);
 }
 
 TEST_CASE(Render_PickingAndOutline)
@@ -457,7 +543,7 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     r.Emplace<MeshRenderer>(a, MeshRenderer{.model = boxTex, .meshIndex = 0});
     const Entity b = scene.CreateEntity("B", a);
     r.Emplace<MeshRenderer>(b, MeshRenderer{.model = plane, .meshIndex = 0});
-    r.Get<Transform>(b).position = glm::vec3(1.0f, 2.0f, 3.0f);
+    scene.EditTransform(b).position = glm::vec3(1.0f, 2.0f, 3.0f);
     const Entity lamp = scene.CreateEntity("Lamp", b);
     r.Emplace<Light>(lamp, Light{.type = LightType::Spot, .intensity = 9.0f, .outerConeAngle = 0.5f});
     const ModelHandle generated = F().assets->CreateModel(MakePlane("Tmp", 1.0f, MaterialData{}));
@@ -532,7 +618,7 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
     const Entity  root = InstantiateModel(scene, h, *model);
     const Entity  spot = scene.CreateEntity("Spot");
     scene.GetRegistry().Emplace<Light>(spot, Light{.type = LightType::Spot, .intensity = 5.0f});
-    scene.GetRegistry().Get<Transform>(spot).position = glm::vec3(0.5f, 1.0f, 1.0f);
+    scene.EditTransform(spot).position = glm::vec3(0.5f, 1.0f, 1.0f);
     const Entity point = scene.CreateEntity("Point");
     scene.GetRegistry().Emplace<Light>(point, Light{.intensity = 5.0f, .range = 2.0f});
     SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);

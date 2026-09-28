@@ -30,6 +30,7 @@ struct Transform {
     glm::vec3 scale{1.0f};
 
     [[nodiscard]] glm::mat4 LocalMatrix() const;
+    bool operator==(const Transform&) const = default;
 };
 
 // Written by Scene::UpdateTransforms(); read-only for everyone else.

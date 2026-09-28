@@ -6,6 +6,7 @@
 #include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/AabbTree.h"
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -20,6 +21,7 @@
 #include <fstream>
 #include <latch>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <unordered_set>
 #include <vector>
@@ -373,8 +375,8 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     scene.CreateEntity("First", parent);
     const Entity node = scene.CreateEntity("Node", parent);
     const Entity child = scene.CreateEntity("Child", node);
-    r.Get<Transform>(node).position = glm::vec3(1.0f, 2.0f, 3.0f);
-    r.Get<Transform>(node).rotation = glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f));
+    scene.EditTransform(node).position = glm::vec3(1.0f, 2.0f, 3.0f);
+    scene.EditTransform(node).rotation = glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f));
     r.Emplace<Light>(child, Light{.type = LightType::Spot, .intensity = 7.0f, .castShadows = false});
     r.Emplace<MeshRenderer>(node, MeshRenderer{.model = ModelHandle{3, 9}, .meshIndex = 2});
     const std::uint64_t nodeUuid  = r.Get<Uuid>(node).value;
@@ -410,11 +412,206 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
 
     // Entity state: components only, absent ones are removed again.
     const std::string state = SnapshotEntityState(scene, node2);
-    r.Get<Transform>(node2).scale = glm::vec3(5.0f);
+    scene.EditTransform(node2).scale = glm::vec3(5.0f);
     r.Get<Name>(node2).value      = "Renamed";
     r.Remove<MeshRenderer>(node2);
     r.Emplace<Light>(node2);
     ApplyEntityState(scene, node2, state);
     CHECK(r.Get<Transform>(node2).scale == glm::vec3(1.0f) && r.Get<Name>(node2).value == "Node");
     CHECK(r.Has<MeshRenderer>(node2) && !r.Has<Light>(node2));
+}
+
+TEST_CASE(Scene_DirtyTransformsAndChanges)
+{
+    Scene     scene;
+    Registry& r = scene.GetRegistry();
+    // Two chains of 3 + a lone root.
+    const Entity a  = scene.CreateEntity("A");
+    const Entity a1 = scene.CreateEntity("A1", a);
+    const Entity a2 = scene.CreateEntity("A2", a1);
+    const Entity b  = scene.CreateEntity("B");
+    const Entity b1 = scene.CreateEntity("B1", b);
+    const Entity c  = scene.CreateEntity("C");
+    scene.UpdateTransforms();
+    CHECK(scene.CountStaleTransforms() == 0);
+    SceneChanges first = scene.TakeChanges();
+    CHECK(first.changed.size() == 6 && first.destroyed.empty() && !first.overflow);
+
+    // Nothing dirty: nothing recomputed, nothing reported.
+    scene.UpdateTransforms();
+    CHECK(scene.LastTransformUpdate().updated == 0 && scene.TakeChanges().changed.empty());
+
+    // Editing a child and its ancestor: one subtree, recomputed once.
+    scene.EditTransform(a1).position = glm::vec3(1.0f, 0.0f, 0.0f);
+    scene.EditTransform(a).position  = glm::vec3(0.0f, 2.0f, 0.0f);
+    scene.UpdateTransforms();
+    CHECK(scene.LastTransformUpdate().dirtyRoots == 1 && scene.LastTransformUpdate().updated == 3);
+    CHECK(glm::vec3(r.Get<WorldTransform>(a2).matrix[3]) == glm::vec3(1.0f, 2.0f, 0.0f));
+    CHECK(scene.CountStaleTransforms() == 0);
+    SceneChanges changes = scene.TakeChanges();
+    CHECK(changes.changed.size() == 3 && std::ranges::find(changes.changed, b) == changes.changed.end());
+
+    // Reparenting marks the moved subtree; the world transform follows the new parent.
+    scene.SetParent(b, a2);
+    scene.UpdateTransforms();
+    CHECK(scene.LastTransformUpdate().updated == 2 && scene.CountStaleTransforms() == 0);
+    CHECK(glm::vec3(r.Get<WorldTransform>(b1).matrix[3]) == glm::vec3(1.0f, 2.0f, 0.0f));
+
+    // MarkChanged reports without recomputing; destruction is reported with the old handles.
+    (void)scene.TakeChanges();
+    scene.MarkChanged(c);
+    scene.MarkChanged(c);
+    scene.DestroyEntity(a1); // with a2, b, b1
+    changes = scene.TakeChanges();
+    CHECK(changes.changed.size() == 1 && changes.changed[0] == c && changes.destroyed.size() == 4);
+
+    // A destroyed dirty entity must not leave its flag to the slot's next owner.
+    scene.EditTransform(c).position = glm::vec3(5.0f);
+    scene.DestroyEntity(c);
+    const Entity reused = scene.CreateEntity("Reused");
+    scene.EditTransform(reused).position = glm::vec3(3.0f);
+    scene.UpdateTransforms();
+    CHECK(glm::vec3(r.Get<WorldTransform>(reused).matrix[3]) == glm::vec3(3.0f) && scene.CountStaleTransforms() == 0);
+}
+
+TEST_CASE(AabbTree_MatchesBruteForce)
+{
+    std::mt19937                          rng(1234);
+    std::uniform_real_distribution<float> pos(-50.0f, 50.0f), ext(0.1f, 3.0f);
+    const auto randomBox = [&] {
+        const glm::vec3 c{pos(rng), pos(rng), pos(rng)};
+        const glm::vec3 e{ext(rng), ext(rng), ext(rng)};
+        return Aabb{c - e, c + e};
+    };
+    const auto overlaps = [](const Aabb& a, const Aabb& b) {
+        return glm::all(glm::lessThanEqual(a.min, b.max)) && glm::all(glm::lessThanEqual(b.min, a.max));
+    };
+
+    AabbTree                  tree;
+    std::vector<Aabb>         boxes;   // tight bounds by user data
+    std::vector<std::int32_t> proxies; // -1: removed
+    for (std::uint32_t i = 0; i < 2000; ++i) {
+        boxes.push_back(randomBox());
+        proxies.push_back(tree.Insert(boxes.back(), i));
+    }
+    // Moves (small and large) and removals.
+    std::uniform_int_distribution<std::uint32_t> pick(0, 1999);
+    for (int step = 0; step < 3000; ++step) {
+        const std::uint32_t i = pick(rng);
+        if (proxies[i] == AabbTree::kNull)
+            continue;
+        if (step % 7 == 0) {
+            tree.Remove(proxies[i]);
+            proxies[i] = AabbTree::kNull;
+        } else {
+            const glm::vec3 delta = step % 2 ? glm::vec3(0.01f) : glm::vec3(pos(rng) * 0.2f);
+            boxes[i]              = {boxes[i].min + delta, boxes[i].max + delta};
+            tree.Move(proxies[i], boxes[i]);
+        }
+    }
+    CHECK(tree.Validate());
+    const std::size_t alive = static_cast<std::size_t>(std::ranges::count_if(proxies, [](std::int32_t p) { return p != AabbTree::kNull; }));
+    CHECK(tree.LeafCount() == alive);
+    CHECK(tree.Height() <= 3 * static_cast<int>(std::log2(static_cast<float>(alive))) + 2); // balanced
+
+    // Box queries: every overlapping tight box is reported (fat boxes may add extra candidates).
+    for (int q = 0; q < 50; ++q) {
+        const Aabb                 query = randomBox();
+        std::vector<std::uint32_t> found;
+        tree.Query(query, [&](std::int32_t proxy) { found.push_back(tree.UserData(proxy)); });
+        for (std::uint32_t i = 0; i < boxes.size(); ++i)
+            if (proxies[i] != AabbTree::kNull && overlaps(boxes[i], query))
+                CHECK(std::ranges::find(found, i) != found.end());
+    }
+
+    // Raycast: nearest tight-box hit equals brute force.
+    std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+    for (int q = 0; q < 50; ++q) {
+        const glm::vec3 origin{pos(rng), pos(rng), pos(rng)};
+        const glm::vec3 dir = glm::normalize(glm::vec3(unit(rng), unit(rng), unit(rng)) + glm::vec3(1e-3f));
+        const glm::vec3 inv = 1.0f / dir;
+        float           brute = -1.0f;
+        for (std::uint32_t i = 0; i < boxes.size(); ++i) {
+            if (proxies[i] == AabbTree::kNull)
+                continue;
+            const float t = AabbTree::RayBox(origin, inv, boxes[i], 1e9f);
+            if (t >= 0.0f && (brute < 0.0f || t < brute))
+                brute = t;
+        }
+        float best = -1.0f;
+        tree.Raycast(origin, dir, 1e9f, [&](std::int32_t proxy, float maxT) {
+            const float t = AabbTree::RayBox(origin, inv, boxes[tree.UserData(proxy)], maxT);
+            if (t < 0.0f)
+                return maxT;
+            best = t;
+            return t;
+        });
+        CHECK(std::abs(best - brute) < 1e-4f);
+    }
+
+    // Remove everything: empty and valid.
+    for (std::int32_t& p : proxies)
+        if (p != AabbTree::kNull) {
+            tree.Remove(p);
+            p = AabbTree::kNull;
+        }
+    CHECK(tree.Validate() && tree.LeafCount() == 0 && tree.Height() == -1);
+}
+
+TEST_CASE(ShadowAtlas_BuddyAllocatorReusesAndMerges)
+{
+    ShadowTileAllocator alloc;
+    alloc.Reset(4096, 128);
+    CHECK(alloc.FreeArea() == 4096ull * 4096ull);
+
+    struct Tile {
+        glm::uvec2    offset;
+        std::uint32_t size;
+    };
+    std::vector<Tile>   tiles;
+    const std::uint32_t sizes[] = {1024, 128, 512, 256, 128, 1024, 512, 128, 256, 2048};
+    for (std::uint32_t size : sizes) {
+        const auto offset = alloc.Allocate(size);
+        CHECK(offset.has_value());
+        if (offset)
+            tiles.push_back({*offset, size});
+    }
+    const auto disjoint = [&] {
+        for (std::size_t i = 0; i < tiles.size(); ++i) {
+            const Tile& a = tiles[i];
+            if (a.offset.x % a.size != 0 || a.offset.y % a.size != 0 || a.offset.x + a.size > 4096 ||
+                a.offset.y + a.size > 4096)
+                return false;
+            for (std::size_t j = i + 1; j < tiles.size(); ++j) {
+                const Tile& b = tiles[j];
+                if (a.offset.x < b.offset.x + b.size && b.offset.x < a.offset.x + a.size &&
+                    a.offset.y < b.offset.y + b.size && b.offset.y < a.offset.y + a.size)
+                    return false;
+            }
+        }
+        return true;
+    };
+    CHECK(disjoint());
+    std::uint64_t used = 0;
+    for (const Tile& t : tiles)
+        used += std::uint64_t{t.size} * t.size;
+    CHECK(alloc.FreeArea() == 4096ull * 4096ull - used);
+
+    // Freeing a tile and allocating the same size reuses space; the others keep their place.
+    const Tile freed = tiles[1];
+    alloc.Free(freed.offset, freed.size);
+    tiles.erase(tiles.begin() + 1);
+    const auto again = alloc.Allocate(128);
+    CHECK(again.has_value());
+    if (again)
+        tiles.push_back({*again, 128});
+    CHECK(disjoint());
+
+    // Free everything: blocks merge back into the whole atlas.
+    for (const Tile& t : tiles)
+        alloc.Free(t.offset, t.size);
+    CHECK(alloc.FreeArea() == 4096ull * 4096ull);
+    const auto whole = alloc.Allocate(4096);
+    CHECK(whole.has_value() && *whole == glm::uvec2(0));
+    CHECK(!alloc.Allocate(128).has_value()); // full
 }

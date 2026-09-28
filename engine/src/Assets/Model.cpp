@@ -93,7 +93,7 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
         const ModelNode& node       = model.nodes[i];
         const Entity     nodeParent = node.parent >= 0 ? entities[static_cast<std::size_t>(node.parent)] : root;
         const Entity     e          = scene.CreateEntity(node.name, nodeParent);
-        registry.Get<Transform>(e) = node.local;
+        scene.SetTransform(e, node.local);
         if (node.mesh >= 0)
             registry.Emplace<MeshRenderer>(e, handle, static_cast<std::uint32_t>(node.mesh));
         if (node.light)

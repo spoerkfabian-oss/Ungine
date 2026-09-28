@@ -2,9 +2,11 @@
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Environment.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Renderer/Vulkan/Pipeline.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/SpatialIndex.h"
 
 #include <glm/glm.hpp>
 
@@ -126,7 +128,12 @@ struct SceneRenderStats {
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
     std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
+    std::uint32_t shadowTilesRendered = 0; // views re-rendered this frame (the rest came from the cache)
     std::uint32_t localShadowDraws = 0;
+    // CPU side
+    double        cpuSpatialMs  = 0.0; // SpatialIndex::Sync (scene changes -> BVH)
+    double        cpuCullingMs  = 0.0; // camera + light queries, draw item setup
+    std::uint32_t drawItems     = 0;   // meshes needed by any view this frame
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
     float         averageLuminance = 0.0f; // adapted scene luminance (auto exposure only)
 };
@@ -178,10 +185,13 @@ public:
     // Engaged once per request: the entity (NullEntity = background / destroyed meanwhile).
     [[nodiscard]] std::optional<Entity> TakePickResult() { return std::exchange(m_PickResult, std::nullopt); }
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
+    // Bounds of the rendered scene (BVH), synced at the start of every Render: queries and raycasts.
+    [[nodiscard]] const SpatialIndex&     Spatial() const { return m_Spatial; }
 
 private:
     // One instantiated mesh this frame, shared by the shadow and main passes.
     struct DrawItem {
+        Entity          entity = NullEntity;
         const Model*    model = nullptr;
         const Mesh*     mesh  = nullptr;
         glm::mat4       world{1.0f};
@@ -191,11 +201,16 @@ private:
 
     void EnsureTargets(VkExtent2D extent);
     void EnsureShadowMap();
-    void CollectDrawItems(Scene& scene);
+    static constexpr std::uint32_t kNoDrawItem = ~0u;
+    // Draw items (matrices uploaded once) are built on demand for meshes some view needs.
+    [[nodiscard]] std::uint32_t DrawItemFor(const SpatialIndex::MeshProxy& proxy);
+    void                        ResetDrawItems();
+    template <class Keep>
+    void GatherMeshes(const Frustum& frustum, std::vector<std::uint32_t>& out, Keep&& keep);
     void CollectLights(Scene& scene, const Frustum& frustum);
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
-    void EnsureShadowAtlas();
+    bool EnsureShadowAtlas(); // true: (re)created, contents undefined
     void ReleaseShadowAtlas();
     void AssignLocalShadows(const CameraData& camera);
     void RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
@@ -254,7 +269,11 @@ private:
     std::vector<ImageView>                  m_ShadowViews;
     std::array<std::uint32_t, kMaxCascades> m_ShadowSlots{};
 
-    std::vector<DrawItem> m_DrawItems;
+    std::vector<DrawItem>      m_DrawItems;
+    std::vector<std::uint32_t> m_DrawItemOf;   // entity index -> draw item this frame
+    std::vector<std::uint32_t> m_CameraItems;  // prepass + lighting pass (same list, same order)
+    SpatialIndex               m_Spatial;
+    const Scene*               m_FrameScene = nullptr; // during Render only
     // Picking: entity IDs, per-slot single-pixel readback.
     Image                                m_EntityIds;
     std::uint32_t                        m_EntityIdSlot = 0;
@@ -266,6 +285,7 @@ private:
 
     std::vector<GpuLight> m_Lights; // this frame's visible lights
     std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
+    std::vector<Entity>   m_LightEntities;     // parallel to m_Lights
 
     // Local light shadow atlas. Views are chosen and packed every frame.
     struct ShadowTile {
@@ -275,7 +295,25 @@ private:
         glm::vec3     lightPosition{0.0f};
         float         lightRange = 0.0f;
         float         texelScale = 0.0f; // texel world size per unit distance
+        bool          render     = true; // not cached: draw this frame
+        std::uint32_t cacheEntry = 0;
+        std::uint32_t face       = 0;
     };
+    // Shadow cache: each shadowed light keeps its atlas tiles (buddy allocator) across frames; a view
+    // is re-rendered only when its matrix changes or a caster in the light's range changed.
+    struct ShadowCacheEntry {
+        Entity                    light = NullEntity;
+        std::uint32_t             size  = 0;
+        std::uint32_t             views = 0;
+        std::array<glm::uvec2, 6> offsets{};
+        std::array<glm::mat4, 6>  viewProj{};
+        std::array<bool, 6>       valid{};
+        glm::vec3                 position{0.0f};
+        float                     range = 0.0f;
+    };
+    std::vector<ShadowCacheEntry> m_ShadowCache;
+    ShadowTileAllocator           m_TileAllocator;
+    glm::vec2                     m_CachedBias{-1.0f};
     Image                      m_ShadowAtlas;
     std::uint32_t              m_ShadowAtlasSlot = 0;
     bool                       m_ShadowAtlasWritten = false; // has left UNDEFINED (debug view)
