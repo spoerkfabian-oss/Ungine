@@ -1,0 +1,22 @@
+#ifndef ENGINE_BINDLESS_GLSL
+#define ENGINE_BINDLESS_GLSL
+// Global descriptor set 0 - mirrors Engine::BindlessRegistry.
+// Requires (declare in the main shader, right after #version):
+//   #extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0) uniform texture2D uTextures[];
+layout(set = 0, binding = 1) uniform sampler   uSamplers[];
+layout(set = 0, binding = 2, rgba16f) uniform image2D uStorageImages[]; // HDR targets
+
+// Must match Engine::DefaultSampler
+#define SAMPLER_LINEAR_REPEAT 0u
+#define SAMPLER_LINEAR_CLAMP  1u
+#define SAMPLER_NEAREST_CLAMP 2u
+
+// nonuniformEXT is required when indices can diverge within a draw (e.g. per-material).
+vec4 SampleTexture(uint texIndex, uint samplerIndex, vec2 uv)
+{
+    return texture(sampler2D(uTextures[nonuniformEXT(texIndex)], uSamplers[nonuniformEXT(samplerIndex)]), uv);
+}
+
+#endif
