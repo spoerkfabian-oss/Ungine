@@ -18,8 +18,11 @@ struct ImageBarrier {
     VkImageAspectFlags    aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
     std::uint32_t         baseMip   = 0;
     std::uint32_t         mipCount  = VK_REMAINING_MIP_LEVELS;
+    std::uint32_t         srcFamily = VK_QUEUE_FAMILY_IGNORED; // set both for ownership transfers
+    std::uint32_t         dstFamily = VK_QUEUE_FAMILY_IGNORED;
 };
 
+[[nodiscard]] VkImageMemoryBarrier2 MakeImageBarrier(const ImageBarrier& barrier);
 void CmdImageBarrier(VkCommandBuffer cmd, const ImageBarrier& barrier);
 
 // Flipped viewport (negative height): +Y is up in NDC, like OpenGL/glTF conventions.

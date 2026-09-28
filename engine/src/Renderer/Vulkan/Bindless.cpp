@@ -150,6 +150,7 @@ BindlessRegistry::~BindlessRegistry()
 
 std::uint32_t BindlessRegistry::AddSampledImage(VkImageView view, VkImageLayout layout)
 {
+    std::scoped_lock    lock{m_Mutex};
     const std::uint32_t index = m_SampledImages.Allocate();
     WriteImage(kBindingSampledImages, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, index, {VK_NULL_HANDLE, view, layout});
     return index;
@@ -157,6 +158,7 @@ std::uint32_t BindlessRegistry::AddSampledImage(VkImageView view, VkImageLayout 
 
 std::uint32_t BindlessRegistry::AddStorageImage(VkImageView view)
 {
+    std::scoped_lock    lock{m_Mutex};
     const std::uint32_t index = m_StorageImages.Allocate();
     WriteImage(kBindingStorageImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, index,
                {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
@@ -165,6 +167,7 @@ std::uint32_t BindlessRegistry::AddStorageImage(VkImageView view)
 
 std::uint32_t BindlessRegistry::AddSampler(VkSampler sampler)
 {
+    std::scoped_lock    lock{m_Mutex};
     const std::uint32_t index = m_Samplers.Allocate();
     WriteImage(kBindingSamplers, VK_DESCRIPTOR_TYPE_SAMPLER, index,
                {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});

@@ -2,17 +2,22 @@
 #include "Engine/Core/Window.h"
 #include "Renderer/Vulkan/VkbUtil.h"
 
+#include <atomic>
 
 namespace Engine {
 
 namespace {
 
+std::atomic<std::uint32_t> g_ValidationErrors{0}; // callback may run on any thread
+
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                              VkDebugUtilsMessageTypeFlagsEXT,
                                              const VkDebugUtilsMessengerCallbackDataEXT* data, void*)
 {
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        g_ValidationErrors.fetch_add(1, std::memory_order_relaxed);
         ENGINE_ERROR("[Vulkan] {}", data->pMessage);
+    }
     else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
         ENGINE_WARN("[Vulkan] {}", data->pMessage);
     else
@@ -135,6 +140,11 @@ void VulkanContext::CreateAllocator()
     info.pVulkanFunctions = &fns;
 
     VK_CHECK(vmaCreateAllocator(&info, &m_Allocator));
+}
+
+std::uint32_t VulkanContext::ValidationErrorCount()
+{
+    return g_ValidationErrors.load(std::memory_order_relaxed);
 }
 
 void VulkanContext::WaitIdle() const

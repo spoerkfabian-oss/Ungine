@@ -1,13 +1,14 @@
 #pragma once
+#include "Engine/Assets/AssetHandle.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Vulkan/Buffer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
+#include "Engine/Renderer/Vulkan/Upload.h"
 #include "Engine/Scene/Components.h"
 
 #include <glm/glm.hpp>
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -125,11 +126,17 @@ struct Model {
     glm::vec3                  boundsMax{0.0f};
 };
 
-// Uploads (blocking) and returns a model whose last owner hands its GPU resources to the
-// renderer's deferred-release queue. The Renderer must outlive every Model it created.
-[[nodiscard]] std::shared_ptr<Model> UploadModel(Renderer& renderer, const ModelData& data);
+// Creates the GPU resources and records their upload on the UploadQueue; `ticket` covers all
+// of them. Thread-safe (asset worker threads). On exception `out` holds whatever was created
+// so far and must be released like a finished model.
+void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket);
 
-// Creates one entity per node under a new root entity; returns the root.
-Entity InstantiateModel(Scene& scene, const std::shared_ptr<const Model>& model, Entity parent = NullEntity);
+// Main thread. Frees GPU memory and bindless slots once in-flight frames are done.
+// Precondition: the build's ticket is ready (UploadQueue::IsReady).
+void ReleaseModel(Renderer& renderer, Model&& model);
+
+// Creates one entity per node under a new root entity; returns the root. The entities
+// reference the model by handle only: releasing it makes them render nothing.
+Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, Entity parent = NullEntity);
 
 } // namespace Engine

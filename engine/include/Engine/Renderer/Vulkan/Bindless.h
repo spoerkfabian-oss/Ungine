@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace Engine {
@@ -23,15 +24,16 @@ public:
     BindlessRegistry(const BindlessRegistry&)            = delete;
     BindlessRegistry& operator=(const BindlessRegistry&) = delete;
 
+    // Add/Remove are thread-safe (asset workers register textures directly).
     [[nodiscard]] std::uint32_t AddSampledImage(VkImageView view,
                                                 VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     [[nodiscard]] std::uint32_t AddStorageImage(VkImageView view);
     [[nodiscard]] std::uint32_t AddSampler(VkSampler sampler);
 
     // Frees the slot for reuse. The GPU may still read it: call through Renderer::DeferCall.
-    void RemoveSampledImage(std::uint32_t index) { m_SampledImages.Release(index); }
-    void RemoveStorageImage(std::uint32_t index) { m_StorageImages.Release(index); }
-    void RemoveSampler(std::uint32_t index)      { m_Samplers.Release(index); }
+    void RemoveSampledImage(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_SampledImages.Release(index); }
+    void RemoveStorageImage(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_StorageImages.Release(index); }
+    void RemoveSampler(std::uint32_t index)      { std::scoped_lock lock{m_Mutex}; m_Samplers.Release(index); }
 
     void Bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) const;
 
@@ -56,6 +58,9 @@ private:
     VkDescriptorSet       m_Set            = VK_NULL_HANDLE;
     VkPipelineLayout      m_PipelineLayout = VK_NULL_HANDLE;
 
+    // Guards the slot allocators and descriptor writes (the set is externally synchronized).
+    // Binding the set while another thread writes unused slots is allowed (UPDATE_AFTER_BIND).
+    std::mutex    m_Mutex;
     SlotAllocator m_SampledImages, m_Samplers, m_StorageImages;
     std::array<VkSampler, static_cast<std::size_t>(DefaultSampler::Count)> m_DefaultSamplers{};
 };

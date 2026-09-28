@@ -2,6 +2,7 @@
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 
@@ -11,62 +12,140 @@ namespace {
 constexpr VkPipelineStageFlags2 kShaderStages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
                                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-} // namespace
 
-UploadContext::UploadContext(const VulkanContext& ctx)
-    : m_Ctx(ctx)
+// Every way graphics/compute work may read an uploaded buffer (BDA reads are storage reads).
+constexpr VkPipelineStageFlags2 kBufferReadStages = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+                                                    VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                                    VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | kShaderStages;
+constexpr VkAccessFlags2 kBufferReadAccess = VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                                             VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                                             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT;
+
+// Layout of mip 0 once the graphics queue owns it: blit source if a mip chain follows.
+VkImageLayout Mip0Layout(std::uint32_t mipLevels)
 {
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = ctx.GraphicsQueue().family;
-    VK_CHECK(vkCreateCommandPool(ctx.Device(), &poolInfo, nullptr, &m_Pool));
-
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool        = m_Pool;
-    alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(ctx.Device(), &alloc, &m_Cmd));
-
-    m_Fence = MakeFence(ctx.Device(), false);
+    return mipLevels > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
-UploadContext::~UploadContext()
+VkCommandPool CreatePool(VkDevice device, std::uint32_t family)
 {
-    vkDestroyFence(m_Ctx.Device(), m_Fence, nullptr);
-    vkDestroyCommandPool(m_Ctx.Device(), m_Pool, nullptr);
+    VkCommandPoolCreateInfo info{};
+    info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT; // reset as a whole
+    info.queueFamilyIndex = family;
+    VkCommandPool pool    = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateCommandPool(device, &info, nullptr, &pool));
+    return pool;
 }
 
-void UploadContext::ImmediateSubmit(const std::function<void(VkCommandBuffer)>& record)
+VkCommandBuffer AllocateCommandBuffer(VkDevice device, VkCommandPool pool)
 {
-    const VkDevice dev = m_Ctx.Device();
-    VK_CHECK(vkResetCommandPool(dev, m_Pool, 0));
+    VkCommandBufferAllocateInfo info{};
+    info.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    info.commandPool        = pool;
+    info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    info.commandBufferCount = 1;
+    VkCommandBuffer cmd     = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateCommandBuffers(device, &info, &cmd));
+    return cmd;
+}
 
+void BeginOneTimeCommands(VkCommandBuffer cmd)
+{
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(m_Cmd, &begin));
-    record(m_Cmd);
-    VK_CHECK(vkEndCommandBuffer(m_Cmd));
-
-    VkCommandBufferSubmitInfo cmdInfo{};
-    cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    cmdInfo.commandBuffer = m_Cmd;
-
-    VkSubmitInfo2 submit{};
-    submit.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submit.commandBufferInfoCount = 1;
-    submit.pCommandBufferInfos    = &cmdInfo;
-    VK_CHECK(vkQueueSubmit2(m_Ctx.GraphicsQueue().handle, 1, &submit, m_Fence));
-
-    VK_CHECK(vkWaitForFences(dev, 1, &m_Fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(dev, 1, &m_Fence));
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
 }
 
-Buffer UploadContext::CreateBuffer(std::span<const std::byte> data, VkBufferUsageFlags usage, const char* debugName)
+void PipelineBarriers(VkCommandBuffer cmd, const std::vector<VkBufferMemoryBarrier2>& buffers,
+                      const std::vector<VkImageMemoryBarrier2>& images)
+{
+    if (buffers.empty() && images.empty())
+        return;
+    VkDependencyInfo dep{};
+    dep.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = static_cast<std::uint32_t>(buffers.size());
+    dep.pBufferMemoryBarriers    = buffers.data();
+    dep.imageMemoryBarrierCount  = static_cast<std::uint32_t>(images.size());
+    dep.pImageMemoryBarriers     = images.data();
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+} // namespace
+
+UploadQueue::UploadQueue(const VulkanContext& ctx)
+    : m_Ctx(ctx)
+    , m_OwnershipTransfer(ctx.TransferQueue().family != ctx.GraphicsQueue().family)
+{
+    const VkDevice dev = ctx.Device();
+
+    VkSemaphoreTypeCreateInfo type{};
+    type.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type.initialValue  = 0;
+    VkSemaphoreCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    info.pNext = &type;
+    VK_CHECK(vkCreateSemaphore(dev, &info, nullptr, &m_Timeline));
+    SetDebugName(dev, VK_OBJECT_TYPE_SEMAPHORE, m_Timeline, "UploadTimeline");
+
+    m_ImmediatePool  = CreatePool(dev, ctx.GraphicsQueue().family);
+    m_ImmediateCmd   = AllocateCommandBuffer(dev, m_ImmediatePool);
+    m_ImmediateFence = MakeFence(dev, false);
+}
+
+UploadQueue::~UploadQueue()
+{
+    // Staging buffers go with the Batch objects; only the pools need explicit destruction.
+    const VkDevice dev     = m_Ctx.Device();
+    const auto     destroy = [dev](const std::unique_ptr<Batch>& b) {
+        if (b)
+            vkDestroyCommandPool(dev, b->pool, nullptr);
+    };
+    destroy(m_Open);
+    for (const auto& b : m_InFlight)
+        destroy(b);
+    for (const auto& b : m_FreeBatches)
+        destroy(b);
+
+    vkDestroyFence(dev, m_ImmediateFence, nullptr);
+    vkDestroyCommandPool(dev, m_ImmediatePool, nullptr);
+    vkDestroySemaphore(dev, m_Timeline, nullptr);
+}
+
+std::unique_ptr<UploadQueue::Batch> UploadQueue::AcquireBatchLocked()
+{
+    if (!m_FreeBatches.empty()) {
+        std::unique_ptr<Batch> batch = std::move(m_FreeBatches.back());
+        m_FreeBatches.pop_back();
+        return batch;
+    }
+    auto batch  = std::make_unique<Batch>();
+    batch->pool = CreatePool(m_Ctx.Device(), m_Ctx.TransferQueue().family);
+    batch->cmd  = AllocateCommandBuffer(m_Ctx.Device(), batch->pool);
+    return batch;
+}
+
+UploadTicket UploadQueue::Record(Buffer staging, const PendingAcquire& acquire,
+                                 const std::function<void(VkCommandBuffer)>& record)
+{
+    std::scoped_lock lock{m_Mutex};
+    if (!m_Open) {
+        m_Open        = AcquireBatchLocked();
+        m_Open->value = m_NextValue++; // opened in submission order -> values stay monotonic
+        BeginOneTimeCommands(m_Open->cmd);
+    }
+    record(m_Open->cmd);
+    m_Open->staging.push_back(std::move(staging));
+    m_Open->acquires.push_back(acquire);
+    return m_Open->value;
+}
+
+Buffer UploadQueue::CreateBuffer(std::span<const std::byte> data, VkBufferUsageFlags usage, UploadTicket& ticket,
+                                 const char* debugName)
 {
     assert(!data.empty());
+    // Allocation and memcpy happen on the calling thread; only the copy command is recorded under the lock.
     Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            .memory = MemoryUsage::Upload, .debugName = "staging"});
     staging.Write(data.data(), data.size());
@@ -74,27 +153,18 @@ Buffer UploadContext::CreateBuffer(std::span<const std::byte> data, VkBufferUsag
     Buffer buffer(m_Ctx, {.size = data.size(), .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                           .memory = MemoryUsage::GpuOnly, .debugName = debugName});
 
-    ImmediateSubmit([&](VkCommandBuffer cmd) {
-        const VkBufferCopy region{0, 0, data.size()};
-        vkCmdCopyBuffer(cmd, staging.Handle(), buffer.Handle(), 1, &region);
-
-        // Make the copy visible to any later GPU read (separate submissions).
-        VkMemoryBarrier2 barrier{};
-        barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        barrier.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
-        VkDependencyInfo dep{};
-        dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dep.memoryBarrierCount = 1;
-        dep.pMemoryBarriers    = &barrier;
-        vkCmdPipelineBarrier2(cmd, &dep);
+    const VkBuffer     src  = staging.Handle();
+    const VkBuffer     dst  = buffer.Handle();
+    const VkDeviceSize size = data.size();
+    const UploadTicket t    = Record(std::move(staging), {.buffer = dst}, [&](VkCommandBuffer cmd) {
+        const VkBufferCopy region{0, 0, size};
+        vkCmdCopyBuffer(cmd, src, dst, 1, &region);
     });
+    ticket = std::max(ticket, t);
     return buffer;
 }
 
-Image UploadContext::CreateTexture2D(const TextureDesc& desc)
+Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket)
 {
     assert(desc.pixels && desc.width > 0 && desc.height > 0);
     const VkDeviceSize byteSize = VkDeviceSize{desc.width} * desc.height * 4;
@@ -122,23 +192,258 @@ Image UploadContext::CreateTexture2D(const TextureDesc& desc)
                         .mipLevels = mipLevels,
                         .debugName = desc.debugName});
 
-    ImmediateSubmit([&](VkCommandBuffer cmd) {
-        CmdImageBarrier(cmd, {.image     = image.Handle(),
+    // Transfer queue: mip 0 only. Blits need a graphics queue -> the mip chain is built in RecordAcquires.
+    const VkBuffer     src = staging.Handle();
+    const VkImage      dst = image.Handle();
+    const UploadTicket t   = Record(std::move(staging),
+                                    {.image = dst, .extent = {desc.width, desc.height}, .mipLevels = mipLevels},
+                                    [&](VkCommandBuffer cmd) {
+        CmdImageBarrier(cmd, {.image     = dst,
                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                               .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              .dstStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                              .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT});
-
+                              .dstStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
+                              .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                              .baseMip   = 0,
+                              .mipCount  = 1});
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent      = {desc.width, desc.height, 1};
-        vkCmdCopyBufferToImage(cmd, staging.Handle(), image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    });
+    ticket = std::max(ticket, t);
+    return image;
+}
 
-        // Mip chain: mip[i-1] (TRANSFER_SRC) --linear blit--> mip[i] (TRANSFER_DST)
-        auto w = static_cast<std::int32_t>(desc.width);
-        auto h = static_cast<std::int32_t>(desc.height);
-        for (std::uint32_t i = 1; i < mipLevels; ++i) {
-            CmdImageBarrier(cmd, {.image     = image.Handle(),
+void UploadQueue::Submit()
+{
+    std::unique_ptr<Batch> batch;
+    {
+        std::scoped_lock lock{m_Mutex};
+        batch = std::move(m_Open); // workers open a fresh batch from here on
+    }
+    if (!batch)
+        return;
+
+    RecordBatchEndBarriers(*batch);
+    VK_CHECK(vkEndCommandBuffer(batch->cmd));
+
+    VkSemaphoreSubmitInfo signal{};
+    signal.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signal.semaphore = m_Timeline;
+    signal.value     = batch->value;
+    signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = batch->cmd;
+
+    VkSubmitInfo2 submit{};
+    submit.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.commandBufferInfoCount   = 1;
+    submit.pCommandBufferInfos      = &cmdInfo;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos    = &signal;
+    VK_CHECK(vkQueueSubmit2(m_Ctx.TransferQueue().handle, 1, &submit, VK_NULL_HANDLE));
+
+    m_InFlight.push_back(std::move(batch));
+}
+
+std::uint64_t UploadQueue::RecordAcquires(VkCommandBuffer graphicsCmd)
+{
+    if (m_InFlight.empty())
+        return 0;
+
+    std::uint64_t completed = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(m_Ctx.Device(), m_Timeline, &completed));
+
+    std::uint64_t acquired = 0;
+    while (!m_InFlight.empty() && m_InFlight.front()->value <= completed) {
+        std::unique_ptr<Batch> batch = std::move(m_InFlight.front());
+        m_InFlight.pop_front();
+
+        RecordAcquireBarriers(graphicsCmd, *batch);
+        for (const PendingAcquire& a : batch->acquires)
+            if (a.image && a.mipLevels > 1)
+                RecordMipChain(graphicsCmd, a);
+        acquired = batch->value;
+
+        // The transfer queue is done with it: recycle immediately.
+        batch->staging.clear();
+        batch->acquires.clear();
+        batch->value = 0;
+        VK_CHECK(vkResetCommandPool(m_Ctx.Device(), batch->pool, 0));
+        std::scoped_lock lock{m_Mutex};
+        m_FreeBatches.push_back(std::move(batch));
+    }
+
+    if (acquired == 0)
+        return 0;
+    m_AcquiredValue.store(acquired, std::memory_order_release);
+    return acquired; // already signaled: the frame's wait on it never stalls
+}
+
+void UploadQueue::Flush()
+{
+    Submit();
+    if (m_InFlight.empty())
+        return;
+
+    const std::uint64_t last = m_InFlight.back()->value;
+    VkSemaphoreWaitInfo wait{};
+    wait.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait.semaphoreCount = 1;
+    wait.pSemaphores    = &m_Timeline;
+    wait.pValues        = &last;
+    VK_CHECK(vkWaitSemaphores(m_Ctx.Device(), &wait, UINT64_MAX));
+
+    ImmediateSubmit([this](VkCommandBuffer cmd) { (void)RecordAcquires(cmd); }, last);
+}
+
+void UploadQueue::ImmediateSubmit(const std::function<void(VkCommandBuffer)>& record, std::uint64_t waitValue)
+{
+    const VkDevice dev = m_Ctx.Device();
+    VK_CHECK(vkResetCommandPool(dev, m_ImmediatePool, 0));
+    BeginOneTimeCommands(m_ImmediateCmd);
+    record(m_ImmediateCmd);
+    VK_CHECK(vkEndCommandBuffer(m_ImmediateCmd));
+
+    VkSemaphoreSubmitInfo wait{};
+    wait.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait.semaphore = m_Timeline;
+    wait.value     = waitValue;
+    wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = m_ImmediateCmd;
+
+    VkSubmitInfo2 submit{};
+    submit.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.waitSemaphoreInfoCount = waitValue > 0 ? 1u : 0u;
+    submit.pWaitSemaphoreInfos    = &wait;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos    = &cmdInfo;
+    VK_CHECK(vkQueueSubmit2(m_Ctx.GraphicsQueue().handle, 1, &submit, m_ImmediateFence));
+
+    VK_CHECK(vkWaitForFences(dev, 1, &m_ImmediateFence, VK_TRUE, UINT64_MAX));
+    VK_CHECK(vkResetFences(dev, 1, &m_ImmediateFence));
+}
+
+void UploadQueue::RecordBatchEndBarriers(const Batch& batch) const
+{
+    if (!m_OwnershipTransfer) {
+        // Shared queue family: make the copies visible to everything later on the queue right
+        // here, so every path into a later frame (submission order, present -> acquire
+        // semaphore) sees them synchronized. The graphics-side barriers then only move layouts.
+        VkMemoryBarrier2 barrier{};
+        barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo dep{};
+        dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers    = &barrier;
+        vkCmdPipelineBarrier2(batch.cmd, &dep);
+        return;
+    }
+
+    // Queue family release (transfer side). Must mirror RecordAcquireBarriers exactly
+    // (same range, same old/new layout); the layout transition executes only once.
+    const std::uint32_t transfer = m_Ctx.TransferQueue().family;
+    const std::uint32_t graphics = m_Ctx.GraphicsQueue().family;
+
+    std::vector<VkBufferMemoryBarrier2> buffers;
+    std::vector<VkImageMemoryBarrier2>  images;
+    for (const PendingAcquire& a : batch.acquires) {
+        if (a.buffer) {
+            VkBufferMemoryBarrier2& b = buffers.emplace_back();
+            b.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            b.srcStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT;
+            b.srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; // chains to the timeline signal
+            b.srcQueueFamilyIndex = transfer;
+            b.dstQueueFamilyIndex = graphics;
+            b.buffer              = a.buffer;
+            b.size                = VK_WHOLE_SIZE;
+        } else {
+            images.push_back(MakeImageBarrier({.image     = a.image,
+                                               .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                               .newLayout = Mip0Layout(a.mipLevels),
+                                               .srcStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                               .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                               .dstStage  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                               .baseMip   = 0,
+                                               .mipCount  = 1,
+                                               .srcFamily = transfer,
+                                               .dstFamily = graphics}));
+        }
+    }
+    PipelineBarriers(batch.cmd, buffers, images);
+}
+
+void UploadQueue::RecordAcquireBarriers(VkCommandBuffer cmd, const Batch& batch) const
+{
+    // srcStage ALL_TRANSFER chains with the frame's timeline wait (ALL_COMMANDS). With an
+    // ownership transfer this is the acquire half (srcAccess is ignored -> 0); on a shared
+    // queue family it is an ordinary barrier that also performs the layout transition.
+    const std::uint32_t  srcFamily = m_OwnershipTransfer ? m_Ctx.TransferQueue().family : VK_QUEUE_FAMILY_IGNORED;
+    const std::uint32_t  dstFamily = m_OwnershipTransfer ? m_Ctx.GraphicsQueue().family : VK_QUEUE_FAMILY_IGNORED;
+    const VkAccessFlags2 srcAccess = m_OwnershipTransfer ? VK_ACCESS_2_NONE : VK_ACCESS_2_TRANSFER_WRITE_BIT;
+
+    std::vector<VkBufferMemoryBarrier2> buffers;
+    std::vector<VkImageMemoryBarrier2>  images;
+    for (const PendingAcquire& a : batch.acquires) {
+        if (a.buffer) {
+            VkBufferMemoryBarrier2& b = buffers.emplace_back();
+            b.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            b.srcStageMask        = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            b.srcAccessMask       = srcAccess;
+            b.dstStageMask        = kBufferReadStages;
+            b.dstAccessMask       = kBufferReadAccess;
+            b.srcQueueFamilyIndex = srcFamily;
+            b.dstQueueFamilyIndex = dstFamily;
+            b.buffer              = a.buffer;
+            b.size                = VK_WHOLE_SIZE;
+            continue;
+        }
+
+        const bool mips = a.mipLevels > 1;
+        images.push_back(MakeImageBarrier({.image     = a.image,
+                                           .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                           .newLayout = Mip0Layout(a.mipLevels),
+                                           .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                           .srcAccess = srcAccess,
+                                           .dstStage  = mips ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : kShaderStages,
+                                           .dstAccess = mips ? VK_ACCESS_2_TRANSFER_READ_BIT
+                                                             : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                           .baseMip   = 0,
+                                           .mipCount  = 1,
+                                           .srcFamily = srcFamily,
+                                           .dstFamily = dstFamily}));
+        if (mips) {
+            // Mips 1..n were never written: no ownership transfer needed, contents are discarded.
+            images.push_back(MakeImageBarrier({.image     = a.image,
+                                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                               .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                               .dstStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                               .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                               .baseMip   = 1,
+                                               .mipCount  = a.mipLevels - 1}));
+        }
+    }
+    PipelineBarriers(cmd, buffers, images);
+}
+
+void UploadQueue::RecordMipChain(VkCommandBuffer cmd, const PendingAcquire& a)
+{
+    // Entry: mip 0 TRANSFER_SRC, mips 1..n TRANSFER_DST. Each level is blitted from the previous one.
+    auto w = static_cast<std::int32_t>(a.extent.width);
+    auto h = static_cast<std::int32_t>(a.extent.height);
+    for (std::uint32_t i = 1; i < a.mipLevels; ++i) {
+        if (i > 1) {
+            CmdImageBarrier(cmd, {.image     = a.image,
                                   .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                   .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -147,55 +452,58 @@ Image UploadContext::CreateTexture2D(const TextureDesc& desc)
                                   .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
                                   .baseMip   = i - 1,
                                   .mipCount  = 1});
-
-            const std::int32_t nw = std::max(w / 2, 1);
-            const std::int32_t nh = std::max(h / 2, 1);
-
-            VkImageBlit2 blit{};
-            blit.sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
-            blit.srcOffsets[1]  = {w, h, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
-            blit.dstOffsets[1]  = {nw, nh, 1};
-
-            VkBlitImageInfo2 blitInfo{};
-            blitInfo.sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
-            blitInfo.srcImage       = image.Handle();
-            blitInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            blitInfo.dstImage       = image.Handle();
-            blitInfo.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            blitInfo.regionCount    = 1;
-            blitInfo.pRegions       = &blit;
-            blitInfo.filter         = VK_FILTER_LINEAR;
-            vkCmdBlitImage2(cmd, &blitInfo);
-
-            w = nw;
-            h = nh;
         }
 
-        // Final layouts: mips [0, n-1) are TRANSFER_SRC, the last one is TRANSFER_DST.
-        if (mipLevels > 1) {
-            CmdImageBarrier(cmd, {.image     = image.Handle(),
-                                  .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                  .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                  .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                                  .srcAccess = VK_ACCESS_2_NONE, // only reads happened: execution dep suffices
-                                  .dstStage  = kShaderStages,
-                                  .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                                  .baseMip   = 0,
-                                  .mipCount  = mipLevels - 1});
-        }
-        CmdImageBarrier(cmd, {.image     = image.Handle(),
-                              .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                              .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                              .dstStage  = kShaderStages,
-                              .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                              .baseMip   = mipLevels - 1,
-                              .mipCount  = 1});
-    });
-    return image;
+        const std::int32_t nw = std::max(w / 2, 1);
+        const std::int32_t nh = std::max(h / 2, 1);
+
+        VkImageBlit2 blit{};
+        blit.sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        blit.srcOffsets[1]  = {w, h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        blit.dstOffsets[1]  = {nw, nh, 1};
+
+        VkBlitImageInfo2 info{};
+        info.sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+        info.srcImage       = a.image;
+        info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        info.dstImage       = a.image;
+        info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        info.regionCount    = 1;
+        info.pRegions       = &blit;
+        info.filter         = VK_FILTER_LINEAR; // sRGB formats are filtered in linear space
+        vkCmdBlitImage2(cmd, &info);
+
+        w = nw;
+        h = nh;
+    }
+
+    // Exit: mips [0, n-1) are TRANSFER_SRC, the last one TRANSFER_DST -> all SHADER_READ_ONLY.
+    const std::array<VkImageMemoryBarrier2, 2> toShaderRead{
+        MakeImageBarrier({.image     = a.image,
+                          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                          .srcAccess = VK_ACCESS_2_NONE, // only reads happened: execution dependency suffices
+                          .dstStage  = kShaderStages,
+                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                          .baseMip   = 0,
+                          .mipCount  = a.mipLevels - 1}),
+        MakeImageBarrier({.image     = a.image,
+                          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                          .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          .dstStage  = kShaderStages,
+                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                          .baseMip   = a.mipLevels - 1,
+                          .mipCount  = 1})};
+    VkDependencyInfo dep{};
+    dep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.imageMemoryBarrierCount = static_cast<std::uint32_t>(toShaderRead.size());
+    dep.pImageMemoryBarriers    = toShaderRead.data();
+    vkCmdPipelineBarrier2(cmd, &dep);
 }
 
 } // namespace Engine

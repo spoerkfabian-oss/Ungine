@@ -1,4 +1,5 @@
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Scene.h"
@@ -26,8 +27,8 @@ struct MeshPush { // mirrors MeshPush in mesh_common.glsl
 static_assert(sizeof(MeshPush) <= kPushConstantSize);
 } // namespace
 
-SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx)
-    : m_Renderer(renderer)
+SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets)
+    : m_Renderer(renderer), m_Assets(assets)
 {
     GraphicsPipelineBuilder builder;
     builder.SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("mesh.frag.spv"))
@@ -90,10 +91,16 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
 
     VkPipeline   boundPipeline = VK_NULL_HANDLE;
     const Model* boundModel    = nullptr;
+    ModelHandle  lastHandle;
+    const Model* lastModel = nullptr; // entities of one model are usually contiguous
 
     scene.GetRegistry().ViewOf<WorldTransform, MeshRenderer>().Each(
         [&](Entity, const WorldTransform& world, const MeshRenderer& renderer) {
-            const Model* model = renderer.model.get();
+            if (renderer.model != lastHandle) {
+                lastHandle = renderer.model;
+                lastModel  = m_Assets.Get(renderer.model); // nullptr while loading or after release
+            }
+            const Model* model = lastModel;
             if (!model || renderer.meshIndex >= model->meshes.size())
                 return;
             if (model != boundModel) {

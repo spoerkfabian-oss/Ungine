@@ -25,4 +25,10 @@ include(cmake/Shaders.cmake)
 add_subdirectory(engine)
 add_subdirectory(sandbox)
 
+option(ENGINE_BUILD_TESTS "Build the test executables" ${PROJECT_IS_TOP_LEVEL})
+if(ENGINE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT Sandbox)

@@ -115,7 +115,7 @@ public:
         requires std::invocable<F&, Entity, Ts&...>
     void Each(F&& fn)
     {
-        if (((std::get<ComponentPool<Ts>*>(m_Pools) == nullptr) || ...))
+        if ((!std::get<ComponentPool<Ts>*>(m_Pools) || ...)) // (x == nullptr) trips clang's -Wparentheses-equality
             return;
 
         const IComponentPool* driver = nullptr;

@@ -2,7 +2,7 @@
 
 namespace Engine {
 
-void CmdImageBarrier(VkCommandBuffer cmd, const ImageBarrier& b)
+VkImageMemoryBarrier2 MakeImageBarrier(const ImageBarrier& b)
 {
     VkImageMemoryBarrier2 barrier{};
     barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -12,10 +12,16 @@ void CmdImageBarrier(VkCommandBuffer cmd, const ImageBarrier& b)
     barrier.dstAccessMask       = b.dstAccess;
     barrier.oldLayout           = b.oldLayout;
     barrier.newLayout           = b.newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.srcQueueFamilyIndex = b.srcFamily;
+    barrier.dstQueueFamilyIndex = b.dstFamily;
     barrier.image               = b.image;
     barrier.subresourceRange    = {b.aspect, b.baseMip, b.mipCount, 0, VK_REMAINING_ARRAY_LAYERS};
+    return barrier;
+}
+
+void CmdImageBarrier(VkCommandBuffer cmd, const ImageBarrier& b)
+{
+    const VkImageMemoryBarrier2 barrier = MakeImageBarrier(b);
 
     VkDependencyInfo dep{};
     dep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;

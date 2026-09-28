@@ -63,12 +63,15 @@ public:
     [[nodiscard]] std::optional<FrameContext> BeginFrame();
     void EndFrame(const FrameContext& frame);
 
+    // Threading: bindless registry, upload queue (see its docs) and DefaultTextureIndex may be
+    // used from worker threads. Everything else, DeferRelease/DeferCall included: main thread.
     [[nodiscard]] const Swapchain&   GetSwapchain() const { return *m_Swapchain; }
     [[nodiscard]] BindlessRegistry&  GetBindless()        { return *m_Bindless; }
-    [[nodiscard]] UploadContext&     GetUploader()        { return *m_Upload; }
+    [[nodiscard]] UploadQueue&       GetUploader()        { return *m_Upload; }
 
     // Deferred destruction: the resource (Buffer, Image, Pipeline, ...) is destroyed once the
     // GPU has finished every frame that might still reference it. Pass with std::move.
+    // Resources from the UploadQueue additionally need IsReady(ticket) before release.
     template <std::movable T>
     void DeferRelease(T resource)
     {
@@ -106,6 +109,7 @@ private:
         std::vector<std::function<void()>>   deferred;
         Buffer                               transient;
         VkDeviceSize                         transientOffset = 0;
+        std::uint64_t                        uploadWait      = 0; // upload timeline value to wait on
     };
 
     FrameData& GarbageSlot();
@@ -120,7 +124,7 @@ private:
     Window&                    m_Window;
     std::unique_ptr<Swapchain>        m_Swapchain;
     std::unique_ptr<BindlessRegistry> m_Bindless;
-    std::unique_ptr<UploadContext>    m_Upload;
+    std::unique_ptr<UploadQueue>      m_Upload;
     Image                             m_Depth;
 
     static constexpr std::size_t kDefaultTextureCount = static_cast<std::size_t>(DefaultTexture::Count);

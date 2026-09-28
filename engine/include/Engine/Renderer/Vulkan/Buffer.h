@@ -4,7 +4,7 @@
 namespace Engine {
 
 enum class MemoryUsage {
-    GpuOnly,  // device-local; fill via UploadContext
+    GpuOnly,  // device-local; fill via UploadQueue
     Upload,   // host-visible, persistently mapped, sequential writes (staging, per-frame UBO/SSBO)
     Readback, // host-visible, persistently mapped, random reads (GPU -> CPU)
 };

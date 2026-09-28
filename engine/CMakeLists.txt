@@ -1,8 +1,10 @@
 add_library(Engine STATIC
+    src/Assets/AssetManager.cpp
     src/Assets/GltfLoader.cpp
     src/Assets/Model.cpp
     src/Core/Application.cpp
     src/Core/Input.cpp
+    src/Core/ThreadPool.cpp
     src/Core/Window.cpp
     src/Events/EventBus.cpp
     src/Renderer/Renderer.cpp

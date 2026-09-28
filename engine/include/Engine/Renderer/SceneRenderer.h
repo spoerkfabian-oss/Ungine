@@ -9,6 +9,7 @@
 
 namespace Engine {
 
+class AssetManager;
 class Scene;
 
 struct SceneLighting {
@@ -24,11 +25,11 @@ struct SceneRenderStats {
     std::uint64_t triangles = 0;
 };
 
-// Forward opaque pass over every (WorldTransform, MeshRenderer) entity.
+// Forward opaque pass over every (WorldTransform, MeshRenderer) entity whose model is Ready.
 // Upcoming: frustum culling, PBR, shadows, HDR target + post-processing.
 class SceneRenderer {
 public:
-    SceneRenderer(Renderer& renderer, const VulkanContext& ctx);
+    SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets);
 
     void Render(const FrameContext& frame, Scene& scene, const CameraData& camera);
 
@@ -36,8 +37,9 @@ public:
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
 
 private:
-    Renderer&        m_Renderer;
-    Pipeline         m_Opaque;      // back-face culled
+    Renderer&           m_Renderer;
+    const AssetManager& m_Assets;
+    Pipeline            m_Opaque;      // back-face culled
     Pipeline         m_DoubleSided; // no culling
     SceneRenderStats m_Stats;
 };

@@ -1,17 +1,15 @@
 #pragma once
+#include "Engine/Assets/AssetHandle.h"
 #include "Engine/ECS/Entity.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
 namespace Engine {
-
-struct Model;
 
 struct Name {
     std::string value;
@@ -36,9 +34,10 @@ struct Hierarchy {
     std::vector<Entity> children;
 };
 
+// Resolved through the AssetManager each frame; renders nothing until the model is Ready.
 struct MeshRenderer {
-    std::shared_ptr<const Model> model;
-    std::uint32_t                meshIndex = 0;
+    ModelHandle   model;
+    std::uint32_t meshIndex = 0;
 };
 
 } // namespace Engine

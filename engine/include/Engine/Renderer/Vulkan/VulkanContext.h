@@ -32,6 +32,9 @@ public:
 
     void WaitIdle() const;
 
+    // Validation-layer errors reported so far (process-wide). Smoke tests fail on > 0.
+    [[nodiscard]] static std::uint32_t ValidationErrorCount();
+
     [[nodiscard]] VkInstance       Instance()       const { return m_Instance.instance; }
     [[nodiscard]] VkPhysicalDevice PhysicalDevice() const { return m_PhysicalDevice.physical_device; }
     [[nodiscard]] VkDevice         Device()         const { return m_Device.device; }

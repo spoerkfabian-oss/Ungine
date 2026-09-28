@@ -14,7 +14,7 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
 {
     m_Swapchain = std::make_unique<Swapchain>(ctx, window.FramebufferExtent(), SwapchainDesc{.vsync = desc.vsync});
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
-    m_Upload    = std::make_unique<UploadContext>(ctx);
+    m_Upload    = std::make_unique<UploadQueue>(ctx);
     CreateDepthBuffer();
     CreateDefaultTextures();
 
@@ -76,6 +76,9 @@ std::optional<FrameContext> Renderer::BeginFrame()
     CollectGarbage(f); // everything this slot's last submission could touch is now free
     f.transientOffset = 0;
 
+    // Hand everything workers recorded since the last frame to the transfer queue.
+    m_Upload->Submit();
+
     if (m_ResizePending)
         RecreateSwapchain();
 
@@ -101,6 +104,9 @@ std::optional<FrameContext> Renderer::BeginFrame()
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(f.cmd, &begin));
+
+    // Finished uploads: queue-family acquire + mip generation, before any pass can use them.
+    f.uploadWait = m_Upload->RecordAcquires(f.cmd);
 
     const VkImage image = m_Swapchain->Image(imageIndex);
     // srcStage = COLOR_ATTACHMENT_OUTPUT chains with the acquire-semaphore wait stage.
@@ -160,10 +166,17 @@ void Renderer::EndFrame(const FrameContext& frame)
 
     VkSemaphore renderFinished = m_RenderFinished[frame.imageIndex];
 
-    VkSemaphoreSubmitInfo wait{};
-    wait.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    wait.semaphore = f.imageAvailable;
-    wait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    std::array<VkSemaphoreSubmitInfo, 2> waits{};
+    waits[0].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waits[0].semaphore = f.imageAvailable;
+    waits[0].stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // Upload timeline: already reached (host-checked), orders the acquire barriers after the
+    // transfer queue's release. ALL_COMMANDS chains with their ALL_TRANSFER source stage.
+    waits[1].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waits[1].semaphore = m_Upload->Timeline();
+    waits[1].value     = f.uploadWait;
+    waits[1].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    const std::uint32_t waitCount = f.uploadWait > 0 ? 2u : 1u;
 
     VkSemaphoreSubmitInfo signal{};
     signal.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -176,8 +189,8 @@ void Renderer::EndFrame(const FrameContext& frame)
 
     VkSubmitInfo2 submit{};
     submit.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submit.waitSemaphoreInfoCount   = 1;
-    submit.pWaitSemaphoreInfos      = &wait;
+    submit.waitSemaphoreInfoCount   = waitCount;
+    submit.pWaitSemaphoreInfos      = waits.data();
     submit.commandBufferInfoCount   = 1;
     submit.pCommandBufferInfos      = &cmdInfo;
     submit.signalSemaphoreInfoCount = 1;
@@ -229,15 +242,18 @@ void Renderer::CreateDefaultTextures()
     // RGBA8 little-endian (0xAABBGGRR). Flat normal = (0.5, 0.5, 1.0).
     constexpr std::array<std::uint32_t, kDefaultTextureCount> texels{0xFFFFFFFFu, 0xFF000000u, 0xFFFF8080u};
     constexpr std::array<const char*, kDefaultTextureCount>   names{"DefaultWhite", "DefaultBlack", "DefaultNormal"};
+    UploadTicket ticket = 0;
     for (std::size_t i = 0; i < kDefaultTextureCount; ++i) {
         m_DefaultTextures[i] = m_Upload->CreateTexture2D({.pixels       = &texels[i],
                                                           .width        = 1,
                                                           .height       = 1,
                                                           .format       = VK_FORMAT_R8G8B8A8_UNORM,
                                                           .generateMips = false,
-                                                          .debugName    = names[i]});
+                                                          .debugName    = names[i]},
+                                                         ticket);
         m_DefaultTextureSlots[i] = m_Bindless->AddSampledImage(m_DefaultTextures[i].View());
     }
+    m_Upload->Flush(); // resident before the first frame
 }
 
 Renderer::FrameData& Renderer::GarbageSlot()

@@ -1,5 +1,7 @@
 #pragma once
+#include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Input.h"
+#include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
@@ -16,11 +18,12 @@ inline constexpr bool kDebugBuild = false;
 #endif
 
 struct ApplicationDesc {
-    WindowDesc   window{};
-    RendererDesc renderer{};
-    bool         enableValidation = kDebugBuild;
-    double       fixedTimestep    = 1.0 / 60.0; // physics tick (Jolt, Phase 3)
-    double       maxFrameTime     = 0.25;       // clamp to avoid "spiral of death"
+    WindowDesc    window{};
+    RendererDesc  renderer{};
+    bool          enableValidation = kDebugBuild;
+    double        fixedTimestep    = 1.0 / 60.0; // physics tick (Jolt, Phase 3)
+    double        maxFrameTime     = 0.25;       // clamp to avoid "spiral of death"
+    std::uint32_t workerThreads    = 0;          // 0 = ThreadPool::DefaultThreadCount()
 };
 
 class Application {
@@ -45,16 +48,20 @@ protected:
     [[nodiscard]] Window&        GetWindow()   { return *m_Window; }
     [[nodiscard]] VulkanContext& GetContext()  { return *m_Context; }
     [[nodiscard]] Renderer&      GetRenderer() { return *m_Renderer; }
+    [[nodiscard]] ThreadPool&    GetJobs()     { return *m_Jobs; }
+    [[nodiscard]] AssetManager&  GetAssets()   { return *m_Assets; }
 
 private:
     ApplicationDesc m_Desc;
     // Declaration order = reverse destruction order:
-    // renderer -> context -> window -> input -> event bus.
+    // assets -> jobs -> renderer -> context -> window -> input -> event bus.
     EventBus                       m_Events;
     Input                          m_Input{m_Events};
     std::unique_ptr<Window>        m_Window;
     std::unique_ptr<VulkanContext> m_Context;
     std::unique_ptr<Renderer>      m_Renderer;
+    std::unique_ptr<ThreadPool>    m_Jobs;
+    std::unique_ptr<AssetManager>  m_Assets; // waits for its jobs, defers GPU frees to the renderer
 };
 
 } // namespace Engine
