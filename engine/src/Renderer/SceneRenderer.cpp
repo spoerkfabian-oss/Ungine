@@ -5,10 +5,15 @@
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
 
+#include <algorithm>
+#include <bit>
+
 namespace Engine {
 
 namespace {
-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkFormat      kHdrFormat     = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkFormat      kShadowFormat  = VK_FORMAT_D32_SFLOAT;
+constexpr std::uint32_t kMaxBloomMips  = 6;
 
 struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::mat4  viewProj;
@@ -20,6 +25,12 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::vec4  sunRadiance;
     glm::vec4  sky;
     glm::uvec4 ibl;
+    glm::mat4  cascadeViewProj[kMaxCascades];
+    glm::vec4  cascadeSplits;
+    glm::vec4  cascadeTexel;
+    glm::uvec4 shadowMaps;
+    glm::vec4  shadowParams;
+    glm::uvec4 shadowInfo;
 };
 
 struct DrawData { // mirrors DrawData in mesh_common.glsl
@@ -33,6 +44,7 @@ struct MeshPush { // mirrors MeshPush in mesh_common.glsl
     VkDeviceAddress materials;
     VkDeviceAddress draw;
     std::uint32_t   materialIndex;
+    std::uint32_t   cascade;
 };
 static_assert(sizeof(MeshPush) <= kPushConstantSize);
 
@@ -40,6 +52,17 @@ struct TonemapPush { // mirrors TonemapPush in tonemap.frag
     std::uint32_t hdrTexture;
     std::uint32_t tonemapper;
     float         exposure;
+    std::uint32_t bloomTexture;
+    float         bloomStrength;
+};
+
+struct BloomPush { // mirrors BloomPush in bloom_*.comp
+    std::uint32_t src;
+    std::uint32_t dst;
+    glm::uvec2    dstSize;
+    glm::vec2     srcTexel;
+    std::uint32_t karis;
+    float         radius;
 };
 
 VkRenderingAttachmentInfo Attachment(VkImageView view, VkImageLayout layout, VkAttachmentLoadOp load)
@@ -53,17 +76,39 @@ VkRenderingAttachmentInfo Attachment(VkImageView view, VkImageLayout layout, VkA
     return a;
 }
 
-void BeginRendering(VkCommandBuffer cmd, VkExtent2D extent, const VkRenderingAttachmentInfo& color,
+void BeginRendering(VkCommandBuffer cmd, VkExtent2D extent, const VkRenderingAttachmentInfo* color,
                     const VkRenderingAttachmentInfo* depth)
 {
     VkRenderingInfo info{};
     info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
     info.renderArea           = {{0, 0}, extent};
     info.layerCount           = 1;
-    info.colorAttachmentCount = 1;
-    info.pColorAttachments    = &color;
+    info.colorAttachmentCount = color ? 1u : 0u;
+    info.pColorAttachments    = color;
     info.pDepthAttachment     = depth;
     vkCmdBeginRendering(cmd, &info);
+}
+
+// Execution + memory dependency between compute passes (and on to the tone mapping read).
+void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                   VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess)
+{
+    VkMemoryBarrier2 barrier{};
+    barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask  = srcStage;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstStageMask  = dstStage;
+    barrier.dstAccessMask = dstAccess;
+    VkDependencyInfo dep{};
+    dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers    = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+VkExtent2D MipExtent(VkExtent2D base, std::uint32_t mip)
+{
+    return {std::max(base.width >> mip, 1u), std::max(base.height >> mip, 1u)};
 }
 } // namespace
 
@@ -106,122 +151,126 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                     .AddColorAttachment(renderer.GetSwapchain().Format())
                     .SetDebugName("Tonemap")
                     .Build(device, layout);
+
+    // Shadow casters: no culling (thin/open meshes cast from both sides), reverse-Z, depth clamp
+    // (pancaking of casters in front of a cascade), slope-scaled bias set per frame.
+    GraphicsPipelineBuilder shadow;
+    shadow.SetShaders(ShaderPath("shadow.vert.spv"))
+        .SetDepthFormat(kShadowFormat)
+        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+        .SetDepthClamp(true)
+        .SetDynamicDepthBias(true)
+        .SetDebugName("ShadowDepth");
+    m_Shadow       = shadow.Build(device, layout);
+    m_ShadowMasked = shadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
+                         .SetDebugName("ShadowDepthMasked")
+                         .Build(device, layout);
+
+    m_BloomDown = CreateComputePipeline(device, layout, ShaderPath("bloom_downsample.comp.spv"), "BloomDownsample");
+    m_BloomUp   = CreateComputePipeline(device, layout, ShaderPath("bloom_upsample.comp.spv"), "BloomUpsample");
 }
 
 SceneRenderer::~SceneRenderer()
 {
-    if (m_Hdr) {
-        Renderer* r = &m_Renderer;
-        r->DeferCall([r, slot = m_HdrSlot] { r->GetBindless().RemoveSampledImage(slot); });
-        r->DeferRelease(std::move(m_Hdr));
-    }
-    m_Renderer.DeferRelease(std::move(m_Mesh));
-    m_Renderer.DeferRelease(std::move(m_Sky));
-    m_Renderer.DeferRelease(std::move(m_Tonemap));
+    ReleaseTargets();
+    ReleaseShadowMap();
+    for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Tonemap, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp})
+        m_Renderer.DeferRelease(std::move(*p));
 }
 
-void SceneRenderer::EnsureHdrTarget(VkExtent2D extent)
+void SceneRenderer::ReleaseTargets()
+{
+    if (!m_Hdr)
+        return;
+    // Frames in flight may still read them: slots and images go through the deferred queue.
+    Renderer* r = &m_Renderer;
+    r->DeferCall([r, hdr = m_HdrSlot, sampled = m_BloomSampled, storage = m_BloomStorage] {
+        BindlessRegistry& b = r->GetBindless();
+        b.RemoveSampledImage(hdr);
+        for (std::uint32_t s : sampled)
+            b.RemoveSampledImage(s);
+        for (std::uint32_t s : storage)
+            b.RemoveStorageImage(s);
+    });
+    r->DeferRelease(std::move(m_BloomViews));
+    r->DeferRelease(std::move(m_Bloom));
+    r->DeferRelease(std::move(m_Hdr));
+    m_BloomViews.clear();
+    m_BloomSampled.clear();
+    m_BloomStorage.clear();
+}
+
+void SceneRenderer::ReleaseShadowMap()
+{
+    if (!m_ShadowMap)
+        return;
+    Renderer* r = &m_Renderer;
+    r->DeferCall([r, slots = m_ShadowSlots] {
+        for (std::uint32_t s : slots)
+            r->GetBindless().RemoveSampledImage(s);
+    });
+    r->DeferRelease(std::move(m_ShadowViews));
+    r->DeferRelease(std::move(m_ShadowMap));
+    m_ShadowViews.clear();
+}
+
+void SceneRenderer::EnsureTargets(VkExtent2D extent)
 {
     if (m_Hdr && m_Hdr.Extent().width == extent.width && m_Hdr.Extent().height == extent.height)
         return;
-    if (m_Hdr) { // resized: frames in flight may still sample the old one
-        Renderer* r = &m_Renderer;
-        r->DeferCall([r, slot = m_HdrSlot] { r->GetBindless().RemoveSampledImage(slot); });
-        r->DeferRelease(std::move(m_Hdr));
+    ReleaseTargets();
+
+    const VulkanContext& ctx      = m_Renderer.GetContext();
+    BindlessRegistry&    bindless = m_Renderer.GetBindless();
+
+    m_Hdr     = Image(ctx, {.extent    = {extent.width, extent.height, 1},
+                            .format    = kHdrFormat,
+                            .usage     = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            .debugName = "HdrColor"});
+    m_HdrSlot = bindless.AddSampledImage(m_Hdr.View());
+
+    // Bloom chain at half resolution, down to at least 1x1 per level.
+    const VkExtent2D    half = MipExtent(extent, 1);
+    const std::uint32_t mips =
+        std::min(kMaxBloomMips, static_cast<std::uint32_t>(std::bit_width(std::min(half.width, half.height))));
+    m_Bloom = Image(ctx, {.extent    = {half.width, half.height, 1},
+                          .format    = kHdrFormat,
+                          .usage     = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                          .mipLevels = mips,
+                          .debugName = "Bloom"});
+    for (std::uint32_t mip = 0; mip < mips; ++mip) {
+        m_BloomViews.push_back(m_Bloom.CreateView(VK_IMAGE_VIEW_TYPE_2D, mip, 1, 0, 1, "BloomMip"));
+        // The chain stays in GENERAL: sampled and storage access alternate between dispatches.
+        m_BloomSampled.push_back(bindless.AddSampledImage(m_BloomViews.back().Handle(), VK_IMAGE_LAYOUT_GENERAL));
+        m_BloomStorage.push_back(bindless.AddStorageImage(m_BloomViews.back().Handle()));
     }
-    m_Hdr     = Image(m_Renderer.GetContext(), {.extent    = {extent.width, extent.height, 1},
-                                                .format    = kHdrFormat,
-                                                .usage     = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                                             VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                .debugName = "HdrColor"});
-    m_HdrSlot = m_Renderer.GetBindless().AddSampledImage(m_Hdr.View());
 }
 
-void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const CameraData& camera)
+void SceneRenderer::EnsureShadowMap()
 {
-    m_Stats = {};
-    const VkCommandBuffer cmd      = frame.cmd;
-    const auto&           bindless = m_Renderer.GetBindless();
-    const SkySettings&    sky      = lighting.sky;
+    const std::uint32_t resolution = std::max(shadows.resolution, 16u);
+    if (m_ShadowMap && m_ShadowMap.Extent().width == resolution)
+        return;
+    ReleaseShadowMap();
 
-    EnsureHdrTarget(frame.extent);
-    m_Environment.Update(cmd, sky); // compute, only when the sky changed
-
-    const glm::mat4     viewProj = camera.projection * camera.view;
-    const FrameUniforms uniforms{
-        .viewProj       = viewProj,
-        .view           = camera.view,
-        .proj           = camera.projection,
-        .invViewProj    = glm::inverse(viewProj),
-        .cameraPosition = glm::vec4(camera.position, 1.0f),
-        .sunDirection   = glm::vec4(glm::normalize(sky.sunDirection), 0.0f),
-        .sunRadiance    = glm::vec4(sky.sunColor * sky.sunIntensity, 0.0f),
-        .sky            = glm::vec4(sky.skyIntensity, lighting.iblIntensity, 0.0f, 0.0f),
-        .ibl            = glm::uvec4(m_Environment.IrradianceCube(), m_Environment.PrefilteredCube(),
-                                     m_Environment.BrdfLut(), m_Environment.PrefilteredMipCount())};
-    const VkDeviceAddress frameAddress = m_Renderer.PushTransient(uniforms);
-
-    // --- Scene -> HDR. The target is shared by all frames in flight: wait for the previous
-    //     frame's tone mapping read before overwriting (WAR, execution dependency only). ---
-    CmdImageBarrier(cmd, {.image     = m_Hdr.Handle(),
-                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                          .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                          .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                          .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
-
-    // No color clear: the sky covers every pixel without geometry.
-    const VkRenderingAttachmentInfo hdr =
-        Attachment(m_Hdr.View(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
-    VkRenderingAttachmentInfo depth =
-        Attachment(frame.depthView, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
-    depth.clearValue.depthStencil = {0.0f, 0}; // reverse-Z: far = 0
-
-    BeginRendering(cmd, frame.extent, hdr, &depth);
-    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-    SetViewportScissor(cmd, frame.extent);
-
-    DrawMeshes(cmd, scene, camera, frameAddress);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
-    vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
-
-    // --- HDR -> swapchain (tone mapping) ---
-    CmdImageBarrier(cmd, {.image     = m_Hdr.Handle(),
-                          .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                          .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT});
-
-    BeginRendering(cmd, frame.extent,
-                   Attachment(frame.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_DONT_CARE),
-                   nullptr);
-    const TonemapPush tonemap{.hdrTexture = m_HdrSlot,
-                              .tonemapper = static_cast<std::uint32_t>(post.tonemapper),
-                              .exposure   = post.exposure};
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Tonemap.Handle());
-    vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(tonemap), &tonemap);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
+    m_ShadowMap = Image(m_Renderer.GetContext(), {.extent      = {resolution, resolution, 1},
+                                                  .format      = kShadowFormat,
+                                                  .usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                  .arrayLayers = kMaxCascades,
+                                                  .viewType    = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                  .debugName   = "ShadowCascades"});
+    for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
+        m_ShadowViews.push_back(m_ShadowMap.CreateView(VK_IMAGE_VIEW_TYPE_2D, 0, 1, c, 1, "ShadowCascade"));
+        m_ShadowSlots[c] = m_Renderer.GetBindless().AddSampledImage(m_ShadowViews.back().Handle());
+    }
 }
 
-void SceneRenderer::DrawMeshes(VkCommandBuffer cmd, Scene& scene, const CameraData& camera,
-                               VkDeviceAddress frameAddress)
+void SceneRenderer::CollectDrawItems(Scene& scene)
 {
-    const VkPipelineLayout layout  = m_Renderer.GetBindless().PipelineLayout();
-    const Frustum          frustum = Frustum::FromViewProjection(camera.projection * camera.view);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Mesh.Handle());
-
-    const Model*    boundModel = nullptr;
-    ModelHandle     lastHandle;
-    const Model*    lastModel = nullptr; // entities of one model are usually contiguous
-    VkCullModeFlags cullMode  = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
-    VkFrontFace     frontFace = VK_FRONT_FACE_MAX_ENUM;
+    m_DrawItems.clear();
+    ModelHandle  lastHandle;
+    const Model* lastModel = nullptr; // entities of one model are usually contiguous
 
     scene.GetRegistry().ViewOf<WorldTransform, MeshRenderer>().Each(
         [&](Entity, const WorldTransform& world, const MeshRenderer& renderer) {
@@ -229,55 +278,292 @@ void SceneRenderer::DrawMeshes(VkCommandBuffer cmd, Scene& scene, const CameraDa
                 lastHandle = renderer.model;
                 lastModel  = m_Assets.Get(renderer.model); // nullptr while loading or after release
             }
-            const Model* model = lastModel;
-            if (!model || renderer.meshIndex >= model->meshes.size())
+            if (!lastModel || renderer.meshIndex >= lastModel->meshes.size())
                 return;
 
-            VkDeviceAddress drawAddress = 0; // allocated lazily: fully culled nodes cost nothing
-            // Mirrored transforms flip the winding (glTF: negative determinant -> clockwise front faces).
-            const VkFrontFace nodeFront = glm::determinant(glm::mat3(world.matrix)) < 0.0f
-                                              ? VK_FRONT_FACE_CLOCKWISE
-                                              : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            const glm::mat3 linear = glm::mat3(world.matrix);
+            const DrawData  data{.model        = world.matrix,
+                                 .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear)))};
+            m_DrawItems.push_back({.model     = lastModel,
+                                   .mesh      = &lastModel->meshes[renderer.meshIndex],
+                                   .world     = world.matrix,
+                                   .drawData  = m_Renderer.PushTransient(data, 16),
+                                   // Mirrored transforms flip the winding (glTF: negative determinant).
+                                   .frontFace = glm::determinant(linear) < 0.0f ? VK_FRONT_FACE_CLOCKWISE
+                                                                                : VK_FRONT_FACE_COUNTER_CLOCKWISE});
+        });
+}
 
-            for (const Submesh& sm : model->meshes[renderer.meshIndex].submeshes) {
-                if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, world.matrix))) {
-                    ++m_Stats.culled;
+void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const CameraData& camera)
+{
+    m_Stats = {};
+    const VkCommandBuffer cmd = frame.cmd;
+    const SkySettings&    sky = lighting.sky;
+
+    EnsureTargets(frame.extent);
+    EnsureShadowMap();
+    m_Environment.Update(cmd, sky); // compute, only when the sky changed
+    CollectDrawItems(scene);
+
+    const std::uint32_t cascadeCount = shadows.enabled ? std::clamp(shadows.cascadeCount, 1u, kMaxCascades) : 0u;
+    const auto          cascades     = ComputeCascades(camera, sky.sunDirection, shadows);
+
+    const glm::mat4 viewProj = camera.projection * camera.view;
+    FrameUniforms   uniforms{
+          .viewProj       = viewProj,
+          .view           = camera.view,
+          .proj           = camera.projection,
+          .invViewProj    = glm::inverse(viewProj),
+          .cameraPosition = glm::vec4(camera.position, 1.0f),
+          .sunDirection   = glm::vec4(glm::normalize(sky.sunDirection), 0.0f),
+          .sunRadiance    = glm::vec4(sky.sunColor * sky.sunIntensity, 0.0f),
+          .sky            = glm::vec4(sky.skyIntensity, lighting.iblIntensity, 0.0f, 0.0f),
+          .ibl            = glm::uvec4(m_Environment.IrradianceCube(), m_Environment.PrefilteredCube(),
+                                       m_Environment.BrdfLut(), m_Environment.PrefilteredMipCount()),
+          .cascadeViewProj = {},
+          .cascadeSplits   = glm::vec4(0.0f),
+          .cascadeTexel    = glm::vec4(0.0f),
+          .shadowMaps      = glm::uvec4(m_ShadowSlots[0], m_ShadowSlots[1], m_ShadowSlots[2], m_ShadowSlots[3]),
+          .shadowParams    = glm::vec4(static_cast<float>(cascadeCount), shadows.normalBias, shadows.filterRadius,
+                                       shadows.cascadeBlend),
+          .shadowInfo      = glm::uvec4(m_ShadowMap.Extent().width, shadows.debugCascades ? 1u : 0u, 0u, 0u)};
+    for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
+        uniforms.cascadeViewProj[c] = cascades[c].viewProj;
+        uniforms.cascadeSplits[c]   = cascades[c].splitFar;
+        uniforms.cascadeTexel[c]    = cascades[c].texelWorldSize;
+    }
+    const VkDeviceAddress frameAddress = m_Renderer.PushTransient(uniforms);
+
+    if (cascadeCount > 0)
+        RenderShadows(cmd, frameAddress, cascades, cascadeCount);
+    RenderMain(cmd, frame, camera, frameAddress);
+
+    // HDR -> sampled by bloom (compute) and tone mapping (fragment).
+    CmdImageBarrier(cmd, {.image     = m_Hdr.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT});
+    const bool bloom = post.bloom && post.bloomStrength > 0.0f;
+    if (bloom)
+        RenderBloom(cmd);
+
+    // --- Tone mapping into the swapchain image ---
+    const auto& bindless  = m_Renderer.GetBindless();
+    const auto  swapchain =
+        Attachment(frame.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+    BeginRendering(cmd, frame.extent, &swapchain, nullptr);
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    SetViewportScissor(cmd, frame.extent);
+    const TonemapPush tonemap{.hdrTexture    = m_HdrSlot,
+                              .tonemapper    = static_cast<std::uint32_t>(post.tonemapper),
+                              .exposure      = post.exposure,
+                              .bloomTexture  = m_BloomSampled.front(),
+                              .bloomStrength = bloom ? post.bloomStrength : 0.0f};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Tonemap.Handle());
+    vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(tonemap), &tonemap);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+}
+
+void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
+                                  const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount)
+{
+    const auto&            bindless   = m_Renderer.GetBindless();
+    const VkPipelineLayout layout     = bindless.PipelineLayout();
+    const std::uint32_t    resolution = m_ShadowMap.Extent().width;
+    constexpr VkPipelineStageFlags2 kDepthStages =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+
+    // Previous frames may still sample the maps (WAR): wait for their fragment shaders.
+    CmdImageBarrier(cmd, {.image     = m_ShadowMap.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                          .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstStage  = kDepthStages,
+                          .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
+
+    // Not flipped (unlike the main pass): shadow UV = NDC * 0.5 + 0.5 in the shader.
+    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(resolution), static_cast<float>(resolution), 0.0f, 1.0f};
+    const VkRect2D   scissor{{0, 0}, {resolution, resolution}};
+
+    for (std::uint32_t c = 0; c < cascadeCount; ++c) {
+        auto depth = Attachment(m_ShadowViews[c].Handle(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                VK_ATTACHMENT_LOAD_OP_CLEAR);
+        depth.clearValue.depthStencil = {0.0f, 0}; // reverse-Z: far = 0
+        BeginRendering(cmd, {resolution, resolution}, nullptr, &depth);
+        bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdSetDepthBias(cmd, -shadows.depthBias, 0.0f, -shadows.slopeBias); // reverse-Z: away from the light
+
+        // Casters between the light and the cascade stay (clamped onto its near plane).
+        const Frustum frustum      = Frustum::FromViewProjection(cascades[c].viewProj, false);
+        VkPipeline    bound        = VK_NULL_HANDLE;
+        const Model*  boundIndices = nullptr;
+        for (const DrawItem& item : m_DrawItems) {
+            for (const Submesh& sm : item.mesh->submeshes) {
+                if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world)))
                     continue;
+                const bool       masked   = (item.model->materialFlags[sm.material] & kMaterialAlphaMask) != 0;
+                const VkPipeline pipeline = masked ? m_ShadowMasked.Handle() : m_Shadow.Handle();
+                if (pipeline != bound) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                    bound = pipeline;
                 }
-                if (drawAddress == 0) {
-                    drawAddress = m_Renderer.PushTransient(
-                        DrawData{.model        = world.matrix,
-                                 .normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(world.matrix))))},
-                        16);
+                if (item.model != boundIndices) {
+                    vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+                    boundIndices = item.model;
                 }
-                if (model != boundModel) {
-                    vkCmdBindIndexBuffer(cmd, model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
-                    boundModel = model;
-                }
-
-                const bool            doubleSided = (model->materialFlags[sm.material] & kMaterialDoubleSided) != 0;
-                const VkCullModeFlags cull        = doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
-                if (cull != cullMode) {
-                    vkCmdSetCullMode(cmd, cull);
-                    cullMode = cull;
-                }
-                if (nodeFront != frontFace) {
-                    vkCmdSetFrontFace(cmd, nodeFront);
-                    frontFace = nodeFront;
-                }
-
                 const MeshPush push{.frame         = frameAddress,
-                                    .vertices      = model->vertexBuffer.Address(),
-                                    .materials     = model->materialBuffer.Address(),
-                                    .draw          = drawAddress,
-                                    .materialIndex = sm.material};
+                                    .vertices      = item.model->vertexBuffer.Address(),
+                                    .materials     = item.model->materialBuffer.Address(),
+                                    .draw          = item.drawData,
+                                    .materialIndex = sm.material,
+                                    .cascade       = c};
                 vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
                 vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
-
-                ++m_Stats.drawCalls;
-                m_Stats.triangles += sm.indexCount / 3;
+                ++m_Stats.shadowDraws;
             }
-        });
+        }
+        vkCmdEndRendering(cmd);
+    }
+
+    CmdImageBarrier(cmd, {.image     = m_ShadowMap.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          .srcStage  = kDepthStages,
+                          .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                          .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
+}
+
+void SceneRenderer::RenderMain(VkCommandBuffer cmd, const FrameContext& frame, const CameraData& camera,
+                               VkDeviceAddress frameAddress)
+{
+    const auto&            bindless = m_Renderer.GetBindless();
+    const VkPipelineLayout layout   = bindless.PipelineLayout();
+
+    // The HDR target is shared by all frames in flight: wait for the previous frame's bloom and
+    // tone mapping reads before overwriting (WAR, execution dependency only).
+    CmdImageBarrier(cmd, {.image     = m_Hdr.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                          .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
+
+    // No color clear: the sky covers every pixel without geometry.
+    const auto hdr = Attachment(m_Hdr.View(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+    auto depth     = Attachment(frame.depthView, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
+    depth.clearValue.depthStencil = {0.0f, 0}; // reverse-Z: far = 0
+
+    BeginRendering(cmd, frame.extent, &hdr, &depth);
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    SetViewportScissor(cmd, frame.extent);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Mesh.Handle());
+
+    const Frustum   frustum    = Frustum::FromViewProjection(camera.projection * camera.view);
+    const Model*    boundModel = nullptr;
+    VkCullModeFlags cullMode   = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
+    VkFrontFace     frontFace  = VK_FRONT_FACE_MAX_ENUM;
+
+    for (const DrawItem& item : m_DrawItems) {
+        for (const Submesh& sm : item.mesh->submeshes) {
+            if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world))) {
+                ++m_Stats.culled;
+                continue;
+            }
+            if (item.model != boundModel) {
+                vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+                boundModel = item.model;
+            }
+
+            const bool doubleSided    = (item.model->materialFlags[sm.material] & kMaterialDoubleSided) != 0;
+            const VkCullModeFlags cull = doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+            if (cull != cullMode) {
+                vkCmdSetCullMode(cmd, cull);
+                cullMode = cull;
+            }
+            if (item.frontFace != frontFace) {
+                vkCmdSetFrontFace(cmd, item.frontFace);
+                frontFace = item.frontFace;
+            }
+
+            const MeshPush push{.frame         = frameAddress,
+                                .vertices      = item.model->vertexBuffer.Address(),
+                                .materials     = item.model->materialBuffer.Address(),
+                                .draw          = item.drawData,
+                                .materialIndex = sm.material,
+                                .cascade       = 0};
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+            vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
+
+            ++m_Stats.drawCalls;
+            m_Stats.triangles += sm.indexCount / 3;
+        }
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+}
+
+void SceneRenderer::RenderBloom(VkCommandBuffer cmd)
+{
+    const auto&            bindless = m_Renderer.GetBindless();
+    const VkPipelineLayout layout   = bindless.PipelineLayout();
+    const auto             mips     = static_cast<std::uint32_t>(m_BloomViews.size());
+    const VkExtent2D       base     = m_Bloom.Extent2D();
+    constexpr auto         kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    constexpr auto         kRW      = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+    // Previous frames' bloom passes and tone mapping may still read the chain (WAR).
+    CmdImageBarrier(cmd, {.image     = m_Bloom.Handle(),
+                          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                          .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | kCompute,
+                          .dstStage  = kCompute,
+                          .dstAccess = kRW});
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+
+    const auto dispatch = [&](const Pipeline& pipeline, const BloomPush& push) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle());
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (push.dstSize.x + 7) / 8, (push.dstSize.y + 7) / 8, 1);
+        MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, kRW);
+    };
+
+    // Downsample: HDR -> mip 0 -> mip 1 -> ...
+    for (std::uint32_t mip = 0; mip < mips; ++mip) {
+        const VkExtent2D src = mip == 0 ? m_Hdr.Extent2D() : MipExtent(base, mip - 1);
+        const VkExtent2D dst = MipExtent(base, mip);
+        dispatch(m_BloomDown, {.src      = mip == 0 ? m_HdrSlot : m_BloomSampled[mip - 1],
+                               .dst      = m_BloomStorage[mip],
+                               .dstSize  = {dst.width, dst.height},
+                               .srcTexel = 1.0f / glm::vec2(static_cast<float>(src.width), static_cast<float>(src.height)),
+                               .karis    = mip == 0 ? 1u : 0u,
+                               .radius   = 0.0f});
+    }
+    // Upsample: mip[i] += tent(mip[i + 1]), smallest to largest.
+    for (std::uint32_t mip = mips - 1; mip-- > 0;) {
+        const VkExtent2D dst = MipExtent(base, mip);
+        dispatch(m_BloomUp, {.src      = m_BloomSampled[mip + 1],
+                             .dst      = m_BloomStorage[mip],
+                             .dstSize  = {dst.width, dst.height},
+                             .srcTexel = glm::vec2(0.0f),
+                             .karis    = 0u,
+                             .radius   = post.bloomRadius});
+    }
+    MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
 
 } // namespace Engine

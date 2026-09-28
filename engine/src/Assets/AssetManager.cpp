@@ -69,19 +69,32 @@ ModelHandle AssetManager::LoadModel(const std::filesystem::path& path)
         return {it->second, e.generation};
     }
 
+    const ModelHandle handle = StartJob(normalized, key, [normalized] { return LoadGltf(normalized); });
+    m_Cache.emplace(std::move(key), handle.index);
+    return handle;
+}
+
+ModelHandle AssetManager::CreateModel(ModelData data)
+{
+    std::filesystem::path name = data.name;
+    auto shared = std::make_shared<ModelData>(std::move(data)); // std::function must be copyable
+    return StartJob(std::move(name), {}, [shared] { return std::move(*shared); });
+}
+
+ModelHandle AssetManager::StartJob(std::filesystem::path path, std::u8string key, std::function<ModelData()> produce)
+{
     const ModelHandle handle = Allocate();
     Entry&            e      = m_Entries[handle.index];
     e.state    = AssetState::Loading;
     e.refCount = 1;
-    e.key      = key;
-    e.path     = normalized;
-    m_Cache.emplace(std::move(key), handle.index);
+    e.key      = std::move(key);
+    e.path     = std::move(path);
 
     {
         std::scoped_lock lock{m_ResultMutex};
         ++m_JobsInFlight;
     }
-    m_Jobs.Enqueue([this, handle, p = std::move(normalized)]() mutable { RunLoadJob(handle, std::move(p)); });
+    m_Jobs.Enqueue([this, handle, produce = std::move(produce)] { RunLoadJob(handle, produce); });
     return handle;
 }
 
@@ -96,7 +109,8 @@ void AssetManager::Release(ModelHandle handle)
     if (--e->refCount > 0)
         return;
 
-    m_Cache.erase(e->key); // a new Load() of this path starts from scratch
+    if (!e->key.empty())
+        m_Cache.erase(e->key); // a new Load() of this path starts from scratch
     if (e->state == AssetState::Loading) {
         e->orphaned = true; // the worker still reports to this slot
         return;
@@ -235,7 +249,7 @@ void AssetManager::Destroy(std::unique_ptr<Model> model, UploadTicket ticket)
         m_Graveyard.push_back({std::move(model), ticket});
 }
 
-void AssetManager::RunLoadJob(ModelHandle handle, std::filesystem::path path)
+void AssetManager::RunLoadJob(ModelHandle handle, const std::function<ModelData()>& produce)
 {
     // Worker thread: touches only the Renderer's thread-safe parts and m_Results.
     JobResult result;
@@ -244,7 +258,7 @@ void AssetManager::RunLoadJob(ModelHandle handle, std::filesystem::path path)
         result.error = "cancelled";
     } else {
         try {
-            const ModelData data = LoadGltf(path);
+            const ModelData data = produce();
             result.model         = std::make_unique<Model>();
             BuildModel(m_Renderer, data, *result.model, result.ticket);
         } catch (const std::exception& ex) {

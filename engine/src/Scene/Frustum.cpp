@@ -13,7 +13,7 @@ Aabb TransformAabb(const Aabb& box, const glm::mat4& m)
     return {newCenter - newExtents, newCenter + newExtents};
 }
 
-Frustum Frustum::FromViewProjection(const glm::mat4& vp)
+Frustum Frustum::FromViewProjection(const glm::mat4& vp, bool clipNear)
 {
     // glm is column-major: row i = (vp[0][i], vp[1][i], vp[2][i], vp[3][i]).
     const auto row = [&](int i) { return glm::vec4(vp[0][i], vp[1][i], vp[2][i], vp[3][i]); };
@@ -26,6 +26,8 @@ Frustum Frustum::FromViewProjection(const glm::mat4& vp)
                   r3 - r1,  // top:     y <= w
                   r2,       // z >= 0: far plane (infinite far with reverse-Z -> always true)
                   r3 - r2}; // z <= w: near plane with reverse-Z
+    if (!clipNear)
+        f.m_Planes[5] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f); // always inside
     return f;
 }
 

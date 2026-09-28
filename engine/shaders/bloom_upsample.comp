@@ -1,0 +1,38 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform BloomPush {
+    uint  src;       // sampled slot of the smaller level
+    uint  dst;       // storage slot of this level (read-modify-write)
+    uvec2 dstSize;
+    vec2  srcTexel;
+    uint  karis;
+    float radius;    // tent radius in UV units
+} pc;
+
+vec3 Tap(vec2 uv)
+{
+    return SampleTextureLod(pc.src, SAMPLER_LINEAR_CLAMP, uv, 0.0).rgb;
+}
+
+// 3x3 tent upsample, accumulated onto the current level: level[i] += up(level[i + 1]).
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.dstSize.x || id.y >= pc.dstSize.y)
+        return;
+    const vec2 uv = (vec2(id) + 0.5) / vec2(pc.dstSize);
+    const float r = pc.radius;
+
+    vec3 up = Tap(uv) * 4.0;
+    up += (Tap(uv + vec2(0.0, r)) + Tap(uv + vec2(-r, 0.0)) + Tap(uv + vec2(r, 0.0)) + Tap(uv + vec2(0.0, -r))) * 2.0;
+    up += Tap(uv + vec2(-r, r)) + Tap(uv + vec2(r, r)) + Tap(uv + vec2(-r, -r)) + Tap(uv + vec2(r, -r));
+    up *= 1.0 / 16.0;
+
+    const ivec2 texel = ivec2(id);
+    const vec3  cur   = imageLoad(uStorageImages[nonuniformEXT(pc.dst)], texel).rgb;
+    imageStore(uStorageImages[nonuniformEXT(pc.dst)], texel, vec4(cur + up, 1.0));
+}

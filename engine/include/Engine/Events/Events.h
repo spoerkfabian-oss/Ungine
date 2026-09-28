@@ -8,7 +8,7 @@ enum class InputAction : int { Release = 0, Press = 1, Repeat = 2 };
 
 namespace Key {
 inline constexpr int Space = 32, Minus = 45, Equal = 61;
-inline constexpr int A = 65, D = 68, E = 69, Q = 81, S = 83, T = 84, W = 87;
+inline constexpr int A = 65, B = 66, C = 67, D = 68, E = 69, P = 80, Q = 81, S = 83, T = 84, W = 87;
 inline constexpr int Right = 262, Left = 263, Down = 264, Up = 265;
 inline constexpr int Escape = 256, Enter = 257, Tab = 258, F1 = 290;
 inline constexpr int LeftShift = 340, LeftControl = 341;

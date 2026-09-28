@@ -46,6 +46,7 @@ layout(push_constant) uniform MeshPush {
     MaterialBuffer materials;
     DrawData       draw;
     uint           materialIndex;
+    uint           cascade; // shadow pass only
 } pc;
 
 #endif

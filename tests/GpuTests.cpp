@@ -2,6 +2,7 @@
 #include "Test.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/Primitives.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
@@ -186,6 +187,23 @@ TEST_CASE(Asset_ManyConcurrentLoads)
     fs::remove_all(dir);
 }
 
+TEST_CASE(Asset_GeneratedModelIsNotCached)
+{
+    const std::size_t cached = F().assets->CachedCount();
+    const ModelHandle a      = F().assets->CreateModel(MakePlane("Plane", 4.0f, MaterialData{.name = "Gray"}));
+    const ModelHandle b      = F().assets->CreateModel(MakePlane("Plane", 4.0f, MaterialData{.name = "Gray"}));
+    CHECK(a != b); // same name, still two assets
+    CHECK(F().assets->CachedCount() == cached);
+    CHECK(F().Pump([&] { return Settled(a) && Settled(b); }));
+
+    const Model* plane = F().assets->Get(a);
+    CHECK(plane && plane->meshes.size() == 1 && plane->meshes[0].submeshes[0].indexCount == 6);
+    F().assets->Release(a);
+    F().assets->Release(b);
+    CHECK(F().assets->State(a) == AssetState::Invalid && F().assets->State(b) == AssetState::Invalid);
+    CHECK(F().assets->CachedCount() == cached);
+}
+
 TEST_CASE(Asset_ShutdownWithLoadsInFlight)
 {
     // Destroying the manager mid-load must wait for the jobs and free everything.
@@ -211,6 +229,8 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     InstantiateModel(scene, h, *model);
     scene.UpdateTransforms();
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.shadows.resolution  = 1024; // lavapipe rasterizes on the CPU
+    renderer.shadows.maxDistance = 50.0f;
 
     const glm::vec3 center = (model->boundsMin + model->boundsMax) * 0.5f;
     const float     radius = glm::length(model->boundsMax - model->boundsMin) * 0.5f;
@@ -232,6 +252,18 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
 
     const SceneRenderStats facing = renderTowards(center);
     CHECK(facing.drawCalls > 0 && facing.culled == 0 && facing.triangles > 0);
+    CHECK(facing.shadowDraws >= facing.drawCalls); // at least one cascade sees every caster
+
+    // Feature toggles and runtime resolution changes (map recreation while frames are in flight).
+    renderer.post.bloom            = false;
+    renderer.shadows.debugCascades = true;
+    renderer.shadows.cascadeCount  = 2;
+    renderer.shadows.resolution    = 512;
+    CHECK(renderTowards(center).drawCalls == facing.drawCalls);
+    renderer.shadows.enabled = false;
+    CHECK(renderTowards(center).shadowDraws == 0);
+    renderer.shadows.enabled = true;
+    renderer.post.bloom      = true;
     // Moving the sun regenerates the IBL maps while earlier frames may still sample them.
     for (float angle : {0.3f, 1.2f, 2.5f}) {
         renderer.lighting.sky.sunDirection = glm::vec3(std::sin(angle), -0.6f, std::cos(angle));

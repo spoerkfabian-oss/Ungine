@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +52,8 @@ public:
     AssetManager& operator=(const AssetManager&) = delete;
 
     [[nodiscard]] ModelHandle LoadModel(const std::filesystem::path& path);
+    // Generated geometry (see Primitives.h): same async upload and lifecycle, never cached.
+    [[nodiscard]] ModelHandle CreateModel(ModelData data);
     void Release(ModelHandle handle);
 
     void Update();
@@ -71,8 +74,8 @@ private:
         bool                   orphaned   = false; // released while its job runs: freed when it lands
         AssetState             state      = AssetState::Invalid;
         std::uint32_t          refCount   = 0;
-        std::u8string          key;            // cache key (normalized path)
-        std::filesystem::path  path;
+        std::u8string          key;            // cache key (normalized path); empty: not cached
+        std::filesystem::path  path;           // file, or the model name for generated ones
         std::unique_ptr<Model> model;
         UploadTicket           ticket = 0;
         std::string            error;
@@ -97,7 +100,9 @@ private:
     [[nodiscard]] ModelHandle  Allocate();
     void Free(std::uint32_t index);
     void Destroy(std::unique_ptr<Model> model, UploadTicket ticket);
-    void RunLoadJob(ModelHandle handle, std::filesystem::path path);
+    [[nodiscard]] ModelHandle StartJob(std::filesystem::path path, std::u8string key,
+                                       std::function<ModelData()> produce);
+    void RunLoadJob(ModelHandle handle, const std::function<ModelData()>& produce);
 
     Renderer&   m_Renderer;
     ThreadPool& m_Jobs;

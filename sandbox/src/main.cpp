@@ -1,4 +1,5 @@
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/Primitives.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Events/Events.h"
 #include "Engine/Renderer/SceneRenderer.h"
@@ -42,6 +43,8 @@ protected:
             [this](const Engine::AssetLoadedEvent<Engine::Model>& e) {
                 if (e.handle == m_Model)
                     OnModelLoaded();
+                else if (e.handle == m_Ground)
+                    OnGroundLoaded();
             });
         m_FailedSub = GetEvents().Subscribe<Engine::AssetFailedEvent<Engine::Model>>(
             [this](const Engine::AssetFailedEvent<Engine::Model>& e) {
@@ -68,9 +71,10 @@ protected:
             const auto& post   = m_SceneRenderer->post;
             const char* status = m_LoadFailed ? " | load failed" : (m_LoadDone ? "" : " | loading...");
             GetWindow().SetTitle(std::format(
-                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled) | {} tris | {} x{:.2f}{}", m_FrameCount,
-                1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.triangles,
-                Engine::ToString(post.tonemapper), post.exposure, status));
+                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {} x{:.2f}{}{}",
+                m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.shadowDraws,
+                stats.triangles, Engine::ToString(post.tonemapper), post.exposure, post.bloom ? " | bloom" : "",
+                status));
             m_FpsTimer   = 0.0;
             m_FrameCount = 0;
         }
@@ -82,10 +86,16 @@ protected:
         m_SceneRenderer->Render(frame, m_Scene, m_Camera.GetData(aspect));
     }
 
-    void OnShutdown() override { GetAssets().Release(m_Model); }
+    void OnShutdown() override
+    {
+        GetAssets().Release(m_Model);
+        if (m_Ground)
+            GetAssets().Release(m_Ground);
+    }
 
 private:
-    // T: next tone mapper, -/=: exposure, arrow keys: rotate the sun (regenerates the IBL maps).
+    // T: next tone mapper, -/=: exposure, B: bloom, P: shadows, C: cascade colors,
+    // arrow keys: rotate the sun (regenerates the IBL maps).
     void UpdateLookControls(float dt)
     {
         const Engine::Input& input = GetInput();
@@ -99,6 +109,13 @@ private:
             post.exposure /= 1.25f;
         if (input.WasKeyPressed(Engine::Key::Equal))
             post.exposure *= 1.25f;
+        if (input.WasKeyPressed(Engine::Key::B))
+            post.bloom = !post.bloom;
+        auto& shadows = m_SceneRenderer->shadows;
+        if (input.WasKeyPressed(Engine::Key::P))
+            shadows.enabled = !shadows.enabled;
+        if (input.WasKeyPressed(Engine::Key::C))
+            shadows.debugCascades = !shadows.debugCascades;
 
         const auto  axis  = [&](int positive, int negative) {
             return (input.IsKeyDown(positive) ? 1.0f : 0.0f) - (input.IsKeyDown(negative) ? 1.0f : 0.0f);
@@ -131,6 +148,19 @@ private:
         m_Camera.nearPlane = std::clamp(radius * 0.01f, 0.001f, 0.1f);
         m_Camera.moveSpeed = std::max(radius, 0.1f);
         m_Camera.LookAt(center);
+
+        // Ground plane under the model (receives the shadows), shadow range scaled to the scene.
+        Engine::MaterialData ground{.name = "Ground", .baseColorFactor = glm::vec4(0.35f, 0.35f, 0.33f, 1.0f),
+                                    .metallic = 0.0f, .roughness = 0.85f};
+        m_Ground       = GetAssets().CreateModel(Engine::MakePlane("Ground", radius * 12.0f, ground));
+        m_GroundHeight = model->boundsMin.y;
+        m_SceneRenderer->shadows.maxDistance = radius * 10.0f;
+    }
+
+    void OnGroundLoaded()
+    {
+        const Engine::Entity root = Engine::InstantiateModel(m_Scene, m_Ground, *GetAssets().Get(m_Ground));
+        m_Scene.GetRegistry().Get<Engine::Transform>(root).position.y = m_GroundHeight;
     }
 
     std::filesystem::path                  m_ModelPath;
@@ -138,6 +168,8 @@ private:
     Engine::Subscription                   m_KeySub, m_LoadedSub, m_FailedSub;
     Engine::Scene                          m_Scene;
     Engine::ModelHandle                    m_Model;
+    Engine::ModelHandle                    m_Ground;
+    float                                  m_GroundHeight = 0.0f;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     Engine::FlyCamera                      m_Camera;
 

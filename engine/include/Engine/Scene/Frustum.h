@@ -17,7 +17,9 @@ struct Aabb {
 // an infinite far plane: that plane degenerates to "always inside".
 class Frustum {
 public:
-    [[nodiscard]] static Frustum FromViewProjection(const glm::mat4& viewProjection);
+    // clipNear = false keeps everything towards the viewer, e.g. shadow casters between the
+    // light and a cascade (they are depth-clamped onto its near plane).
+    [[nodiscard]] static Frustum FromViewProjection(const glm::mat4& viewProjection, bool clipNear = true);
 
     // False only if the box is completely outside one plane (may keep some invisible boxes).
     [[nodiscard]] bool Intersects(const Aabb& box) const;

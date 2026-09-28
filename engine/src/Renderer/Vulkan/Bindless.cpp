@@ -37,6 +37,25 @@ VkSampler CreateSampler(VkDevice device, VkFilter filter, VkSamplerAddressMode a
     VK_CHECK(vkCreateSampler(device, &info, nullptr, &sampler));
     return sampler;
 }
+// 2x2 hardware PCF. Outside the map: border depth 0 = farthest with reverse-Z -> lit.
+VkSampler CreateShadowSampler(VkDevice device)
+{
+    VkSamplerCreateInfo info{};
+    info.sType         = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    info.magFilter     = VK_FILTER_LINEAR;
+    info.minFilter     = VK_FILTER_LINEAR;
+    info.mipmapMode    = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    info.addressModeU  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.addressModeV  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.addressModeW  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    info.borderColor   = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    info.compareEnable = VK_TRUE;
+    info.compareOp     = VK_COMPARE_OP_GREATER_OR_EQUAL; // lit if receiver depth >= occluder depth
+    info.maxLod        = 0.0f;
+    VkSampler sampler  = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateSampler(device, &info, nullptr, &sampler));
+    return sampler;
+}
 } // namespace
 
 std::uint32_t BindlessRegistry::SlotAllocator::Allocate()
@@ -140,7 +159,8 @@ BindlessRegistry::BindlessRegistry(const VulkanContext& ctx)
     const float aniso = std::min(16.0f, ctx.Properties().limits.maxSamplerAnisotropy);
     m_DefaultSamplers = {CreateSampler(m_Device, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, aniso),
                          CreateSampler(m_Device, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, aniso),
-                         CreateSampler(m_Device, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 1.0f)};
+                         CreateSampler(m_Device, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 1.0f),
+                         CreateShadowSampler(m_Device)};
     for (std::uint32_t i = 0; i < m_DefaultSamplers.size(); ++i) {
         [[maybe_unused]] const std::uint32_t index = AddSampler(m_DefaultSamplers[i]);
         assert(index == i && "Default samplers must occupy the first slots");

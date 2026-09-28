@@ -2,6 +2,7 @@ add_library(Engine STATIC
     src/Assets/AssetManager.cpp
     src/Assets/GltfLoader.cpp
     src/Assets/Model.cpp
+    src/Assets/Primitives.cpp
     src/Core/Application.cpp
     src/Core/Input.cpp
     src/Core/ThreadPool.cpp
@@ -10,6 +11,7 @@ add_library(Engine STATIC
     src/Renderer/Environment.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
+    src/Renderer/ShadowCascades.cpp
     src/Renderer/Vulkan/Bindless.cpp
     src/Renderer/Vulkan/Buffer.cpp
     src/Renderer/Vulkan/Image.cpp
@@ -52,11 +54,14 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
     shaders/include/pbr.glsl
+    shaders/include/shadow.glsl
     shaders/include/sky.glsl)
 target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
 set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 engine_add_shaders(Engine SOURCES
+    shaders/bloom_downsample.comp
+    shaders/bloom_upsample.comp
     shaders/fullscreen.vert
     shaders/ibl_brdf.comp
     shaders/ibl_irradiance.comp
@@ -64,5 +69,7 @@ engine_add_shaders(Engine SOURCES
     shaders/ibl_sky.comp
     shaders/mesh.frag
     shaders/mesh.vert
+    shaders/shadow.vert
+    shaders/shadow_mask.frag
     shaders/sky.frag
     shaders/tonemap.frag)

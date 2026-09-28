@@ -2,6 +2,7 @@
 
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Core/ThreadPool.h"
+#include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Frustum.h"
 
@@ -153,6 +154,85 @@ TEST_CASE(Frustum_TransformAabb)
     // Mirroring must not produce an inverted box.
     const Aabb mirrored = TransformAabb(unit, glm::scale(glm::mat4(1.0f), glm::vec3(-2.0f, 1.0f, 1.0f)));
     CHECK(mirrored.min.x == -1.0f && mirrored.max.x == 1.0f);
+}
+
+TEST_CASE(Cascades_SplitDistribution)
+{
+    const auto uniform = ComputeCascadeSplits(1.0f, 101.0f, 4, 0.0f);
+    CHECK(std::abs(uniform[0] - 26.0f) < 1e-3f && std::abs(uniform[1] - 51.0f) < 1e-3f);
+    const auto logarithmic = ComputeCascadeSplits(1.0f, 10000.0f, 4, 1.0f);
+    CHECK(std::abs(logarithmic[0] - 10.0f) < 1e-2f && std::abs(logarithmic[2] - 1000.0f) < 1.0f);
+
+    const auto practical = ComputeCascadeSplits(0.1f, 60.0f, 4, 0.8f);
+    CHECK(practical[0] > 0.1f && practical[0] < practical[1] && practical[1] < practical[2]);
+    CHECK(practical[3] == 60.0f);
+    CHECK(ComputeCascadeSplits(0.1f, 60.0f, 2, 0.5f)[1] == 60.0f);
+}
+
+TEST_CASE(Cascades_OrthoReverseZ)
+{
+    const glm::mat4 p    = OrthoReverseZ(-2.0f, 2.0f, -1.0f, 1.0f, 0.5f, 10.0f);
+    const glm::vec4 near = p * glm::vec4(2.0f, -1.0f, -0.5f, 1.0f);
+    const glm::vec4 far  = p * glm::vec4(-2.0f, 1.0f, -10.0f, 1.0f);
+    CHECK(std::abs(near.x - 1.0f) < 1e-6f && std::abs(near.y + 1.0f) < 1e-6f && std::abs(near.z - 1.0f) < 1e-6f);
+    CHECK(std::abs(far.x + 1.0f) < 1e-6f && std::abs(far.y - 1.0f) < 1e-6f && std::abs(far.z) < 1e-6f);
+}
+
+namespace {
+CameraData TestCamera(glm::vec3 position, float yaw)
+{
+    const glm::vec3 forward{std::sin(yaw), -0.2f, -std::cos(yaw)};
+    return {.view       = glm::lookAt(position, position + forward, glm::vec3(0.0f, 1.0f, 0.0f)),
+            .projection = PerspectiveReverseZ(glm::radians(60.0f), 16.0f / 9.0f, 0.1f),
+            .position   = position,
+            .nearPlane  = 0.1f};
+}
+} // namespace
+
+TEST_CASE(Cascades_CoverTheirFrustumSlice)
+{
+    const ShadowSettings settings{.resolution = 2048, .maxDistance = 80.0f};
+    const glm::vec3      light{-0.4f, -0.8f, -0.3f};
+    const CameraData     camera   = TestCamera({3.0f, 2.0f, 5.0f}, 0.7f);
+    const auto           cascades = ComputeCascades(camera, light, settings);
+
+    // Every point of every slice must land inside its cascade (xy in [-1, 1], depth in [0, 1]).
+    const glm::mat4 world = glm::inverse(camera.view);
+    const float     tanX  = 1.0f / camera.projection[0][0];
+    const float     tanY  = 1.0f / camera.projection[1][1];
+    float           near  = camera.nearPlane;
+    for (std::uint32_t c = 0; c < settings.cascadeCount; ++c) {
+        for (const float d : {near, cascades[c].splitFar})
+            for (const float sx : {-1.0f, 1.0f})
+                for (const float sy : {-1.0f, 1.0f}) {
+                    const glm::vec4 p = world * glm::vec4(sx * d * tanX, sy * d * tanY, -d, 1.0f);
+                    const glm::vec4 q = cascades[c].viewProj * p;
+                    CHECK(std::abs(q.x) <= 1.0f && std::abs(q.y) <= 1.0f && q.z >= 0.0f && q.z <= 1.0f);
+                }
+        near = cascades[c].splitFar;
+    }
+}
+
+TEST_CASE(Cascades_StableUnderCameraMotion)
+{
+    const ShadowSettings settings{.resolution = 2048, .maxDistance = 80.0f};
+    const glm::vec3      light{-0.4f, -0.8f, -0.3f};
+
+    // Rotation only: same slice sizes -> identical projection scale in every cascade.
+    const auto a = ComputeCascades(TestCamera({0.0f, 2.0f, 0.0f}, 0.1f), light, settings);
+    const auto b = ComputeCascades(TestCamera({0.0f, 2.0f, 0.0f}, 2.3f), light, settings);
+    for (std::uint32_t c = 0; c < 4; ++c)
+        CHECK(a[c].viewProj[0][0] == b[c].viewProj[0][0] && a[c].texelWorldSize == b[c].texelWorldSize);
+
+    // Small translation: a fixed world point moves by whole shadow texels only (no shimmering).
+    const auto      moved = ComputeCascades(TestCamera({0.013f, 2.0f, 0.021f}, 0.1f), light, settings);
+    const glm::vec4 point{1.0f, 0.0f, -4.0f, 1.0f};
+    for (std::uint32_t c = 0; c < 4; ++c) {
+        const glm::vec2 ta = glm::vec2(a[c].viewProj * point) * (0.5f * settings.resolution);
+        const glm::vec2 tb = glm::vec2(moved[c].viewProj * point) * (0.5f * settings.resolution);
+        const glm::vec2 d  = ta - tb;
+        CHECK(std::abs(d.x - std::round(d.x)) < 1e-2f && std::abs(d.y - std::round(d.y)) < 1e-2f);
+    }
 }
 
 int main(int argc, char** argv)

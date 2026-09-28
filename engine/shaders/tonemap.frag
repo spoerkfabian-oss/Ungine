@@ -6,6 +6,8 @@ layout(push_constant) uniform TonemapPush {
     uint  hdrTexture;
     uint  tonemapper; // Engine::Tonemapper: 0 PBR Neutral, 1 ACES (fitted), 2 none (clamp)
     float exposure;
+    uint  bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
+    float bloomStrength; // 0 = bloom off (the texture is not read)
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -46,8 +48,16 @@ vec3 AcesFitted(vec3 color)
 void main()
 {
     // Same size as the swapchain: fetch the texel under this pixel.
-    const vec3 hdr = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
-                                ivec2(gl_FragCoord.xy), 0).rgb * pc.exposure;
+    const ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec3 hdr = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                          pixel, 0).rgb;
+    if (pc.bloomStrength > 0.0) {
+        const vec2 size  = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)],
+                                                      uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
+        const vec3 bloom = SampleTexture(pc.bloomTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size).rgb;
+        hdr              = mix(hdr, bloom, pc.bloomStrength);
+    }
+    hdr *= pc.exposure;
     vec3 ldr;
     switch (pc.tonemapper) {
     case 0u: ldr = PbrNeutral(hdr); break;

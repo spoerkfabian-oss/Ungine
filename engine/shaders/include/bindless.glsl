@@ -14,11 +14,18 @@ layout(set = 0, binding = 4, rgba16f) uniform image2DArray uStorageArrays[]; // 
 #define SAMPLER_LINEAR_REPEAT 0u
 #define SAMPLER_LINEAR_CLAMP  1u
 #define SAMPLER_NEAREST_CLAMP 2u
+#define SAMPLER_SHADOW        3u // comparison sampler (reverse-Z: GREATER_OR_EQUAL)
 
 // nonuniformEXT is required when indices can diverge within a draw (e.g. per-material).
 vec4 SampleTexture(uint texIndex, uint samplerIndex, vec2 uv)
 {
     return texture(sampler2D(uTextures[nonuniformEXT(texIndex)], uSamplers[nonuniformEXT(samplerIndex)]), uv);
+}
+
+// Explicit LOD: required outside fragment shaders (no implicit derivatives in compute).
+vec4 SampleTextureLod(uint texIndex, uint samplerIndex, vec2 uv, float lod)
+{
+    return textureLod(sampler2D(uTextures[nonuniformEXT(texIndex)], uSamplers[nonuniformEXT(samplerIndex)]), uv, lod);
 }
 
 vec4 SampleCube(uint cubeIndex, uint samplerIndex, vec3 dir, float lod)

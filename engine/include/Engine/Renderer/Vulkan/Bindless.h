@@ -9,7 +9,14 @@
 namespace Engine {
 
 // Pre-registered samplers, fixed indices (mirrored in bindless.glsl).
-enum class DefaultSampler : std::uint32_t { LinearRepeat = 0, LinearClamp = 1, NearestClamp = 2, Count };
+// ShadowCompare: linear depth comparison (GREATER_OR_EQUAL for reverse-Z), border = depth 0 (lit).
+enum class DefaultSampler : std::uint32_t {
+    LinearRepeat  = 0,
+    LinearClamp   = 1,
+    NearestClamp  = 2,
+    ShadowCompare = 3,
+    Count
+};
 
 inline constexpr std::uint32_t kPushConstantSize = 128; // guaranteed minimum on every device
 

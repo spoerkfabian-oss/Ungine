@@ -4,6 +4,7 @@
 #include "bindless.glsl"
 #include "mesh_common.glsl"
 #include "pbr.glsl"
+#include "shadow.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -14,6 +15,8 @@ layout(location = 0) out vec4 outColor;
 
 // Tangent frame from screen-space derivatives (Schueler, "Normal Mapping Without Precomputed
 // Tangents"). Scaled by sign(det) so it is independent of screen handedness (flipped viewport).
+// Returns (grad u, -grad v, N): glTF's bitangent cross(N, T) * w points towards decreasing v
+// (image up), for mirrored UVs as well.
 mat3 CotangentFrame(vec3 N, vec3 p, vec2 uv)
 {
     const vec3 dp1 = dFdx(p);
@@ -30,7 +33,8 @@ mat3 CotangentFrame(vec3 N, vec3 p, vec2 uv)
     if (lenSq < 1e-20) // no UVs: any frame works, the normal map is flat anyway
         return BasisFromNormal(N);
     const float s = dot(N, cross(dp1, dp2)) < 0.0 ? -1.0 : 1.0;
-    return mat3(T * (s * inversesqrt(lenSq)), B * (s * inversesqrt(lenSq)), N);
+    const float k = s * inversesqrt(lenSq);
+    return mat3(T * k, -B * k, N);
 }
 
 void main()
@@ -76,9 +80,15 @@ void main()
     const float NdotH = clamp(dot(N, H), 0.0, 1.0);
     const float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
+    // Shadows use the geometric normal (normal maps would drag the offset into the surface).
+    const float viewDepth = -(frame.view * vec4(inWorldPos, 1.0)).z;
+    uint        cascade;
+    const float shadow = NdotL > 0.0 ? SunShadow(frame, inWorldPos, tbn[2], viewDepth, gl_FragCoord.xy, cascade)
+                                     : 0.0;
+
     const vec3 F      = F_Schlick(f0, VdotH);
     const vec3 direct = ((1.0 - F) * cDiff / PI + F * (D_GGX(NdotH, a) * V_SmithGGXCorrelated(NdotV, NdotL, a))) *
-                        frame.sunRadiance.rgb * NdotL;
+                        frame.sunRadiance.rgb * (NdotL * shadow);
 
     // --- Image-based lighting: split sum + multiple-scattering compensation (Fdez-Aguera 2019) ---
     const vec2  lut      = SampleTexture(frame.ibl.z, SAMPLER_LINEAR_CLAMP, vec2(NdotV, roughness)).rg;
@@ -100,5 +110,11 @@ void main()
     const vec3  indirect = (FssEss * radiance + (FmsEms + kD) * irradiance) * ao * frame.sky.y;
 
     const vec3 emissive = m.emissiveFactor.rgb * SampleTexture(m.emissiveTexture, m.samplerIndex, inUV).rgb;
-    outColor = vec4(direct + indirect + emissive, 1.0);
+    vec3       color    = direct + indirect + emissive;
+
+    if (frame.shadowInfo.y != 0u && NdotL > 0.0 && cascade < 4u) { // debug: red, green, blue, yellow
+        const vec3 tint[4] = vec3[](vec3(1.0, 0.3, 0.3), vec3(0.3, 1.0, 0.3), vec3(0.3, 0.3, 1.0), vec3(1.0, 1.0, 0.3));
+        color *= tint[cascade];
+    }
+    outColor = vec4(color, 1.0);
 }

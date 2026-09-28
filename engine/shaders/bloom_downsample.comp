@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform BloomPush {
+    uint  src;       // sampled slot (previous level, or the HDR target)
+    uint  dst;       // storage slot of this level
+    uvec2 dstSize;
+    vec2  srcTexel;  // 1 / source size
+    uint  karis;     // first level: Karis average against fireflies
+    float radius;    // upsample only
+} pc;
+
+vec3 Tap(vec2 uv)
+{
+    return SampleTextureLod(pc.src, SAMPLER_LINEAR_CLAMP, uv, 0.0).rgb;
+}
+
+float KarisWeight(vec3 c)
+{
+    return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722)));
+}
+
+// 13-tap downsample (Jimenez, "Next Generation Post Processing in Call of Duty: AW", 2014).
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.dstSize.x || id.y >= pc.dstSize.y)
+        return;
+    const vec2 uv = (vec2(id) + 0.5) / vec2(pc.dstSize);
+    const vec2 t  = pc.srcTexel;
+
+    const vec3 a = Tap(uv + t * vec2(-2.0, 2.0)), b = Tap(uv + t * vec2(0.0, 2.0)), c = Tap(uv + t * vec2(2.0, 2.0));
+    const vec3 d = Tap(uv + t * vec2(-2.0, 0.0)), e = Tap(uv), f = Tap(uv + t * vec2(2.0, 0.0));
+    const vec3 g = Tap(uv + t * vec2(-2.0, -2.0)), h = Tap(uv + t * vec2(0.0, -2.0)), i = Tap(uv + t * vec2(2.0, -2.0));
+    const vec3 j = Tap(uv + t * vec2(-1.0, 1.0)), k = Tap(uv + t * vec2(1.0, 1.0));
+    const vec3 l = Tap(uv + t * vec2(-1.0, -1.0)), m = Tap(uv + t * vec2(1.0, -1.0));
+
+    vec3 result;
+    if (pc.karis != 0u) {
+        // Five 2x2 boxes, each weighted by 1 / (1 + luma): a single very bright texel cannot dominate.
+        const vec3 box0 = (j + k + l + m) * 0.25;
+        const vec3 box1 = (a + b + d + e) * 0.25, box2 = (b + c + e + f) * 0.25;
+        const vec3 box3 = (d + e + g + h) * 0.25, box4 = (e + f + h + i) * 0.25;
+        const float w0 = 0.5 * KarisWeight(box0), w1 = 0.125 * KarisWeight(box1), w2 = 0.125 * KarisWeight(box2);
+        const float w3 = 0.125 * KarisWeight(box3), w4 = 0.125 * KarisWeight(box4);
+        result = (box0 * w0 + box1 * w1 + box2 * w2 + box3 * w3 + box4 * w4) / (w0 + w1 + w2 + w3 + w4);
+    } else {
+        result = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.dst)], ivec2(id), vec4(max(result, 0.0), 1.0));
+}
