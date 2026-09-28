@@ -8,6 +8,7 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -769,6 +770,128 @@ TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
     { std::ofstream(broken) << "{ not json"; }
     CHECK(!editor.OpenScene(broken) && r.AliveCount() == initial);
     fs::remove(broken);
+
+    for (ModelHandle ref : modelRefs)
+        F().assets->Release(ref);
+    F().assets->Release(h);
+}
+
+TEST_CASE(Physics_MeshColliderAndEditorPlayStop)
+{
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+
+    // Mesh collider on a model that is still loading: pending until it is Ready.
+    const ModelHandle h    = F().assets->LoadModel(kBox);
+    const Entity      mesh = scene.CreateEntity("Mesh");
+    r.Emplace<MeshRenderer>(mesh, MeshRenderer{.model = h, .meshIndex = 0});
+    r.Emplace<RigidBody>(mesh, RigidBody{.type = BodyType::Dynamic}); // falls back to static
+    r.Emplace<Collider>(mesh, Collider{.shape = ColliderShape::Mesh});
+    scene.EditTransform(mesh).scale = {2.0f, 1.0f, 2.0f};
+    physics.Sync(scene);
+    CHECK(!physics.HasBody(mesh) && physics.Stats().pendingMeshes == 1);
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr && !model->collisionPositions.empty());
+    if (!model)
+        return;
+    physics.Sync(scene);
+    CHECK(physics.HasBody(mesh) && physics.Activity(mesh) == BodyActivity::Static);
+
+    // The ray hits the scaled triangles (top face of the box mesh).
+    Aabb local{glm::vec3(1e30f), glm::vec3(-1e30f)};
+    for (const Submesh& sm : model->meshes[0].submeshes) {
+        local.min = glm::min(local.min, sm.boundsMin);
+        local.max = glm::max(local.max, sm.boundsMax);
+    }
+    const Aabb world = TransformAabb(local, r.Get<WorldTransform>(mesh).matrix);
+    const auto hit   = physics.Raycast({0.25f, 10.0f, 0.25f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+    CHECK(hit && hit->entity == mesh && std::abs(hit->point.y - world.max.y) < 1e-3f);
+    const auto side = physics.Raycast({10.0f, 0.5f * (world.min.y + world.max.y), 0.0f}, {-1.0f, 0.0f, 0.0f}, 100.0f);
+    CHECK(side && std::abs(side->point.x - world.max.x) < 1e-3f && glm::dot(side->normal, glm::vec3(1, 0, 0)) > 0.99f);
+
+    // Editor Play / Pause / Step / Stop.
+    const Entity ball = scene.CreateEntity("Ball");
+    scene.EditTransform(ball).position = {0.0f, world.max.y + 3.0f, 0.0f};
+    r.Emplace<RigidBody>(ball);
+    Collider sphere;
+    sphere.shape  = ColliderShape::Sphere;
+    sphere.radius = 0.25f;
+    r.Emplace<Collider>(ball, sphere);
+    const std::uint64_t ballUuid = r.Get<Uuid>(ball).value;
+    const std::uint64_t meshUuid = r.Get<Uuid>(mesh).value; // entities are recreated by Stop
+    const glm::vec3     start    = scene.GetTransform(ball).position;
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics});
+    camera.position = {0.0f, world.max.y + 2.0f, 6.0f};
+    camera.LookAt({0.0f, world.max.y, 0.0f});
+    const auto runFrames = [&](int count, int stepsPerFrame) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            for (int s = 0; s < stepsPerFrame; ++s)
+                editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    editor.Select(ball);
+    runFrames(3, 4); // edit mode: FixedUpdate does not simulate, bodies follow the scene
+    CHECK(scene.GetTransform(ball).position == start && physics.HasBody(ball));
+    const bool couldUndo = editor.CanUndo();
+
+    editor.Play();
+    CHECK(editor.GetPlayState() == PlayState::Playing);
+    runFrames(20, 6); // 2 s
+    const Entity playBall = scene.FindByUuid(ballUuid);
+    CHECK(playBall != NullEntity && std::abs(scene.GetTransform(playBall).position.y - (world.max.y + 0.25f)) < 0.03f);
+    CHECK(editor.CanUndo() == couldUndo); // no history while playing
+    CHECK(!editor.SaveScene(fs::path(ENGINE_ASSET_DIR) / "test_play.scene.json"));
+    CHECK(!fs::exists(fs::path(ENGINE_ASSET_DIR) / "test_play.scene.json"));
+
+    // Pause holds, Step advances exactly one fixed step.
+    physics.AddImpulse(playBall, {0.0f, 3.0f, 0.0f});
+    editor.Pause();
+    const glm::vec3 paused = scene.GetTransform(playBall).position;
+    runFrames(2, 3);
+    CHECK(scene.GetTransform(playBall).position == paused);
+    editor.StepOnce();
+    runFrames(1, 3);
+    CHECK(std::abs(scene.GetTransform(playBall).position.y - paused.y - 3.0f / 60.0f) < 0.02f);
+
+    // Stop restores the scene; the selection follows the UUID.
+    editor.Stop();
+    CHECK(editor.GetPlayState() == PlayState::Edit);
+    const Entity restored = scene.FindByUuid(ballUuid);
+    CHECK(restored != NullEntity && scene.GetTransform(restored).position == start);
+    CHECK(editor.Selected() == restored);
+    runFrames(2, 2);
+    CHECK(physics.HasBody(restored) && scene.GetTransform(restored).position == start);
+    CHECK(physics.HasBody(scene.FindByUuid(meshUuid)));
+    CHECK(scene.CountStaleTransforms() == 0);
+
+    // A second session starts from the restored scene.
+    editor.Play();
+    runFrames(5, 6);
+    CHECK(scene.GetTransform(scene.FindByUuid(ballUuid)).position != start);
+    editor.Stop();
+    CHECK(scene.GetTransform(scene.FindByUuid(ballUuid)).position == start);
 
     for (ModelHandle ref : modelRefs)
         F().assets->Release(ref);

@@ -98,6 +98,86 @@ Light LightFromJson(const json& j)
     return l;
 }
 
+template <class E, std::size_t N>
+json EnumToJson(E value, const char* const (&names)[N])
+{
+    return names[static_cast<std::size_t>(value)];
+}
+template <class E, std::size_t N>
+void ReadEnum(const json& j, const char* key, E& value, const char* const (&names)[N])
+{
+    std::string name;
+    Read(j, key, name);
+    for (std::size_t i = 0; i < N; ++i)
+        if (name == names[i])
+            value = static_cast<E>(i);
+}
+
+constexpr const char* kBodyTypes[]      = {"static", "kinematic", "dynamic"};
+constexpr const char* kColliderShapes[] = {"box", "sphere", "capsule", "mesh"};
+
+json RigidBodyToJson(const RigidBody& b)
+{
+    return {{"type", EnumToJson(b.type, kBodyTypes)}, {"mass", b.mass},
+            {"linearDamping", b.linearDamping},       {"angularDamping", b.angularDamping},
+            {"gravityFactor", b.gravityFactor},       {"allowSleeping", b.allowSleeping}};
+}
+
+RigidBody RigidBodyFromJson(const json& j)
+{
+    RigidBody b;
+    ReadEnum(j, "type", b.type, kBodyTypes);
+    Read(j, "mass", b.mass);
+    Read(j, "linearDamping", b.linearDamping);
+    Read(j, "angularDamping", b.angularDamping);
+    Read(j, "gravityFactor", b.gravityFactor);
+    Read(j, "allowSleeping", b.allowSleeping);
+    return b;
+}
+
+json ColliderToJson(const Collider& c)
+{
+    return {{"shape", EnumToJson(c.shape, kColliderShapes)},
+            {"halfExtents", ToJson(c.halfExtents)},
+            {"radius", c.radius},
+            {"halfHeight", c.halfHeight},
+            {"center", ToJson(c.center)},
+            {"friction", c.friction},
+            {"restitution", c.restitution},
+            {"trigger", c.trigger}};
+}
+
+Collider ColliderFromJson(const json& j)
+{
+    Collider c;
+    ReadEnum(j, "shape", c.shape, kColliderShapes);
+    Read(j, "halfExtents", c.halfExtents);
+    Read(j, "radius", c.radius);
+    Read(j, "halfHeight", c.halfHeight);
+    Read(j, "center", c.center);
+    Read(j, "friction", c.friction);
+    Read(j, "restitution", c.restitution);
+    Read(j, "trigger", c.trigger);
+    return c;
+}
+
+json CharacterToJson(const CharacterController& c)
+{
+    return {{"radius", c.radius},         {"height", c.height},         {"maxSlope", c.maxSlope},
+            {"stepHeight", c.stepHeight}, {"jumpSpeed", c.jumpSpeed}};
+}
+
+CharacterController CharacterFromJson(const json& j)
+{
+    CharacterController c;
+    Read(j, "radius", c.radius);
+    Read(j, "height", c.height);
+    Read(j, "maxSlope", c.maxSlope);
+    Read(j, "stepHeight", c.stepHeight);
+    Read(j, "jumpSpeed", c.jumpSpeed);
+    return c;
+}
+
 json PrimitiveToJson(const PrimitiveDesc& p)
 {
     return {{"shape", ToString(p.shape)}, {"size", p.size},          {"baseColor", ToJson(p.baseColor)},
@@ -109,7 +189,7 @@ PrimitiveDesc PrimitiveFromJson(const json& j)
     PrimitiveDesc p;
     std::string   shape = ToString(p.shape);
     Read(j, "shape", shape);
-    p.shape = shape == ToString(PrimitiveShape::Plane) ? PrimitiveShape::Plane : PrimitiveShape::Box;
+    p.shape = PrimitiveShapeFromString(shape).value_or(PrimitiveShape::Box);
     Read(j, "size", p.size);
     Read(j, "baseColor", p.baseColor);
     Read(j, "metallic", p.metallic);
@@ -183,7 +263,22 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
     }
     if (const auto* light = r.TryGet<Light>(e))
         j["light"] = LightToJson(*light);
+    if (const auto* body = r.TryGet<RigidBody>(e))
+        j["rigidBody"] = RigidBodyToJson(*body);
+    if (const auto* collider = r.TryGet<Collider>(e))
+        j["collider"] = ColliderToJson(*collider);
+    if (const auto* character = r.TryGet<CharacterController>(e))
+        j["character"] = CharacterToJson(*character);
     return j;
+}
+
+template <class T, class F>
+void ApplyOptional(Registry& r, Entity e, const json& j, const char* key, F fromJson)
+{
+    if (const auto it = j.find(key); it != j.end())
+        r.EmplaceOrReplace<T>(e, fromJson(*it));
+    else
+        r.Remove<T>(e);
 }
 
 // Overwrites the components with the JSON's; components missing there are removed.
@@ -209,6 +304,9 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         r.EmplaceOrReplace<Light>(e, LightFromJson(*it));
     else
         r.Remove<Light>(e);
+    ApplyOptional<RigidBody>(r, e, j, "rigidBody", RigidBodyFromJson);
+    ApplyOptional<Collider>(r, e, j, "collider", ColliderFromJson);
+    ApplyOptional<CharacterController>(r, e, j, "character", CharacterFromJson);
     scene.MarkChanged(e); // bounds / shadow caches
 }
 

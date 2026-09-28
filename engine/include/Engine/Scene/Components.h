@@ -64,6 +64,54 @@ struct Light {
     bool      castShadows    = true; // candidate for the shadow atlas (the renderer picks the most important)
 };
 
+// --- Physics (simulated by PhysicsWorld; a body needs RigidBody + Collider) ---
+
+enum class BodyType : std::uint8_t { Static, Kinematic, Dynamic };
+
+// Static: never moves (moving it by hand teleports it). Kinematic: follows its Transform (animation,
+// gizmo) and pushes dynamic bodies. Dynamic: simulated, the physics writes its Transform.
+struct RigidBody {
+    BodyType type           = BodyType::Dynamic;
+    float    mass           = 1.0f; // kg, dynamic only
+    float    linearDamping  = 0.05f;
+    float    angularDamping = 0.05f;
+    float    gravityFactor  = 1.0f;
+    bool     allowSleeping  = true;
+
+    bool operator==(const RigidBody&) const = default;
+};
+
+enum class ColliderShape : std::uint8_t { Box, Sphere, Capsule, Mesh };
+
+// Collision shape in the entity's local space, scaled by its world scale (box and mesh per axis,
+// sphere and capsule by the largest axis). Capsules are Y-up. Mesh uses the triangles of the
+// entity's MeshRenderer and is static or kinematic only (dynamic falls back to static).
+struct Collider {
+    ColliderShape shape = ColliderShape::Box;
+    glm::vec3     halfExtents{0.5f};  // box
+    float         radius     = 0.5f;  // sphere, capsule
+    float         halfHeight = 0.5f;  // capsule: half the cylinder part
+    glm::vec3     center{0.0f};       // offset in local space
+    float         friction    = 0.5f;
+    float         restitution = 0.0f;
+    bool          trigger     = false; // sensor: reports CollisionEvents, no collision response
+
+    bool operator==(const Collider&) const = default;
+};
+
+// Kinematic character (capsule, feet at the entity's position) moved by PhysicsWorld::SetCharacterInput:
+// walks up steps and ramps up to maxSlope, sticks to the floor, jumps, pushes dynamic bodies.
+// Takes precedence over RigidBody / Collider on the same entity.
+struct CharacterController {
+    float radius     = 0.3f;
+    float height     = 1.8f;  // total, incl. the hemispheres
+    float maxSlope   = 0.87266463f; // radians (50 degrees)
+    float stepHeight = 0.35f;
+    float jumpSpeed  = 5.0f;  // m/s
+
+    bool operator==(const CharacterController&) const = default;
+};
+
 // Illuminance below which a light without explicit range is cut off (lights need a finite range
 // for clustering).
 inline constexpr float kLightCutoffIlluminance = 0.005f;

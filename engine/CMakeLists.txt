@@ -29,6 +29,7 @@ add_library(Engine STATIC
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
     src/Scene/SpatialIndex.cpp
+    src/Physics/PhysicsWorld.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
 target_include_directories(Engine PUBLIC include PRIVATE src)
@@ -36,7 +37,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json)
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt)
 
 target_compile_definitions(Engine PUBLIC
     GLFW_INCLUDE_NONE

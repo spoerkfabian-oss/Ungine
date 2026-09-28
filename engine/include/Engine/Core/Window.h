@@ -1,6 +1,8 @@
 #pragma once
 #include "Engine/Renderer/Vulkan/VkCommon.h"
 
+#include <glm/glm.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -38,6 +40,7 @@ public:
     [[nodiscard]] bool       ShouldClose() const;
     [[nodiscard]] bool       IsMinimized() const;
     [[nodiscard]] VkExtent2D FramebufferExtent() const;
+    [[nodiscard]] glm::vec2  WindowSize() const; // screen coordinates (mouse positions), may differ on HiDPI
 
     [[nodiscard]] VkSurfaceKHR CreateSurface(VkInstance instance) const;
     [[nodiscard]] GLFWwindow*  Native() const { return m_Handle; }

@@ -129,6 +129,9 @@ struct Model {
     std::vector<ModelNode>     nodes;
     glm::vec3                  boundsMin{0.0f};
     glm::vec3                  boundsMax{0.0f};
+    // CPU copy of the geometry for mesh colliders (submesh ranges as on the GPU).
+    std::vector<glm::vec3>     collisionPositions;
+    std::vector<std::uint32_t> collisionIndices;
 };
 
 // Creates the GPU resources and records their upload on the UploadQueue; `ticket` covers all

@@ -26,6 +26,7 @@ class FileDialog;
 class FlyCamera;
 class History;
 class ImGuiLayer;
+class PhysicsWorld;
 class Scene;
 class SceneRenderer;
 class Window;
@@ -43,11 +44,15 @@ struct EditorContext {
     // Models the editor acquired (scene files, asset browser, primitives). Owned by the
     // application so they outlive the editor (F1 toggle); released on New/Open scene.
     std::vector<ModelHandle>& modelRefs;
+    // Optional: Play mode, collider overlay, physics inspector. The editor steps it only while playing.
+    PhysicsWorld* physics = nullptr;
 };
+
+enum class PlayState : std::uint8_t { Edit, Playing, Paused };
 
 // ImGui editor: dockspace with Viewport (scene rendered into a texture, GPU picking, outline,
 // transform gizmo), Hierarchy, Inspector, Renderer settings, Stats and Assets; undo/redo of
-// scene edits, multi-selection, duplicate, scene files (JSON).
+// scene edits, multi-selection, duplicate, scene files (JSON), physics Play / Pause / Stop.
 // Main thread only; the ImGui dependency stays inside the Editor library.
 class Editor {
 public:
@@ -59,6 +64,9 @@ public:
 
     // Once per frame, before rendering: ImGui frame, panels, gizmo, hotkeys. dt in seconds.
     void Update(float dt);
+    // Fixed-rate tick: steps the physics while playing (or once after StepOnce). In edit mode the
+    // bodies only follow the scene (Sync in Update).
+    void FixedUpdate(float dt);
     // Scene into the viewport texture, then the UI into the swapchain image.
     void Render(const FrameContext& frame);
 
@@ -82,6 +90,14 @@ public:
     [[nodiscard]] bool CanRedo() const;
     [[nodiscard]] bool HasUnsavedChanges() const;
 
+    // Play mode: Play snapshots the scene and starts the simulation, Stop restores the snapshot
+    // (selection kept by UUID). No undo history while playing; scene files are locked.
+    [[nodiscard]] PlayState GetPlayState() const { return m_PlayState; }
+    void                    Play();     // from Edit: snapshot + simulate; from Paused: resume
+    void                    Pause();
+    void                    Stop();     // back to the snapshot
+    void                    StepOnce(); // paused: one fixed step
+
     // Scene files. New/Open replace the scene and release the editor's model refs.
     void NewScene();
     bool OpenScene(const std::filesystem::path& file); // false: error (logged, scene unchanged)
@@ -103,6 +119,9 @@ private:
     // Light icons (click selects), range sphere / spot cone of the selected light. True: an icon was hit.
     bool DrawLightOverlay(float x, float y, float width, float height, bool clicked);
     void DrawBvhOverlay(float x, float y, float width, float height);
+    void DrawColliderOverlay(float x, float y, float width, float height);
+    // Local bounds of the entity's MeshRenderer mesh (collider fitting); nullopt without a ready mesh.
+    [[nodiscard]] std::optional<std::pair<glm::vec3, glm::vec3>> MeshBounds(Entity entity) const;
     // World bounds of the selection (meshes in the selected subtrees); nullopt if there are none.
     [[nodiscard]] std::optional<Aabb> SelectionBounds() const;
     // Where new objects go: the surface under the viewport center, else in front of the camera.
@@ -164,6 +183,12 @@ private:
     bool                m_ShowLightIcons  = true;
     bool                m_ShowBvh         = false; // BVH nodes + selection bounds in the viewport
     int                 m_BvhDepth        = 8;
+    bool                m_ShowColliders   = true;
+
+    // Play mode
+    PlayState   m_PlayState = PlayState::Edit;
+    std::string m_PlaySnapshot; // whole scene before Play
+    bool        m_StepRequested = false;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
     std::optional<std::vector<StateEdit>> m_GizmoEdit;

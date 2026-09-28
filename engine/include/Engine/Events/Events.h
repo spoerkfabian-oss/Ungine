@@ -10,7 +10,7 @@ namespace Key {
 inline constexpr int Space = 32, Minus = 45, Equal = 61;
 inline constexpr int A = 65, B = 66, C = 67, D = 68, E = 69, O = 79, P = 80, Q = 81, S = 83, T = 84;
 inline constexpr int V = 86, W = 87, X = 88;
-inline constexpr int F = 70, L = 76, R = 82;
+inline constexpr int F = 70, G = 71, H = 72, J = 74, L = 76, R = 82;
 inline constexpr int Delete = 261, Right = 262, Left = 263, Down = 264, Up = 265;
 inline constexpr int Escape = 256, Enter = 257, Tab = 258, F1 = 290;
 inline constexpr int LeftShift = 340, LeftControl = 341;

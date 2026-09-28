@@ -71,6 +71,11 @@ void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTic
     out.nodes     = data.nodes;
     out.boundsMin = data.boundsMin;
     out.boundsMax = data.boundsMax;
+
+    out.collisionPositions.reserve(data.vertices.size());
+    for (const Vertex& v : data.vertices)
+        out.collisionPositions.push_back(v.position);
+    out.collisionIndices = data.indices;
 }
 
 void ReleaseModel(Renderer& renderer, Model&& model)

@@ -5,6 +5,7 @@
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -28,11 +29,14 @@ std::uint64_t Editor::UuidOf(Entity entity) const
 
 void Editor::PushCommand(EditCommand command)
 {
-    m_History->Push(std::move(command));
+    if (m_PlayState == PlayState::Edit) // play-mode changes are discarded by Stop
+        m_History->Push(std::move(command));
 }
 
 bool Editor::Undo()
 {
+    if (m_PlayState != PlayState::Edit)
+        return false;
     m_GizmoEdit.reset();
     m_InspectorEdit.reset();
     const bool done = m_History->Undo();
@@ -43,6 +47,8 @@ bool Editor::Undo()
 
 bool Editor::Redo()
 {
+    if (m_PlayState != PlayState::Edit)
+        return false;
     m_GizmoEdit.reset();
     m_InspectorEdit.reset();
     const bool done = m_History->Redo();
@@ -123,11 +129,14 @@ Entity Editor::CreatePrimitiveEntity(PrimitiveShape shape)
     const float       scale  = std::max(m_Ctx.camera.moveSpeed, 0.1f);
     const ModelHandle handle = m_Ctx.assets.CreatePrimitive({.shape = shape, .size = scale});
     m_Ctx.modelRefs.push_back(handle); // renders once the (async) upload is done
-    const Entity e = m_Ctx.scene.CreateEntity(shape == PrimitiveShape::Box ? "Cube" : "Plane");
-    m_Ctx.scene.EditTransform(e).position = PlacementPoint(3.0f * scale) + glm::vec3(0.0f, 0.5f * scale, 0.0f);
+    static constexpr const char* kNames[] = {"Plane", "Cube", "Sphere", "Capsule"};
+    const char*                  name     = kNames[static_cast<std::size_t>(shape)];
+    const Entity                 e        = m_Ctx.scene.CreateEntity(name);
+    const float lift = shape == PrimitiveShape::Capsule ? scale : 0.5f * scale; // rest on the surface
+    m_Ctx.scene.EditTransform(e).position = PlacementPoint(3.0f * scale) + glm::vec3(0.0f, lift, 0.0f);
     m_Ctx.scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = handle, .meshIndex = 0});
     const Entity roots[] = {e};
-    PushCreated(shape == PrimitiveShape::Box ? "Create cube" : "Create plane", roots);
+    PushCreated(std::string("Create ") + name, roots);
     return e;
 }
 
@@ -231,6 +240,7 @@ void Editor::ReleaseModelRefs()
 
 void Editor::RequestSceneChange(std::function<void()> action)
 {
+    Stop(); // the play state is never saved: continue from the edit scene
     if (!HasUnsavedChanges()) {
         action();
         return;
@@ -288,6 +298,10 @@ bool Editor::OpenScene(const std::filesystem::path& file)
 
 bool Editor::SaveScene(const std::filesystem::path& file)
 {
+    if (m_PlayState != PlayState::Edit) {
+        m_Status = "Stop playing to save";
+        return false;
+    }
     try {
         SaveSceneFile(file, m_Ctx.scene, m_Ctx.assets, {.renderer = &m_Ctx.sceneRenderer, .camera = &m_Ctx.camera});
     } catch (const std::exception& e) {
@@ -333,6 +347,94 @@ void Editor::DrawDialogs()
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
+    }
+}
+
+} // namespace Engine
+
+namespace Engine {
+
+// ---------------------------------------------------------------------------------------------
+// Play mode
+// ---------------------------------------------------------------------------------------------
+
+void Editor::Play()
+{
+    if (!m_Ctx.physics)
+        return;
+    if (m_PlayState == PlayState::Paused) {
+        m_PlayState = PlayState::Playing;
+        return;
+    }
+    if (m_PlayState != PlayState::Edit)
+        return;
+    // Finish edits in progress so they land in the history before it is frozen.
+    if (m_InspectorEdit)
+        PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+    if (m_GizmoEdit)
+        PushStateChange("Transform", std::exchange(m_GizmoEdit, std::nullopt).value());
+
+    std::vector<Entity> roots;
+    m_Ctx.scene.GetRegistry().ViewOf<Hierarchy>().Each([&](Entity e, Hierarchy& h) {
+        if (h.parent == NullEntity)
+            roots.push_back(e);
+    });
+    std::reverse(roots.begin(), roots.end()); // views iterate backwards: keep creation order
+    m_PlaySnapshot = SnapshotEntities(m_Ctx.scene, roots);
+    m_Ctx.physics->Reset(); // fresh bodies: no velocities or sleep state from editing
+    m_PlayState    = PlayState::Playing;
+    m_StepRequested = false;
+    m_Status       = "Playing";
+}
+
+void Editor::Pause()
+{
+    if (m_PlayState == PlayState::Playing)
+        m_PlayState = PlayState::Paused;
+}
+
+void Editor::StepOnce()
+{
+    if (m_PlayState == PlayState::Playing)
+        m_PlayState = PlayState::Paused;
+    if (m_PlayState == PlayState::Paused)
+        m_StepRequested = true;
+}
+
+void Editor::Stop()
+{
+    if (m_PlayState == PlayState::Edit)
+        return;
+    std::vector<std::uint64_t> selected;
+    for (Entity e : m_Selection)
+        if (m_Ctx.scene.GetRegistry().Valid(e))
+            selected.push_back(UuidOf(e));
+
+    m_Ctx.scene.Clear();
+    (void)RestoreEntities(m_Ctx.scene, m_PlaySnapshot, RestoreMode::Original);
+    m_Ctx.scene.UpdateTransforms();
+    m_Ctx.physics->Reset();
+
+    m_Selection.clear();
+    for (std::uint64_t uuid : selected)
+        if (const Entity e = m_Ctx.scene.FindByUuid(uuid); e != NullEntity)
+            m_Selection.push_back(e);
+    m_GizmoEdit.reset();
+    m_InspectorEdit.reset();
+    m_EulerEntity   = NullEntity;
+    m_PlaySnapshot.clear();
+    m_PlayState     = PlayState::Edit;
+    m_StepRequested = false;
+    m_Status        = "Stopped";
+}
+
+void Editor::FixedUpdate(float dt)
+{
+    if (!m_Ctx.physics)
+        return;
+    if (m_PlayState == PlayState::Playing || (m_PlayState == PlayState::Paused && m_StepRequested)) {
+        m_Ctx.physics->Step(m_Ctx.scene, dt);
+        m_StepRequested = false;
     }
 }
 
