@@ -1,0 +1,55 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform DenoisePush {
+    uint  src;       // raw GTAO (sampled, GENERAL)
+    uint  depth;
+    uint  dst;       // storage
+    uint  _pad;
+    vec2  invSize;
+    float nearPlane;
+    float sharpness; // higher: stronger depth edge stopping
+} pc;
+
+float Fetch(uint slot, ivec2 p)
+{
+    return texelFetch(sampler2D(uTextures[nonuniformEXT(slot)], uSamplers[SAMPLER_NEAREST_CLAMP]), p, 0).r;
+}
+
+float ViewDistance(float depth)
+{
+    return pc.nearPlane / max(depth, 1e-7);
+}
+
+// 5x5 depth-aware blur: removes the per-pixel slice/step noise without bleeding across edges.
+void main()
+{
+    const ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(round(1.0 / pc.invSize));
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    const float depth = Fetch(pc.depth, id);
+    float       ao    = 1.0;
+    if (depth > 0.0) {
+        const float center = ViewDistance(depth);
+        float       sum    = 0.0;
+        float       weight = 0.0;
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                const ivec2 p = clamp(id + ivec2(x, y), ivec2(0), size - 1);
+                const float d = Fetch(pc.depth, p);
+                if (d <= 0.0)
+                    continue;
+                const float w = exp(-abs(ViewDistance(d) - center) / center * pc.sharpness);
+                sum += Fetch(pc.src, p) * w;
+                weight += w;
+            }
+        }
+        ao = sum / max(weight, 1e-4);
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.dst)], id, vec4(ao, 0.0, 0.0, 1.0));
+}

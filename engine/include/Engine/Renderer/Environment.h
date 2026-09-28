@@ -1,0 +1,68 @@
+#pragma once
+#include "Engine/Renderer/Vulkan/Image.h"
+#include "Engine/Renderer/Vulkan/Pipeline.h"
+
+#include <glm/glm.hpp>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace Engine {
+
+class Renderer;
+
+struct SkySettings {
+    glm::vec3 sunDirection{-0.45f, -0.75f, -0.5f}; // direction the light travels
+    glm::vec3 sunColor{1.0f, 0.96f, 0.9f};
+    float     sunIntensity = 3.0f;
+    float     skyIntensity = 1.0f;
+
+    bool operator==(const SkySettings&) const = default;
+};
+
+// Image-based lighting from the procedural sky (sky.glsl), generated with compute:
+//   environment cube (256^2, mips via blit) -> irradiance cube (32^2)
+//                                           -> prefiltered specular cube (128^2, 5 roughness mips)
+//   BRDF LUT (256^2, once)
+// Everything is regenerated only when the SkySettings change.
+class Environment {
+public:
+    explicit Environment(Renderer& renderer);
+    ~Environment(); // defers GPU destruction through the renderer
+
+    Environment(const Environment&)            = delete;
+    Environment& operator=(const Environment&) = delete;
+
+    // Main thread, inside a frame and outside of rendering. Records compute work into `cmd`
+    // if the maps are missing or `sky` changed; afterwards they are in SHADER_READ_ONLY layout.
+    void Update(VkCommandBuffer cmd, const SkySettings& sky);
+
+    // Bindless slots (binding 3: cubes, binding 0: LUT).
+    [[nodiscard]] std::uint32_t IrradianceCube()      const { return m_IrradianceSlot; }
+    [[nodiscard]] std::uint32_t PrefilteredCube()     const { return m_PrefilteredSlot; }
+    [[nodiscard]] std::uint32_t BrdfLut()             const { return m_BrdfLutSlot; }
+    [[nodiscard]] std::uint32_t PrefilteredMipCount() const { return m_Prefiltered.MipLevels(); }
+
+private:
+    void GenerateBrdfLut(VkCommandBuffer cmd);
+    void GenerateCubes(VkCommandBuffer cmd, const SkySettings& sky);
+
+    Renderer& m_Renderer;
+
+    Pipeline m_SkyPipeline, m_IrradiancePipeline, m_PrefilterPipeline, m_BrdfPipeline;
+    Image    m_EnvCube, m_Irradiance, m_Prefiltered, m_BrdfLut;
+
+    // Per-mip 2D-array views for compute writes (+ their storage slots).
+    std::vector<ImageView>     m_StorageViews;
+    std::vector<std::uint32_t> m_StorageArraySlots;
+    std::uint32_t              m_EnvStorage = 0, m_IrradianceStorage = 0, m_BrdfLutStorage = 0;
+    std::uint32_t              m_PrefilterStorageBase = 0; // index into m_StorageArraySlots
+
+    std::uint32_t m_EnvSlot = 0, m_IrradianceSlot = 0, m_PrefilteredSlot = 0, m_BrdfLutSlot = 0;
+
+    std::optional<SkySettings> m_Generated;
+    bool                       m_LutReady = false;
+};
+
+} // namespace Engine

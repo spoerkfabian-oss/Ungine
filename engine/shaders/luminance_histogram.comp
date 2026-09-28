@@ -1,0 +1,39 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "exposure.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform HistogramPush {
+    LuminanceHistogram histogram;
+    uint               hdr;
+    float              minLogLuminance;
+    float              invLogLuminanceRange;
+    uint               _pad;
+    uvec2              size;
+} pc;
+
+shared uint localBins[256];
+
+void main()
+{
+    localBins[gl_LocalInvocationIndex] = 0u;
+    barrier();
+
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x < pc.size.x && id.y < pc.size.y) {
+        const vec3  color = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.hdr)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                       ivec2(id), 0).rgb;
+        const float lum   = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        uint        bin   = 0u;
+        if (lum > 1e-5)
+            bin = uint(clamp((log2(lum) - pc.minLogLuminance) * pc.invLogLuminanceRange, 0.0, 1.0) * 254.0) + 1u;
+        atomicAdd(localBins[bin], 1u);
+    }
+    barrier();
+    // One global atomic per bin and workgroup instead of one per pixel.
+    if (localBins[gl_LocalInvocationIndex] != 0u)
+        atomicAdd(pc.histogram.bins[gl_LocalInvocationIndex], localBins[gl_LocalInvocationIndex]);
+}

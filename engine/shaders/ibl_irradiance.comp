@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "ibl_common.glsl"
+#include "pbr.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// E(N) = 1/pi * integral L(w) cos(theta) dw, cosine-weighted importance sampling.
+// Diffuse lighting is then simply E(N) * diffuseColor.
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= pc.size || id.y >= pc.size)
+        return;
+    const vec3 N     = CubeDirection(id.z, id.xy, pc.size);
+    const mat3 basis = BasisFromNormal(N);
+
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < pc.sampleCount; ++i) {
+        const vec2  Xi       = Hammersley(i, pc.sampleCount);
+        const float phi      = 2.0 * PI * Xi.x;
+        const float cosTheta = sqrt(1.0 - Xi.y);
+        const float sinTheta = sqrt(Xi.y);
+        const vec3  L        = basis * vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+        const float pdf      = cosTheta / PI;
+        sum += SampleCube(pc.src, SAMPLER_LINEAR_CLAMP, L, SourceLod(pdf, pc.sampleCount, pc.srcSize)).rgb;
+    }
+    imageStore(uStorageArrays[nonuniformEXT(pc.dst)], ivec3(id), vec4(sum / float(pc.sampleCount), 1.0));
+}

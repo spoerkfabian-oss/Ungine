@@ -1,0 +1,101 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#include "frame.glsl"
+
+// Clustered light assignment: one thread per cluster (16 x 9 x 24 = 27 groups of 128). Lights are
+// transformed to view space once per group into shared memory, then every thread tests the batch
+// against its cluster.
+#define GROUP_SIZE 128u
+layout(local_size_x = GROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// Same memory as FrameData.clusters, but writable (the fragment stage only gets a readonly view).
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer ClusterOutput {
+    uint counts[CLUSTER_COUNT];
+    uint indices[];
+};
+
+layout(push_constant) uniform CullPush {
+    FrameData     frame;
+    ClusterOutput clusters;
+} pc;
+
+shared vec4  sPositionRange[GROUP_SIZE]; // view space position, range
+shared vec4  sDirectionCos[GROUP_SIZE];  // view space direction, cos(outer); < -1: point light
+shared float sSinOuter[GROUP_SIZE];
+
+// Cone vs sphere (Wronski, "Cull that cone").
+bool ConeIntersectsSphere(vec3 origin, vec3 dir, float range, float cosAngle, float sinAngle, vec3 center, float radius)
+{
+    const vec3  v        = center - origin;
+    const float vLenSq   = dot(v, v);
+    const float v1Len    = dot(v, dir);
+    const float closest  = cosAngle * sqrt(max(vLenSq - v1Len * v1Len, 0.0)) - v1Len * sinAngle;
+    const bool  outside  = closest > radius;
+    const bool  front    = v1Len > radius + range;
+    const bool  back     = v1Len < -radius;
+    return !(outside || front || back);
+}
+
+void main()
+{
+    FrameData   frame   = pc.frame;
+    const uint  cluster = gl_GlobalInvocationID.x;
+    const bool  valid   = cluster < CLUSTER_COUNT;
+    const uvec3 id      = uvec3(cluster % CLUSTER_X, (cluster / CLUSTER_X) % CLUSTER_Y, cluster / (CLUSTER_X * CLUSTER_Y));
+
+    // View-space AABB of the cluster. Framebuffer y grows downwards, NDC y upwards (viewport flip).
+    const float nearPlane = frame.clusterDepth.x;
+    const float ratio     = frame.clusterDepth.y / nearPlane;
+    const float zNear     = nearPlane * pow(ratio, float(id.z) / float(CLUSTER_Z));
+    // The last slice reaches to infinity: fragments beyond the far distance are clamped into it.
+    const float zFar      = id.z + 1u == CLUSTER_Z ? 1e9 : nearPlane * pow(ratio, float(id.z + 1u) / float(CLUSTER_Z));
+    const vec2  uv0       = vec2(id.xy) / vec2(CLUSTER_X, CLUSTER_Y);
+    const vec2  uv1       = vec2(id.xy + 1u) / vec2(CLUSTER_X, CLUSTER_Y);
+    const vec2  ndcMin    = vec2(uv0.x * 2.0 - 1.0, 1.0 - uv1.y * 2.0);
+    const vec2  ndcMax    = vec2(uv1.x * 2.0 - 1.0, 1.0 - uv0.y * 2.0);
+    const vec2  invProj   = vec2(1.0 / frame.proj[0][0], 1.0 / frame.proj[1][1]);
+
+    vec3 boxMin = vec3(1e30);
+    vec3 boxMax = vec3(-1e30);
+    for (uint c = 0u; c < 8u; ++c) {
+        const vec2  ndc   = vec2((c & 1u) != 0u ? ndcMax.x : ndcMin.x, (c & 2u) != 0u ? ndcMax.y : ndcMin.y);
+        const float depth = (c & 4u) != 0u ? zFar : zNear;
+        const vec3  p     = vec3(ndc * invProj * depth, -depth);
+        boxMin            = min(boxMin, p);
+        boxMax            = max(boxMax, p);
+    }
+    const vec3  boxCenter = (boxMin + boxMax) * 0.5;
+    const float boxRadius = length(boxMax - boxCenter);
+
+    const uint lightCount = frame.lightInfo.x;
+    const uint first      = cluster * CLUSTER_MAX_LIGHTS;
+    uint       count      = 0u;
+    for (uint base = 0u; base < lightCount; base += GROUP_SIZE) {
+        const uint i = base + gl_LocalInvocationIndex;
+        if (i < lightCount) {
+            const GpuLight light = frame.lights.l[i];
+            const vec3     p     = (frame.view * vec4(light.position, 1.0)).xyz;
+            const vec3     d     = normalize(mat3(frame.view) * light.direction);
+            sPositionRange[gl_LocalInvocationIndex] = vec4(p, light.range);
+            sDirectionCos[gl_LocalInvocationIndex]  = vec4(d, light.type == LIGHT_SPOT ? light.cosOuter : -2.0);
+            sSinOuter[gl_LocalInvocationIndex]      = light.sinOuter;
+        }
+        barrier();
+
+        const uint batch = min(GROUP_SIZE, lightCount - base);
+        for (uint j = 0u; valid && j < batch && count < CLUSTER_MAX_LIGHTS; ++j) {
+            const vec4 pr = sPositionRange[j];
+            // Sphere vs AABB.
+            const vec3 d = max(boxMin - pr.xyz, 0.0) + max(pr.xyz - boxMax, 0.0);
+            bool       hit = dot(d, d) <= pr.w * pr.w;
+            const vec4 dc  = sDirectionCos[j];
+            if (hit && dc.w >= -1.0)
+                hit = ConeIntersectsSphere(pr.xyz, dc.xyz, pr.w, dc.w, sSinOuter[j], boxCenter, boxRadius);
+            if (hit)
+                pc.clusters.indices[first + count++] = base + j;
+        }
+        barrier();
+    }
+    if (valid)
+        pc.clusters.counts[cluster] = count;
+}

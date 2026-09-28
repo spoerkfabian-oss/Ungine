@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#include "exposure.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform AveragePush {
+    LuminanceHistogram histogram;
+    ExposureState      state;
+    float              minLogLuminance;
+    float              logLuminanceRange;
+    float              pixelCount;
+    float              adaptation;   // 1 - exp(-dt * speed); 1 = snap
+    float              key;          // target luminance of the scene average after exposure
+    float              compensation; // manual multiplier on top of the automatic exposure
+} pc;
+
+shared float weighted[256];
+
+// Geometric mean luminance from the histogram (black bin excluded), smoothed over time.
+// Also clears the histogram for the next frame.
+void main()
+{
+    const uint  i     = gl_LocalInvocationIndex;
+    const uint  count = pc.histogram.bins[i];
+    weighted[i]       = float(count) * float(i);
+    pc.histogram.bins[i] = 0u;
+    const float black = float(i == 0u ? count : 0u);
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (i < stride)
+            weighted[i] += weighted[i + stride];
+        barrier();
+    }
+
+    if (i == 0u) {
+        const float lit     = max(pc.pixelCount - black, 1.0);
+        const float meanBin = weighted[0] / lit; // in [1, 255] when anything is lit
+        const float logLum  = (max(meanBin, 1.0) - 1.0) / 254.0 * pc.logLuminanceRange + pc.minLogLuminance;
+        const float target  = exp2(logLum);
+
+        const float previous = pc.state.adaptedLuminance;
+        const float adapted  = previous > 0.0 ? previous + (target - previous) * pc.adaptation : target;
+        pc.state.adaptedLuminance = adapted;
+        pc.state.exposure         = pc.key / adapted * pc.compensation;
+    }
+}

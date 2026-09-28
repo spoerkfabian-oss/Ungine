@@ -1,0 +1,38 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "ibl_common.glsl"
+#include "pbr.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Split-sum BRDF LUT (Karis 2013): u = NdotV, v = perceptual roughness -> (scale, bias) of F0.
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.size || id.y >= pc.size)
+        return;
+    const float NdotV     = (float(id.x) + 0.5) / float(pc.size);
+    const float roughness = (float(id.y) + 0.5) / float(pc.size);
+    const float a         = roughness * roughness;
+
+    const vec3 V     = vec3(sqrt(1.0 - NdotV * NdotV), 0.0, NdotV);
+    const mat3 basis = mat3(1.0); // N = +Z
+    float      A     = 0.0;
+    float      B     = 0.0;
+    for (uint i = 0u; i < pc.sampleCount; ++i) {
+        const vec3  H     = ImportanceSampleGGX(Hammersley(i, pc.sampleCount), basis, a);
+        const vec3  L     = 2.0 * dot(V, H) * H - V;
+        const float NdotL = clamp(L.z, 0.0, 1.0);
+        if (NdotL <= 0.0)
+            continue;
+        const float NdotH = clamp(H.z, 0.0, 1.0);
+        const float VdotH = clamp(dot(V, H), 0.0, 1.0);
+        // f * NdotL / pdf with F factored out: 4 * Vis * NdotL * VdotH / NdotH
+        const float GVis = 4.0 * V_SmithGGXCorrelated(NdotV, NdotL, a) * NdotL * VdotH / max(NdotH, 1e-5);
+        const float Fc   = pow(1.0 - VdotH, 5.0);
+        A += (1.0 - Fc) * GVis;
+        B += Fc * GVis;
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.dst)], ivec2(id), vec4(A, B, 0.0, 0.0) / float(pc.sampleCount));
+}

@@ -1,0 +1,18 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "ibl_common.glsl"
+#include "sky.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Environment cube mip 0 from the analytic sky (no sun disk).
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= pc.size || id.y >= pc.size)
+        return;
+    const vec3 dir = CubeDirection(id.z, id.xy, pc.size);
+    const vec3 sky = SkyRadiance(dir, pc.toSun.xyz, pc.sunRadiance.rgb, pc.skyParams.x);
+    imageStore(uStorageArrays[nonuniformEXT(pc.dst)], ivec3(id), vec4(sky, 1.0));
+}

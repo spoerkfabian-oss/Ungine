@@ -1,0 +1,39 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "ibl_common.glsl"
+#include "pbr.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Specular pre-filter for one mip (roughness), split-sum approximation with N = V = R.
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= pc.size || id.y >= pc.size)
+        return;
+    const vec3 N = CubeDirection(id.z, id.xy, pc.size);
+
+    vec3 result;
+    if (pc.roughness <= 0.0) {
+        result = SampleCube(pc.src, SAMPLER_LINEAR_CLAMP, N, 0.0).rgb; // mirror: plain copy
+    } else {
+        const float a      = pc.roughness * pc.roughness;
+        const mat3  basis  = BasisFromNormal(N);
+        vec3        sum    = vec3(0.0);
+        float       weight = 0.0;
+        for (uint i = 0u; i < pc.sampleCount; ++i) {
+            const vec3  H     = ImportanceSampleGGX(Hammersley(i, pc.sampleCount), basis, a);
+            const vec3  L     = 2.0 * dot(N, H) * H - N;
+            const float NdotL = dot(N, L);
+            if (NdotL <= 0.0)
+                continue;
+            const float NdotH = max(dot(N, H), 0.0);
+            const float pdf   = D_GGX(NdotH, a) * 0.25; // D * NdotH / (4 VdotH), V = N
+            sum += SampleCube(pc.src, SAMPLER_LINEAR_CLAMP, L, SourceLod(pdf, pc.sampleCount, pc.srcSize)).rgb * NdotL;
+            weight += NdotL;
+        }
+        result = sum / max(weight, 1e-4);
+    }
+    imageStore(uStorageArrays[nonuniformEXT(pc.dst)], ivec3(id), vec4(result, 1.0));
+}
