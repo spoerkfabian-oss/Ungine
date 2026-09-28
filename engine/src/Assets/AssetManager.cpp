@@ -81,6 +81,33 @@ ModelHandle AssetManager::CreateModel(ModelData data)
     return StartJob(std::move(name), {}, [shared] { return std::move(*shared); });
 }
 
+ModelHandle AssetManager::CreatePrimitive(const PrimitiveDesc& desc)
+{
+    const std::string key = PrimitiveKey(desc);
+    std::u8string     u8key(key.begin(), key.end()); // ASCII
+    if (const auto it = m_Cache.find(u8key); it != m_Cache.end()) {
+        Entry& e = m_Entries[it->second];
+        ++e.refCount;
+        return {it->second, e.generation};
+    }
+    const ModelHandle handle = StartJob(key, u8key, [desc] { return MakePrimitive(desc); });
+    m_Entries[handle.index].primitive = desc;
+    m_Cache.emplace(std::move(u8key), handle.index);
+    return handle;
+}
+
+ModelSource AssetManager::Source(ModelHandle handle) const
+{
+    const Entry* e = Find(handle);
+    if (!e)
+        return {};
+    if (e->primitive)
+        return {.file = {}, .primitive = e->primitive};
+    if (e->key.empty())
+        return {}; // CreateModel
+    return {.file = e->path, .primitive = std::nullopt};
+}
+
 ModelHandle AssetManager::StartJob(std::filesystem::path path, std::u8string key, std::function<ModelData()> produce)
 {
     const ModelHandle handle = Allocate();

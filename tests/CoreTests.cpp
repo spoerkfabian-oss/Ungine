@@ -7,6 +7,8 @@
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Frustum.h"
+#include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 
 #include <glm/gtc/epsilon.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -337,4 +339,82 @@ TEST_CASE(ShadowAtlas_CubeFacesAndBorder)
     // 90 degrees plus a 4-texel border on a 256 tile: the face edge lands 4 texels inside.
     const float t = ShadowTanHalfWithBorder(1.0f, 256, 4.0f);
     CHECK(std::abs(1.0f / t - (1.0f - 8.0f / 256.0f)) < 1e-6f);
+}
+
+TEST_CASE(Scene_UuidsAndSiblingOrder)
+{
+    Scene        scene;
+    const Entity root = scene.CreateEntity("Root");
+    const Entity a    = scene.CreateEntity("A", root);
+    const Entity b    = scene.CreateEntity("B", root);
+    const Entity c    = scene.CreateEntity("C", root, 42);
+    Registry&    r    = scene.GetRegistry();
+    CHECK(r.Get<Uuid>(c).value == 42 && scene.FindByUuid(42) == c);
+    CHECK(r.Get<Uuid>(a).value != 0 && r.Get<Uuid>(a).value != r.Get<Uuid>(b).value);
+    CHECK(scene.CreateEntity("Dup", NullEntity, 42) != c); // taken: gets a fresh one
+    CHECK(scene.FindByUuid(42) == c);
+
+    CHECK(scene.SiblingIndex(a) == 0 && scene.SiblingIndex(b) == 1 && scene.SiblingIndex(c) == 2);
+    scene.SetParent(c, root, 0);
+    CHECK(scene.SiblingIndex(c) == 0 && scene.SiblingIndex(a) == 1);
+    CHECK(scene.IsAncestor(root, c) && !scene.IsAncestor(c, root));
+
+    scene.DestroyEntity(root);
+    CHECK(scene.FindByUuid(42) == NullEntity && !r.Valid(a));
+    scene.Clear();
+    CHECK(r.AliveCount() == 0);
+}
+
+TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
+{
+    Scene        scene;
+    Registry&    r      = scene.GetRegistry();
+    const Entity parent = scene.CreateEntity("Parent");
+    scene.CreateEntity("First", parent);
+    const Entity node = scene.CreateEntity("Node", parent);
+    const Entity child = scene.CreateEntity("Child", node);
+    r.Get<Transform>(node).position = glm::vec3(1.0f, 2.0f, 3.0f);
+    r.Get<Transform>(node).rotation = glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f));
+    r.Emplace<Light>(child, Light{.type = LightType::Spot, .intensity = 7.0f, .castShadows = false});
+    r.Emplace<MeshRenderer>(node, MeshRenderer{.model = ModelHandle{3, 9}, .meshIndex = 2});
+    const std::uint64_t nodeUuid  = r.Get<Uuid>(node).value;
+    const std::uint64_t childUuid = r.Get<Uuid>(child).value;
+
+    // Delete + undo: same UUIDs, same place, same components.
+    const Entity      roots[] = {node};
+    const std::string snapshot = SnapshotEntities(scene, roots);
+    scene.DestroyEntity(node);
+    CHECK(scene.FindByUuid(nodeUuid) == NullEntity);
+    const auto restored = RestoreEntities(scene, snapshot, RestoreMode::Original);
+    CHECK(restored.size() == 1);
+    const Entity node2  = scene.FindByUuid(nodeUuid);
+    const Entity child2 = scene.FindByUuid(childUuid);
+    CHECK(node2 != NullEntity && child2 != NullEntity && restored[0] == node2);
+    CHECK(r.Get<Hierarchy>(node2).parent == parent && scene.SiblingIndex(node2) == 1);
+    CHECK(r.Get<Hierarchy>(child2).parent == node2);
+    CHECK(r.Get<Name>(node2).value == "Node");
+    CHECK(r.Get<Transform>(node2).position == glm::vec3(1.0f, 2.0f, 3.0f));
+    CHECK(std::abs(glm::dot(r.Get<Transform>(node2).rotation,
+                            glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f))) - 1.0f) < 1e-5f);
+    CHECK(r.Has<MeshRenderer>(node2) && r.Get<MeshRenderer>(node2).model == (ModelHandle{3, 9}) &&
+          r.Get<MeshRenderer>(node2).meshIndex == 2);
+    CHECK(r.Has<Light>(child2) && r.Get<Light>(child2).type == LightType::Spot &&
+          r.Get<Light>(child2).intensity == 7.0f && !r.Get<Light>(child2).castShadows);
+
+    // Duplicate: fresh UUIDs, appended to the same parent, subtree copied.
+    const Entity dupRoots[] = {node2};
+    const auto   dup = RestoreEntities(scene, SnapshotEntities(scene, dupRoots), RestoreMode::Duplicate);
+    CHECK(dup.size() == 1 && dup[0] != node2 && r.Get<Uuid>(dup[0]).value != nodeUuid);
+    CHECK(r.Get<Hierarchy>(dup[0]).parent == parent && scene.SiblingIndex(dup[0]) == 2);
+    CHECK(r.Get<Hierarchy>(dup[0]).children.size() == 1 && r.Has<Light>(r.Get<Hierarchy>(dup[0]).children[0]));
+
+    // Entity state: components only, absent ones are removed again.
+    const std::string state = SnapshotEntityState(scene, node2);
+    r.Get<Transform>(node2).scale = glm::vec3(5.0f);
+    r.Get<Name>(node2).value      = "Renamed";
+    r.Remove<MeshRenderer>(node2);
+    r.Emplace<Light>(node2);
+    ApplyEntityState(scene, node2, state);
+    CHECK(r.Get<Transform>(node2).scale == glm::vec3(1.0f) && r.Get<Name>(node2).value == "Node");
+    CHECK(r.Has<MeshRenderer>(node2) && !r.Has<Light>(node2));
 }

@@ -50,8 +50,10 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
 };
 
 struct DrawData { // mirrors DrawData in mesh_common.glsl
-    glm::mat4 model;
-    glm::mat4 normalMatrix;
+    glm::mat4     model;
+    glm::mat4     normalMatrix;
+    std::uint32_t entityId; // slot index + 1 (picking)
+    std::uint32_t pad[3];
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -75,6 +77,10 @@ struct TonemapPush { // mirrors TonemapPush in tonemap.frag
     std::uint32_t   debugView;
     std::uint32_t   debugTexture;
     VkDeviceAddress frame; // light clusters view
+    std::uint32_t   idTexture;
+    std::uint32_t   outlineWords;
+    VkDeviceAddress outline;
+    glm::vec4       outlineColor;
 };
 
 struct LightCullPush { // mirrors CullPush in light_cull.comp
@@ -133,6 +139,7 @@ static_assert(sizeof(TonemapPush) <= kPushConstantSize && sizeof(GtaoPush) <= kP
               sizeof(AveragePush) <= kPushConstantSize);
 
 constexpr VkFormat kNormalFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkFormat kEntityIdFormat = VK_FORMAT_R32_UINT;
 constexpr VkFormat kAoFormat     = VK_FORMAT_R16G16B16A16_SFLOAT; // matches the rgba16f storage binding
 
 struct BloomPush { // mirrors BloomPush in bloom_*.comp
@@ -156,13 +163,13 @@ VkRenderingAttachmentInfo Attachment(VkImageView view, VkImageLayout layout, VkA
 }
 
 void BeginRendering(VkCommandBuffer cmd, VkExtent2D extent, const VkRenderingAttachmentInfo* color,
-                    const VkRenderingAttachmentInfo* depth)
+                    const VkRenderingAttachmentInfo* depth, std::uint32_t colorCount = 1)
 {
     VkRenderingInfo info{};
     info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
     info.renderArea           = {{0, 0}, extent};
     info.layerCount           = 1;
-    info.colorAttachmentCount = color ? 1u : 0u;
+    info.colorAttachmentCount = color ? colorCount : 0u;
     info.pColorAttachments    = color;
     info.pDepthAttachment     = depth;
     vkCmdBeginRendering(cmd, &info);
@@ -229,6 +236,15 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                     .SetDynamicCulling(true)
                     .SetDebugName("DepthNormalPrepass")
                     .Build(device, layout);
+    m_PrepassPicking = GraphicsPipelineBuilder{}
+                           .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("depth_normal_id.frag.spv"))
+                           .AddColorAttachment(kNormalFormat)
+                           .AddColorAttachment(kEntityIdFormat)
+                           .SetDepthFormat(kDepthFormat)
+                           .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                           .SetDynamicCulling(true)
+                           .SetDebugName("DepthNormalIdPrepass")
+                           .Build(device, layout);
     m_Mesh = GraphicsPipelineBuilder{}
                  .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("mesh.frag.spv"))
                  .AddColorAttachment(kHdrFormat)
@@ -293,6 +309,9 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                                         .debugName = "ExposureState"});
     m_Clusters           = Buffer(ctx, {.size  = std::uint64_t{kClusterCount} * (1 + kClusterMaxLights) * sizeof(std::uint32_t),
                                         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .debugName = "LightClusters"});
+    for (Buffer& b : m_PickReadback)
+        b = Buffer(ctx, {.size = 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .memory = MemoryUsage::Readback,
+                         .debugName = "PickReadback"});
     for (Buffer& b : m_ExposureReadback)
         b = Buffer(ctx, {.size = 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .memory = MemoryUsage::Readback,
                          .debugName = "ExposureReadback"});
@@ -303,16 +322,18 @@ SceneRenderer::~SceneRenderer()
     ReleaseTargets();
     ReleaseShadowMap();
     ReleaseShadowAtlas();
+    ReleasePickingTarget();
     for (auto& [format, pipeline] : m_Tonemap)
         m_Renderer.DeferRelease(std::move(pipeline));
     for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp,
                         &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull,
-                        &m_LocalShadow, &m_LocalShadowMasked})
+                        &m_LocalShadow, &m_LocalShadowMasked, &m_PrepassPicking})
         m_Renderer.DeferRelease(std::move(*p));
     m_Renderer.DeferRelease(std::move(m_Clusters));
     m_Renderer.DeferRelease(std::move(m_LuminanceHistogram));
     m_Renderer.DeferRelease(std::move(m_ExposureState));
     m_Renderer.DeferRelease(std::move(m_ExposureReadback));
+    m_Renderer.DeferRelease(std::move(m_PickReadback));
 }
 
 void SceneRenderer::ReleaseTargets()
@@ -466,7 +487,7 @@ void SceneRenderer::CollectDrawItems(Scene& scene)
     const Model* lastModel = nullptr; // entities of one model are usually contiguous
 
     scene.GetRegistry().ViewOf<WorldTransform, MeshRenderer>().Each(
-        [&](Entity, const WorldTransform& world, const MeshRenderer& renderer) {
+        [&](Entity entity, const WorldTransform& world, const MeshRenderer& renderer) {
             if (renderer.model != lastHandle) {
                 lastHandle = renderer.model;
                 lastModel  = m_Assets.Get(renderer.model); // nullptr while loading or after release
@@ -476,7 +497,9 @@ void SceneRenderer::CollectDrawItems(Scene& scene)
 
             const glm::mat3 linear = glm::mat3(world.matrix);
             const DrawData  data{.model        = world.matrix,
-                                 .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear)))};
+                                 .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear))),
+                                 .entityId     = EntityIndex(entity) + 1,
+                                 .pad          = {}};
             m_DrawItems.push_back({.model     = lastModel,
                                    .mesh      = &lastModel->meshes[renderer.meshIndex],
                                    .world     = world.matrix,
@@ -518,9 +541,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const float deltaTime = m_LastFrameTime ? std::chrono::duration<float>(now - *m_LastFrameTime).count() : 0.0f;
     m_LastFrameTime       = now;
     ReadExposure(frame.frameIndex); // this slot's fence was waited on in BeginFrame
+    ReadPick(scene, frame.frameIndex);
 
     const VkExtent2D extent = output.extent;
     EnsureTargets(extent);
+    EnsurePickingTarget(extent);
     EnsureShadowMap();
     GpuProfiler* profiler = &m_Renderer.Profiler();
     {
@@ -597,7 +622,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
 
     {
         GpuScope scope(profiler, cmd, "Depth + normals");
-        RenderPrepass(cmd, extent, frustum, frameAddress);
+        RenderPrepass(cmd, extent, frustum, frameAddress, frame.frameIndex);
     }
     if (ao.enabled) {
         GpuScope scope(profiler, cmd, "GTAO");
@@ -638,6 +663,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     BeginRendering(cmd, extent, &target, nullptr);
     bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     SetViewportScissor(cmd, extent);
+    const auto [outlineAddress, outlineWords] = PushOutlineBits();
     const TonemapPush tonemap{.state         = m_ExposureState.Address(),
                               .hdrTexture    = m_HdrSlot,
                               .tonemapper    = static_cast<std::uint32_t>(post.tonemapper),
@@ -647,7 +673,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
                               .autoExposure  = post.autoExposure ? 1u : 0u,
                               .debugView     = static_cast<std::uint32_t>(post.debugView),
                               .debugTexture  = DebugTexture(),
-                              .frame         = frameAddress};
+                              .frame         = frameAddress,
+                              .idTexture     = m_EntityIdSlot,
+                              .outlineWords  = outlineWords,
+                              .outline       = outlineAddress,
+                              .outlineColor  = overlay.outlineColor};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, TonemapPipeline(output.format).Handle());
     vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(tonemap), &tonemap);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1036,8 +1066,67 @@ void SceneRenderer::DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkD
     }
 }
 
+void SceneRenderer::EnsurePickingTarget(VkExtent2D extent)
+{
+    if (!overlay.picking) {
+        ReleasePickingTarget();
+        m_PickRequest.reset();
+        return;
+    }
+    if (m_EntityIds && m_EntityIds.Extent().width == extent.width && m_EntityIds.Extent().height == extent.height)
+        return;
+    ReleasePickingTarget();
+    m_EntityIds    = Image(m_Renderer.GetContext(), {.extent    = {extent.width, extent.height, 1},
+                                                     .format    = kEntityIdFormat,
+                                                     .usage     = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                     .debugName = "EntityIds"});
+    m_EntityIdSlot = m_Renderer.GetBindless().AddSampledImage(m_EntityIds.View());
+}
+
+void SceneRenderer::ReleasePickingTarget()
+{
+    if (!m_EntityIds)
+        return;
+    Renderer* r = &m_Renderer;
+    r->DeferCall([r, slot = m_EntityIdSlot] { r->GetBindless().RemoveSampledImage(slot); });
+    r->DeferRelease(std::move(m_EntityIds));
+    m_EntityIds    = {};
+    m_EntityIdSlot = 0;
+}
+
+void SceneRenderer::ReadPick(const Scene& scene, std::uint32_t frameIndex)
+{
+    if (!std::exchange(m_PickPending[frameIndex], false))
+        return;
+    Buffer& readback = m_PickReadback[frameIndex];
+    readback.Invalidate(0, VK_WHOLE_SIZE);
+    std::uint32_t id = 0;
+    std::memcpy(&id, readback.Mapped(), sizeof(id));
+
+    // Slot index -> current entity; the slot may have been freed or reused since.
+    const Registry& registry = scene.GetRegistry();
+    const Entity    entity   = id == 0 ? NullEntity : registry.EntityAtIndex(id - 1);
+    m_PickResult             = entity != NullEntity && registry.Has<Hierarchy>(entity) ? entity : NullEntity;
+}
+
+std::pair<VkDeviceAddress, std::uint32_t> SceneRenderer::PushOutlineBits()
+{
+    if (!m_EntityIds || overlay.outlined.empty())
+        return {0, 0};
+    std::uint32_t maxIndex = 0;
+    for (Entity e : overlay.outlined)
+        maxIndex = std::max(maxIndex, EntityIndex(e));
+    std::vector<std::uint32_t> words(maxIndex / 32 + 1, 0u);
+    for (Entity e : overlay.outlined)
+        words[EntityIndex(e) / 32] |= 1u << (EntityIndex(e) % 32);
+    const TransientAllocation a = m_Renderer.AllocateTransient(words.size() * sizeof(std::uint32_t), 16);
+    std::memcpy(a.cpu, words.data(), words.size() * sizeof(std::uint32_t));
+    return {a.gpu, static_cast<std::uint32_t>(words.size())};
+}
+
 void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum,
-                                  VkDeviceAddress frameAddress)
+                                  VkDeviceAddress frameAddress, std::uint32_t frameIndex)
 {
     // Depth is shared by all frames in flight: earlier frames' tests, GTAO and denoise may still use it.
     constexpr VkPipelineStageFlags2 kDepthStages =
@@ -1062,17 +1151,61 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const 
                           .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                           .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
 
-    auto normals = Attachment(m_Normals.View(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
-    normals.clearValue.color = {{0.0f, 0.0f, 1.0f, 0.0f}}; // sky: facing the camera
+    // Entity IDs: the previous frame's outline (fragment) and pick copy (transfer) read them.
+    const bool picking = static_cast<bool>(m_EntityIds);
+    if (picking)
+        CmdImageBarrier(cmd, {.image     = m_EntityIds.Handle(),
+                              .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                              .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+                              .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
+
+    std::array<VkRenderingAttachmentInfo, 2> colors{
+        Attachment(m_Normals.View(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR),
+        Attachment(picking ? m_EntityIds.View() : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_ATTACHMENT_LOAD_OP_CLEAR)};
+    colors[0].clearValue.color = {{0.0f, 0.0f, 1.0f, 0.0f}}; // sky: facing the camera
+    colors[1].clearValue.color.uint32[0] = 0;                // no entity
     auto depth = Attachment(m_Depth.View(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
     depth.clearValue.depthStencil = {0.0f, 0}; // reverse-Z: far = 0
 
-    BeginRendering(cmd, extent, &normals, &depth);
+    BeginRendering(cmd, extent, colors.data(), &depth, picking ? 2u : 1u);
     m_Renderer.GetBindless().Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     SetViewportScissor(cmd, extent);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Prepass.Handle());
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, picking ? m_PrepassPicking.Handle() : m_Prepass.Handle());
     DrawVisible(cmd, frustum, frameAddress, false);
     vkCmdEndRendering(cmd);
+
+    if (picking) {
+        // Requested pixel -> this slot's readback buffer (read when the slot comes around again).
+        const bool copy = m_PickRequest && m_PickRequest->x < extent.width && m_PickRequest->y < extent.height;
+        CmdImageBarrier(cmd, {.image     = m_EntityIds.Handle(),
+                              .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              .newLayout = copy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                              .dstStage  = copy ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                              .dstAccess = copy ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT});
+        if (copy) {
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageOffset      = {static_cast<std::int32_t>(m_PickRequest->x),
+                                       static_cast<std::int32_t>(m_PickRequest->y), 0};
+            region.imageExtent      = {1, 1, 1};
+            vkCmdCopyImageToBuffer(cmd, m_EntityIds.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   m_PickReadback[frameIndex].Handle(), 1, &region);
+            CmdImageBarrier(cmd, {.image     = m_EntityIds.Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  .srcStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                  .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                  .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT});
+            m_PickPending[frameIndex] = true;
+        }
+        m_PickRequest.reset();
+    }
 
     // Depth: read-only attachment for the lighting pass and sampled by GTAO from here on.
     const std::array<VkImageMemoryBarrier2, 2> barriers{
@@ -1251,6 +1384,10 @@ void SceneRenderer::RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex
     constexpr auto         kRW      = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
     if (!m_ExposureInitialized) { // zero histogram, "not adapted yet" state
+        // New buffers may reuse memory that earlier (fenced, finished) frames read. That is safe, but
+        // sync validation does not always see the host fence wait: make the order explicit.
+        MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
         vkCmdFillBuffer(cmd, m_LuminanceHistogram.Handle(), 0, VK_WHOLE_SIZE, 0);
         vkCmdFillBuffer(cmd, m_ExposureState.Handle(), 0, VK_WHOLE_SIZE, 0);
         MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, // fill: COPY or CLEAR

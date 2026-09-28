@@ -26,6 +26,7 @@ add_library(Engine STATIC
     src/Scene/Camera.cpp
     src/Scene/Frustum.cpp
     src/Scene/Scene.cpp
+    src/Scene/SceneSerializer.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
 target_include_directories(Engine PUBLIC include PRIVATE src)
@@ -33,7 +34,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb)
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json)
 
 target_compile_definitions(Engine PUBLIC
     GLFW_INCLUDE_NONE
@@ -52,6 +53,7 @@ set_target_properties(Engine PROPERTIES FOLDER "Engine")
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE
 set(ENGINE_SHADER_INCLUDES
     shaders/include/bindless.glsl
+    shaders/include/depth_normal.glsl
     shaders/include/exposure.glsl
     shaders/include/frame.glsl
     shaders/include/lights.glsl
@@ -68,6 +70,7 @@ engine_add_shaders(Engine SOURCES
     shaders/bloom_downsample.comp
     shaders/bloom_upsample.comp
     shaders/depth_normal.frag
+    shaders/depth_normal_id.frag
     shaders/exposure_average.comp
     shaders/fullscreen.vert
     shaders/gtao.comp

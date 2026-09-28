@@ -5,6 +5,8 @@
 #include "exposure.glsl"
 #include "frame.glsl"
 
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer OutlineBits { uint words[]; };
+
 layout(push_constant) uniform TonemapPush {
     ExposureState state;         // auto exposure result of this frame
     uint          hdrTexture;
@@ -16,6 +18,10 @@ layout(push_constant) uniform TonemapPush {
     uint          debugView;     // Engine::DebugView: 0 off, 1 AO, 2 normals, 3 light clusters, 4 shadow atlas
     uint          debugTexture;  // slot shown by the debug view (light clusters: depth; shadow atlas: atlas)
     FrameData     frame;         // light clusters view
+    uint          idTexture;     // entity IDs (R32_UINT), editor outline
+    uint          outlineWords;  // 0: no outline
+    OutlineBits   outline;       // bit per entity slot index
+    vec4          outlineColor;  // rgb, a = opacity
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -83,6 +89,31 @@ vec3 LightClusterOverlay(vec3 ldr, ivec2 pixel)
     return color;
 }
 
+bool Outlined(uint id)
+{
+    if (id == 0u)
+        return false;
+    const uint index = id - 1u;
+    const uint word  = index >> 5u;
+    return word < pc.outlineWords && (pc.outline.words[word] & (1u << (index & 31u))) != 0u;
+}
+
+// Edge of the outlined entities' visible pixels, 2 px on both sides.
+bool OutlineEdge(ivec2 pixel)
+{
+    const ivec2 size   = textureSize(usampler2D(uUintTextures[nonuniformEXT(pc.idTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]), 0);
+    const bool  center = Outlined(texelFetch(usampler2D(uUintTextures[nonuniformEXT(pc.idTexture)],
+                                                        uSamplers[SAMPLER_NEAREST_CLAMP]), pixel, 0).r);
+    for (int y = -2; y <= 2; y += 2)
+        for (int x = -2; x <= 2; x += 2) {
+            const ivec2 p = clamp(pixel + ivec2(x, y), ivec2(0), size - 1);
+            if (Outlined(texelFetch(usampler2D(uUintTextures[nonuniformEXT(pc.idTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                    p, 0).r) != center)
+                return true;
+        }
+    return false;
+}
+
 void main()
 {
     // Same size as the swapchain: fetch the texel under this pixel.
@@ -117,5 +148,7 @@ void main()
     }
     if (pc.debugView == 3u)
         ldr = LightClusterOverlay(ldr, pixel);
+    if (pc.outlineWords > 0u && OutlineEdge(pixel))
+        ldr = mix(ldr, pc.outlineColor.rgb, pc.outlineColor.a);
     outColor = vec4(ldr, 1.0); // sRGB swapchain encodes
 }

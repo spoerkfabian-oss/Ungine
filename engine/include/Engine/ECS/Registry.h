@@ -92,6 +92,15 @@ public:
         return m_Components[m_Sparse[EntityIndex(e)]];
     }
     [[nodiscard]] T* TryGet(Entity e) { return Contains(e) ? &m_Components[m_Sparse[EntityIndex(e)]] : nullptr; }
+    [[nodiscard]] const T& Get(Entity e) const
+    {
+        assert(Contains(e));
+        return m_Components[m_Sparse[EntityIndex(e)]];
+    }
+    [[nodiscard]] const T* TryGet(Entity e) const
+    {
+        return Contains(e) ? &m_Components[m_Sparse[EntityIndex(e)]] : nullptr;
+    }
 
     [[nodiscard]] std::size_t Size() const override { return m_Dense.size(); }
     [[nodiscard]] Entity      EntityAt(std::size_t i) const override { return m_Dense[i]; }
@@ -177,6 +186,13 @@ public:
         return e != NullEntity && index < m_Generations.size() && m_Generations[index] == EntityGeneration(e);
     }
 
+    // Handle with the slot's current generation (e.g. from a GPU entity-index buffer). A free slot
+    // also yields a "valid" handle: check for a component the entity must have.
+    [[nodiscard]] Entity EntityAtIndex(std::uint32_t index) const
+    {
+        return index < m_Generations.size() ? MakeEntity(index, m_Generations[index]) : NullEntity;
+    }
+
     template <Component T, class... Args>
     T& Emplace(Entity e, Args&&... args)
     {
@@ -222,6 +238,21 @@ public:
     {
         auto* pool = FindPool<T>();
         return pool ? pool->TryGet(e) : nullptr;
+    }
+
+    template <Component T>
+    [[nodiscard]] const T& Get(Entity e) const
+    {
+        const auto* pool = FindPool<T>();
+        assert(pool && "Component type never added");
+        return std::as_const(*pool).Get(e);
+    }
+
+    template <Component T>
+    [[nodiscard]] const T* TryGet(Entity e) const
+    {
+        const auto* pool = FindPool<T>();
+        return pool ? std::as_const(*pool).TryGet(e) : nullptr;
     }
 
     template <Component... Ts>

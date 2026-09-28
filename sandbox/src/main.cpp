@@ -117,6 +117,9 @@ protected:
         GetAssets().Release(m_Model);
         if (m_Ground)
             GetAssets().Release(m_Ground);
+        for (Engine::ModelHandle h : m_EditorModels) // scene files, asset browser, primitives
+            if (GetAssets().State(h) != Engine::AssetState::Invalid)
+                GetAssets().Release(h);
     }
 
 private:
@@ -132,7 +135,8 @@ private:
                 .scene         = m_Scene,
                 .assets        = GetAssets(),
                 .sceneRenderer = *m_SceneRenderer,
-                .camera        = m_Camera});
+                .camera        = m_Camera,
+                .modelRefs     = m_EditorModels});
         else
             m_Editor.reset(); // waits for the GPU once
     }
@@ -261,9 +265,12 @@ private:
         m_Camera.LookAt(center);
 
         // Ground plane under the model (receives the shadows), shadow range scaled to the scene.
-        Engine::MaterialData ground{.name = "Ground", .baseColorFactor = glm::vec4(0.35f, 0.35f, 0.33f, 1.0f),
-                                    .metallic = 0.0f, .roughness = 0.85f};
-        m_Ground       = GetAssets().CreateModel(Engine::MakePlane("Ground", radius * 12.0f, ground));
+        // A primitive (not CreateModel): saved scenes can recreate it.
+        m_Ground       = GetAssets().CreatePrimitive({.shape     = Engine::PrimitiveShape::Plane,
+                                                      .size      = radius * 12.0f,
+                                                      .baseColor = glm::vec4(0.35f, 0.35f, 0.33f, 1.0f),
+                                                      .metallic  = 0.0f,
+                                                      .roughness = 0.85f});
         m_GroundHeight = model->boundsMin.y;
         m_SceneCenter  = center;
         m_SceneRadius  = radius;
@@ -276,6 +283,7 @@ private:
     {
         const Engine::Entity root = Engine::InstantiateModel(m_Scene, m_Ground, *GetAssets().Get(m_Ground));
         m_Scene.GetRegistry().Get<Engine::Transform>(root).position.y = m_GroundHeight;
+        m_Scene.GetRegistry().Get<Engine::Name>(root).value           = "Ground";
     }
 
     std::filesystem::path                  m_ModelPath;
@@ -292,6 +300,7 @@ private:
     Engine::Entity                         m_LightRoot      = Engine::NullEntity;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     Engine::FlyCamera                      m_Camera;
+    std::vector<Engine::ModelHandle>       m_EditorModels; // acquired by the editor, kept across F1 toggles
     std::unique_ptr<Engine::Editor>        m_Editor; // references the members above: declared after them
 
     std::chrono::steady_clock::time_point m_LoadStart;

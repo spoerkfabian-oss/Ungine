@@ -1,6 +1,7 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/Model.h"
+#include "Engine/Assets/Primitives.h"
 #include "Engine/Renderer/Vulkan/Upload.h"
 
 #include <atomic>
@@ -33,6 +34,12 @@ struct AssetFailedEvent {
     std::string    error;
 };
 
+// Where a model came from: a file, a primitive recipe, or neither (CreateModel: not serializable).
+struct ModelSource {
+    std::filesystem::path        file;
+    std::optional<PrimitiveDesc> primitive;
+};
+
 struct ModelInfo {
     ModelHandle   handle;
     AssetState    state    = AssetState::Invalid;
@@ -62,6 +69,8 @@ public:
     [[nodiscard]] ModelHandle LoadModel(const std::filesystem::path& path);
     // Generated geometry (see Primitives.h): same async upload and lifecycle, never cached.
     [[nodiscard]] ModelHandle CreateModel(ModelData data);
+    // Generated from a recipe; cached like files (same recipe: same handle, refcount + 1).
+    [[nodiscard]] ModelHandle CreatePrimitive(const PrimitiveDesc& desc);
     void Release(ModelHandle handle);
 
     void Update();
@@ -71,6 +80,7 @@ public:
     [[nodiscard]] AssetState    State(ModelHandle handle) const;
     [[nodiscard]] std::string   Error(ModelHandle handle) const; // empty unless Failed
     [[nodiscard]] std::uint32_t RefCount(ModelHandle handle) const;
+    [[nodiscard]] ModelSource   Source(ModelHandle handle) const; // empty for invalid handles
 
     // Every model that has not been released (tools, diagnostics).
     [[nodiscard]] std::vector<ModelInfo> Models() const;
@@ -87,6 +97,7 @@ private:
         std::uint32_t          refCount   = 0;
         std::u8string          key;            // cache key (normalized path); empty: not cached
         std::filesystem::path  path;           // file, or the model name for generated ones
+        std::optional<PrimitiveDesc> primitive;
         std::unique_ptr<Model> model;
         UploadTicket           ticket = 0;
         std::string            error;

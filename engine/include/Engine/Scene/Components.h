@@ -18,6 +18,11 @@ struct Name {
     std::string value;
 };
 
+// Stable identity (never 0): survives save/load and editor undo, unlike Entity handles.
+struct Uuid {
+    std::uint64_t value = 0;
+};
+
 // Local TRS relative to the parent.
 struct Transform {
     glm::vec3 position{0.0f};

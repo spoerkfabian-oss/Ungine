@@ -1,4 +1,5 @@
 #pragma once
+#include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Environment.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/ShadowCascades.h"
@@ -108,6 +109,14 @@ struct GpuLight {
 };
 static_assert(sizeof(GpuLight) == 64);
 
+// Editor support, off by default: entity IDs per pixel (R32_UINT, written by the prepass) for
+// mouse picking, and an outline around the visible pixels of chosen entities.
+struct SelectionOverlay {
+    bool                picking = false;
+    std::vector<Entity> outlined; // needs picking
+    glm::vec4           outlineColor{1.0f, 0.55f, 0.1f, 1.0f}; // rgb, a = opacity
+};
+
 struct SceneRenderStats {
     std::uint32_t drawCalls   = 0;
     std::uint32_t culled      = 0; // submeshes rejected by frustum culling (camera)
@@ -161,6 +170,13 @@ public:
     AoSettings                            ao;
     LightSettings                         lights;
     LocalShadowSettings                   localShadows;
+    SelectionOverlay                      overlay;
+
+    // Picking (overlay.picking): the entity under pixel (x, y) of the output, top-left origin.
+    // The answer arrives kFramesInFlight frames later: poll TakePickResult() every frame.
+    void RequestPick(std::uint32_t x, std::uint32_t y) { m_PickRequest = glm::uvec2(x, y); }
+    // Engaged once per request: the entity (NullEntity = background / destroyed meanwhile).
+    [[nodiscard]] std::optional<Entity> TakePickResult() { return std::exchange(m_PickResult, std::nullopt); }
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
 
 private:
@@ -186,7 +202,12 @@ private:
     void RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
                        const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount);
     void DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress, bool countStats);
-    void RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress);
+    void RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress,
+                       std::uint32_t frameIndex);
+    void EnsurePickingTarget(VkExtent2D extent);
+    void ReleasePickingTarget();
+    void ReadPick(const Scene& scene, std::uint32_t frameIndex);
+    [[nodiscard]] std::pair<VkDeviceAddress, std::uint32_t> PushOutlineBits(); // address, word count
     void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
     void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
@@ -234,6 +255,15 @@ private:
     std::array<std::uint32_t, kMaxCascades> m_ShadowSlots{};
 
     std::vector<DrawItem> m_DrawItems;
+    // Picking: entity IDs, per-slot single-pixel readback.
+    Image                                m_EntityIds;
+    std::uint32_t                        m_EntityIdSlot = 0;
+    Pipeline                             m_PrepassPicking; // + entity ID attachment
+    std::array<Buffer, kFramesInFlight>  m_PickReadback;
+    std::array<bool, kFramesInFlight>    m_PickPending{};
+    std::optional<glm::uvec2>            m_PickRequest;
+    std::optional<Entity>                m_PickResult;
+
     std::vector<GpuLight> m_Lights; // this frame's visible lights
     std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
 

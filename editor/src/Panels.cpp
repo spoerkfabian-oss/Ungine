@@ -1,21 +1,28 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "FileDialog.h"
+#include "History.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 
 #include <imgui.h>
-#include <imgui_stdlib.h> // InputText(std::string*)
+#include <imgui_internal.h> // ActiveIdWindow (inspector edit sessions)
+#include <imgui_stdlib.h>   // InputText(std::string*)
 
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <initializer_list>
 #include <numeric>
+#include <system_error>
+#include <utility>
 
 namespace Engine {
 
@@ -165,11 +172,16 @@ void Editor::DrawHierarchy()
         ImGui::OpenPopup("add");
     if (ImGui::BeginPopup("add")) {
         if (ImGui::MenuItem("Entity"))
-            m_Selected = m_Ctx.scene.CreateEntity("Entity");
+            Select(CreateEntity("Entity", NullEntity));
+        if (ImGui::MenuItem("Cube"))
+            Select(CreatePrimitiveEntity(PrimitiveShape::Box));
+        if (ImGui::MenuItem("Plane"))
+            Select(CreatePrimitiveEntity(PrimitiveShape::Plane));
+        ImGui::Separator();
         if (ImGui::MenuItem("Point Light"))
-            m_Selected = CreateLight(LightType::Point, NullEntity);
+            Select(CreateLight(LightType::Point, NullEntity));
         if (ImGui::MenuItem("Spot Light"))
-            m_Selected = CreateLight(LightType::Spot, NullEntity);
+            Select(CreateLight(LightType::Spot, NullEntity));
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -190,11 +202,12 @@ void Editor::DrawHierarchy()
     // Empty space: click clears the selection, dropping an entity makes it a root.
     ImGui::Dummy(ImGui::GetContentRegionAvail());
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-        m_Selected = NullEntity;
+        Select(NullEntity);
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kEntityPayload)) {
-            m_ReparentChild = *static_cast<const Entity*>(payload->Data);
-            m_ReparentTo    = NullEntity;
+            m_ReparentChild   = *static_cast<const Entity*>(payload->Data);
+            m_ReparentTo      = NullEntity;
+            m_ReparentPending = true;
         }
         ImGui::EndDragDropTarget();
     }
@@ -213,7 +226,7 @@ void Editor::DrawHierarchyNode(Entity entity)
                                ImGuiTreeNodeFlags_SpanAvailWidth;
     if (children.empty())
         flags |= ImGuiTreeNodeFlags_Leaf;
-    if (entity == m_Selected)
+    if (IsSelected(entity))
         flags |= ImGuiTreeNodeFlags_Selected;
     const bool tinted = registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
     if (tinted)
@@ -224,7 +237,7 @@ void Editor::DrawHierarchyNode(Entity entity)
         ImGui::PopStyleColor();
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
-        m_Selected = entity;
+        SelectFromClick(entity, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
 
     if (ImGui::BeginDragDropSource()) {
         ImGui::SetDragDropPayload(kEntityPayload, &entity, sizeof(entity));
@@ -233,24 +246,29 @@ void Editor::DrawHierarchyNode(Entity entity)
     }
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kEntityPayload)) {
-            m_ReparentChild = *static_cast<const Entity*>(payload->Data);
-            m_ReparentTo    = entity;
+            m_ReparentChild   = *static_cast<const Entity*>(payload->Data);
+            m_ReparentTo      = entity;
+            m_ReparentPending = true;
         }
         ImGui::EndDragDropTarget();
     }
 
     if (ImGui::BeginPopupContextItem()) {
-        m_Selected = entity;
+        if (!IsSelected(entity))
+            Select(entity);
         if (ImGui::MenuItem("Create child"))
-            m_Selected = m_Ctx.scene.CreateEntity("Entity", entity);
+            Select(CreateEntity("Entity", entity));
         if (ImGui::MenuItem("Create point light"))
-            m_Selected = CreateLight(LightType::Point, entity);
+            Select(CreateLight(LightType::Point, entity));
         if (ImGui::MenuItem("Create spot light"))
-            m_Selected = CreateLight(LightType::Spot, entity);
+            Select(CreateLight(LightType::Spot, entity));
+        ImGui::Separator();
         if (ImGui::MenuItem("Focus", "F"))
             FocusSelected();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D"))
+            m_PendingDuplicate = true;
         if (ImGui::MenuItem("Delete", "Del"))
-            m_PendingDelete = entity;
+            m_PendingDelete = m_Selection; // after the tree was drawn
         ImGui::EndPopup();
     }
 
@@ -273,16 +291,24 @@ void Editor::DrawInspector()
         return;
     }
     Registry& registry = m_Ctx.scene.GetRegistry();
-    if (m_Selected == NullEntity || !registry.Valid(m_Selected)) {
+    const Entity e     = Selected();
+    if (e == NullEntity) {
+        if (m_InspectorEdit) { // the edited entity was deselected mid-edit
+            PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+        }
         ImGui::TextDisabled("Nothing selected");
         ImGui::End();
         return;
     }
-    const Entity e = m_Selected;
+    // Undo: the state before any widget of this frame touched it (see the end of this function).
+    const std::string frameState = SnapshotEntityState(m_Ctx.scene, e);
 
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputText("##name", &registry.Get<Name>(e).value);
-    ImGui::TextDisabled("Entity %u (gen %u)", EntityIndex(e), EntityGeneration(e));
+    if (m_Selection.size() > 1)
+        ImGui::TextDisabled("%zu selected - showing the last one", m_Selection.size());
+    ImGui::TextDisabled("Entity %u (gen %u), uuid %016llx", EntityIndex(e), EntityGeneration(e),
+                        static_cast<unsigned long long>(registry.Get<Uuid>(e).value));
 
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("transform")) {
         Transform& t = registry.Get<Transform>(e);
@@ -382,6 +408,21 @@ void Editor::DrawInspector()
         if (ImGui::MenuItem("Spot Light", nullptr, false, !registry.Has<Light>(e)))
             registry.Emplace<Light>(e, Light{.type = LightType::Spot});
         ImGui::EndPopup();
+    }
+
+    // One undo step per edit: instant widgets (checkbox, combo, buttons) push right away, drags and
+    // text fields when they are released. Detected by comparing the entity's state.
+    const std::uint64_t uuid    = registry.Get<Uuid>(e).value;
+    const bool          editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
+    if (m_InspectorEdit && m_InspectorEdit->uuid == uuid && editing) {
+        // still dragging / typing
+    } else if (m_InspectorEdit) {
+        PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+    } else if (SnapshotEntityState(m_Ctx.scene, e) != frameState) {
+        if (editing)
+            m_InspectorEdit = StateEdit{uuid, frameState};
+        else
+            PushStateChange("Edit properties", {StateEdit{uuid, frameState}});
     }
     ImGui::End();
 }
@@ -649,13 +690,24 @@ void Editor::DrawAssets()
         return;
     }
 
-    const float loadWidth = ImGui::CalcTextSize("Load").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - loadWidth - ImGui::GetStyle().ItemSpacing.x);
+    const ImGuiStyle& style   = ImGui::GetStyle();
+    const float       buttons = ImGui::CalcTextSize("LoadBrowse...").x + style.FramePadding.x * 4.0f + style.ItemSpacing.x;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - buttons - style.ItemSpacing.x);
     const bool submit = ImGui::InputTextWithHint("##path", "path/to/model.glb", &m_LoadPath,
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
     if ((ImGui::Button("Load") || submit) && !m_LoadPath.empty())
-        m_OwnedModels.push_back(m_Ctx.assets.LoadModel(m_LoadPath));
+        m_Ctx.modelRefs.push_back(m_Ctx.assets.LoadModel(std::filesystem::path(std::u8string(m_LoadPath.begin(), m_LoadPath.end()))));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        m_DialogPurpose = DialogPurpose::LoadModel;
+        std::error_code             ec;
+        const std::filesystem::path current(std::u8string(m_LoadPath.begin(), m_LoadPath.end()));
+        m_FileDialog->Open("Load model", FileDialog::Mode::Open,
+                           std::filesystem::is_directory(current.parent_path(), ec) ? current.parent_path()
+                                                                                    : std::filesystem::current_path(),
+                           {".glb", ".gltf"});
+    }
 
     constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                                       ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
@@ -691,11 +743,14 @@ void Editor::DrawAssets()
 
         ImGui::TableSetColumnIndex(3);
         if (const Model* model = m_Ctx.assets.Get(info.handle)) {
-            if (ImGui::SmallButton("Instantiate"))
-                m_Selected = InstantiateModel(m_Ctx.scene, info.handle, *model);
+            if (ImGui::SmallButton("Instantiate")) {
+                const Entity roots[] = {InstantiateModel(m_Ctx.scene, info.handle, *model)};
+                PushCreated("Instantiate " + model->name, roots);
+                Select(roots[0]);
+            }
             ImGui::SameLine();
         }
-        if (std::ranges::find(m_OwnedModels, info.handle) != m_OwnedModels.end()) {
+        if (std::ranges::find(m_Ctx.modelRefs, info.handle) != m_Ctx.modelRefs.end()) {
             if (ImGui::SmallButton("Release"))
                 toRelease = info.handle;
         } else {
@@ -709,7 +764,7 @@ void Editor::DrawAssets()
     ImGui::End();
 
     if (toRelease) { // entities that still use it render nothing
-        m_OwnedModels.erase(std::ranges::find(m_OwnedModels, toRelease));
+        m_Ctx.modelRefs.erase(std::ranges::find(m_Ctx.modelRefs, toRelease));
         m_Ctx.assets.Release(toRelease);
     }
 }

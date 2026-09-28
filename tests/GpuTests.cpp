@@ -11,11 +11,14 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <cmath>
+#include <fstream>
+#include <optional>
 #include <string_view>
 #include <filesystem>
 #include <functional>
@@ -396,6 +399,124 @@ TEST_CASE(Render_ClusteredLights)
     F().assets->Release(h);
 }
 
+TEST_CASE(Render_PickingAndOutline)
+{
+    // Entity IDs from the prepass: pick the box in the middle of the image and the sky in a corner.
+    const ModelHandle h = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 2.0f});
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+    Scene        scene;
+    const Entity root = InstantiateModel(scene, h, *model);
+    const Entity box  = scene.GetRegistry().Get<Hierarchy>(root).children.at(0);
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.overlay.picking  = true;
+    renderer.overlay.outlined = {box};
+    const glm::vec3  eye{0.0f, 0.0f, 6.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 320.0f / 240.0f, 0.05f),
+                            .position   = eye,
+                            .nearPlane  = 0.05f};
+    const auto pick = [&](std::uint32_t x, std::uint32_t y) -> std::optional<Entity> {
+        std::optional<Entity> result;
+        bool                  requested = false;
+        for (int i = 0; i < 8 && !result; ++i)
+            if (auto frame = F().renderer->BeginFrame()) {
+                if (!requested) { // the output is the swapchain image here (320 x 240)
+                    renderer.RequestPick(x * frame->extent.width / 320, y * frame->extent.height / 240);
+                    requested = true;
+                }
+                renderer.Render(*frame, scene, camera);
+                F().renderer->EndFrame(*frame);
+                result = renderer.TakePickResult();
+            }
+        return result;
+    };
+    const auto center = pick(160, 120);
+    CHECK(center.has_value() && *center == box);
+    const auto corner = pick(2, 2);
+    CHECK(corner.has_value() && *corner == NullEntity);
+
+    renderer.overlay.picking = false; // releases the ID target; outline ignored
+    CHECK(!pick(160, 120).has_value());
+    F().assets->Release(h);
+}
+
+TEST_CASE(SceneFile_SaveLoadRoundTrip)
+{
+    // Files: models by path (relative to the scene) or primitive recipe, lights, settings, camera.
+    Scene             scene;
+    Registry&         r      = scene.GetRegistry();
+    const ModelHandle boxTex = F().assets->LoadModel(kBox);
+    const ModelHandle plane  = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 10.0f});
+    const Entity      a      = scene.CreateEntity("A");
+    r.Emplace<MeshRenderer>(a, MeshRenderer{.model = boxTex, .meshIndex = 0});
+    const Entity b = scene.CreateEntity("B", a);
+    r.Emplace<MeshRenderer>(b, MeshRenderer{.model = plane, .meshIndex = 0});
+    r.Get<Transform>(b).position = glm::vec3(1.0f, 2.0f, 3.0f);
+    const Entity lamp = scene.CreateEntity("Lamp", b);
+    r.Emplace<Light>(lamp, Light{.type = LightType::Spot, .intensity = 9.0f, .outerConeAngle = 0.5f});
+    const ModelHandle generated = F().assets->CreateModel(MakePlane("Tmp", 1.0f, MaterialData{}));
+    const Entity      skipped   = scene.CreateEntity("Generated");
+    r.Emplace<MeshRenderer>(skipped, MeshRenderer{.model = generated, .meshIndex = 0});
+
+    SceneRenderer settings(*F().renderer, *F().context, *F().assets);
+    settings.post.tonemapper      = Tonemapper::Aces;
+    settings.localShadows.maxLights = 3;
+    FlyCamera camera;
+    camera.position = glm::vec3(4.0f, 5.0f, 6.0f);
+    camera.yaw      = 1.25f;
+
+    const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_roundtrip.scene.json"; // next to the models
+    SaveSceneFile(file, scene, *F().assets, {.renderer = &settings, .camera = &camera});
+
+    Scene         loaded;
+    SceneRenderer settings2(*F().renderer, *F().context, *F().assets);
+    FlyCamera     camera2;
+    const auto    handles = LoadSceneFile(file, loaded, *F().assets, {.renderer = &settings2, .camera = &camera2});
+    fs::remove(file);
+
+    Registry& r2 = loaded.GetRegistry();
+    CHECK(r2.AliveCount() == 4 && handles.size() == 2);
+    const Entity a2    = loaded.FindByUuid(r.Get<Uuid>(a).value);
+    const Entity b2    = loaded.FindByUuid(r.Get<Uuid>(b).value);
+    const Entity lamp2 = loaded.FindByUuid(r.Get<Uuid>(lamp).value);
+    const Entity gen2  = loaded.FindByUuid(r.Get<Uuid>(skipped).value);
+    CHECK(a2 != NullEntity && b2 != NullEntity && lamp2 != NullEntity && gen2 != NullEntity);
+    if (a2 == NullEntity || b2 == NullEntity || lamp2 == NullEntity || gen2 == NullEntity)
+        return;
+    CHECK(r2.Get<Hierarchy>(b2).parent == a2 && r2.Get<Hierarchy>(lamp2).parent == b2);
+    CHECK(r2.Get<Transform>(b2).position == glm::vec3(1.0f, 2.0f, 3.0f));
+    CHECK(r2.Get<MeshRenderer>(a2).model == boxTex); // cache hit: same handle, refcount + 1
+    CHECK(r2.Get<MeshRenderer>(b2).model == plane);
+    CHECK(F().assets->RefCount(boxTex) == 2 && F().assets->RefCount(plane) == 2);
+    CHECK(r2.Has<Light>(lamp2) && r2.Get<Light>(lamp2).intensity == 9.0f && r2.Get<Light>(lamp2).outerConeAngle == 0.5f);
+    CHECK(!r2.Has<MeshRenderer>(gen2)); // generated models cannot be saved
+    CHECK(settings2.post.tonemapper == Tonemapper::Aces && settings2.localShadows.maxLights == 3);
+    CHECK(camera2.position == glm::vec3(4.0f, 5.0f, 6.0f) && camera2.yaw == 1.25f);
+
+    // Broken files throw and leave the scene alone.
+    const fs::path broken = fs::path(ENGINE_ASSET_DIR) / "test_broken.scene.json";
+    { std::ofstream(broken) << R"({"version": 1, "entities": [{"uuid": 5, "name": "X", "mesh": {"model": {}}}]})"; }
+    bool threw = false;
+    try {
+        (void)LoadSceneFile(broken, loaded, *F().assets);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    fs::remove(broken);
+    CHECK(threw && r2.AliveCount() == 4);
+
+    for (ModelHandle handle : handles)
+        F().assets->Release(handle);
+    for (ModelHandle handle : {boxTex, plane, generated})
+        F().assets->Release(handle);
+}
+
 TEST_CASE(Editor_FramesSelectionAndToggle)
 {
     // Editor frame flow (viewport texture + UI into the swapchain) under validation, recreated
@@ -419,12 +540,14 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
     FlyCamera camera;
     camera.position = glm::vec3(0.0f, 1.0f, 4.0f);
 
-    const EditorContext context{.window        = *F().window,
-                                .renderer      = *F().renderer,
-                                .scene         = scene,
-                                .assets        = *F().assets,
-                                .sceneRenderer = sceneRenderer,
-                                .camera        = camera};
+    std::vector<ModelHandle> modelRefs;
+    const EditorContext      context{.window        = *F().window,
+                                     .renderer      = *F().renderer,
+                                     .scene         = scene,
+                                     .assets        = *F().assets,
+                                     .sceneRenderer = sceneRenderer,
+                                     .camera        = camera,
+                                     .modelRefs     = modelRefs};
     const auto runFrames = [&](Editor& editor, int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -469,6 +592,100 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
         }
     }
     CHECK(!camera.moveRequiresLook); // restored by the editor
+    F().assets->Release(h);
+}
+
+TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
+{
+    const ModelHandle h = F().assets->LoadModel(kBox);
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+
+    Scene         scene;
+    Registry&     r     = scene.GetRegistry();
+    const Entity  root  = InstantiateModel(scene, h, *model); // root + 1 mesh node
+    const Entity  light = scene.CreateEntity("Light");
+    r.Emplace<Light>(light, Light{.intensity = 3.0f});
+    const std::uint64_t rootUuid  = r.Get<Uuid>(root).value;
+    const std::uint64_t lightUuid = r.Get<Uuid>(light).value;
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const std::size_t subtree      = 1 + model->nodes.size(); // root + one entity per node
+    const std::size_t rootChildren = r.Get<Hierarchy>(root).children.size();
+    const std::size_t initial      = r.AliveCount();
+    CHECK(initial == subtree + 1);
+
+    // Selection outline covers the meshes below the selected root; picking target is on.
+    editor.Select(root);
+    runFrames(2);
+    CHECK(sceneRenderer.overlay.picking && sceneRenderer.overlay.outlined.size() == 1);
+
+    // Duplicate: subtree copied with new UUIDs and selected; undo / redo recreate the same copy.
+    editor.DuplicateSelection();
+    CHECK(r.AliveCount() == initial + subtree && editor.Selection().size() == 1 && editor.Selected() != root);
+    const std::uint64_t copyUuid = r.Get<Uuid>(editor.Selected()).value;
+    CHECK(copyUuid != rootUuid && editor.CanUndo() && editor.HasUnsavedChanges());
+    CHECK(editor.Undo() && r.AliveCount() == initial && scene.FindByUuid(copyUuid) == NullEntity);
+    CHECK(editor.Redo() && r.AliveCount() == initial + subtree && scene.FindByUuid(copyUuid) != NullEntity);
+    CHECK(editor.Undo());
+
+    // Multi-selection delete, undo restores both with their UUIDs and hierarchy.
+    editor.Select(root);
+    editor.ToggleSelection(light);
+    CHECK(editor.Selection().size() == 2);
+    editor.DeleteSelection();
+    CHECK(r.AliveCount() == 0 && editor.Selection().empty());
+    CHECK(editor.Undo() && r.AliveCount() == initial);
+    const Entity root2 = scene.FindByUuid(rootUuid);
+    CHECK(root2 != NullEntity && scene.FindByUuid(lightUuid) != NullEntity);
+    CHECK(root2 != NullEntity && r.Get<Hierarchy>(root2).children.size() == rootChildren);
+    CHECK(editor.Redo() && r.AliveCount() == 0);
+    CHECK(editor.Undo() && r.AliveCount() == initial);
+    runFrames(2); // restored entities render
+
+    // Save, new scene, open: same content, clean history, model refs owned by the application.
+    const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_editor.scene.json";
+    CHECK(editor.SaveScene(file) && !editor.HasUnsavedChanges() && editor.ScenePath() == file);
+    editor.NewScene();
+    CHECK(r.AliveCount() == 0 && !editor.CanUndo() && editor.ScenePath().empty());
+    CHECK(editor.OpenScene(file));
+    CHECK(r.AliveCount() == initial && scene.FindByUuid(rootUuid) != NullEntity && !modelRefs.empty());
+    CHECK(!editor.CanUndo() && !editor.HasUnsavedChanges());
+    runFrames(3);
+    fs::remove(file);
+
+    // A broken file leaves the scene alone.
+    const fs::path broken = fs::path(ENGINE_ASSET_DIR) / "test_editor_broken.scene.json";
+    { std::ofstream(broken) << "{ not json"; }
+    CHECK(!editor.OpenScene(broken) && r.AliveCount() == initial);
+    fs::remove(broken);
+
+    for (ModelHandle ref : modelRefs)
+        F().assets->Release(ref);
     F().assets->Release(h);
 }
 

@@ -1,4 +1,6 @@
 #include "Editor/Editor.h"
+#include "FileDialog.h"
+#include "History.h"
 #include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
@@ -7,6 +9,7 @@
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 
 #include <ImGuizmo.h>
 #include <imgui.h>
@@ -22,20 +25,39 @@ namespace Engine {
 
 namespace {
 constexpr VkFormat kViewportFormat = VK_FORMAT_R8G8B8A8_SRGB; // sampled by ImGui, encoded like the swapchain
+
+// Local TRS that puts an entity at `world` under its parent (false: not decomposable, e.g. skew).
+bool SetWorldMatrix(Registry& registry, Entity entity, const glm::mat4& world)
+{
+    const Entity    parent      = registry.Get<Hierarchy>(entity).parent;
+    const glm::mat4 parentWorld = parent != NullEntity ? registry.Get<WorldTransform>(parent).matrix : glm::mat4(1.0f);
+    glm::vec3       scale, translation, skew;
+    glm::vec4       perspective;
+    glm::quat       rotation;
+    if (!glm::decompose(glm::inverse(parentWorld) * world, scale, rotation, translation, skew, perspective))
+        return false;
+    Transform& t = registry.Get<Transform>(entity);
+    t.position   = translation;
+    t.rotation   = glm::normalize(rotation);
+    t.scale      = scale;
+    return true;
+}
 } // namespace
 
 Editor::Editor(const EditorContext& context)
-    : m_Ctx(context), m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer))
+    : m_Ctx(context),
+      m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer)),
+      m_History(std::make_unique<History>()),
+      m_FileDialog(std::make_unique<FileDialog>())
 {
-    m_Ctx.camera.moveRequiresLook = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
+    m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
+    m_Ctx.sceneRenderer.overlay.picking = true;
 }
 
 Editor::~Editor()
 {
-    for (ModelHandle h : m_OwnedModels)
-        if (m_Ctx.assets.State(h) != AssetState::Invalid)
-            m_Ctx.assets.Release(h);
     m_Ctx.camera.moveRequiresLook = false;
+    m_Ctx.sceneRenderer.overlay   = {};
 
     if (m_ViewportImage) {
         m_ImGui->RemoveTexture(m_ViewportTexture);
@@ -55,14 +77,19 @@ float Editor::ViewportAspect() const
     return static_cast<float>(e.width) / static_cast<float>(std::max(e.height, 1u));
 }
 
+bool Editor::CanUndo() const { return m_History->CanUndo(); }
+bool Editor::CanRedo() const { return m_History->CanRedo(); }
+bool Editor::HasUnsavedChanges() const { return m_History->Dirty(); }
+
 void Editor::Update(float dt)
 {
     m_FrameTimes[m_FrameTimeHead] = dt * 1000.0f;
     m_FrameTimeHead               = (m_FrameTimeHead + 1) % kHistory;
 
-    Registry& registry = m_Ctx.scene.GetRegistry();
-    if (m_Selected != NullEntity && !registry.Valid(m_Selected))
-        m_Selected = NullEntity;
+    // Pick requested a few frames ago (click in the viewport).
+    if (const std::optional<Entity> picked = m_Ctx.sceneRenderer.TakePickResult())
+        SelectFromClick(*picked, m_PickAdditive);
+    ValidateSelection();
 
     // Mouse look hides and warps the cursor: keep ImGui from hovering widgets meanwhile.
     ImGuiIO& io = ImGui::GetIO();
@@ -92,12 +119,15 @@ void Editor::Update(float dt)
         DrawStats();
     if (m_ShowDemo)
         ImGui::ShowDemoWindow(&m_ShowDemo);
+    DrawDialogs();
 
     HandleHotkeys();
     ApplyPendingEdits();
+    ValidateSelection();
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
+    UpdateSelectionOverlay();
 }
 
 void Editor::Render(const FrameContext& frame)
@@ -173,8 +203,50 @@ void Editor::DrawMenuBar()
     if (!ImGui::BeginMainMenuBar())
         return;
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("New scene", "Ctrl+N"))
+            RequestSceneChange([this] { NewScene(); });
+        if (ImGui::MenuItem("Open scene...", "Ctrl+O"))
+            RequestSceneChange([this] {
+                m_DialogPurpose = DialogPurpose::OpenScene;
+                m_FileDialog->Open("Open scene", FileDialog::Mode::Open,
+                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   {".json"});
+            });
+        if (ImGui::MenuItem("Save scene", "Ctrl+S")) {
+            if (m_ScenePath.empty()) {
+                m_DialogPurpose = DialogPurpose::SaveScene;
+                m_FileDialog->Open("Save scene", FileDialog::Mode::Save, std::filesystem::current_path(),
+                                   {".scene.json", ".json"}, "untitled.scene.json");
+            } else {
+                SaveScene(m_ScenePath);
+            }
+        }
+        if (ImGui::MenuItem("Save scene as...", "Ctrl+Shift+S")) {
+            m_DialogPurpose = DialogPurpose::SaveScene;
+            m_FileDialog->Open("Save scene", FileDialog::Mode::Save,
+                               m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                               {".scene.json", ".json"},
+                               m_ScenePath.empty() ? "untitled.scene.json" : m_ScenePath.filename().string());
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Esc"))
             m_Ctx.window.RequestClose();
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Edit")) {
+        const std::string undo = "Undo " + m_History->UndoLabel();
+        const std::string redo = "Redo " + m_History->RedoLabel();
+        if (ImGui::MenuItem(undo.c_str(), "Ctrl+Z", false, CanUndo()))
+            Undo();
+        if (ImGui::MenuItem(redo.c_str(), "Ctrl+Y", false, CanRedo()))
+            Redo();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !m_Selection.empty()))
+            DuplicateSelection();
+        if (ImGui::MenuItem("Delete", "Del", false, !m_Selection.empty()))
+            DeleteSelection();
+        if (ImGui::MenuItem("Select none", nullptr, false, !m_Selection.empty()))
+            Select(NullEntity);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -187,7 +259,8 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("ImGui demo", nullptr, &m_ShowDemo);
         ImGui::EndMenu();
     }
-    ImGui::TextDisabled("  F1: editor on/off | RMB + WASD/QE: fly | W/E/R: move/rotate/scale | F: focus | Del");
+    const std::string scene = m_ScenePath.empty() ? "untitled" : m_ScenePath.filename().string();
+    ImGui::TextDisabled("  %s%s  %s", scene.c_str(), HasUnsavedChanges() ? "*" : "", m_Status.c_str());
     ImGui::EndMainMenuBar();
 }
 
@@ -209,21 +282,31 @@ void Editor::DrawViewport()
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::Image(ImTextureRef(m_ViewportTexture), ImVec2(static_cast<float>(width), static_cast<float>(height)));
-    m_ViewportHovered   = ImGui::IsItemHovered();
-    m_ViewportFocused   = ImGui::IsWindowFocused();
-    const bool clicked  = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
-    DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    m_ViewportHovered  = ImGui::IsItemHovered();
+    m_ViewportFocused  = ImGui::IsWindowFocused();
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
+    const bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    if (clicked && !iconHit) {
+        // GPU picking: the entity under the cursor arrives a few frames later (Update).
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float  px    = mouse.x - origin.x;
+        const float  py    = mouse.y - origin.y;
+        if (px >= 0.0f && py >= 0.0f && px < static_cast<float>(width) && py < static_cast<float>(height)) {
+            m_Ctx.sceneRenderer.RequestPick(static_cast<std::uint32_t>(px), static_cast<std::uint32_t>(py));
+            m_PickAdditive = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+        }
+    }
 
     // Toolbar overlay.
     ImGui::SetCursorScreenPos(ImVec2(origin.x + 8.0f, origin.y + 8.0f));
     const auto toolButton = [&](const char* label, bool active) {
         if (active)
             ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        const bool clicked = ImGui::Button(label);
+        const bool pressed = ImGui::Button(label);
         if (active)
             ImGui::PopStyleColor();
         ImGui::SameLine();
-        return clicked;
+        return pressed;
     };
     if (toolButton("Move", m_GizmoOperation == GizmoOperation::Translate))
         m_GizmoOperation = GizmoOperation::Translate;
@@ -243,9 +326,12 @@ void Editor::DrawViewport()
 
 void Editor::DrawGizmo(float x, float y, float width, float height)
 {
-    Registry& registry = m_Ctx.scene.GetRegistry();
-    if (m_Selected == NullEntity || !registry.Has<Transform>(m_Selected))
+    Registry&    registry = m_Ctx.scene.GetRegistry();
+    const Entity primary  = Selected();
+    if (primary == NullEntity) {
+        m_GizmoEdit.reset();
         return;
+    }
 
     ImGuizmo::SetOrthographic(false);
     ImGuizmo::SetDrawlist();
@@ -253,27 +339,33 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
 
     // The engine projection is reverse-Z with an infinite far plane; ImGuizmo handles both.
     const CameraData camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
-    glm::mat4        world  = registry.Get<WorldTransform>(m_Selected).matrix;
+    const glm::mat4  before = registry.Get<WorldTransform>(primary).matrix;
+    glm::mat4        world  = before;
 
     const ImGuizmo::OPERATION op = m_GizmoOperation == GizmoOperation::Translate ? ImGuizmo::TRANSLATE
                                    : m_GizmoOperation == GizmoOperation::Rotate  ? ImGuizmo::ROTATE
                                                                                  : ImGuizmo::SCALE;
     const ImGuizmo::MODE mode = m_GizmoLocal || op == ImGuizmo::SCALE ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
-    if (!ImGuizmo::Manipulate(glm::value_ptr(camera.view), glm::value_ptr(camera.projection), op, mode,
-                              glm::value_ptr(world)))
-        return;
+    const bool changed = ImGuizmo::Manipulate(glm::value_ptr(camera.view), glm::value_ptr(camera.projection), op, mode,
+                                              glm::value_ptr(world));
 
-    // Back to the local transform relative to the parent.
-    const Entity    parent      = registry.Get<Hierarchy>(m_Selected).parent;
-    const glm::mat4 parentWorld = parent != NullEntity ? registry.Get<WorldTransform>(parent).matrix : glm::mat4(1.0f);
-    glm::vec3       scale, translation, skew;
-    glm::vec4       perspective;
-    glm::quat       rotation;
-    if (glm::decompose(glm::inverse(parentWorld) * world, scale, rotation, translation, skew, perspective)) {
-        Transform& t = registry.Get<Transform>(m_Selected);
-        t.position   = translation;
-        t.rotation   = glm::normalize(rotation);
-        t.scale      = scale;
+    // One undo step per drag, covering every moved root.
+    const std::vector<Entity> roots = SelectionRoots();
+    if (ImGuizmo::IsUsing() && !m_GizmoEdit) {
+        m_GizmoEdit.emplace();
+        for (Entity e : roots)
+            m_GizmoEdit->push_back({UuidOf(e), SnapshotEntityState(m_Ctx.scene, e)});
+    }
+    if (changed) {
+        // The same world-space delta for all roots: they move / turn / scale about the primary's pivot.
+        const glm::mat4 delta = world * glm::inverse(before);
+        for (Entity e : roots)
+            SetWorldMatrix(registry, e, e == primary ? world : delta * registry.Get<WorldTransform>(e).matrix);
+    }
+    if (!ImGuizmo::IsUsing() && m_GizmoEdit) {
+        const char* label = op == ImGuizmo::TRANSLATE ? "Move" : op == ImGuizmo::ROTATE ? "Rotate" : "Scale";
+        PushStateChange(label, std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
     }
 }
 
@@ -335,10 +427,10 @@ ImU32 LightColor(const Light& light, float alpha)
 
 } // namespace
 
-void Editor::DrawLightOverlay(float x, float y, float width, float height, bool clicked)
+bool Editor::DrawLightOverlay(float x, float y, float width, float height, bool clicked)
 {
     if (!m_ShowLightIcons)
-        return;
+        return false;
     Registry&               registry = m_Ctx.scene.GetRegistry();
     const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
     const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
@@ -353,7 +445,7 @@ void Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
         ImVec2 p;
         if (!projector.Project(glm::vec3(world.matrix[3]), p))
             return;
-        const bool selected = e == m_Selected;
+        const bool selected = IsSelected(e);
         list->AddCircleFilled(p, kIconRadius, LightColor(light, 0.9f));
         list->AddCircle(p, kIconRadius + 1.0f, selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(0, 0, 0, 200), 0,
                         selected ? 2.5f : 1.5f);
@@ -368,24 +460,26 @@ void Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
         }
     });
     if (clicked && hit != NullEntity)
-        m_Selected = hit;
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
 
-    // Selected light: range sphere (three great circles) or spot cone.
-    if (m_Selected != NullEntity && registry.Has<Light>(m_Selected)) {
-        const Light&     light  = registry.Get<Light>(m_Selected);
-        const glm::mat4& world  = registry.Get<WorldTransform>(m_Selected).matrix;
-        const glm::vec3  pos    = world[3];
-        const float      range  = EffectiveRange(light);
-        const ImU32      color  = LightColor(light, 0.8f);
+    // Selected lights: range sphere (three great circles) or spot cone.
+    for (Entity e : m_Selection) {
+        if (!registry.Has<Light>(e))
+            continue;
+        const Light&     light = registry.Get<Light>(e);
+        const glm::mat4& world = registry.Get<WorldTransform>(e).matrix;
+        const glm::vec3  pos   = world[3];
+        const float      range = EffectiveRange(light);
+        const ImU32      color = LightColor(light, 0.8f);
         if (light.type == LightType::Point) {
             projector.Circle(list, pos, {1, 0, 0}, {0, 1, 0}, range, color);
             projector.Circle(list, pos, {1, 0, 0}, {0, 0, 1}, range, color);
             projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, range, color);
         } else {
-            const glm::vec3 dir   = glm::normalize(-glm::vec3(world[2]));
-            const glm::vec3 u     = glm::normalize(glm::vec3(world[0]));
-            const glm::vec3 v     = glm::normalize(glm::cross(dir, u));
-            const auto      cone  = [&](float angle, ImU32 c) {
+            const glm::vec3 dir  = glm::normalize(-glm::vec3(world[2]));
+            const glm::vec3 u    = glm::normalize(glm::vec3(world[0]));
+            const glm::vec3 v    = glm::normalize(glm::cross(dir, u));
+            const auto      cone = [&](float angle, ImU32 c) {
                 const glm::vec3 center = pos + dir * (range * std::cos(angle));
                 const float     radius = range * std::sin(angle);
                 projector.Circle(list, center, u, v, radius, c);
@@ -398,26 +492,52 @@ void Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
         }
     }
     list->PopClipRect();
-}
-
-Entity Editor::CreateLight(LightType type, Entity parent)
-{
-    // Scaled like the fly camera (its speed follows the scene size in the Sandbox).
-    const float scale = std::max(m_Ctx.camera.moveSpeed, 0.1f);
-    Light       light{.type = type, .intensity = 4.0f * scale * scale, .range = 4.0f * scale};
-    const Entity e = m_Ctx.scene.CreateEntity(type == LightType::Spot ? "Spot Light" : "Point Light", parent);
-    Transform&   t = m_Ctx.scene.GetRegistry().Get<Transform>(e);
-    if (parent == NullEntity)
-        t.position = m_Ctx.camera.position + m_Ctx.camera.Forward() * (2.0f * scale);
-    if (type == LightType::Spot)
-        t.rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // pointing down
-    m_Ctx.scene.GetRegistry().Emplace<Light>(e, light);
-    return e;
+    return clicked && hit != NullEntity;
 }
 
 void Editor::HandleHotkeys()
 {
-    if (ImGui::GetIO().WantTextInput || m_Ctx.camera.IsCaptured() || !(m_ViewportHovered || m_ViewportFocused))
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput || m_Ctx.camera.IsCaptured() || ImGui::IsAnyItemActive() || m_FileDialog->IsOpen())
+        return;
+
+    // Global shortcuts (any editor window).
+    if (io.KeyCtrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (io.KeyShift)
+                Redo();
+            else
+                Undo();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y, false))
+            Redo();
+        if (ImGui::IsKeyPressed(ImGuiKey_D, false))
+            DuplicateSelection();
+        if (ImGui::IsKeyPressed(ImGuiKey_N, false))
+            RequestSceneChange([this] { NewScene(); });
+        if (ImGui::IsKeyPressed(ImGuiKey_O, false))
+            RequestSceneChange([this] {
+                m_DialogPurpose = DialogPurpose::OpenScene;
+                m_FileDialog->Open("Open scene", FileDialog::Mode::Open,
+                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   {".json"});
+            });
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+            if (m_ScenePath.empty() || io.KeyShift) {
+                m_DialogPurpose = DialogPurpose::SaveScene;
+                m_FileDialog->Open("Save scene", FileDialog::Mode::Save,
+                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   {".scene.json", ".json"},
+                                   m_ScenePath.empty() ? "untitled.scene.json" : m_ScenePath.filename().string());
+            } else {
+                SaveScene(m_ScenePath);
+            }
+        }
+        return;
+    }
+
+    // Viewport tools.
+    if (!(m_ViewportHovered || m_ViewportFocused))
         return;
     if (ImGui::IsKeyPressed(ImGuiKey_W, false))
         m_GizmoOperation = GizmoOperation::Translate;
@@ -428,63 +548,92 @@ void Editor::HandleHotkeys()
     if (ImGui::IsKeyPressed(ImGuiKey_F, false))
         FocusSelected();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
-        DeleteSelected();
-}
-
-void Editor::ApplyPendingEdits()
-{
-    Registry& registry = m_Ctx.scene.GetRegistry();
-    if (m_PendingDelete != NullEntity) {
-        if (registry.Valid(m_PendingDelete)) {
-            m_Ctx.scene.DestroyEntity(m_PendingDelete);
-            if (!registry.Valid(m_Selected))
-                m_Selected = NullEntity;
-        }
-        m_PendingDelete = NullEntity;
-    }
-
-    const Entity child = std::exchange(m_ReparentChild, NullEntity);
-    const Entity parent = std::exchange(m_ReparentTo, NullEntity);
-    if (!registry.Valid(child) || (parent != NullEntity && !registry.Valid(parent)) || child == parent)
-        return;
-    // Refuse cycles: the new parent must not live below the child.
-    for (Entity e = parent; e != NullEntity; e = registry.Get<Hierarchy>(e).parent)
-        if (e == child)
-            return;
-    if (registry.Get<Hierarchy>(child).parent == parent)
-        return;
-
-    // Keep the world transform (world matrices are from the last UpdateTransforms).
-    const glm::mat4 childWorld  = registry.Get<WorldTransform>(child).matrix;
-    const glm::mat4 parentWorld = parent != NullEntity ? registry.Get<WorldTransform>(parent).matrix : glm::mat4(1.0f);
-    m_Ctx.scene.SetParent(child, parent);
-    glm::vec3 scale, translation, skew;
-    glm::vec4 perspective;
-    glm::quat rotation;
-    if (glm::decompose(glm::inverse(parentWorld) * childWorld, scale, rotation, translation, skew, perspective)) {
-        Transform& t = registry.Get<Transform>(child);
-        t.position   = translation;
-        t.rotation   = glm::normalize(rotation);
-        t.scale      = scale;
-    }
-}
-
-void Editor::DeleteSelected()
-{
-    if (m_Selected != NullEntity)
-        m_PendingDelete = m_Selected;
+        DeleteSelection();
 }
 
 void Editor::FocusSelected()
 {
-    Registry& registry = m_Ctx.scene.GetRegistry();
-    if (m_Selected == NullEntity || !registry.Has<WorldTransform>(m_Selected))
+    const Entity primary = Selected();
+    if (primary == NullEntity)
         return;
     // Look at the pivot from a comfortable distance, keeping the current viewing direction.
-    const glm::vec3 target   = glm::vec3(registry.Get<WorldTransform>(m_Selected).matrix[3]);
+    const glm::vec3 target   = glm::vec3(m_Ctx.scene.GetRegistry().Get<WorldTransform>(primary).matrix[3]);
     const float     distance = std::clamp(glm::length(target - m_Ctx.camera.position), 1.0f, 10.0f);
     m_Ctx.camera.position    = target - m_Ctx.camera.Forward() * distance;
     m_Ctx.camera.LookAt(target);
+}
+
+// --- Selection --------------------------------------------------------------------------------
+
+Entity Editor::Selected() const
+{
+    return m_Selection.empty() ? NullEntity : m_Selection.back();
+}
+
+void Editor::Select(Entity entity)
+{
+    m_Selection.clear();
+    if (entity != NullEntity)
+        m_Selection.push_back(entity);
+}
+
+void Editor::ToggleSelection(Entity entity)
+{
+    if (entity == NullEntity)
+        return;
+    if (const auto it = std::ranges::find(m_Selection, entity); it != m_Selection.end())
+        m_Selection.erase(it);
+    else
+        m_Selection.push_back(entity);
+}
+
+bool Editor::IsSelected(Entity entity) const
+{
+    return std::ranges::find(m_Selection, entity) != m_Selection.end();
+}
+
+void Editor::SelectFromClick(Entity entity, bool additive)
+{
+    if (additive)
+        ToggleSelection(entity);
+    else
+        Select(entity);
+}
+
+void Editor::ValidateSelection()
+{
+    const Registry& registry = m_Ctx.scene.GetRegistry();
+    std::erase_if(m_Selection, [&](Entity e) { return !registry.Valid(e) || !registry.Has<Hierarchy>(e); });
+}
+
+std::vector<Entity> Editor::SelectionRoots() const
+{
+    std::vector<Entity> roots;
+    for (Entity e : m_Selection) {
+        const bool coveredByAncestor = std::ranges::any_of(
+            m_Selection, [&](Entity other) { return other != e && m_Ctx.scene.IsAncestor(other, e); });
+        if (!coveredByAncestor)
+            roots.push_back(e);
+    }
+    return roots;
+}
+
+void Editor::UpdateSelectionOverlay()
+{
+    // Outline every mesh below the selected entities (selecting a model root outlines the model).
+    const Registry&     registry = m_Ctx.scene.GetRegistry();
+    std::vector<Entity> outlined;
+    std::vector<Entity> stack(m_Selection.begin(), m_Selection.end());
+    while (!stack.empty()) {
+        const Entity e = stack.back();
+        stack.pop_back();
+        if (registry.Has<MeshRenderer>(e))
+            outlined.push_back(e);
+        const auto& children = registry.Get<Hierarchy>(e).children;
+        stack.insert(stack.end(), children.begin(), children.end());
+    }
+    m_Ctx.sceneRenderer.overlay.picking  = true;
+    m_Ctx.sceneRenderer.overlay.outlined = std::move(outlined);
 }
 
 } // namespace Engine

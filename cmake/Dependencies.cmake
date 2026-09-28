@@ -77,6 +77,14 @@ FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)
 target_include_directories(stb SYSTEM INTERFACE "${stb_SOURCE_DIR}")
 
+# --- nlohmann/json: scene files, editor snapshots (engine-private) ---
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_Declare(nlohmann_json
+    URL      https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+    SYSTEM)  # third-party headers: no warnings in our /W4 builds
+FetchContent_MakeAvailable(nlohmann_json)
+
 # --- Dear ImGui (docking branch) + GLFW/Vulkan backends: editor only ---
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git

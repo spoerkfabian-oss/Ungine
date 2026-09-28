@@ -5,6 +5,7 @@
 //   #extension GL_EXT_nonuniform_qualifier : require
 
 layout(set = 0, binding = 0) uniform texture2D uTextures[];
+layout(set = 0, binding = 0) uniform utexture2D uUintTextures[]; // same binding, integer formats (entity IDs)
 layout(set = 0, binding = 1) uniform sampler   uSamplers[];
 layout(set = 0, binding = 2, rgba16f) uniform image2D uStorageImages[]; // HDR targets
 layout(set = 0, binding = 3) uniform textureCube uCubeTextures[];

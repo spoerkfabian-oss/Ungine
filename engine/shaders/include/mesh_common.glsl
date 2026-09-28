@@ -38,6 +38,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Ma
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DrawData {
     mat4 model;
     mat4 normalMatrix; // inverse-transpose of the upper 3x3, computed on the CPU
+    uint entityId;     // entity slot index + 1 (picking)
 };
 
 layout(push_constant) uniform MeshPush {
