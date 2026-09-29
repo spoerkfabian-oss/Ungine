@@ -2,6 +2,7 @@
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <utility>
 
@@ -17,6 +18,12 @@ Buffer::Buffer(const VulkanContext& ctx, const BufferDesc& desc)
     info.size        = desc.size;
     info.usage       = desc.usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const std::uint32_t families[] = {ctx.GraphicsQueue().family, ctx.TransferQueue().family};
+    if (desc.concurrent && families[0] != families[1]) {
+        info.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+        info.queueFamilyIndexCount = 2;
+        info.pQueueFamilyIndices   = families;
+    }
 
     VmaAllocationCreateInfo alloc{};
     switch (desc.memory) {

@@ -4,6 +4,7 @@
 #include "History.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -20,6 +21,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <initializer_list>
+#include <iterator>
+#include <limits>
 #include <numeric>
 #include <system_error>
 #include <utility>
@@ -136,6 +139,22 @@ bool EnumComboRow(const char* label, E* value)
     return changed;
 }
 
+template <class E, std::size_t N>
+bool ComboRow(const char* label, E* value, const char* const (&names)[N])
+{
+    PropertyRow(label);
+    int        index   = static_cast<int>(*value);
+    const bool changed = ImGui::Combo("##v", &index, names, static_cast<int>(N));
+    if (changed)
+        *value = static_cast<E>(index);
+    ImGui::PopID();
+    return changed;
+}
+
+constexpr const char* kBodyTypeNames[]      = {"Static", "Kinematic", "Dynamic"};
+constexpr const char* kColliderShapeNames[] = {"Box", "Sphere", "Capsule", "Mesh"};
+constexpr const char* kActivityNames[]      = {"-", "static", "kinematic", "active", "sleeping", "character"};
+
 bool Vec3Row(const char* label, glm::vec3* v, float speed, float resetValue, const char* fmt = "%.3f")
 {
     PropertyRow(label);
@@ -177,6 +196,10 @@ void Editor::DrawHierarchy()
             Select(CreatePrimitiveEntity(PrimitiveShape::Box));
         if (ImGui::MenuItem("Plane"))
             Select(CreatePrimitiveEntity(PrimitiveShape::Plane));
+        if (ImGui::MenuItem("Sphere"))
+            Select(CreatePrimitiveEntity(PrimitiveShape::Sphere));
+        if (ImGui::MenuItem("Capsule"))
+            Select(CreatePrimitiveEntity(PrimitiveShape::Capsule));
         ImGui::Separator();
         if (ImGui::MenuItem("Point Light"))
             Select(CreateLight(LightType::Point, NullEntity));
@@ -403,6 +426,97 @@ void Editor::DrawInspector()
             registry.Remove<Light>(e);
     }
 
+    if (RigidBody* body = registry.TryGet<RigidBody>(e);
+        body && ImGui::CollapsingHeader("Rigid Body", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("body")) {
+        ComboRow("Type", &body->type, kBodyTypeNames);
+        if (body->type == BodyType::Dynamic) {
+            DragFloatRow("Mass", &body->mass, 0.05f, 0.001f, 1e6f, "%.3f kg");
+            DragFloatRow("Gravity factor", &body->gravityFactor, 0.01f, -10.0f, 10.0f);
+            DragFloatRow("Linear damping", &body->linearDamping, 0.005f, 0.0f, 10.0f);
+            DragFloatRow("Angular damping", &body->angularDamping, 0.005f, 0.0f, 10.0f);
+            CheckboxRow("Allow sleeping", &body->allowSleeping);
+        }
+        if (m_Ctx.physics) {
+            PropertyRow("State");
+            const BodyActivity activity = m_Ctx.physics->Activity(e);
+            ImGui::TextDisabled("%s", kActivityNames[static_cast<std::size_t>(activity)]);
+            ImGui::PopID();
+            if (activity == BodyActivity::Active || activity == BodyActivity::Sleeping) {
+                const glm::vec3 v = m_Ctx.physics->LinearVelocity(e);
+                PropertyRow("Velocity");
+                ImGui::TextDisabled("%.2f  %.2f  %.2f", v.x, v.y, v.z);
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+        if (!registry.Has<Collider>(e))
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Needs a Collider");
+        if (ImGui::Button("Remove rigid body"))
+            registry.Remove<RigidBody>(e);
+    }
+
+    if (Collider* collider = registry.TryGet<Collider>(e);
+        collider && ImGui::CollapsingHeader("Collider", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("collider")) {
+        ComboRow("Shape", &collider->shape, kColliderShapeNames);
+        switch (collider->shape) {
+        case ColliderShape::Box: Vec3Row("Half extents", &collider->halfExtents, 0.005f, 0.5f); break;
+        case ColliderShape::Sphere: DragFloatRow("Radius", &collider->radius, 0.005f, 0.001f, 1e4f); break;
+        case ColliderShape::Capsule:
+            DragFloatRow("Radius", &collider->radius, 0.005f, 0.001f, 1e4f);
+            DragFloatRow("Half height", &collider->halfHeight, 0.005f, 0.0f, 1e4f);
+            break;
+        case ColliderShape::Mesh:
+            PropertyRow("Triangles");
+            ImGui::TextDisabled(registry.Has<MeshRenderer>(e) ? "from the Mesh Renderer" : "needs a Mesh Renderer");
+            ImGui::PopID();
+            break;
+        }
+        if (collider->shape != ColliderShape::Mesh)
+            Vec3Row("Center", &collider->center, 0.005f, 0.0f);
+        DragFloatRow("Friction", &collider->friction, 0.005f, 0.0f, 10.0f);
+        DragFloatRow("Restitution", &collider->restitution, 0.005f, 0.0f, 1.0f);
+        CheckboxRow("Trigger", &collider->trigger);
+        ImGui::EndTable();
+        if (collider->shape == ColliderShape::Mesh && registry.Has<RigidBody>(e) &&
+            registry.Get<RigidBody>(e).type == BodyType::Dynamic)
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Mesh colliders are static or kinematic");
+        const std::optional<std::pair<glm::vec3, glm::vec3>> bounds = MeshBounds(e);
+        if (bounds && collider->shape != ColliderShape::Mesh) {
+            if (ImGui::Button("Fit to mesh")) {
+                const Collider fitted = FitCollider(collider->shape, bounds->first, bounds->second);
+                collider->halfExtents = fitted.halfExtents;
+                collider->radius      = fitted.radius;
+                collider->halfHeight  = fitted.halfHeight;
+                collider->center      = fitted.center;
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Remove collider"))
+            registry.Remove<Collider>(e);
+    }
+
+    if (CharacterController* character = registry.TryGet<CharacterController>(e);
+        character && ImGui::CollapsingHeader("Character Controller", ImGuiTreeNodeFlags_DefaultOpen) &&
+        BeginProperties("character")) {
+        DragFloatRow("Radius", &character->radius, 0.005f, 0.01f, 10.0f);
+        DragFloatRow("Height", &character->height, 0.005f, 0.05f, 20.0f);
+        PropertyRow("Max slope");
+        ImGui::SliderAngle("##v", &character->maxSlope, 0.0f, 89.0f);
+        ImGui::PopID();
+        DragFloatRow("Step height", &character->stepHeight, 0.005f, 0.0f, 5.0f);
+        DragFloatRow("Jump speed", &character->jumpSpeed, 0.05f, 0.0f, 100.0f, "%.2f m/s");
+        if (m_Ctx.physics) {
+            if (const std::optional<CharacterState> state = m_Ctx.physics->GetCharacterState(e)) {
+                PropertyRow("State");
+                ImGui::TextDisabled("%s, v %.2f m/s", state->onGround ? "on ground" : "in air", glm::length(state->velocity));
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+        if (ImGui::Button("Remove character controller"))
+            registry.Remove<CharacterController>(e);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -411,6 +525,31 @@ void Editor::DrawInspector()
             registry.Emplace<Light>(e, Light{.type = LightType::Point});
         if (ImGui::MenuItem("Spot Light", nullptr, false, !registry.Has<Light>(e)))
             registry.Emplace<Light>(e, Light{.type = LightType::Spot});
+        ImGui::Separator();
+        // Physics: a body with a collider fitted to the mesh (box), or just one of them.
+        const auto fitted = [&](ColliderShape shape) {
+            const auto bounds = MeshBounds(e);
+            return bounds ? FitCollider(shape, bounds->first, bounds->second) : Collider{.shape = shape};
+        };
+        if (ImGui::MenuItem("Dynamic body (box)", nullptr, false, !registry.Has<RigidBody>(e) && !registry.Has<Collider>(e))) {
+            registry.Emplace<RigidBody>(e);
+            registry.Emplace<Collider>(e, fitted(ColliderShape::Box));
+        }
+        if (ImGui::MenuItem("Static body (mesh)", nullptr, false,
+                            !registry.Has<RigidBody>(e) && !registry.Has<Collider>(e) && registry.Has<MeshRenderer>(e))) {
+            registry.Emplace<RigidBody>(e, RigidBody{.type = BodyType::Static});
+            registry.Emplace<Collider>(e, Collider{.shape = ColliderShape::Mesh});
+        }
+        if (ImGui::MenuItem("Rigid Body", nullptr, false, !registry.Has<RigidBody>(e)))
+            registry.Emplace<RigidBody>(e);
+        if (ImGui::BeginMenu("Collider", !registry.Has<Collider>(e))) {
+            for (std::size_t i = 0; i < std::size(kColliderShapeNames); ++i)
+                if (ImGui::MenuItem(kColliderShapeNames[i]))
+                    registry.Emplace<Collider>(e, fitted(static_cast<ColliderShape>(i)));
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Character Controller", nullptr, false, !registry.Has<CharacterController>(e)))
+            registry.Emplace<CharacterController>(e);
         ImGui::EndPopup();
     }
 
@@ -432,6 +571,20 @@ void Editor::DrawInspector()
             PushStateChange("Edit properties", {StateEdit{uuid, frameState}});
     }
     ImGui::End();
+}
+
+std::optional<std::pair<glm::vec3, glm::vec3>> Editor::MeshBounds(Entity entity) const
+{
+    const MeshRenderer* mesh  = m_Ctx.scene.GetRegistry().TryGet<MeshRenderer>(entity);
+    const Model*        model = mesh ? m_Ctx.assets.Get(mesh->model) : nullptr;
+    if (!model || mesh->meshIndex >= model->meshes.size() || model->meshes[mesh->meshIndex].submeshes.empty())
+        return std::nullopt;
+    glm::vec3 lo(std::numeric_limits<float>::max()), hi(-std::numeric_limits<float>::max());
+    for (const Submesh& sm : model->meshes[mesh->meshIndex].submeshes) {
+        lo = glm::min(lo, sm.boundsMin);
+        hi = glm::max(hi, sm.boundsMax);
+    }
+    return std::pair{lo, hi};
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -491,6 +644,21 @@ void Editor::DrawRendererSettings()
             SliderFloatRow("Bloom radius", &post.bloomRadius, 0.0005f, 0.02f, "%.4f");
         }
         EnumComboRow("Debug view", &post.debugView);
+        ImGui::EndTable();
+    }
+
+    if (ImGui::CollapsingHeader("Culling (GPU-driven)") && BeginProperties("culling")) {
+        CullingSettings& c = m_Ctx.sceneRenderer.culling;
+        CheckboxRow("GPU-driven", &c.gpuDriven);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Compute culling + indirect multi-draws (off: CPU BVH culling, one draw per submesh)");
+        ImGui::BeginDisabled(!c.gpuDriven);
+        CheckboxRow("Occlusion (Hi-Z)", &c.occlusion);
+        CheckboxRow("Freeze culling", &c.freeze);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keep culling with the current camera and Hi-Z; move away to see what was culled");
+        SliderUintRow("Hi-Z debug level", &c.hizDebugLevel, 0, 12);
+        ImGui::EndDisabled();
         ImGui::EndTable();
     }
 
@@ -580,6 +748,17 @@ void Editor::DrawRendererSettings()
         ImGui::EndTable();
     }
 
+    if (m_Ctx.physics && ImGui::CollapsingHeader("Physics") && BeginProperties("physics")) {
+        PhysicsSettings& ps = m_Ctx.physics->settings;
+        Vec3Row("Gravity", &ps.gravity, 0.05f, 0.0f);
+        PropertyRow("Collision steps");
+        ImGui::SliderInt("##v", &ps.collisionSteps, 1, 8);
+        ImGui::PopID();
+        DragFloatRow("Air control", &ps.airControl, 0.01f, 0.0f, 20.0f, "%.2f /s");
+        CheckboxRow("Show colliders", &m_ShowColliders);
+        ImGui::EndTable();
+    }
+
     if (ImGui::CollapsingHeader("Camera") && BeginProperties("camera")) {
         FlyCamera& cam = m_Ctx.camera;
         PropertyRow("Field of view");
@@ -653,7 +832,7 @@ void Editor::DrawStats()
         ImGui::TableSetColumnIndex(1);
         ImGui::SeparatorText("Scene");
         const SceneRenderStats& stats = m_Ctx.sceneRenderer.Stats();
-        ImGui::Text("Draw calls     %u", stats.drawCalls);
+        ImGui::Text("Draw calls     %u%s", stats.drawCalls, stats.gpuDriven ? " (indirect multi-draws)" : "");
         ImGui::Text("Culled         %u", stats.culled);
         ImGui::Text("Shadow draws   %u", stats.shadowDraws);
         ImGui::Text("Triangles      %llu", static_cast<unsigned long long>(stats.triangles));
@@ -665,13 +844,26 @@ void Editor::DrawStats()
         if (m_Ctx.sceneRenderer.post.autoExposure)
             ImGui::Text("Avg luminance  %.4f", stats.averageLuminance);
 
+        ImGui::SeparatorText(stats.gpuDriven ? "GPU-driven culling (2 frames old)" : "GPU scene");
+        ImGui::Text("Instances      %u  (%u draws, %u batches)", stats.instances, stats.draws, stats.batches);
+        if (stats.gpuDriven) {
+            ImGui::Text("Camera         %u tested: %u frustum, %u occluded", stats.gpuTested, stats.gpuFrustumCulled,
+                        stats.gpuOccluded);
+            ImGui::Text("Drawn          %u early + %u late", stats.gpuEarly, stats.gpuLate);
+            ImGui::Text("Commands       %u  (all views)", stats.gpuCommands);
+        }
+        ImGui::Text("Geometry pool  %.1f / %.1f M vertices, %.1f / %.1f M indices",
+                    static_cast<double>(stats.geometryVertices) * 1e-6, static_cast<double>(stats.geometryVertexCapacity) * 1e-6,
+                    static_cast<double>(stats.geometryIndices) * 1e-6, static_cast<double>(stats.geometryIndexCapacity) * 1e-6);
+
         ImGui::SeparatorText("CPU (ms)");
         const TransformUpdateStats& xf      = m_Ctx.scene.FrameTransformUpdate();
         const SpatialIndex&         spatial = m_Ctx.sceneRenderer.Spatial();
         ImGui::Text("Transforms     %.3f  (%u subtrees, %u matrices)", xf.milliseconds, xf.dirtyRoots, xf.updated);
         ImGui::Text("BVH sync       %.3f  (%u changed, %u re-inserted, %u pending)", stats.cpuSpatialMs,
                     spatial.LastSync().changed, spatial.LastSync().reinserted, spatial.LastSync().pending);
-        ImGui::Text("Culling        %.3f  (%u draw items)", stats.cpuCullingMs, stats.drawItems);
+        ImGui::Text("GPU scene      %.3f  (instance updates)", stats.cpuGpuSceneMs);
+        ImGui::Text("Culling        %.3f  (%u CPU draws)", stats.cpuCullingMs, stats.drawItems);
 
         ImGui::SeparatorText("BVH");
         ImGui::Text("Meshes         %zu  (height %d, %zu nodes)", spatial.MeshCount(), spatial.MeshTree().Height(),
@@ -681,6 +873,15 @@ void Editor::DrawStats()
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100.0f);
         ImGui::SliderInt("max depth", &m_BvhDepth, 0, 32);
+
+        if (m_Ctx.physics) {
+            const PhysicsStats& ps = m_Ctx.physics->Stats();
+            ImGui::SeparatorText("Physics");
+            ImGui::Text("Bodies         %u  (%u active), %u characters", ps.bodies, ps.activeBodies, ps.characters);
+            ImGui::Text("Contacts       %u pairs", ps.contactPairs);
+            ImGui::Text("Sync / step    %.3f / %.3f ms  (+%u -%u, %u meshes pending)", ps.syncMs, ps.stepMs, ps.created,
+                        ps.removed, ps.pendingMeshes);
+        }
 
         ImGui::SeparatorText("Memory");
         const VkPhysicalDeviceMemoryProperties* memory = nullptr;

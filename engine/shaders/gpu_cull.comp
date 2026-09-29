@@ -1,0 +1,234 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#include "scene_common.glsl"
+
+// GPU-driven culling, one dispatch per phase (mirrors GpuCulling.cpp):
+//   phase 0 (early):    x = draw record, y = view. Frustum (+ light range) test; the camera's early
+//                       view only takes draws that were visible after last frame's late pass.
+//   phase 1 (late):     x = draw record, camera late view only. Frustum + Hi-Z occlusion against the
+//                       early pass's depth; emits draws that became visible, updates the visibility.
+//   phase 2 (commands): x = batch, y = view. One indexed indirect command per batch with visible
+//                       draws (instanceCount = their number), appended to the view's bucket.
+// Visible draws are appended per batch: visible[listBase + batch.instanceBase + slot] = record.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define VIEW_SHADOW       1u // commands grouped by shadowBucket (else cameraBucket)
+#define VIEW_CAMERA_EARLY 2u
+#define VIEW_CAMERA_LATE  4u
+#define VIEW_OCCLUSION    8u // camera views: two-phase occlusion culling
+#define VIEW_SPHERE       16u // local light: also test the range sphere
+
+#define STAT_TESTED    0u // camera: draw records tested
+#define STAT_FRUSTUM   1u // camera: outside the frustum
+#define STAT_OCCLUDED  2u // camera: behind the Hi-Z
+#define STAT_EARLY     3u // camera: drawn by the early pass
+#define STAT_LATE      4u // camera: drawn by the late pass
+#define STAT_SHADOW    5u // shadow views: draws emitted
+#define STAT_COMMANDS  6u // indirect commands, all views
+#define STAT_TRIANGLES 7u // camera triangles
+#define STAT_COUNT     8u
+
+struct CullView {
+    mat4 viewProj;
+    vec4 planes[6]; // dot(xyz, p) + w >= 0 inside
+    vec4 sphere;    // VIEW_SPHERE: center, radius
+    uint listBase;
+    uint counterBase;
+    uint commandBase; // bucket b starts at commandBase + b * batchCapacity
+    uint flags;
+};
+
+struct DrawCommand { // VkDrawIndexedIndirectCommand
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ViewBuffer { CullView v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer UintBuffer { uint u[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer CommandBuffer { DrawCommand c[]; };
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer CullData {
+    ViewBuffer     views;
+    DrawBuffer     draws;
+    InstanceBuffer instances;
+    SubmeshBuffer  submeshes;
+    BatchBuffer    batches;
+    UintBuffer     counters;   // per view: visible draws per batch
+    UintBuffer     visible;    // per view: draw records grouped by batch
+    UintBuffer     visibility; // per draw record: visible after the last late pass
+    UintBuffer     drawCounts; // per view: commands per bucket (4)
+    CommandBuffer  commands;
+    HiZBuffer      hiz;
+    UintBuffer     stats;
+    uint  drawCount;
+    uint  batchCount;
+    uint  batchCapacity;
+    uint  pad;
+    uvec4 hizInfo;   // xy: level 0 size, z: level count
+    uvec4 depthSize; // xy: depth target size (pixels)
+};
+
+layout(push_constant) uniform CullPush {
+    CullData data;
+    uint     phase;
+    uint     firstView;
+} pc;
+
+shared uint sStats[STAT_COUNT];
+
+bool InFrustum(CullView view, vec3 center, vec3 extent)
+{
+    for (int i = 0; i < 6; ++i) {
+        const vec4 p = view.planes[i];
+        if (dot(p.xyz, center) + p.w + dot(abs(p.xyz), extent) < 0.0)
+            return false;
+    }
+    if ((view.flags & VIEW_SPHERE) != 0u) {
+        const vec3 closest = clamp(view.sphere.xyz, center - extent, center + extent);
+        const vec3 d       = closest - view.sphere.xyz;
+        if (dot(d, d) > view.sphere.w * view.sphere.w)
+            return false;
+    }
+    return true;
+}
+
+float HiZ(uvec2 texel, uint base, uvec2 size)
+{
+    texel = min(texel, size - 1u);
+    return pc.data.hiz.d[base + texel.y * size.x + texel.x];
+}
+
+// True if the box lies entirely behind the farthest depth (reverse-Z: smallest value) of the
+// Hi-Z texels covering its screen rectangle.
+bool Occluded(CullView view, mat4 model, vec3 bmin, vec3 bmax)
+{
+    CullData data = pc.data;
+    if (data.hizInfo.z == 0u)
+        return false;
+    const mat4 mvp     = view.viewProj * model;
+    vec2       lo      = vec2(1.0e30);
+    vec2       hi      = vec2(-1.0e30);
+    float      nearest = 0.0;
+    for (uint i = 0u; i < 8u; ++i) {
+        const vec3 p    = vec3((i & 1u) != 0u ? bmax.x : bmin.x, (i & 2u) != 0u ? bmax.y : bmin.y,
+                               (i & 4u) != 0u ? bmax.z : bmin.z);
+        const vec4 clip = mvp * vec4(p, 1.0);
+        if (clip.w <= 1.0e-5)
+            return false; // reaches behind the camera: keep
+        const vec3 ndc = clip.xyz / clip.w;
+        lo      = min(lo, ndc.xy);
+        hi      = max(hi, ndc.xy);
+        nearest = max(nearest, ndc.z);
+    }
+    lo = clamp(lo, vec2(-1.0), vec2(1.0));
+    hi = clamp(hi, vec2(-1.0), vec2(1.0));
+
+    // NDC -> depth pixels; the viewport flips Y (NDC +Y is the top row).
+    const vec2  size = vec2(data.depthSize.xy);
+    const uvec2 last = data.depthSize.xy - 1u;
+    const uvec2 p0   = min(uvec2(vec2(lo.x * 0.5 + 0.5, 0.5 - hi.y * 0.5) * size), last);
+    const uvec2 p1   = min(uvec2(vec2(hi.x * 0.5 + 0.5, 0.5 - lo.y * 0.5) * size), last);
+
+    // Level whose texels (2^(level + 1) pixels) cover the rectangle with at most 2 x 2 texels.
+    uint level = 0u;
+    while (level + 1u < data.hizInfo.z &&
+           (((p1.x >> (level + 1u)) - (p0.x >> (level + 1u))) > 1u || ((p1.y >> (level + 1u)) - (p0.y >> (level + 1u))) > 1u))
+        ++level;
+    const uvec2 t0    = p0 >> (level + 1u);
+    const uvec2 t1    = p1 >> (level + 1u);
+    const uvec2 lsize = HiZLevelSize(data.hizInfo.xy, level);
+    const uint  base  = HiZLevelOffset(data.hizInfo.xy, level);
+    const float farthest = min(min(HiZ(t0, base, lsize), HiZ(uvec2(t1.x, t0.y), base, lsize)),
+                               min(HiZ(uvec2(t0.x, t1.y), base, lsize), HiZ(t1, base, lsize)));
+    return nearest < farthest;
+}
+
+void Emit(CullView view, GpuDraw draw, uint record)
+{
+    const uint slot = atomicAdd(pc.data.counters.u[view.counterBase + draw.batch], 1u);
+    pc.data.visible.u[view.listBase + pc.data.batches.b[draw.batch].instanceBase + slot] = record;
+}
+
+void BuildCommand(uint batchIndex, uint viewIndex)
+{
+    CullData data = pc.data;
+    if (batchIndex >= data.batchCount)
+        return;
+    const CullView view  = data.views.v[viewIndex];
+    const uint     count = data.counters.u[view.counterBase + batchIndex];
+    if (count == 0u)
+        return;
+    const GpuBatch batch  = data.batches.b[batchIndex];
+    const uint     bucket = (view.flags & VIEW_SHADOW) != 0u ? batch.shadowBucket : batch.cameraBucket;
+    const uint     index  = atomicAdd(data.drawCounts.u[viewIndex * 4u + bucket], 1u);
+    data.commands.c[view.commandBase + bucket * data.batchCapacity + index] =
+        DrawCommand(batch.indexCount, count, batch.firstIndex, batch.vertexOffset, view.listBase + batch.instanceBase);
+    atomicAdd(data.stats.u[STAT_COMMANDS], 1u);
+    if ((view.flags & VIEW_SHADOW) == 0u)
+        atomicAdd(data.stats.u[STAT_TRIANGLES], count * (batch.indexCount / 3u));
+}
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    const uint viewIndex = pc.firstView + gl_GlobalInvocationID.y;
+    if (pc.phase == 2u) { // uniform per dispatch: no shared memory below is touched
+        BuildCommand(index, viewIndex);
+        return;
+    }
+
+    if (gl_LocalInvocationIndex < STAT_COUNT)
+        sStats[gl_LocalInvocationIndex] = 0u;
+    barrier();
+
+    CullData data = pc.data;
+    if (index < data.drawCount) {
+        const GpuDraw draw = data.draws.d[index];
+        const CullView view = data.views.v[viewIndex];
+        const bool early = pc.phase == 0u && (view.flags & VIEW_CAMERA_LATE) == 0u;
+        const bool late  = pc.phase == 1u;
+        if (draw.instance != DRAW_FREE && (early || late)) {
+            const GpuInstance inst = data.instances.i[draw.instance];
+            const GpuSubmesh  sm   = data.submeshes.s[draw.submesh];
+            const vec3 c      = (sm.boundsMin + sm.boundsMax) * 0.5;
+            const vec3 e      = (sm.boundsMax - sm.boundsMin) * 0.5;
+            const vec3 center = (inst.model * vec4(c, 1.0)).xyz;
+            const vec3 extent = mat3(abs(inst.model[0].xyz), abs(inst.model[1].xyz), abs(inst.model[2].xyz)) * e;
+            const bool inside = InFrustum(view, center, extent);
+            const bool occlusion = (view.flags & VIEW_OCCLUSION) != 0u;
+
+            if (late) {
+                if (!inside) {
+                    data.visibility.u[index] = 0u;
+                } else if (Occluded(view, inst.model, sm.boundsMin, sm.boundsMax)) {
+                    data.visibility.u[index] = 0u;
+                    atomicAdd(sStats[STAT_OCCLUDED], 1u);
+                } else {
+                    if (data.visibility.u[index] == 0u) {
+                        Emit(view, draw, index);
+                        atomicAdd(sStats[STAT_LATE], 1u);
+                    }
+                    data.visibility.u[index] = 1u;
+                }
+            } else if ((view.flags & VIEW_CAMERA_EARLY) != 0u) {
+                atomicAdd(sStats[STAT_TESTED], 1u);
+                if (!inside) {
+                    atomicAdd(sStats[STAT_FRUSTUM], 1u);
+                } else if (!occlusion || data.visibility.u[index] != 0u) {
+                    Emit(view, draw, index);
+                    atomicAdd(sStats[STAT_EARLY], 1u);
+                }
+            } else if (inside) { // shadow view
+                Emit(view, draw, index);
+                atomicAdd(sStats[STAT_SHADOW], 1u);
+            }
+        }
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex < STAT_COUNT && sStats[gl_LocalInvocationIndex] != 0u)
+        atomicAdd(data.stats.u[gl_LocalInvocationIndex], sStats[gl_LocalInvocationIndex]);
+}

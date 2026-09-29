@@ -6,18 +6,25 @@ layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
 layout(location = 3) out vec4 outTangent;
+layout(location = 4) flat out uint outMaterial;
+layout(location = 5) flat out uint outEntity;
 
 // The depth prepass and the main pass (depth test EQUAL) must produce bit-identical depth.
 invariant gl_Position;
 
 void main()
 {
-    Vertex v     = pc.vertices.v[gl_VertexIndex]; // vertexOffset already applied by DrawIndexed
-    vec4   world = pc.draw.model * vec4(v.position, 1.0);
+    FrameData         frame = pc.frame;
+    const GpuDraw     draw  = frame.draws.d[pc.visible.v[gl_InstanceIndex]];
+    const GpuInstance inst  = frame.instances.i[draw.instance];
+    const Vertex      v     = frame.vertices.v[gl_VertexIndex]; // vertexOffset (pool) applied by the draw
+    const vec4        world = inst.model * vec4(v.position, 1.0);
 
     outWorldPos = world.xyz;
-    outNormal   = mat3(pc.draw.normalMatrix) * v.normal;
-    outTangent  = vec4(mat3(pc.draw.model) * v.tangent.xyz, v.tangent.w); // w == 0 passes through
+    outNormal   = NormalMatrix(inst) * v.normal;
+    outTangent  = vec4(mat3(inst.model) * v.tangent.xyz, v.tangent.w); // w == 0 passes through
     outUV       = vec2(v.uvX, v.uvY);
-    gl_Position = pc.frame.viewProj * world;
+    outMaterial = frame.submeshes.s[draw.submesh].material;
+    outEntity   = inst.entityId;
+    gl_Position = frame.viewProj * world;
 }

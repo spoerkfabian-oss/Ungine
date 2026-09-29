@@ -49,6 +49,11 @@ public:
     // removed meshes); a full rebuild reports one infinite box.
     [[nodiscard]] std::span<const Aabb> ChangedRegions() const { return m_ChangedRegions; }
     [[nodiscard]] const SyncStats&      LastSync() const { return m_LastSync; }
+    // Entities whose mesh proxy was added, updated (any world transform or MeshRenderer change)
+    // or removed during the last Sync; after a rebuild (LastSync().rebuilt) use Meshes() instead.
+    [[nodiscard]] std::span<const Entity>    MeshUpdates() const { return m_MeshUpdates; }
+    [[nodiscard]] std::span<const MeshProxy> Meshes() const { return m_Meshes; }
+    [[nodiscard]] const MeshProxy*           FindMesh(Entity entity) const;
 
     // fn(const MeshProxy&) for meshes whose bounds intersect the frustum / box.
     template <class F>
@@ -92,6 +97,7 @@ private:
     std::unordered_map<std::uint64_t, std::uint32_t> m_MeshIndex, m_LightIndex;
     std::unordered_set<std::uint64_t>            m_Pending; // entities waiting for their model
     std::vector<Aabb>                            m_ChangedRegions;
+    std::vector<Entity>                          m_MeshUpdates;
     std::uint64_t                                m_Submeshes = 0;
     bool                                         m_Initialized = false;
     SyncStats                                    m_LastSync;

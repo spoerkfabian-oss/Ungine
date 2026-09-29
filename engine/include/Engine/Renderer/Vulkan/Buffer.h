@@ -14,6 +14,9 @@ struct BufferDesc {
     VkBufferUsageFlags usage     = 0;
     MemoryUsage        memory    = MemoryUsage::GpuOnly;
     const char*        debugName = nullptr;
+    // Shared by the graphics and transfer queue families without ownership transfers (buffers
+    // that are written piecewise by async uploads while the GPU reads other parts of them).
+    bool               concurrent = false;
 };
 
 // Move-only RAII buffer. Every buffer gets a device address (vertex pulling / BDA).

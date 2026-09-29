@@ -5,6 +5,7 @@
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Window.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
@@ -57,6 +58,7 @@ Editor::Editor(const EditorContext& context)
 
 Editor::~Editor()
 {
+    Stop(); // leaving the editor while playing returns to the edit scene
     m_Ctx.camera.moveRequiresLook = false;
     m_Ctx.sceneRenderer.overlay   = {};
 
@@ -128,6 +130,9 @@ void Editor::Update(float dt)
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
+    // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
+    if (m_Ctx.physics && m_PlayState == PlayState::Edit)
+        m_Ctx.physics->Sync(m_Ctx.scene);
     UpdateSelectionOverlay();
 }
 
@@ -260,6 +265,23 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("ImGui demo", nullptr, &m_ShowDemo);
         ImGui::EndMenu();
     }
+    if (m_Ctx.physics) {
+        ImGui::Separator();
+        const bool playing = m_PlayState == PlayState::Playing;
+        if (playing)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
+        if (ImGui::MenuItem(m_PlayState == PlayState::Edit ? "Play" : "Resume", "Ctrl+P", playing, !playing))
+            Play();
+        if (playing)
+            ImGui::PopStyleColor();
+        if (ImGui::MenuItem("Pause", nullptr, m_PlayState == PlayState::Paused, playing))
+            Pause();
+        if (ImGui::MenuItem("Step", nullptr, false, m_PlayState != PlayState::Edit))
+            StepOnce();
+        if (ImGui::MenuItem("Stop", "Ctrl+P", false, m_PlayState != PlayState::Edit))
+            Stop();
+        ImGui::Separator();
+    }
     const std::string scene = m_ScenePath.empty() ? "untitled" : m_ScenePath.filename().string();
     ImGui::TextDisabled("  %s%s  %s", scene.c_str(), HasUnsavedChanges() ? "*" : "", m_Status.c_str());
     ImGui::EndMainMenuBar();
@@ -289,6 +311,13 @@ void Editor::DrawViewport()
     const bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    if (m_ShowColliders && m_Ctx.physics)
+        DrawColliderOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    if (m_PlayState != PlayState::Edit) // frame: this is the simulated scene, changes are temporary
+        ImGui::GetWindowDrawList()->AddRect(origin, ImVec2(origin.x + static_cast<float>(width), origin.y + static_cast<float>(height)),
+                                            m_PlayState == PlayState::Playing ? IM_COL32(60, 200, 90, 255)
+                                                                              : IM_COL32(230, 170, 40, 255),
+                                            0.0f, 3.0f);
     if (clicked && !iconHit) {
         // GPU picking: the entity under the cursor arrives a few frames later (Update).
         const ImVec2 mouse = ImGui::GetIO().MousePos;
@@ -323,6 +352,8 @@ void Editor::DrawViewport()
         m_ShowLightIcons = !m_ShowLightIcons;
     if (toolButton("BVH", m_ShowBvh))
         m_ShowBvh = !m_ShowBvh;
+    if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
+        m_ShowColliders = !m_ShowColliders;
     ImGui::NewLine();
 
     DrawGizmo(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
@@ -530,6 +561,85 @@ void Editor::DrawBvhOverlay(float x, float y, float width, float height)
     list->PopClipRect();
 }
 
+void Editor::DrawColliderOverlay(float x, float y, float width, float height)
+{
+    const CameraData        camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+
+    // Static gray, kinematic yellow, active green, sleeping blue, character cyan, trigger magenta.
+    const auto color = [&](const ColliderDebugShape& s) {
+        float alpha = IsSelected(s.entity) ? 1.0f : 0.6f;
+        if (s.trigger)
+            return ImGui::GetColorU32(ImVec4(1.0f, 0.3f, 1.0f, alpha));
+        switch (s.activity) {
+        case BodyActivity::Kinematic: return ImGui::GetColorU32(ImVec4(1.0f, 0.85f, 0.2f, alpha));
+        case BodyActivity::Active: return ImGui::GetColorU32(ImVec4(0.3f, 1.0f, 0.4f, alpha));
+        case BodyActivity::Sleeping: return ImGui::GetColorU32(ImVec4(0.35f, 0.55f, 1.0f, alpha));
+        case BodyActivity::Character: return ImGui::GetColorU32(ImVec4(0.2f, 0.9f, 1.0f, alpha));
+        default: alpha *= 0.7f; return ImGui::GetColorU32(ImVec4(0.75f, 0.75f, 0.75f, alpha));
+        }
+    };
+    const glm::vec3 eye = glm::inverse(camera.view)[3];
+    m_Ctx.physics->ForEachCollider([&](const ColliderDebugShape& s) {
+        const glm::mat4& m      = s.transform;
+        const glm::vec3  center = m[3];
+        const glm::vec3  ax     = glm::normalize(glm::vec3(m[0])), ay = glm::normalize(glm::vec3(m[1])),
+                        az     = glm::normalize(glm::vec3(m[2]));
+        const ImU32 c = color(s);
+        switch (s.shape) {
+        case ColliderShape::Box:
+        case ColliderShape::Mesh: {
+            glm::vec3 corners[8];
+            for (int i = 0; i < 8; ++i)
+                corners[i] = center + ax * ((i & 1) ? s.halfExtents.x : -s.halfExtents.x) +
+                             ay * ((i & 2) ? s.halfExtents.y : -s.halfExtents.y) +
+                             az * ((i & 4) ? s.halfExtents.z : -s.halfExtents.z);
+            for (int i = 0; i < 8; ++i)
+                for (int bit : {1, 2, 4})
+                    if (!(i & bit))
+                        projector.Line(list, corners[i], corners[i | bit], c);
+            break;
+        }
+        case ColliderShape::Sphere: {
+            projector.Circle(list, center, ax, ay, s.radius, c);
+            projector.Circle(list, center, ax, az, s.radius, c);
+            projector.Circle(list, center, ay, az, s.radius, c);
+            // Silhouette: circle facing the camera.
+            const glm::vec3 view = glm::normalize(center - eye);
+            const glm::vec3 u    = glm::normalize(glm::cross(view, std::abs(view.y) < 0.99f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0)));
+            projector.Circle(list, center, u, glm::cross(view, u), s.radius, c);
+            break;
+        }
+        case ColliderShape::Capsule: {
+            const glm::vec3 top = center + ay * s.halfHeight, bottom = center - ay * s.halfHeight;
+            projector.Circle(list, top, ax, az, s.radius, c);
+            projector.Circle(list, bottom, ax, az, s.radius, c);
+            for (const glm::vec3& side : {ax, -ax, az, -az})
+                projector.Line(list, top + side * s.radius, bottom + side * s.radius, c);
+            // Hemisphere arcs in the two vertical planes.
+            constexpr int kArc = 12;
+            for (const glm::vec3& side : {ax, az}) {
+                glm::vec3 prevTop = top + side * s.radius, prevBottom = bottom + side * s.radius;
+                for (int i = 1; i <= kArc; ++i) {
+                    const float     t  = glm::pi<float>() * static_cast<float>(i) / kArc;
+                    const glm::vec3 d  = side * std::cos(t);
+                    const glm::vec3 nt = top + (d + ay * std::sin(t)) * s.radius;
+                    const glm::vec3 nb = bottom + (d - ay * std::sin(t)) * s.radius;
+                    projector.Line(list, prevTop, nt, c);
+                    projector.Line(list, prevBottom, nb, c);
+                    prevTop    = nt;
+                    prevBottom = nb;
+                }
+            }
+            break;
+        }
+        }
+    });
+    list->PopClipRect();
+}
+
 std::optional<Aabb> Editor::SelectionBounds() const
 {
     const Registry&     registry = m_Ctx.scene.GetRegistry();
@@ -580,6 +690,12 @@ void Editor::HandleHotkeys()
             Redo();
         if (ImGui::IsKeyPressed(ImGuiKey_D, false))
             DuplicateSelection();
+        if (ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+            if (m_PlayState == PlayState::Edit)
+                Play();
+            else
+                Stop();
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_N, false))
             RequestSceneChange([this] { NewScene(); });
         if (ImGui::IsKeyPressed(ImGuiKey_O, false))

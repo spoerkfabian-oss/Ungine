@@ -9,7 +9,11 @@ add_library(Engine STATIC
     src/Core/Window.cpp
     src/Events/EventBus.cpp
     src/Renderer/Environment.cpp
+    src/Renderer/GeometryPool.cpp
+    src/Renderer/GpuCulling.cpp
     src/Renderer/GpuProfiler.cpp
+    src/Renderer/GpuScene.cpp
+    src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
     src/Renderer/ShadowAtlas.cpp
@@ -29,6 +33,7 @@ add_library(Engine STATIC
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
     src/Scene/SpatialIndex.cpp
+    src/Physics/PhysicsWorld.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
 target_include_directories(Engine PUBLIC include PRIVATE src)
@@ -36,7 +41,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json)
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt)
 
 target_compile_definitions(Engine PUBLIC
     GLFW_INCLUDE_NONE
@@ -62,6 +67,7 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
     shaders/include/pbr.glsl
+    shaders/include/scene_common.glsl
     shaders/include/shadow.glsl
     shaders/include/sky.glsl
     shaders/include/surface.glsl)
@@ -76,7 +82,9 @@ engine_add_shaders(Engine SOURCES
     shaders/exposure_average.comp
     shaders/fullscreen.vert
     shaders/gtao.comp
+    shaders/gpu_cull.comp
     shaders/gtao_denoise.comp
+    shaders/hiz.comp
     shaders/ibl_brdf.comp
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
@@ -85,6 +93,7 @@ engine_add_shaders(Engine SOURCES
     shaders/luminance_histogram.comp
     shaders/mesh.frag
     shaders/mesh.vert
+    shaders/scatter.comp
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

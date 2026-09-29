@@ -16,12 +16,11 @@ void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTic
 
     UploadQueue&      uploader = renderer.GetUploader();
     BindlessRegistry& bindless = renderer.GetBindless();
+    GeometryPool&     pool     = renderer.Geometry();
 
-    out.name         = data.name;
-    out.vertexBuffer = uploader.CreateBuffer(std::as_bytes(std::span{data.vertices}),
-                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ticket, "ModelVertices");
-    out.indexBuffer  = uploader.CreateBuffer(std::as_bytes(std::span{data.indices}),
-                                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ticket, "ModelIndices");
+    out.name     = data.name;
+    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{data.vertices}, ticket);
+    out.indices  = pool.Upload(GeometryKind::Indices, std::span{data.indices}, ticket);
 
     // The slot may be written now: nothing samples it until the material buffer is resident.
     out.textures.reserve(data.textures.size());
@@ -64,21 +63,50 @@ void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTic
                              .occlusionStrength        = m.occlusionStrength});
         out.materialFlags.push_back(flags);
     }
-    out.materialBuffer = uploader.CreateBuffer(std::as_bytes(std::span{materials}),
-                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ticket, "ModelMaterials");
+    out.materials = pool.Upload(GeometryKind::Materials, std::span<const GpuMaterial>{materials}, ticket);
 
-    out.meshes    = data.meshes;
+    // Submesh records with absolute pool offsets (GPU culling, indirect draws).
+    out.meshes = data.meshes;
+    std::vector<GpuSubmesh> records;
+    for (Mesh& mesh : out.meshes) {
+        mesh.firstGpuSubmesh = static_cast<std::uint32_t>(records.size()); // made absolute below
+        for (const Submesh& sm : mesh.submeshes)
+            records.push_back({.firstIndex   = out.indices.offset + sm.firstIndex,
+                               .indexCount   = sm.indexCount,
+                               .vertexOffset = static_cast<std::int32_t>(out.vertices.offset) + sm.vertexOffset,
+                               .material     = out.materials.offset + sm.material,
+                               .boundsMin    = sm.boundsMin,
+                               .flags        = out.materialFlags[sm.material],
+                               .boundsMax    = sm.boundsMax,
+                               .pad          = 0});
+    }
+    if (!records.empty()) {
+        out.submeshes = pool.Upload(GeometryKind::Submeshes, std::span<const GpuSubmesh>{records}, ticket);
+        for (Mesh& mesh : out.meshes)
+            mesh.firstGpuSubmesh += out.submeshes.offset;
+    }
     out.nodes     = data.nodes;
     out.boundsMin = data.boundsMin;
     out.boundsMax = data.boundsMax;
+
+    out.collisionPositions.reserve(data.vertices.size());
+    for (const Vertex& v : data.vertices)
+        out.collisionPositions.push_back(v.position);
+    out.collisionIndices = data.indices;
 }
 
 void ReleaseModel(Renderer& renderer, Model&& model)
 {
     Renderer* r = &renderer;
-    renderer.DeferCall([r, slots = std::move(model.bindlessTextures)] {
+    renderer.DeferCall([r, slots = std::move(model.bindlessTextures), vertices = model.vertices,
+                        indices = model.indices, materials = model.materials, submeshes = model.submeshes] {
         for (std::uint32_t s : slots)
             r->GetBindless().RemoveSampledImage(s);
+        GeometryPool& pool = r->Geometry();
+        pool.Free(GeometryKind::Vertices, vertices); // empty ranges (failed builds) are ignored
+        pool.Free(GeometryKind::Indices, indices);
+        pool.Free(GeometryKind::Materials, materials);
+        pool.Free(GeometryKind::Submeshes, submeshes);
     });
     renderer.DeferRelease(std::move(model));
 }

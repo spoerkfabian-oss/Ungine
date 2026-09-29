@@ -111,6 +111,13 @@ VkExtent2D Window::FramebufferExtent() const
     return {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h)};
 }
 
+glm::vec2 Window::WindowSize() const
+{
+    int w = 0, h = 0;
+    glfwGetWindowSize(m_Handle, &w, &h);
+    return {static_cast<float>(w), static_cast<float>(h)};
+}
+
 VkSurfaceKHR Window::CreateSurface(VkInstance instance) const
 {
     VkSurfaceKHR surface = VK_NULL_HANDLE;

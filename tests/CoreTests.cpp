@@ -3,6 +3,9 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/ThreadPool.h"
+#include "Engine/Events/EventBus.h"
+#include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Renderer/RangeAllocator.h"
 #include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
@@ -614,4 +617,306 @@ TEST_CASE(ShadowAtlas_BuddyAllocatorReusesAndMerges)
     const auto whole = alloc.Allocate(4096);
     CHECK(whole.has_value() && *whole == glm::uvec2(0));
     CHECK(!alloc.Allocate(128).has_value()); // full
+}
+
+// --- Physics ---------------------------------------------------------------------------------
+
+namespace {
+
+struct PhysicsFixture {
+    ThreadPool                  pool{2};
+    EventBus                    bus;
+    Scene                       scene;
+    PhysicsWorld                physics{pool, bus};
+    std::vector<CollisionEvent> events;
+    Subscription                sub = bus.Subscribe<CollisionEvent>([this](const CollisionEvent& e) { events.push_back(e); });
+
+    Entity Body(const char* name, glm::vec3 position, BodyType type, Collider collider, Entity parent = NullEntity)
+    {
+        const Entity e = scene.CreateEntity(name, parent);
+        scene.EditTransform(e).position = position;
+        scene.GetRegistry().Emplace<RigidBody>(e, RigidBody{.type = type});
+        scene.GetRegistry().Emplace<Collider>(e, collider);
+        return e;
+    }
+    Entity Ground()
+    {
+        Collider box;
+        box.halfExtents = {20.0f, 0.5f, 20.0f};
+        return Body("Ground", {0.0f, -0.5f, 0.0f}, BodyType::Static, box);
+    }
+    static Collider Sphere(float radius)
+    {
+        Collider c;
+        c.shape  = ColliderShape::Sphere;
+        c.radius = radius;
+        return c;
+    }
+    void Run(float seconds)
+    {
+        for (int i = 0, n = static_cast<int>(seconds * 60.0f); i < n; ++i)
+            physics.Step(scene, 1.0f / 60.0f);
+    }
+    glm::vec3 WorldPosition(Entity e) const { return scene.GetRegistry().Get<WorldTransform>(e).matrix[3]; }
+    std::size_t Count(bool begin, bool trigger) const
+    {
+        return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), [&](const CollisionEvent& e) {
+            return e.begin == begin && e.trigger == trigger;
+        }));
+    }
+};
+
+bool Near(const glm::vec3& a, const glm::vec3& b, float eps) { return glm::all(glm::epsilonEqual(a, b, eps)); }
+
+} // namespace
+
+TEST_CASE(Physics_FallRestSleepAndEvents)
+{
+    PhysicsFixture f;
+    const Entity   ground = f.Ground();
+    const Entity   ball   = f.Body("Ball", {0.0f, 5.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.5f));
+    f.physics.Sync(f.scene);
+    CHECK(f.physics.Stats().bodies == 2);
+    CHECK(f.physics.Activity(ground) == BodyActivity::Static);
+    CHECK(f.physics.Activity(ball) == BodyActivity::Active);
+
+    f.Run(4.0f);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f) < 0.03f); // Jolt penetration slop 2 cm
+    CHECK(f.scene.CountStaleTransforms() == 0);
+    CHECK(f.physics.Activity(ball) == BodyActivity::Sleeping);
+    // One Begin, no End although Jolt drops the contacts of sleeping bodies.
+    CHECK(f.events.size() == 1);
+    if (!f.events.empty()) {
+        const CollisionEvent& e = f.events[0];
+        CHECK(e.begin && !e.trigger);
+        CHECK((e.a == ground && e.b == ball) || (e.a == ball && e.b == ground));
+    }
+    CHECK(f.physics.Stats().contactPairs == 1);
+
+    // Kicked upwards: wakes up, leaves the ground (End), lands again (Begin).
+    f.physics.AddImpulse(ball, {0.0f, 5.0f, 0.0f});
+    CHECK(f.physics.Activity(ball) == BodyActivity::Active);
+    f.Run(0.3f);
+    CHECK(f.WorldPosition(ball).y > 0.8f);
+    CHECK(f.Count(false, false) == 1);
+    f.Run(3.0f);
+    CHECK(f.Count(true, false) == 2);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f) < 0.03f); // Jolt penetration slop 2 cm
+
+    // Destroying a touching body ends its contact.
+    f.scene.DestroyEntity(ball);
+    f.physics.Sync(f.scene);
+    CHECK(f.Count(false, false) == 2);
+    CHECK(f.physics.Stats().bodies == 1 && f.physics.Stats().contactPairs == 0);
+}
+
+TEST_CASE(Physics_QueriesTeleportAndKinematic)
+{
+    PhysicsFixture f;
+    const Entity   ground = f.Ground();
+    const Entity   ball   = f.Body("Ball", {0.0f, 3.0f, 0.0f}, BodyType::Static, PhysicsFixture::Sphere(1.0f));
+    f.physics.Sync(f.scene);
+
+    auto hit = f.physics.Raycast({0.0f, 10.0f, 0.0f}, {0.0f, -2.0f, 0.0f}, 100.0f);
+    CHECK(hit && hit->entity == ball && std::abs(hit->distance - 6.0f) < 1e-3f);
+    CHECK(hit && Near(hit->normal, {0.0f, 1.0f, 0.0f}, 1e-3f) && Near(hit->point, {0.0f, 4.0f, 0.0f}, 1e-3f));
+    hit = f.physics.Raycast({0.0f, 10.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f, ball); // ignored
+    CHECK(hit && hit->entity == ground && std::abs(hit->distance - 10.0f) < 1e-3f);
+    CHECK(!f.physics.Raycast({0.0f, 10.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, 100.0f));
+    CHECK(!f.physics.Raycast({0.0f, 10.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 5.0f)); // too short
+
+    const auto cast = f.physics.SphereCast({3.0f, 3.0f, 0.0f}, 0.5f, {-1.0f, 0.0f, 0.0f}, 10.0f);
+    CHECK(cast && cast->entity == ball && std::abs(cast->distance - 1.5f) < 1e-2f);
+    CHECK(cast && Near(cast->normal, {1.0f, 0.0f, 0.0f}, 1e-2f) && Near(cast->point, {1.0f, 3.0f, 0.0f}, 1e-2f));
+
+    // Moving a static body by hand teleports it.
+    f.scene.EditTransform(ball).position = {5.0f, 3.0f, 0.0f};
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.Raycast({0.0f, 10.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f, ground));
+    hit = f.physics.Raycast({5.0f, 10.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+    CHECK(hit && hit->entity == ball);
+
+    // A kinematic box moved during simulation pushes a dynamic box out of its way.
+    Collider box;
+    box.halfExtents = glm::vec3(0.5f);
+    const Entity pusher = f.Body("Pusher", {-3.0f, 0.5f, 0.0f}, BodyType::Kinematic, box);
+    const Entity crate  = f.Body("Crate", {0.0f, 0.5f, 0.0f}, BodyType::Dynamic, box);
+    f.Run(0.5f);
+    for (int i = 0; i < 120; ++i) { // 2 m/s along +X for 2 s
+        f.scene.EditTransform(pusher).position.x += 2.0f / 60.0f;
+        f.physics.Step(f.scene, 1.0f / 60.0f);
+    }
+    CHECK(std::abs(f.WorldPosition(pusher).x - 1.0f) < 1e-3f);
+    CHECK(f.WorldPosition(crate).x > 1.5f);
+    CHECK(f.physics.Activity(pusher) == BodyActivity::Kinematic);
+
+    // Removing the collider removes the body.
+    f.scene.GetRegistry().Remove<Collider>(crate);
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.HasBody(crate) && f.physics.HasBody(pusher));
+    f.physics.Reset();
+    CHECK(f.physics.Stats().bodies == 0);
+    f.physics.Sync(f.scene);
+    CHECK(f.physics.Stats().bodies == 3);
+}
+
+TEST_CASE(Physics_TriggerScaleAndHierarchy)
+{
+    PhysicsFixture f;
+    f.Ground();
+    Collider zone;
+    zone.halfExtents = {2.0f, 0.5f, 2.0f};
+    zone.trigger     = true;
+    const Entity trigger = f.Body("Zone", {0.0f, 3.0f, 0.0f}, BodyType::Static, zone);
+    const Entity ball    = f.Body("Ball", {0.0f, 6.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.25f));
+    f.Run(3.0f);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.25f) < 0.02f); // fell through the trigger
+    CHECK(f.Count(true, true) == 1 && f.Count(false, true) == 1);
+    CHECK(f.Count(true, false) == 1); // ground
+    // Queries ignore triggers.
+    const auto hit = f.physics.Raycast({1.0f, 10.0f, 1.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+    CHECK(hit && hit->entity != trigger);
+
+    // World scale scales the shape (box per axis, sphere by the largest axis).
+    Collider unit;
+    unit.halfExtents = glm::vec3(0.5f);
+    const Entity parent = f.scene.CreateEntity("Parent");
+    f.scene.EditTransform(parent).position = {10.0f, 0.0f, 0.0f};
+    f.scene.EditTransform(parent).scale    = glm::vec3(2.0f);
+    const Entity box = f.Body("Box", {0.0f, 3.0f, 0.0f}, BodyType::Static, unit, parent); // world (10, 6, 0), 2x2x2
+    f.physics.Sync(f.scene);
+    auto top = f.physics.Raycast({10.0f, 20.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+    CHECK(top && top->entity == box && std::abs(top->point.y - 7.0f) < 1e-3f);
+    f.scene.EditTransform(box).scale = {1.0f, 2.0f, 1.0f}; // now 2x4x2
+    f.physics.Sync(f.scene);
+    top = f.physics.Raycast({10.0f, 20.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+    CHECK(top && std::abs(top->point.y - 8.0f) < 1e-3f);
+
+    // A dynamic child of a rotated, translated parent: the local transform is written so that the
+    // world transform matches the body; no stale transforms, no teleport feedback.
+    const Entity holder = f.scene.CreateEntity("Holder");
+    f.scene.EditTransform(holder).position = {-10.0f, 1.0f, 0.0f};
+    f.scene.EditTransform(holder).rotation = glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    const Entity child = f.Body("Child", {0.0f, 4.0f, 2.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.5f), holder);
+    f.Run(3.0f);
+    CHECK(f.scene.CountStaleTransforms() == 0);
+    const glm::vec3 world = f.WorldPosition(child);
+    CHECK(Near(world, {-8.0f, 0.5f, 0.0f}, 0.03f)); // local +Z rotated by 90 deg about Y = world +X
+    const auto below = f.physics.Raycast(world + glm::vec3(0.0f, 5.0f, 0.0f), {0.0f, -1.0f, 0.0f}, 10.0f);
+    CHECK(below && below->entity == child);
+}
+
+TEST_CASE(Physics_CharacterWalksClimbsAndJumps)
+{
+    PhysicsFixture f;
+    f.Ground();
+    Collider stepBox;
+    stepBox.halfExtents = {1.0f, 0.1f, 2.0f}; // 20 cm step at x = 2..4
+    f.Body("Step", {3.0f, 0.1f, 0.0f}, BodyType::Static, stepBox);
+    Collider wall;
+    wall.halfExtents = {0.2f, 2.0f, 2.0f};
+    f.Body("Wall", {7.0f, 2.0f, 0.0f}, BodyType::Static, wall);
+
+    const Entity player = f.scene.CreateEntity("Player");
+    f.scene.EditTransform(player).position = {0.0f, 0.05f, 0.0f};
+    f.scene.GetRegistry().Emplace<CharacterController>(player);
+    f.Run(0.5f);
+    auto state = f.physics.GetCharacterState(player);
+    CHECK(state && state->onGround);
+    CHECK(f.physics.Activity(player) == BodyActivity::Character);
+    CHECK(std::abs(f.WorldPosition(player).y) < 0.05f);
+
+    // Walk onto the step.
+    f.physics.SetCharacterInput(player, {2.0f, 0.0f, 0.0f}, false);
+    f.Run(1.5f);
+    CHECK(f.WorldPosition(player).x > 2.5f);
+    CHECK(std::abs(f.WorldPosition(player).y - 0.2f) < 0.05f);
+
+    // Keep walking: stops at the wall (radius 0.3 + wall half width 0.2).
+    f.Run(3.0f);
+    CHECK(f.WorldPosition(player).x < 6.55f && f.WorldPosition(player).x > 6.3f);
+
+    // Jump: leaves the ground, lands again.
+    f.physics.SetCharacterInput(player, glm::vec3(0.0f), true);
+    f.Run(0.25f);
+    state = f.physics.GetCharacterState(player);
+    CHECK(state && !state->onGround && f.WorldPosition(player).y > 0.5f);
+    f.Run(2.0f);
+    state = f.physics.GetCharacterState(player);
+    CHECK(state && state->onGround && std::abs(f.WorldPosition(player).y) < 0.05f);
+
+    // Teleport by hand, then removal.
+    f.scene.EditTransform(player).position = {-5.0f, 1.0f, 0.0f};
+    f.Run(1.0f);
+    CHECK(Near(f.WorldPosition(player), {-5.0f, 0.0f, 0.0f}, 0.05f));
+    f.scene.GetRegistry().Remove<CharacterController>(player);
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.HasBody(player) && f.physics.Stats().characters == 0);
+}
+
+TEST_CASE(SceneSerializer_PhysicsComponents)
+{
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Body");
+    Registry&    r = scene.GetRegistry();
+    r.Emplace<RigidBody>(e, RigidBody{.type = BodyType::Kinematic, .mass = 3.0f, .linearDamping = 0.2f,
+                                      .angularDamping = 0.3f, .gravityFactor = 0.5f, .allowSleeping = false});
+    Collider c;
+    c.shape       = ColliderShape::Capsule;
+    c.halfExtents = {1.0f, 2.0f, 3.0f};
+    c.radius      = 0.7f;
+    c.halfHeight  = 1.1f;
+    c.center      = {0.0f, 0.5f, 0.0f};
+    c.friction    = 0.9f;
+    c.restitution = 0.4f;
+    c.trigger     = true;
+    r.Emplace<Collider>(e, c);
+    r.Emplace<CharacterController>(e, CharacterController{.radius = 0.4f, .height = 2.0f, .maxSlope = 0.5f,
+                                                          .stepHeight = 0.25f, .jumpSpeed = 6.0f});
+
+    const std::string   snapshot = SnapshotEntities(scene, std::span(&e, 1));
+    const auto          copies   = RestoreEntities(scene, snapshot, RestoreMode::Duplicate);
+    CHECK(copies.size() == 1);
+    if (copies.size() == 1) {
+        const Entity copy = copies[0];
+        CHECK(r.Has<RigidBody>(copy) && r.Get<RigidBody>(copy) == r.Get<RigidBody>(e));
+        CHECK(r.Has<Collider>(copy) && r.Get<Collider>(copy) == c);
+        CHECK(r.Has<CharacterController>(copy) && r.Get<CharacterController>(copy) == r.Get<CharacterController>(e));
+    }
+
+    // Entity state (undo): removing components is restored too.
+    const std::string state = SnapshotEntityState(scene, e);
+    r.Remove<Collider>(e);
+    r.Get<RigidBody>(e).mass = 9.0f;
+    ApplyEntityState(scene, e, state);
+    CHECK(r.Has<Collider>(e) && r.Get<Collider>(e) == c && r.Get<RigidBody>(e).mass == 3.0f);
+}
+
+TEST_CASE(RangeAllocator_FirstFitMergeGrow)
+{
+    RangeAllocator ranges(100);
+    const auto a = ranges.Allocate(30);
+    const auto b = ranges.Allocate(30);
+    const auto c = ranges.Allocate(30);
+    CHECK(a == 0u && b == 30u && c == 60u && ranges.Used() == 90);
+    CHECK(!ranges.Allocate(11).has_value() && ranges.LargestFree() == 10);
+
+    // Freeing the middle leaves a hole reused first-fit; freeing the neighbors merges everything.
+    ranges.Free(*b, 30);
+    CHECK(ranges.Allocate(20) == 30u); // [30, 50) from the hole, [50, 60) left
+    CHECK(ranges.FreeBlocks() == 2);
+    ranges.Free(30, 20);
+    ranges.Free(*a, 30);
+    CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 60); // [0, 60) + [90, 100)
+    ranges.Free(*c, 30);
+    CHECK(ranges.FreeBlocks() == 1 && ranges.LargestFree() == 100 && ranges.Used() == 0);
+
+    // Growing appends free space and merges with a free tail.
+    CHECK(ranges.Allocate(100) == 0u && !ranges.Allocate(1).has_value());
+    ranges.Grow(150);
+    CHECK(ranges.Capacity() == 150 && ranges.Used() == 100 && ranges.Allocate(50) == 100u);
+    ranges.Free(0, 100);
+    ranges.Grow(200);
+    CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 100); // [0, 100) and [150, 200)
+    CHECK(!ranges.Allocate(0).has_value());
 }

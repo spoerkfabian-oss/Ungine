@@ -5,11 +5,12 @@
 #include "mesh_common.glsl"
 
 layout(location = 0) in vec2 inUV;
+layout(location = 1) flat in uint inMaterial;
 
 // Alpha-tested casters (foliage, fences).
 void main()
 {
-    const Material m     = pc.materials.m[pc.materialIndex];
+    const Material m     = pc.frame.materials.m[inMaterial];
     const float    alpha = m.baseColorFactor.a * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV).a;
     if (alpha < m.alphaCutoff)
         discard;

@@ -15,7 +15,8 @@ layout(push_constant) uniform TonemapPush {
     uint          bloomTexture;  // half-resolution bloom result (mip 0 of the chain)
     float         bloomStrength; // 0 = bloom off (the texture is not read)
     uint          autoExposure;
-    uint          debugView;     // Engine::DebugView: 0 off, 1 AO, 2 normals, 3 light clusters, 4 shadow atlas
+    uint          debugView;     // Engine::DebugView: 0 off, 1 AO, 2 normals, 3 light clusters, 4 shadow atlas,
+                                 // 5 Hi-Z, 6 culling (tint drawn by the mesh pass)
     uint          debugTexture;  // slot shown by the debug view (light clusters: depth; shadow atlas: atlas)
     FrameData     frame;         // light clusters view
     uint          idTexture;     // entity IDs (R32_UINT), editor outline
@@ -130,6 +131,20 @@ void main()
         const vec2  size  = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)],
                                                        uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
         const float depth = SampleTextureLod(pc.debugTexture, SAMPLER_NEAREST_CLAMP, gl_FragCoord.xy / size, 0.0).r;
+        outColor          = vec4(vec3(sqrt(sqrt(max(depth, 0.0)))), 1.0);
+        return;
+    }
+    if (pc.debugView == 5u) { // Hi-Z level hizInfo.w (farthest depth per texel); dark blue: no pyramid
+        FrameData frame = pc.frame;
+        const uvec4     info  = frame.hizInfo;
+        if (info.z == 0u) {
+            outColor = vec4(0.0, 0.0, 0.15, 1.0);
+            return;
+        }
+        const uint  level = min(info.w, info.z - 1u);
+        const uvec2 size  = HiZLevelSize(info.xy, level);
+        const uvec2 texel = min(uvec2(pixel) >> (level + 1u), size - 1u);
+        const float depth = frame.hiz.d[HiZLevelOffset(info.xy, level) + texel.y * size.x + texel.x];
         outColor          = vec4(vec3(sqrt(sqrt(max(depth, 0.0)))), 1.0);
         return;
     }

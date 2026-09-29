@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Events/EventBus.h"
+#include "Engine/Renderer/GeometryPool.h"
 #include "Engine/Renderer/GpuProfiler.h"
 #include "Engine/Renderer/Vulkan/Bindless.h"
 #include "Engine/Renderer/Vulkan/Swapchain.h"
@@ -33,7 +34,8 @@ struct TransientAllocation {
 };
 
 struct RendererDesc {
-    bool vsync = true;
+    bool             vsync = true;
+    GeometryPoolDesc geometry{}; // capacities of the global vertex / index / material pools
 };
 
 // Everything a pass needs to record into the current frame.
@@ -60,13 +62,14 @@ public:
     [[nodiscard]] std::optional<FrameContext> BeginFrame();
     void EndFrame(const FrameContext& frame);
 
-    // Threading: bindless registry, upload queue (see its docs) and DefaultTextureIndex may be
+    // Threading: bindless registry, upload queue, geometry pool (see their docs) and DefaultTextureIndex may be
     // used from worker threads. Everything else, DeferRelease/DeferCall included: main thread.
     [[nodiscard]] const VulkanContext& GetContext() const { return m_Ctx; }
     [[nodiscard]] const Swapchain&   GetSwapchain() const { return *m_Swapchain; }
     [[nodiscard]] BindlessRegistry&  GetBindless()        { return *m_Bindless; }
     [[nodiscard]] UploadQueue&       GetUploader()        { return *m_Upload; }
     [[nodiscard]] GpuProfiler&       Profiler()           { return *m_Profiler; } // "Frame" scope included
+    [[nodiscard]] GeometryPool&      Geometry()           { return *m_Geometry; } // thread-safe (see its docs)
 
     // Deferred destruction: the resource (Buffer, Image, Pipeline, ...) is destroyed once the
     // GPU has finished every frame that might still reference it. Pass with std::move.
@@ -125,6 +128,7 @@ private:
     std::unique_ptr<BindlessRegistry> m_Bindless;
     std::unique_ptr<UploadQueue>      m_Upload;
     std::unique_ptr<GpuProfiler>      m_Profiler;
+    std::unique_ptr<GeometryPool>     m_Geometry;
 
     static constexpr std::size_t kDefaultTextureCount = static_cast<std::size_t>(DefaultTexture::Count);
     std::array<Image, kDefaultTextureCount>         m_DefaultTextures;

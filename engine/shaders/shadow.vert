@@ -3,15 +3,19 @@
 #include "mesh_common.glsl"
 
 layout(location = 0) out vec2 outUV;
+layout(location = 1) flat out uint outMaterial;
 
 // Depth-only shadow rendering (the fragment stage exists only for alpha-masked materials).
 // pc.cascade < 4: sun cascade; otherwise local light shadow view (pc.cascade - 4).
 void main()
 {
-    Vertex    v        = pc.vertices.v[gl_VertexIndex];
-    FrameData frame    = pc.frame;
-    const mat4 viewProj = pc.cascade < 4u ? frame.cascadeViewProj[pc.cascade]
-                                          : frame.shadowViews.v[pc.cascade - 4u].viewProj;
+    FrameData         frame    = pc.frame;
+    const GpuDraw     draw     = frame.draws.d[pc.visible.v[gl_InstanceIndex]];
+    const GpuInstance inst     = frame.instances.i[draw.instance];
+    const Vertex      v        = frame.vertices.v[gl_VertexIndex];
+    const mat4        viewProj = pc.cascade < 4u ? frame.cascadeViewProj[pc.cascade]
+                                                 : frame.shadowViews.v[pc.cascade - 4u].viewProj;
     outUV       = vec2(v.uvX, v.uvY);
-    gl_Position = viewProj * (pc.draw.model * vec4(v.position, 1.0));
+    outMaterial = frame.submeshes.s[draw.submesh].material;
+    gl_Position = viewProj * (inst.model * vec4(v.position, 1.0));
 }

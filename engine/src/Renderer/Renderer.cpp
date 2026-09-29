@@ -16,6 +16,7 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
     m_Upload    = std::make_unique<UploadQueue>(ctx);
     m_Profiler  = std::make_unique<GpuProfiler>(ctx, kFramesInFlight);
+    m_Geometry  = std::make_unique<GeometryPool>(ctx, *m_Upload, desc.geometry);
     CreateDefaultTextures();
 
     const VkDevice dev = ctx.Device();
@@ -50,7 +51,8 @@ Renderer::~Renderer()
 {
     m_Ctx.WaitIdle();
     for (FrameData& f : m_Frames)
-        CollectGarbage(f); // may reference the bindless registry -> run first
+        CollectGarbage(f); // may reference the bindless registry / geometry pool -> run first
+    m_Geometry.reset();
     m_Profiler.reset();
     m_Upload.reset();
     m_Bindless.reset();
