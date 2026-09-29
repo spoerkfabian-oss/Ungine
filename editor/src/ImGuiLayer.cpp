@@ -36,14 +36,14 @@ void LinearizeStyle(ImGuiStyle& style)
 }
 } // namespace
 
-ImGuiLayer::ImGuiLayer(Window& window, Renderer& renderer)
-    : m_Renderer(renderer)
+ImGuiLayer::ImGuiLayer(Window& window, Renderer& renderer, std::string iniFile)
+    : m_Renderer(renderer), m_IniFile(std::move(iniFile))
 {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // no keyboard nav: arrows and letters stay engine hotkeys
-    io.IniFilename = "editor.ini"; // layout, next to the working directory
+    io.IniFilename = m_IniFile.empty() ? nullptr : m_IniFile.c_str(); // layout
     io.ConfigWindowsMoveFromTitleBarOnly = true; // dragging in the viewport must not move the window
 
     ImGui::StyleColorsDark();
@@ -68,6 +68,7 @@ ImGuiLayer::ImGuiLayer(Window& window, Renderer& renderer)
     info.Device             = ctx.Device();
     info.QueueFamily        = ctx.GraphicsQueue().family;
     info.Queue              = ctx.GraphicsQueue().handle;
+    info.PipelineCache      = ctx.PipelineCache();
     info.DescriptorPoolSize = 64; // backend-owned pool: font atlas + viewport textures
     info.MinImageCount      = 2;
     // Vertex/index buffers are cycled per RenderDrawData call: must exceed the frames in flight.

@@ -134,6 +134,14 @@ AssetManager::AssetManager(Renderer& renderer, ThreadPool& jobs, EventBus& event
 {
     m_Cook.compress = desc.textures.compress && renderer.GetContext().SupportsBC();
     CreatePlaceholder();
+    if (!m_Cook.cacheDirectory.empty()) // bounded cache, trimmed off the main thread
+        EnqueueJob([this, directory = m_Cook.cacheDirectory, limit = m_Cook.cacheLimitBytes] {
+            const TextureCacheStats stats = PruneTextureCache(directory, limit);
+            if (stats.removed > 0)
+                ENGINE_INFO("Texture cache: removed {} old file(s), {} MB left", stats.removed, stats.bytes >> 20);
+            std::scoped_lock lock{m_ResultMutex};
+            FinishJob();
+        });
 }
 
 AssetManager::~AssetManager()

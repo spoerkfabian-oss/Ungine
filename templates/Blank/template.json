@@ -1,0 +1,5 @@
+{
+  "name": "Blank",
+  "description": "An empty level with a floor and a camera.",
+  "startScene": "Content/Scenes/Main.scene.json"
+}

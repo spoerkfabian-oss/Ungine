@@ -16,6 +16,7 @@ Input::Input(EventBus& events)
             m_KeysPressed.set(static_cast<std::size_t>(e.key));
         } else if (e.action == InputAction::Release) {
             m_Keys.reset(static_cast<std::size_t>(e.key));
+            m_KeysReleased.set(static_cast<std::size_t>(e.key));
         }
     });
     m_ButtonSub = events.Subscribe<MouseButtonEvent>([this](const MouseButtonEvent& e) {
@@ -49,6 +50,7 @@ Input::Input(EventBus& events)
 void Input::NewFrame()
 {
     m_KeysPressed.reset();
+    m_KeysReleased.reset();
     m_ButtonsPressed.reset();
     m_MouseDelta = glm::vec2{0.0f};
     m_Scroll     = 0.0f;
@@ -58,6 +60,10 @@ bool Input::IsKeyDown(int key) const { return InRange(key, Key::Last) && m_Keys.
 bool Input::WasKeyPressed(int key) const
 {
     return InRange(key, Key::Last) && m_KeysPressed.test(static_cast<std::size_t>(key));
+}
+bool Input::WasKeyReleased(int key) const
+{
+    return InRange(key, Key::Last) && m_KeysReleased.test(static_cast<std::size_t>(key));
 }
 bool Input::IsMouseDown(int b) const
 {

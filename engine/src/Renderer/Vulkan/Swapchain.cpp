@@ -3,10 +3,10 @@
 
 namespace Engine {
 
-Swapchain::Swapchain(const VulkanContext& ctx, VkExtent2D extent, const SwapchainDesc& desc)
+Swapchain::Swapchain(const VulkanContext& ctx, VkExtent2D extent, const SwapchainDesc& desc, VkSwapchainKHR oldSwapchain)
     : m_Ctx(ctx), m_Desc(desc)
 {
-    Create(extent, VK_NULL_HANDLE);
+    Create(extent, oldSwapchain);
 }
 
 Swapchain::~Swapchain()

@@ -69,6 +69,8 @@ public:
     // used from worker threads. Everything else, DeferRelease/DeferCall included: main thread.
     [[nodiscard]] const VulkanContext& GetContext() const { return m_Ctx; }
     [[nodiscard]] const Swapchain&   GetSwapchain() const { return *m_Swapchain; }
+    // Replaced swapchains still waiting for their presents (swapchain maintenance), diagnostics.
+    [[nodiscard]] std::size_t        RetiredSwapchains() const { return m_RetiredSwapchains.size(); }
     [[nodiscard]] BindlessRegistry&  GetBindless()        { return *m_Bindless; }
     [[nodiscard]] UploadQueue&       GetUploader()        { return *m_Upload; }
     [[nodiscard]] GpuProfiler&       Profiler()           { return *m_Profiler; } // "Frame" scope included
@@ -144,6 +146,7 @@ private:
     static void CollectGarbage(FrameData& frame);
 
     void RecreateSwapchain();
+    void RetirePresents(bool wait); // swapchain maintenance: recycle finished presents, destroy retired swapchains
     void CreateDefaultTextures();
     void GrowRenderFinishedSemaphores();
     void UpdateTextureTable(FrameData& frame);
@@ -170,9 +173,30 @@ private:
     std::uint64_t                    m_ReloadGeneration = 0; // m_ShaderReload->Generation() already counted
 
     std::array<FrameData, kFramesInFlight> m_Frames{};
-    // Per swapchain IMAGE, not per frame: presentation may still hold the semaphore
-    // when the same frame slot comes around again.
+    // Without swapchain maintenance: per swapchain IMAGE, not per frame (presentation may still
+    // hold the semaphore when the same frame slot comes around again); never destroyed mid-run.
     std::vector<VkSemaphore> m_RenderFinished;
+
+    // With VK_EXT_swapchain_maintenance1: every present gets a fence, so its semaphore (and a
+    // replaced swapchain) can be recycled exactly when presentation is done - resizes need no
+    // device wait.
+    struct PendingPresent {
+        VkFence       fence     = VK_NULL_HANDLE;
+        VkSemaphore   semaphore = VK_NULL_HANDLE;
+        std::uint64_t swapchain = 0; // m_SwapchainId it was presented to
+    };
+    struct RetiredSwapchain {
+        std::unique_ptr<Swapchain> swapchain;
+        std::uint64_t              id        = 0;
+        std::uint64_t              retiredAt = 0; // m_FrameCounter
+    };
+    std::vector<PendingPresent>   m_PendingPresents;
+    std::vector<VkFence>          m_FreePresentFences;
+    std::vector<VkSemaphore>      m_FreeRenderSemaphores;
+    std::vector<RetiredSwapchain> m_RetiredSwapchains;
+    std::uint64_t                 m_SwapchainId  = 0;
+    std::uint64_t                 m_FrameCounter = 0;
+    bool                          m_PresentFences = false;
 
     std::uint32_t m_FrameIndex    = 0;
     bool          m_ResizePending = false;

@@ -2,6 +2,9 @@
 #include "Test.h"
 
 #include "Editor/Editor.h"
+#include "Editor/ProjectLauncher.h"
+#include "Editor/ScriptGraphEditor.h"
+#include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Core/ThreadPool.h"
@@ -14,9 +17,11 @@
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
+#include "Engine/Script/ScriptSystem.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
+#include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -568,14 +573,21 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     FlyCamera camera;
     camera.position = glm::vec3(4.0f, 5.0f, 6.0f);
     camera.yaw      = 1.25f;
+    PhysicsSettings physics;
+    physics.gravity        = {0.0f, -3.0f, 0.0f};
+    physics.collisionSteps = 3;
+    physics.interpolate    = false;
+    physics.SetLayerCollision(2, 7, false);
 
     const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_roundtrip.scene.json"; // next to the models
-    SaveSceneFile(file, scene, *F().assets, {.renderer = &settings, .camera = &camera});
+    SaveSceneFile(file, scene, *F().assets, {.renderer = &settings, .camera = &camera, .physics = &physics});
 
     Scene         loaded;
     SceneRenderer settings2(*F().renderer, *F().context, *F().assets);
-    FlyCamera     camera2;
-    const auto    handles = LoadSceneFile(file, loaded, *F().assets, {.renderer = &settings2, .camera = &camera2});
+    FlyCamera       camera2;
+    PhysicsSettings physics2;
+    const auto      handles =
+        LoadSceneFile(file, loaded, *F().assets, {.renderer = &settings2, .camera = &camera2, .physics = &physics2});
     fs::remove(file);
 
     Registry& r2 = loaded.GetRegistry();
@@ -597,6 +609,8 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     CHECK(settings2.post.tonemapper == Tonemapper::Aces && settings2.localShadows.maxLights == 3);
     CHECK(!settings2.culling.occlusion && settings2.culling.gpuDriven);
     CHECK(camera2.position == glm::vec3(4.0f, 5.0f, 6.0f) && camera2.yaw == 1.25f);
+    CHECK(physics2.gravity == physics.gravity && physics2.collisionSteps == 3 && !physics2.interpolate);
+    CHECK(physics2.layerCollision == physics.layerCollision && !physics2.LayersCollide(7, 2));
 
     // Broken files throw and leave the scene alone.
     const fs::path broken = fs::path(ENGINE_ASSET_DIR) / "test_broken.scene.json";
@@ -765,6 +779,16 @@ TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
     CHECK(editor.Redo() && r.AliveCount() == 0);
     CHECK(editor.Undo() && r.AliveCount() == initial);
     runFrames(2); // restored entities render
+
+    // Box selection: meshes whose bounds center and lights whose position project into the box.
+    std::size_t meshes = 0;
+    r.ViewOf<MeshRenderer>().Each([&](Entity, MeshRenderer&) { ++meshes; });
+    editor.SelectInRect({0.0f, 0.0f}, {1e5f, 1e5f}, false);
+    CHECK(meshes > 0 && editor.Selection().size() == meshes + 1);
+    editor.SelectInRect({0.0f, 0.0f}, {2.0f, 2.0f}, true); // additive, empty corner: unchanged
+    CHECK(editor.Selection().size() == meshes + 1);
+    editor.SelectInRect({0.0f, 0.0f}, {2.0f, 2.0f}, false);
+    CHECK(editor.Selection().empty());
 
     // Save, new scene, open: same content, clean history, model refs owned by the application.
     const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_editor.scene.json";
@@ -1351,6 +1375,13 @@ TEST_CASE(Render_MeshLodSelection)
     CHECK(nearCpu.lodDraws == 0 && nearCpu.triangles == full);
     CHECK(farCpu.lodDraws == 1 && farCpu.triangles == coarsest);
 
+    // Inside the fade band before LOD 1 takes over: both levels drawn (complementary dithering).
+    const float w      = 0.5f * 120.0f / std::tan(glm::radians(30.0f)); // pixels per unit at distance 1, 1 px
+    const float inBand = sm.lods[1].error * w * 0.9f + std::sqrt(3.0f);   // + box radius
+    const std::uint64_t both = full + sm.lods[1].indexCount / 3;
+    CHECK(measure(true, inBand).triangles == both && measure(false, inBand).triangles == both);
+    CHECK(renderer.Stats().drawCalls == 2 && renderer.Stats().lodDraws == 2);
+
     renderer.culling.forceLod = 2;
     CHECK(measure(true, 1.75f).triangles == sm.lods[2].indexCount / 3);
     CHECK(measure(false, 1.75f).triangles == sm.lods[2].indexCount / 3);
@@ -1450,6 +1481,83 @@ TEST_CASE(Upload_RingBudgetAndLargeUploads)
     F().context->WaitIdle();
 }
 
+TEST_CASE(Renderer_ResizeWithoutDeviceWait)
+{
+    // With swapchain maintenance the old swapchain is retired (no device wait) and destroyed
+    // once its presents are done; either way the resize must be clean under validation.
+    const VkExtent2D before = F().renderer->GetSwapchain().Extent();
+    for (const auto& [w, h] : {std::pair{400, 300}, std::pair{256, 200}, std::pair{static_cast<int>(before.width), static_cast<int>(before.height)}}) {
+        glfwSetWindowSize(F().window->Native(), w, h);
+        CHECK(F().Pump([&] {
+            const VkExtent2D e = F().renderer->GetSwapchain().Extent();
+            return e.width == static_cast<std::uint32_t>(w) && e.height == static_cast<std::uint32_t>(h);
+        }, 500));
+    }
+    CHECK(F().Pump([] { return F().renderer->RetiredSwapchains() == 0; }, 50));
+}
+
+TEST_CASE(Render_TransparentAndShadowOcclusion)
+{
+    const ModelHandle box   = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    const ModelHandle glass = F().assets->CreateModel(MakeBox(
+        "Glass", 1.0f, MaterialData{.name = "Glass", .baseColorFactor = {0.1f, 0.3f, 1.0f, 0.4f}, .alphaBlend = true}));
+    CHECK(F().Pump([&] { return Settled(box) && Settled(glass); }));
+
+    Scene     scene;
+    Registry& r   = scene.GetRegistry();
+    const auto add = [&](ModelHandle model, glm::vec3 position, glm::vec3 scale) {
+        const Entity e = scene.CreateEntity("E");
+        r.Emplace<MeshRenderer>(e, MeshRenderer{.model = model, .meshIndex = 0});
+        scene.EditTransform(e).position = position;
+        scene.EditTransform(e).scale    = scale;
+        return e;
+    };
+    add(box, {0.0f, -0.5f, 0.0f}, {40.0f, 1.0f, 40.0f});  // ground
+    add(box, {0.0f, 5.0f, -2.0f}, {60.0f, 20.0f, 0.5f});  // wall filling the view (no sky in the Hi-Z)
+    add(box, {0.0f, 0.5f, -8.0f}, {1.0f, 1.0f, 1.0f});    // caster behind the wall, shadow straight down
+    add(glass, {0.0f, 1.0f, 2.0f}, {1.0f, 1.0f, 1.0f});   // transparent box in front of the wall
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure       = false;
+
+    renderer.shadows.resolution      = 512;
+    renderer.shadows.maxDistance     = 20.0f;
+    renderer.lighting.sky.sunDirection = glm::normalize(glm::vec3(0.01f, -1.0f, 0.02f));
+    const glm::vec3  eye{0.0f, 1.0f, 8.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+
+    // Transparent: blended over the wall, sorted CPU pass on both paths, never an indirect command.
+    renderer.culling.gpuDriven          = false;
+    const std::vector<std::uint8_t> cpu = RenderImage(renderer, scene, camera, 3);
+    CHECK(renderer.Stats().transparentDraws == 1);
+    renderer.culling.gpuDriven          = true;
+    const std::vector<std::uint8_t> gpu = RenderImage(renderer, scene, camera, 6);
+    const SceneRenderStats          stats = renderer.Stats();
+    CHECK(stats.transparentDraws == 1);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < cpu.size(); ++i)
+        differing += std::abs(static_cast<int>(cpu[i]) - static_cast<int>(gpu[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0);
+    const glm::ivec3 center = CenterPixel(gpu);
+    CHECK(center.b > center.r + 20); // blue glass over the grey wall
+
+    // The hidden caster's shadow falls behind the wall: culled against the Hi-Z; the image is the
+    // same without that culling.
+    CHECK(stats.shadowOccluded >= 1);
+    renderer.culling.shadowOcclusion = false;
+    const std::vector<std::uint8_t> reference = RenderImage(renderer, scene, camera, 6);
+    CHECK(renderer.Stats().shadowOccluded == 0);
+    differing = 0;
+    for (std::size_t i = 0; i < gpu.size(); ++i)
+        differing += std::abs(static_cast<int>(reference[i]) - static_cast<int>(gpu[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0);
+    F().assets->Release(glass);
+    F().assets->Release(box);
+}
+
 int main(int argc, char** argv)
 {
     int result = 1;
@@ -1466,4 +1574,198 @@ int main(int argc, char** argv)
     const std::uint32_t errors = VulkanContext::ValidationErrorCount(); // teardown included
     std::printf("Vulkan validation errors: %u\n", errors);
     return errors == 0 ? result : 1;
+}
+
+TEST_CASE(Editor_BlueprintPlayAndGraphEditing)
+{
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    const Entity actor = scene.CreateEntity("Spawner");
+    scene.EditTransform(actor).position = {0.0f, 1.0f, 0.0f};
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts});
+    camera.position = {0.0f, 2.0f, 8.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto countNamed = [&](const std::string& name) {
+        int n = 0;
+        r.ViewOf<Name>().Each([&](Entity, Name& e) { n += e.value == name ? 1 : 0; });
+        return n;
+    };
+
+    // A new blueprint from the template (BeginPlay -> Print), extended: For 1..3 spawn a sphere at (0, i, 0).
+    const fs::path     file = fs::path(ENGINE_ASSET_DIR) / "test_blueprint.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Count() == 1 && !bp.Dirty() && bp.Graph() && bp.Graph()->nodes.size() == 3);
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, spawn = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes)
+        if (n.type == "Debug.Print")
+            print = n.id;
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        const std::uint32_t loop = g.AddNode("Flow.ForLoop", {200.0f, 200.0f});
+        const std::uint32_t make = g.AddNode("Vector.Make", {200.0f, 360.0f});
+        spawn                    = g.AddNode("Entity.SpawnPrimitive", {500.0f, 200.0f}, "sphere");
+        g.FindNode(loop)->defaults["First Index"] = std::int32_t{1};
+        g.FindNode(loop)->defaults["Last Index"]  = std::int32_t{3};
+        g.FindNode(spawn)->defaults["Simulate Physics"] = false;
+        CHECK(g.Connect(print, "Then", loop, "In").empty());
+        CHECK(g.Connect(loop, "Loop Body", spawn, "In").empty());
+        CHECK(g.Connect(loop, "Index", make, "Y").empty());
+        CHECK(g.Connect(make, "Vector", spawn, "Location").empty());
+    });
+    CHECK(bp.Dirty() && bp.CanUndo() && bp.Graph()->nodes.size() == 6);
+    CHECK(bp.Undo() && bp.Graph()->nodes.size() == 3 && !bp.Dirty()); // back at the saved state
+    CHECK(bp.Redo() && bp.Graph()->nodes.size() == 6 && bp.Dirty());
+    bp.Select({spawn});
+    bp.DuplicateSelection();
+    CHECK(bp.Graph()->nodes.size() == 7 && bp.SelectedNodes().size() == 1 && bp.SelectedNodes()[0] != spawn);
+    bp.DeleteSelection();
+    CHECK(bp.Graph()->nodes.size() == 6);
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+
+    // Play runs the unsaved graph: three spheres; Stop removes them again.
+    r.Emplace<ScriptComponent>(actor, ScriptComponent{file.string()});
+    const std::uint64_t actorUuid = r.Get<Uuid>(actor).value; // Stop recreates the entities
+    runFrames(2);
+    editor.Play();
+    runFrames(6);
+    CHECK(scripts.Running() && countNamed("sphere") == 3);
+    const auto messages = scripts.Messages();
+    CHECK(std::ranges::any_of(messages, [](const ScriptMessage& m) { return m.text == "Hello from test_blueprint"; }));
+    const ScriptDebugInfo* info = scripts.Debug(file);
+    CHECK(info && info->nodeTimes.contains(spawn));
+    bp.Focus(); // the Blueprint tab in front: canvas with execution highlight, viewport hidden
+    runFrames(3);
+    editor.Stop();
+    const Entity restored = scene.FindByUuid(actorUuid);
+    CHECK(!scripts.Running() && countNamed("sphere") == 0 && restored != NullEntity && r.Has<ScriptComponent>(restored));
+
+    // Save, close, reopen.
+    CHECK(bp.Save() && !bp.Dirty());
+    bp.Close(0);
+    CHECK(bp.Count() == 0 && bp.Open(file) && bp.Graph()->nodes.size() == 6);
+    runFrames(2);
+    bp.Close(0);
+    fs::remove(file);
+}
+
+TEST_CASE(Editor_ProjectLauncherAndContent)
+{
+    const fs::path root = fs::temp_directory_path() / "ungine_tests" / "gpu_project";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+#ifndef _WIN32
+    setenv("XDG_CONFIG_HOME", (root / "config").c_str(), 1); // the test's own recent-projects list
+#endif
+    // Project browser: a new project from the physics template.
+    std::optional<fs::path> chosen;
+    {
+        ProjectLauncher launcher(*F().window, *F().renderer);
+        const auto&     templates = launcher.Templates();
+        const auto      physics   = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Physics"; });
+        CHECK(templates.size() >= 3 && physics != templates.end());
+        for (int i = 0; i < 2; ++i) {
+            F().window->PollEvents();
+            launcher.Update();
+            if (auto frame = F().renderer->BeginFrame()) {
+                launcher.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+        CHECK(!launcher.CreateProject("bad/name", root, 0) && !launcher.Error().empty());
+        CHECK(launcher.CreateProject("LauncherGame", root, static_cast<std::size_t>(physics - templates.begin())));
+        chosen = launcher.Chosen();
+        F().renderer->GetContext().WaitIdle(); // the launcher's ImGui textures
+    }
+    CHECK(chosen.has_value());
+    if (!chosen)
+        return;
+    const auto recent = LoadRecentProjects();
+    CHECK(!recent.empty() && recent.front().name == "LauncherGame");
+    std::optional<Project> project = Project::Load(*chosen);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+
+    // Editor on the project: content root, start scene, blueprint and model from the content browser.
+    Scene        scene;
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .physics       = &physics,
+                       .scripts       = &scripts,
+                       .project       = &*project,
+                       .layoutFile    = project->SavedDirectory() / "EditorLayout.ini"});
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                editor.FixedUpdate(1.0f / 60.0f);
+                F().assets->Update();
+                editor.Update(1.0f / 60.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        CHECK(editor.ContentRoot() == project->ContentDirectory());
+        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 10);
+        CHECK(scene.FindPrimaryCamera() != NullEntity);
+        editor.OpenAsset(project->ContentDirectory() / "Scripts" / "RainOnSpace.ugraph");
+        CHECK(editor.Blueprints().Count() == 1);
+        fs::copy_file(fs::path(ENGINE_ASSET_DIR) / "models" / "BoxTextured.glb", project->ContentDirectory() / "Models" / "Box.glb", ec);
+        editor.OpenAsset(project->ContentDirectory() / "Models" / "Box.glb");
+        CHECK(F().Pump([&] {
+            runFrames(1);
+            return scene.GetRegistry().AliveCount() > 10;
+        }));
+        CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
+        CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
+        CHECK(!editor.BuildAndRun()); // no UnginePlayer next to the test executable: reported, no crash
+        runFrames(3);                 // content browser, project menus
+        editor.NewScene();
+    }
+    for (ModelHandle h : modelRefs)
+        F().assets->Release(h);
+    CHECK(fs::exists(project->SavedDirectory() / "EditorLayout.ini"));
+    fs::remove_all(root, ec);
 }

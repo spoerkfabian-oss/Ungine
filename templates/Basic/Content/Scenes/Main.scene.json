@@ -1,0 +1,239 @@
+{
+  "version": 1,
+  "entities": [
+    {
+      "uuid": 1001,
+      "parent": 0,
+      "name": "Ground",
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "plane",
+            "size": 20.0,
+            "baseColor": [
+              0.55,
+              0.56,
+              0.58,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.85
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "static"
+      },
+      "collider": {
+        "shape": "box",
+        "halfExtents": [
+          10,
+          0.5,
+          10
+        ],
+        "center": [
+          0,
+          -0.5,
+          0
+        ]
+      }
+    },
+    {
+      "uuid": 1002,
+      "parent": 0,
+      "name": "Camera",
+      "transform": {
+        "position": [
+          0,
+          2.5,
+          7
+        ],
+        "rotation": [
+          -0.10452846326765347,
+          0.0,
+          0.0,
+          0.9945218953682733
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "cameraComponent": {
+        "fovY": 1.0471976,
+        "nearPlane": 0.05,
+        "primary": true
+      }
+    },
+    {
+      "uuid": 1003,
+      "parent": 0,
+      "name": "Cube",
+      "transform": {
+        "position": [
+          0,
+          1.0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "box",
+            "size": 1.0,
+            "baseColor": [
+              0.95,
+              0.45,
+              0.1,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.4
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "kinematic"
+      },
+      "collider": {
+        "shape": "box",
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      },
+      "script": {
+        "graph": "../Scripts/Rotator.ugraph"
+      }
+    },
+    {
+      "uuid": 1004,
+      "parent": 0,
+      "name": "Sphere",
+      "transform": {
+        "position": [
+          2.2,
+          3.0,
+          0.3
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "sphere",
+            "size": 0.8,
+            "baseColor": [
+              0.2,
+              0.5,
+              0.95,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.3
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "dynamic",
+        "mass": 1.0
+      },
+      "collider": {
+        "shape": "sphere",
+        "radius": 0.4
+      }
+    },
+    {
+      "uuid": 1005,
+      "parent": 0,
+      "name": "Point Light",
+      "transform": {
+        "position": [
+          -2.0,
+          2.5,
+          2.0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "light": {
+        "type": "point",
+        "color": [
+          1.0,
+          0.8,
+          0.6
+        ],
+        "intensity": 20.0,
+        "range": 0.0,
+        "innerCone": 0.0,
+        "outerCone": 0.785398,
+        "castShadows": true
+      }
+    }
+  ],
+  "camera": {
+    "position": [
+      0,
+      2.5,
+      7
+    ],
+    "yaw": 0.0,
+    "pitch": -0.21,
+    "fovY": 1.0471976,
+    "nearPlane": 0.05,
+    "moveSpeed": 4.0
+  }
+}

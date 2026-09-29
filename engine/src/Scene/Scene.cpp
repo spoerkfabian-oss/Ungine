@@ -172,6 +172,22 @@ Entity Scene::FindByUuid(std::uint64_t uuid) const
     return it != m_ByUuid.end() && m_Registry.Valid(it->second) ? it->second : NullEntity;
 }
 
+Entity Scene::FindPrimaryCamera()
+{
+    Entity        best = NullEntity;
+    bool          bestPrimary = false;
+    std::uint64_t bestUuid    = 0;
+    m_Registry.ViewOf<CameraComponent>().Each([&](Entity e, CameraComponent& cam) {
+        const std::uint64_t uuid = m_Registry.Get<Uuid>(e).value;
+        if (best == NullEntity || (cam.primary && !bestPrimary) || (cam.primary == bestPrimary && uuid < bestUuid)) {
+            best        = e;
+            bestPrimary = cam.primary;
+            bestUuid    = uuid;
+        }
+    });
+    return best;
+}
+
 void Scene::Detach(Entity child)
 {
     auto& h = m_Registry.Get<Hierarchy>(child);

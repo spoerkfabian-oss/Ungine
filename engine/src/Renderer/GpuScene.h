@@ -48,22 +48,32 @@ struct GpuBatch {
     std::uint32_t firstIndex   = 0;
     std::int32_t  vertexOffset = 0;
     std::uint32_t instanceBase = 0; // slice of a view's visible list (prefix sum of draw counts)
-    std::uint32_t cameraBucket = 0; // bit 0: double-sided, bit 1: mirrored
+    std::uint32_t cameraBucket = 0; // bit 0: double-sided, bit 1: mirrored; kCameraBucketBlend: alpha-blended
     std::uint32_t shadowBucket = 0; // 1: alpha-masked
     std::uint32_t pad0 = 0, pad1 = 0;
 };
 static_assert(sizeof(GpuBatch) == 32);
 
-inline constexpr std::uint32_t kCameraBuckets = 4;
-inline constexpr std::uint32_t kShadowBuckets = 2;
+inline constexpr std::uint32_t kCameraBuckets     = 4;
+inline constexpr std::uint32_t kCameraBucketBlend = 4; // alpha-blended: no indirect command, sorted CPU pass
+inline constexpr std::uint32_t kShadowBuckets     = 2;
 
-// Visible list entry: draw record | LOD << 30 (mirrors VISIBLE_* in scene_common.glsl).
-inline constexpr std::uint32_t kVisibleRecordMask = 0x3FFFFFFFu;
-inline constexpr std::uint32_t kVisibleLodShift   = 30;
+// Visible list entry (mirrors VISIBLE_* in scene_common.glsl): draw record (22 bits) | LOD << 22 |
+// cross-fade << 24 | fading in << 31.
+inline constexpr std::uint32_t kVisibleRecordMask = 0x003FFFFFu;
+inline constexpr std::uint32_t kVisibleLodShift   = 22;
+inline constexpr std::uint32_t kVisibleFadeShift  = 24;
+inline constexpr std::uint32_t kVisibleFadeIn     = 0x80000000u;
+inline constexpr std::uint32_t kMaxDrawRecords    = kVisibleRecordMask + 1;
+
+struct LodChoice {
+    std::uint32_t lod  = 0;
+    std::uint32_t fade = 0; // 0..127 towards lod + 1 (camera views draw both, dithered)
+};
 
 // Mirrors SelectLod in scene_common.glsl (the CPU path must pick the same geometry).
-[[nodiscard]] std::uint32_t SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
-                                      std::uint32_t forced);
+[[nodiscard]] LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
+                                  std::uint32_t forced);
 
 // Persistent GPU copy of the scene's mesh instances for GPU-driven rendering (and the CPU path,
 // which draws the same records directly). Update() applies the spatial index's mesh changes on
@@ -91,6 +101,7 @@ public:
     // CPU path / stats
     [[nodiscard]] const GpuInstance* FindInstance(Entity entity) const;
     [[nodiscard]] const GpuDraw&     Draw(std::uint32_t index) const { return m_Draws[index]; }
+    [[nodiscard]] const GpuInstance& InstanceData(std::uint32_t index) const { return m_InstanceData[index]; }
     [[nodiscard]] const GpuSubmesh&  DrawSubmesh(std::uint32_t index) const { return m_DrawSubmeshes[index]; }
     [[nodiscard]] const GpuBatch&    Batch(std::uint32_t index) const { return m_Batches[index]; }
     [[nodiscard]] std::uint32_t InstanceCount() const { return m_LiveInstances; }
@@ -99,6 +110,7 @@ public:
     [[nodiscard]] std::uint32_t VisibleCapacity() const { return m_VisibleCapacity; }
     [[nodiscard]] std::uint32_t DrawCapacity() const { return m_DrawRanges.Capacity(); } // incl. free slots
     [[nodiscard]] std::uint32_t BatchCount() const { return static_cast<std::uint32_t>(m_Batches.size()); } // incl. free ids
+    [[nodiscard]] std::uint32_t BlendDraws() const { return m_BlendDraws; } // alpha-blended draw records
     [[nodiscard]] std::uint32_t LiveBatches() const { return static_cast<std::uint32_t>(m_BatchOf.size()); } // blocks
 
     // GPU buffers (valid after Upload).
@@ -137,7 +149,9 @@ private:
     RangeAllocator             m_DrawRanges;
     std::vector<GpuDraw>       m_Draws;         // mirror
     std::vector<GpuSubmesh>    m_DrawSubmeshes; // CPU path: geometry of each draw
-    std::uint32_t              m_LiveDraws = 0;
+    std::uint32_t              m_LiveDraws  = 0;
+    std::uint32_t              m_BlendDraws = 0;
+    bool                       m_ReportedFull = false;
 
     struct ModelUse {
         std::uint32_t instances = 0;

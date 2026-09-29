@@ -1,5 +1,6 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Editor/ScriptGraphEditor.h"
 #include "FileDialog.h"
 #include "History.h"
 #include "ImGuiLayer.h"
@@ -10,6 +11,7 @@
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptSystem.h"
 
 #include <imgui.h>
 #include <imgui_internal.h> // ActiveIdWindow (inspector edit sessions)
@@ -317,9 +319,8 @@ void Editor::DrawInspector()
     Registry& registry = m_Ctx.scene.GetRegistry();
     const Entity e     = Selected();
     if (e == NullEntity) {
-        if (m_InspectorEdit) { // the edited entity was deselected mid-edit
-            PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
-        }
+        if (m_InspectorEdit) // the edited entity was deselected mid-edit
+            PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
         ImGui::TextDisabled("Nothing selected");
         ImGui::End();
         return;
@@ -330,7 +331,7 @@ void Editor::DrawInspector()
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputText("##name", &registry.Get<Name>(e).value);
     if (m_Selection.size() > 1)
-        ImGui::TextDisabled("%zu selected - showing the last one", m_Selection.size());
+        ImGui::TextDisabled("%zu selected - edits apply to all (values of the last one shown)", m_Selection.size());
     ImGui::TextDisabled("Entity %u (gen %u), uuid %016llx", EntityIndex(e), EntityGeneration(e),
                         static_cast<unsigned long long>(registry.Get<Uuid>(e).value));
 
@@ -436,6 +437,7 @@ void Editor::DrawInspector()
             DragFloatRow("Linear damping", &body->linearDamping, 0.005f, 0.0f, 10.0f);
             DragFloatRow("Angular damping", &body->angularDamping, 0.005f, 0.0f, 10.0f);
             CheckboxRow("Allow sleeping", &body->allowSleeping);
+            CheckboxRow("Continuous (CCD)", &body->continuous);
         }
         if (m_Ctx.physics) {
             PropertyRow("State");
@@ -477,6 +479,9 @@ void Editor::DrawInspector()
         DragFloatRow("Friction", &collider->friction, 0.005f, 0.0f, 10.0f);
         DragFloatRow("Restitution", &collider->restitution, 0.005f, 0.0f, 1.0f);
         CheckboxRow("Trigger", &collider->trigger);
+        std::uint32_t layer = collider->layer;
+        if (SliderUintRow("Layer", &layer, 0, kPhysicsLayers - 1))
+            collider->layer = static_cast<std::uint8_t>(layer);
         ImGui::EndTable();
         if (collider->shape == ColliderShape::Mesh && registry.Has<RigidBody>(e) &&
             registry.Get<RigidBody>(e).type == BodyType::Dynamic)
@@ -518,6 +523,59 @@ void Editor::DrawInspector()
             registry.Remove<CharacterController>(e);
     }
 
+    if (CameraComponent* cam = registry.TryGet<CameraComponent>(e);
+        cam && ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("camera component")) {
+        PropertyRow("Field of view");
+        ImGui::SliderAngle("##v", &cam->fovY, 10.0f, 150.0f);
+        ImGui::PopID();
+        DragFloatRow("Near plane", &cam->nearPlane, 0.001f, 0.001f, 10.0f);
+        CheckboxRow("Primary", &cam->primary);
+        ImGui::EndTable();
+        ImGui::TextDisabled("The player renders through the first primary camera.");
+        if (ImGui::Button("Remove camera"))
+            registry.Remove<CameraComponent>(e);
+    }
+
+    if (ScriptComponent* script = registry.TryGet<ScriptComponent>(e);
+        script && ImGui::CollapsingHeader("Script (Blueprint)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##graph", "path/to/script.ugraph", &script->graph);
+        std::error_code             ec;
+        const std::filesystem::path dir = !script->graph.empty() ? std::filesystem::path(script->graph).parent_path()
+                                          : !m_ScenePath.empty() ? m_ScenePath.parent_path()
+                                                                 : std::filesystem::current_path(ec);
+        if (ImGui::Button("Edit") && !script->graph.empty()) {
+            if (m_Graphs->Open(script->graph)) {
+                m_ShowBlueprint = true;
+                m_Graphs->Focus();
+            } else {
+                m_Status = "Cannot open script (see log)";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            m_ScriptTarget  = e;
+            m_DialogPurpose = DialogPurpose::AssignScript;
+            m_FileDialog->Open("Choose script", FileDialog::Mode::Open, dir, {".ugraph"});
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New...")) {
+            m_ScriptTarget  = e;
+            m_DialogPurpose = DialogPurpose::NewScript;
+            m_FileDialog->Open("New script", FileDialog::Mode::Save, dir, {".ugraph"}, registry.Get<Name>(e).value + ".ugraph");
+        }
+        if (m_Ctx.scripts && m_Ctx.scripts->Running() && !script->graph.empty())
+            if (const ScriptDebugInfo* info = m_Ctx.scripts->Debug(script->graph)) {
+                const auto errors = std::ranges::count_if(info->diagnostics, [](const ScriptDiagnostic& d) { return d.error; });
+                if (errors)
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%d error(s) - see the Blueprint window", static_cast<int>(errors));
+                else
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Running");
+            }
+        if (ImGui::Button("Remove script"))
+            registry.Remove<ScriptComponent>(e);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -551,25 +609,51 @@ void Editor::DrawInspector()
         }
         if (ImGui::MenuItem("Character Controller", nullptr, false, !registry.Has<CharacterController>(e)))
             registry.Emplace<CharacterController>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Script (Blueprint)", nullptr, false, !registry.Has<ScriptComponent>(e)))
+            registry.Emplace<ScriptComponent>(e);
+        if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
+            registry.Emplace<CameraComponent>(e);
         ImGui::EndPopup();
     }
 
     // One undo step per edit: instant widgets (checkbox, combo, buttons) push right away, drags and
     // text fields when they are released. Detected by comparing the entity's state.
-    const std::uint64_t uuid    = registry.Get<Uuid>(e).value;
-    const bool          editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
-    const bool          changed = SnapshotEntityState(m_Ctx.scene, e) != frameState;
-    if (changed)
+    // Multi-selection: the same change (changed fields, added / removed components) goes to the
+    // other selected entities.
+    const std::uint64_t    uuid    = registry.Get<Uuid>(e).value;
+    const bool             editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
+    const std::string      after   = SnapshotEntityState(m_Ctx.scene, e);
+    const bool             changed = after != frameState;
+    std::vector<StateEdit> others;
+    if (changed) {
         m_Ctx.scene.MarkChanged(e); // light / mesh edits: bounds and shadow caches
-    if (m_InspectorEdit && m_InspectorEdit->uuid == uuid && editing) {
-        // still dragging / typing
-    } else if (m_InspectorEdit) {
-        PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+        for (Entity other : m_Selection) {
+            if (other == e)
+                continue;
+            std::string before = SnapshotEntityState(m_Ctx.scene, other);
+            if (ApplyEntityStateDiff(m_Ctx.scene, other, frameState, after))
+                others.push_back({UuidOf(other), std::move(before)});
+        }
+    }
+    const auto addOthers = [&](std::vector<StateEdit>& edit) { // first change of each entity only
+        for (StateEdit& o : others)
+            if (std::ranges::none_of(edit, [&](const StateEdit& x) { return x.uuid == o.uuid; }))
+                edit.push_back(std::move(o));
+    };
+    if (m_InspectorEdit && m_InspectorEdit->front().uuid != uuid) // the primary changed mid-edit
+        PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
+    if (m_InspectorEdit) {
+        addOthers(*m_InspectorEdit);
+        if (!editing) // released: one step for the whole drag / typing session
+            PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
     } else if (changed) {
+        std::vector<StateEdit> edit{StateEdit{uuid, frameState}};
+        addOthers(edit);
         if (editing)
-            m_InspectorEdit = StateEdit{uuid, frameState};
+            m_InspectorEdit = std::move(edit);
         else
-            PushStateChange("Edit properties", {StateEdit{uuid, frameState}});
+            PushStateChange("Edit properties", std::move(edit));
     }
     ImGui::End();
 }
@@ -767,8 +851,40 @@ void Editor::DrawRendererSettings()
         ImGui::SliderInt("##v", &ps.collisionSteps, 1, 8);
         ImGui::PopID();
         DragFloatRow("Air control", &ps.airControl, 0.01f, 0.0f, 20.0f, "%.2f /s");
+        CheckboxRow("Interpolate", &ps.interpolate);
         CheckboxRow("Show colliders", &m_ShowColliders);
         ImGui::EndTable();
+
+        // Lower triangle of the symmetric layer matrix: row a, column b <= a.
+        if (ImGui::TreeNode("Layer collision")) {
+            static int shownLayers = 4;
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Layers shown", &shownLayers, 1, static_cast<int>(kPhysicsLayers));
+            const int n = std::clamp(shownLayers, 1, static_cast<int>(kPhysicsLayers));
+            if (ImGui::BeginTable("layers", n + 1, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX)) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                for (int b = 0; b < n; ++b) {
+                    ImGui::TableSetColumnIndex(b + 1);
+                    ImGui::Text("%d", b);
+                }
+                for (int a = 0; a < n; ++a) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%d", a);
+                    for (int b = 0; b <= a; ++b) {
+                        ImGui::TableSetColumnIndex(b + 1);
+                        ImGui::PushID(a * static_cast<int>(kPhysicsLayers) + b);
+                        bool collide = ps.LayersCollide(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b));
+                        if (ImGui::Checkbox("##c", &collide))
+                            ps.SetLayerCollision(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b), collide);
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
     }
 
     if (ImGui::CollapsingHeader("Camera") && BeginProperties("camera")) {
@@ -894,6 +1010,13 @@ void Editor::DrawStats()
             ImGui::Text("Contacts       %u pairs", ps.contactPairs);
             ImGui::Text("Sync / step    %.3f / %.3f ms  (+%u -%u, %u meshes pending)", ps.syncMs, ps.stepMs, ps.created,
                         ps.removed, ps.pendingMeshes);
+        }
+        if (m_Ctx.scripts) {
+            const ScriptStats& ss = m_Ctx.scripts->Stats();
+            ImGui::SeparatorText("Scripts");
+            ImGui::Text("Instances      %u  (%s)", ss.instances, m_Ctx.scripts->Running() ? "running" : "stopped");
+            ImGui::Text("Last frame     %u events, %u nodes, %u waiting", ss.eventsFired, ss.nodesExecuted, ss.waiting);
+            ImGui::Text("Errors         %u", ss.errors);
         }
 
         ImGui::SeparatorText("Memory");

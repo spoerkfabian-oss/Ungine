@@ -3,6 +3,7 @@
 
 #include <imgui.h>
 
+#include <string>
 #include <vector>
 
 namespace Engine {
@@ -12,7 +13,8 @@ class Window;
 // Dear ImGui context + GLFW/Vulkan backends (dynamic rendering, volk). Main thread only.
 class ImGuiLayer {
 public:
-    ImGuiLayer(Window& window, Renderer& renderer);
+    // iniFile: layout settings (empty: not saved).
+    ImGuiLayer(Window& window, Renderer& renderer, std::string iniFile = "editor.ini");
     ~ImGuiLayer(); // waits for the device: the backend frees its resources immediately
 
     ImGuiLayer(const ImGuiLayer&)            = delete;
@@ -35,6 +37,7 @@ private:
     };
 
     Renderer&                   m_Renderer;
+    std::string                 m_IniFile; // ImGui keeps the pointer
     std::vector<PendingRemoval> m_PendingRemovals; // kept here: must not outlive the backend
     bool                        m_FrameOpen = false;
 };

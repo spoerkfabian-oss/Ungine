@@ -97,29 +97,41 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Ba
 // Draw record per drawn instance (indexed by gl_InstanceIndex: firstInstance selects the slice).
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer VisibleBuffer   { uint        v[]; };
 
-// Visible list entries: draw record | LOD << 30 (the LOD picks the batch's index range; the
-// shaders only need it for the LOD debug view).
-#define VISIBLE_RECORD_MASK 0x3FFFFFFFu
-#define VISIBLE_LOD_SHIFT   30u
+// Visible list entries: draw record (22 bits: the culling dispatch covers at most 4M records)
+// | LOD << 22 | cross-fade amount (7 bits) << 24 | fading in << 31. The LOD picks the batch; the
+// shaders use LOD + fade for dithering (LodFadeDiscard) and the LOD debug view.
+#define VISIBLE_RECORD_MASK 0x003FFFFFu
+#define VISIBLE_LOD_SHIFT   22u
+#define VISIBLE_FADE_SHIFT  24u
+#define VISIBLE_FADE_IN     0x80000000u
 
-// LOD whose object-space error, seen from the camera, stays below the pixel threshold.
-// lodCamera: xyz camera position, w: pixels per unit of error at distance 1 (0: always LOD 0).
-uint SelectLod(GpuSubmesh sm, vec3 center, vec3 extent, float scale, vec4 lodCamera, uint forced)
+// LOD whose object-space error, seen from the camera, stays below the pixel threshold, and the
+// cross-fade towards the next coarser level (0..127) inside the last LOD_FADE_BAND of the distance
+// range. lodCamera: xyz camera position, w: pixels per unit of error at distance 1 (0: always
+// LOD 0). Mirrors Engine::SelectLod (GpuScene.cpp).
+#define LOD_FADE_BAND 0.2
+uvec2 SelectLod(GpuSubmesh sm, vec3 center, vec3 extent, float scale, vec4 lodCamera, uint forced)
 {
     if (sm.lodCount <= 1u)
-        return 0u;
+        return uvec2(0u);
     if (forced > 0u)
-        return min(forced - 1u, sm.lodCount - 1u);
+        return uvec2(min(forced - 1u, sm.lodCount - 1u), 0u);
     if (lodCamera.w <= 0.0)
-        return 0u;
+        return uvec2(0u);
     const float distance = length(lodCamera.xyz - center) - length(extent);
     if (distance <= 0.0)
-        return 0u;
+        return uvec2(0u);
     uint lod = 0u;
     for (uint l = 1u; l < sm.lodCount; ++l)
         if (sm.lodError[l] * scale * lodCamera.w <= distance)
             lod = l;
-    return lod;
+    uint fade = 0u;
+    if (lod + 1u < sm.lodCount) {
+        const float next = sm.lodError[lod + 1u] * scale * lodCamera.w; // distance where lod + 1 takes over
+        const float t    = (distance / next - (1.0 - LOD_FADE_BAND)) / LOD_FADE_BAND;
+        fade = t > 0.0 ? min(uint(t * 128.0), 127u) : 0u;
+    }
+    return uvec2(lod, fade);
 }
 // Hi-Z pyramid (min depth, reverse-Z = farthest occluder), all levels packed one after another.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer HiZBuffer       { float       d[]; };

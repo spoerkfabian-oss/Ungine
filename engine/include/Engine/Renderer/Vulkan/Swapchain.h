@@ -12,14 +12,17 @@ struct SwapchainDesc {
 
 class Swapchain {
 public:
-    Swapchain(const VulkanContext& ctx, VkExtent2D extent, const SwapchainDesc& desc);
+    // `oldSwapchain`: the one it replaces (retired by the driver; destroy it once its presents are done).
+    Swapchain(const VulkanContext& ctx, VkExtent2D extent, const SwapchainDesc& desc,
+              VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE);
     ~Swapchain();
 
     Swapchain(const Swapchain&)            = delete;
     Swapchain& operator=(const Swapchain&) = delete;
 
-    // Caller guarantees the device is idle w.r.t. the old images.
+    // In place. Caller guarantees the device is idle w.r.t. the old images.
     void Recreate(VkExtent2D extent);
+    [[nodiscard]] const SwapchainDesc& Desc() const { return m_Desc; }
 
     [[nodiscard]] VkSwapchainKHR Handle()        const { return m_Swapchain.swapchain; }
     [[nodiscard]] VkFormat       Format()        const { return m_Swapchain.image_format; }

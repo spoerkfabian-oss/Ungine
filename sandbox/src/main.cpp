@@ -1,4 +1,5 @@
 #include "Editor/Editor.h"
+#include "Editor/ScriptGraphEditor.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Core/Application.h"
@@ -7,6 +8,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Script/ScriptSystem.h"
 
 #include <algorithm>
 #include <array>
@@ -41,6 +43,7 @@ public:
 
     [[nodiscard]] bool LoadFailed() const { return m_LoadFailed; }
     void SetStartDebugView(std::uint32_t view) { m_StartDebugView = view; } // --debug-view N (Engine::DebugView)
+    void SetStartScript(std::filesystem::path graph) { m_StartScript = std::move(graph); } // --script: on the model root
 
 protected:
     void OnInit() override
@@ -55,6 +58,10 @@ protected:
         m_CollisionSub  = GetEvents().Subscribe<Engine::CollisionEvent>([this](const Engine::CollisionEvent& e) {
             m_Collisions += e.begin ? 1u : 0u;
         });
+        // Visual scripts run in the game view; the editor runs them only while playing.
+        m_Scripts = std::make_unique<Engine::ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets());
+        if (!m_StartWithEditor)
+            m_Scripts->Begin(m_Scene);
         SetEditorEnabled(m_StartWithEditor);
 
         m_LoadStart = std::chrono::steady_clock::now();
@@ -68,6 +75,12 @@ protected:
                 }
                 else if (e.handle == m_Ground)
                     OnGroundLoaded();
+            });
+        // A reloaded model may have other nodes: instances follow (hot reload, F5).
+        m_ReloadedSub = GetEvents().Subscribe<Engine::AssetReloadedEvent<Engine::Model>>(
+            [this](const Engine::AssetReloadedEvent<Engine::Model>& e) {
+                if (const Engine::Model* model = GetAssets().Get(e.handle))
+                    Engine::RefreshModelInstances(m_Scene, e.handle, *model);
             });
         m_FailedSub = GetEvents().Subscribe<Engine::AssetFailedEvent<Engine::Model>>(
             [this](const Engine::AssetFailedEvent<Engine::Model>& e) {
@@ -101,6 +114,8 @@ protected:
                                         t.rotation);
         }
         AnimateInstances(static_cast<float>(dt));
+        if (!m_Editor) // Space etc. belong to the character in character mode
+            m_Scripts->Update(m_Scene, static_cast<float>(dt), !m_CharacterMode);
         m_Scene.UpdateTransforms(); // only the dirty subtrees
         if (m_Editor)
             m_Editor->Update(static_cast<float>(dt));
@@ -144,12 +159,15 @@ protected:
             m_Physics->Step(m_Scene, static_cast<float>(dt));
     }
 
-    void OnRender(const Engine::FrameContext& frame, double) override
+    void OnRender(const Engine::FrameContext& frame, double alpha) override
     {
         if (m_Editor) {
-            m_Editor->Render(frame);
+            m_Editor->Render(frame, static_cast<float>(alpha));
             return;
         }
+        m_Physics->Interpolate(m_Scene, static_cast<float>(alpha)); // smooth motion between fixed steps
+        if (m_CharacterMode && m_Scene.GetRegistry().Valid(m_Player))
+            FollowPlayer();
         const float aspect = static_cast<float>(frame.extent.width) / static_cast<float>(frame.extent.height);
         m_SceneRenderer->Render(frame, m_Scene, m_Camera.GetData(aspect));
     }
@@ -157,6 +175,7 @@ protected:
     void OnShutdown() override
     {
         m_Editor.reset();
+        m_Scripts->End(m_Scene); // releases spawned models
         if (m_InstanceModel)
             GetAssets().Release(m_InstanceModel);
         GetAssets().Release(m_Model);
@@ -180,7 +199,8 @@ private:
             return;
         if (enabled)
             SetCharacterMode(false);
-        if (enabled)
+        if (enabled) {
+            m_Scripts->End(m_Scene); // edit mode: scripts run again when playing
             m_Editor = std::make_unique<Engine::Editor>(Engine::EditorContext{
                 .window        = GetWindow(),
                 .renderer      = GetRenderer(),
@@ -189,9 +209,12 @@ private:
                 .sceneRenderer = *m_SceneRenderer,
                 .camera        = m_Camera,
                 .modelRefs     = m_EditorModels,
-                .physics       = m_Physics.get()});
-        else
+                .physics       = m_Physics.get(),
+                .scripts       = m_Scripts.get()});
+        } else {
             m_Editor.reset(); // waits for the GPU once
+            m_Scripts->Begin(m_Scene);
+        }
     }
 
     // Stress scene: a grid of m_InstanceCount boxes on the ground, every tenth one bobbing (dirty
@@ -416,10 +439,15 @@ private:
         if (glm::dot(move, move) > 0.0f)
             move = glm::normalize(move) * (input.IsKeyDown(Engine::Key::LeftShift) ? 6.0f : 3.0f);
         m_Physics->SetCharacterInput(m_Player, move, input.WasKeyPressed(Engine::Key::Space));
+        FollowPlayer();
+    }
 
+    // Third-person camera behind the (interpolated) character.
+    void FollowPlayer()
+    {
         const glm::vec3 target = glm::vec3(m_Scene.GetRegistry().Get<Engine::WorldTransform>(m_Player).matrix[3]) +
                                  glm::vec3(0.0f, 1.0f, 0.0f);
-        m_Camera.position = target - forward * 4.0f;
+        m_Camera.position = target - m_Camera.Forward() * 4.0f;
     }
 
     // T: next tone mapper, -/=: exposure (compensation with auto exposure), X: auto exposure,
@@ -495,6 +523,13 @@ private:
                 registry.Emplace<Engine::Collider>(e, Engine::Collider{.shape = Engine::ColliderShape::Mesh});
             }
         });
+        if (!m_StartScript.empty()) {
+            std::error_code             ec;
+            const std::filesystem::path graph = std::filesystem::absolute(m_StartScript, ec);
+            registry.Emplace<Engine::ScriptComponent>(root, Engine::ScriptComponent{graph.string()});
+            if (m_Editor) // ready to edit in the Blueprint tab
+                (void)m_Editor->Blueprints().Open(graph);
+        }
         if (m_Editor)
             m_Editor->Select(root);
 
@@ -544,7 +579,7 @@ private:
     std::filesystem::path                  m_ModelPath;
     std::uint32_t                          m_ExitAfterFrames = 0;
     bool                                   m_StartWithEditor = false;
-    Engine::Subscription                   m_KeySub, m_LoadedSub, m_FailedSub;
+    Engine::Subscription                   m_KeySub, m_LoadedSub, m_FailedSub, m_ReloadedSub;
     Engine::Scene                          m_Scene;
     Engine::ModelHandle                    m_Model;
     Engine::ModelHandle                    m_Ground;
@@ -560,6 +595,8 @@ private:
     Engine::Entity                         m_LightRoot      = Engine::NullEntity;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     std::unique_ptr<Engine::PhysicsWorld>  m_Physics;
+    std::unique_ptr<Engine::ScriptSystem>  m_Scripts;
+    std::filesystem::path                  m_StartScript; // --script
     Engine::Subscription                   m_CollisionSub;
     std::uint32_t                          m_Collisions = 0; // Begin events since the last title update
     static constexpr float                 kDemoBodySize = 0.35f;
@@ -589,7 +626,7 @@ private:
 int main(int argc, char** argv)
 {
     // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N]
-    //                [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed]
+    //                [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed] [--script graph.ugraph]
     std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
     bool                  editor    = false;
@@ -598,6 +635,7 @@ int main(int argc, char** argv)
     std::uint32_t         bodies    = 0;
     bool                  cpuCulling = false;
     std::uint32_t         debugView  = 0;
+    std::filesystem::path script;
     Engine::AssetManagerDesc assets;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -619,12 +657,15 @@ int main(int argc, char** argv)
             assets.hotReload = true;
         else if (arg == "--uncompressed") // textures stay RGBA8 (e.g. software rasterizers: slow BC decoding)
             assets.textures.compress = false;
+        else if (arg == "--script" && i + 1 < argc)
+            script = argv[++i];
         else
             modelPath = arg;
     }
     if (!std::filesystem::exists(modelPath)) {
         ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] "
-                     "[--instances N] [--physics N] [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed]",
+                     "[--instances N] [--physics N] [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed] "
+                     "[--script graph.ugraph]",
                      modelPath.string());
         return 1;
     }
@@ -636,6 +677,7 @@ int main(int argc, char** argv)
                     lights, instances,
                     bodies, cpuCulling);
         app.SetStartDebugView(debugView);
+        app.SetStartScript(script);
         app.Run();
         loadFailed = app.LoadFailed();
     } catch (const std::exception& e) {

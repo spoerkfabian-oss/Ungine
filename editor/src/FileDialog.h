@@ -7,10 +7,12 @@
 namespace Engine {
 
 // Modal ImGui file browser (no native dialogs, same on every platform). Open() once, then call
-// Draw() every frame: it returns the chosen path exactly once.
+// Draw() every frame: it returns the chosen path exactly once. Save asks before overwriting an
+// existing file; Folder returns the current directory. Places: home, working directory, drives
+// (Windows).
 class FileDialog {
 public:
-    enum class Mode { Open, Save };
+    enum class Mode { Open, Save, Folder };
 
     // extensions: lower case with dot (".glb"); empty = all files. Save mode appends the first one
     // when the typed name has none of them.
@@ -18,6 +20,9 @@ public:
               std::vector<std::string> extensions, std::string fileName = {});
     [[nodiscard]] std::optional<std::filesystem::path> Draw();
     [[nodiscard]] bool IsOpen() const { return m_Open; }
+
+    // Existing roots to jump to (drive letters on Windows, "/" elsewhere) plus home / working dir.
+    [[nodiscard]] static std::vector<std::filesystem::path> Places();
 
 private:
     struct Item {
@@ -27,6 +32,7 @@ private:
     };
 
     void Refresh();
+    void Navigate(const std::filesystem::path& directory);
     [[nodiscard]] bool Matches(const std::filesystem::path& file) const;
     [[nodiscard]] std::optional<std::filesystem::path> Confirm();
 
@@ -39,6 +45,8 @@ private:
     std::string              m_FileName;
     std::string              m_Error;
     std::vector<Item>        m_Items;
+    std::filesystem::path    m_Overwrite; // Save: existing file waiting for confirmation
+    std::vector<std::filesystem::path> m_Places;
 };
 
 } // namespace Engine

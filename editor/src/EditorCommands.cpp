@@ -5,7 +5,12 @@
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Core/Project.h"
+#include "Engine/Core/Window.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Script/ScriptSystem.h"
+#include "Editor/ScriptGraphEditor.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -277,7 +282,9 @@ bool Editor::OpenScene(const std::filesystem::path& file)
     NewScene();
     bool loaded = true;
     try {
-        const SceneFileOptions options{.renderer = &m_Ctx.sceneRenderer, .camera = &m_Ctx.camera};
+        const SceneFileOptions options{.renderer = &m_Ctx.sceneRenderer,
+                                       .camera   = &m_Ctx.camera,
+                                       .physics  = m_Ctx.physics ? &m_Ctx.physics->settings : nullptr};
         const auto             handles = LoadSceneFile(file, m_Ctx.scene, m_Ctx.assets, options);
         m_Ctx.modelRefs.insert(m_Ctx.modelRefs.end(), handles.begin(), handles.end());
     } catch (const std::exception& e) { // e.g. the file changed in between
@@ -303,7 +310,10 @@ bool Editor::SaveScene(const std::filesystem::path& file)
         return false;
     }
     try {
-        SaveSceneFile(file, m_Ctx.scene, m_Ctx.assets, {.renderer = &m_Ctx.sceneRenderer, .camera = &m_Ctx.camera});
+        SaveSceneFile(file, m_Ctx.scene, m_Ctx.assets,
+                      {.renderer = &m_Ctx.sceneRenderer,
+                       .camera   = &m_Ctx.camera,
+                       .physics  = m_Ctx.physics ? &m_Ctx.physics->settings : nullptr});
     } catch (const std::exception& e) {
         ENGINE_ERROR("Save scene failed: {}", e.what());
         m_Status = "Save failed (see log)";
@@ -320,6 +330,18 @@ void Editor::DrawDialogs()
 {
     if (const std::optional<std::filesystem::path> path = m_FileDialog->Draw()) {
         switch (std::exchange(m_DialogPurpose, DialogPurpose::None)) {
+        case DialogPurpose::NewScript:
+            if (m_Graphs->New(*path)) {
+                AssignScript(m_ScriptTarget, *path);
+                m_ShowBlueprint = true;
+                m_Graphs->Focus();
+            }
+            break;
+        case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
+        case DialogPurpose::Package:
+            if (m_Ctx.project)
+                PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
+            break;
         case DialogPurpose::OpenScene: OpenScene(*path); break;
         case DialogPurpose::SaveScene: SaveScene(*path); break;
         case DialogPurpose::LoadModel: {
@@ -330,6 +352,28 @@ void Editor::DrawDialogs()
         }
         case DialogPurpose::None: break;
         }
+    }
+
+    if (std::exchange(m_AskQuit, false))
+        ImGui::OpenPopup("Quit?");
+    if (ImGui::BeginPopupModal("Quit?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("There are unsaved changes (scene or blueprints).");
+        if (m_ScenePath.empty() && HasUnsavedChanges())
+            ImGui::TextDisabled("The untitled scene has no file: use Save scene as... to keep it.");
+        const auto quit = [&] {
+            m_QuitConfirmed = true;
+            m_Ctx.window.RequestClose();
+            ImGui::CloseCurrentPopup();
+        };
+        if (ImGui::Button("Save all and quit", ImVec2(150.0f, 0.0f)) && SaveAll())
+            quit();
+        ImGui::SameLine();
+        if (ImGui::Button("Quit without saving", ImVec2(150.0f, 0.0f)))
+            quit();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
 
     if (std::exchange(m_ConfirmDiscard, false))
@@ -358,9 +402,20 @@ namespace Engine {
 // Play mode
 // ---------------------------------------------------------------------------------------------
 
+void Editor::AssignScript(Entity entity, const std::filesystem::path& graph)
+{
+    if (!m_Ctx.scene.GetRegistry().Valid(entity))
+        return;
+    std::error_code ec;
+    const std::u8string path = std::filesystem::absolute(graph, ec).lexically_normal().u8string();
+    std::string         before = SnapshotEntityState(m_Ctx.scene, entity);
+    m_Ctx.scene.GetRegistry().EmplaceOrReplace<ScriptComponent>(entity, ScriptComponent{std::string(path.begin(), path.end())});
+    PushStateChange("Assign script", {StateEdit{UuidOf(entity), std::move(before)}});
+}
+
 void Editor::Play()
 {
-    if (!m_Ctx.physics)
+    if (!m_Ctx.physics && !m_Ctx.scripts)
         return;
     if (m_PlayState == PlayState::Paused) {
         m_PlayState = PlayState::Playing;
@@ -370,7 +425,7 @@ void Editor::Play()
         return;
     // Finish edits in progress so they land in the history before it is frozen.
     if (m_InspectorEdit)
-        PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+        PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
     if (m_GizmoEdit)
         PushStateChange("Transform", std::exchange(m_GizmoEdit, std::nullopt).value());
 
@@ -381,7 +436,14 @@ void Editor::Play()
     });
     std::reverse(roots.begin(), roots.end()); // views iterate backwards: keep creation order
     m_PlaySnapshot = SnapshotEntities(m_Ctx.scene, roots);
-    m_Ctx.physics->Reset(); // fresh bodies: no velocities or sleep state from editing
+    if (m_Ctx.physics) {
+        m_Ctx.physics->Reset(); // fresh bodies: no velocities or sleep state from editing
+        m_Ctx.physics->Sync(m_Ctx.scene); // bodies exist for BeginPlay (impulses, raycasts)
+    }
+    if (m_Ctx.scripts) {
+        m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
+        m_Ctx.scripts->Begin(m_Ctx.scene);
+    }
     m_PlayState    = PlayState::Playing;
     m_StepRequested = false;
     m_Status       = "Playing";
@@ -410,10 +472,13 @@ void Editor::Stop()
         if (m_Ctx.scene.GetRegistry().Valid(e))
             selected.push_back(UuidOf(e));
 
+    if (m_Ctx.scripts)
+        m_Ctx.scripts->End(m_Ctx.scene); // EndPlay, spawned models released
     m_Ctx.scene.Clear();
     (void)RestoreEntities(m_Ctx.scene, m_PlaySnapshot, RestoreMode::Original);
     m_Ctx.scene.UpdateTransforms();
-    m_Ctx.physics->Reset();
+    if (m_Ctx.physics)
+        m_Ctx.physics->Reset();
 
     m_Selection.clear();
     for (std::uint64_t uuid : selected)
@@ -431,7 +496,7 @@ void Editor::Stop()
 void Editor::FixedUpdate(float dt)
 {
     if (!m_Ctx.physics)
-        return;
+        return; // scripts tick per frame (Update)
     if (m_PlayState == PlayState::Playing || (m_PlayState == PlayState::Paused && m_StepRequested)) {
         m_Ctx.physics->Step(m_Ctx.scene, dt);
         m_StepRequested = false;

@@ -1,5 +1,7 @@
 #include "FileDialog.h"
 
+#include "Engine/Core/Platform.h"
+
 #include <imgui.h>
 #include <imgui_stdlib.h>
 
@@ -38,8 +40,39 @@ void FileDialog::Open(std::string title, Mode mode, const std::filesystem::path&
     m_Extensions    = std::move(extensions);
     m_FileName      = std::move(fileName);
     m_Error.clear();
+    m_Overwrite.clear();
+    m_Places        = Places();
     m_Open          = true;
     m_OpenRequested = true;
+    Refresh();
+}
+
+std::vector<std::filesystem::path> FileDialog::Places()
+{
+    std::vector<std::filesystem::path> places;
+    std::error_code                    ec;
+    if (const std::filesystem::path home = HomeDirectory(); !home.empty() && std::filesystem::is_directory(home, ec))
+        places.push_back(home);
+    if (const auto cwd = std::filesystem::current_path(ec); !ec)
+        places.push_back(cwd);
+#ifdef _WIN32
+    for (char letter = 'A'; letter <= 'Z'; ++letter) {
+        const std::filesystem::path drive = std::string(1, letter) + ":\\";
+        if (std::filesystem::exists(drive, ec))
+            places.push_back(drive);
+    }
+#else
+    places.emplace_back("/");
+#endif
+    return places;
+}
+
+void FileDialog::Navigate(const std::filesystem::path& directory)
+{
+    std::error_code ec;
+    m_Directory = std::filesystem::absolute(directory, ec).lexically_normal();
+    m_Error.clear();
+    m_Overwrite.clear();
     Refresh();
 }
 
@@ -74,6 +107,20 @@ void FileDialog::Refresh()
 
 std::optional<std::filesystem::path> FileDialog::Confirm()
 {
+    if (m_Mode == Mode::Folder) {
+        if (!m_FileName.empty()) { // a typed or selected sub directory
+            std::filesystem::path path = FromUtf8(m_FileName);
+            std::error_code       ec;
+            if (path.is_relative())
+                path = m_Directory / path;
+            if (!std::filesystem::is_directory(path, ec)) {
+                m_Error = "Not a directory";
+                return std::nullopt;
+            }
+            return std::filesystem::absolute(path, ec).lexically_normal();
+        }
+        return m_Directory.lexically_normal();
+    }
     if (m_FileName.empty())
         return std::nullopt;
     std::filesystem::path path = FromUtf8(m_FileName);
@@ -81,9 +128,8 @@ std::optional<std::filesystem::path> FileDialog::Confirm()
         path = m_Directory / path;
     std::error_code ec;
     if (std::filesystem::is_directory(path, ec)) { // typed a directory: go there
-        m_Directory = std::filesystem::absolute(path, ec).lexically_normal();
+        Navigate(path);
         m_FileName.clear();
-        Refresh();
         return std::nullopt;
     }
     if (m_Mode == Mode::Open && !std::filesystem::exists(path, ec)) {
@@ -92,7 +138,12 @@ std::optional<std::filesystem::path> FileDialog::Confirm()
     }
     if (m_Mode == Mode::Save && !m_Extensions.empty() && !Matches(path))
         path += m_Extensions.front();
-    return path.lexically_normal();
+    path = path.lexically_normal();
+    if (m_Mode == Mode::Save && std::filesystem::exists(path, ec) && path != m_Overwrite) {
+        m_Overwrite = path; // ask first; confirming the same path again saves
+        return std::nullopt;
+    }
+    return path;
 }
 
 std::optional<std::filesystem::path> FileDialog::Draw()
@@ -110,9 +161,15 @@ std::optional<std::filesystem::path> FileDialog::Draw()
         return std::nullopt;
     }
 
-    if (ImGui::Button("Up") && m_Directory.has_parent_path() && m_Directory.parent_path() != m_Directory) {
-        m_Directory = m_Directory.parent_path();
-        Refresh();
+    if (ImGui::Button("Up") && m_Directory.has_parent_path() && m_Directory.parent_path() != m_Directory)
+        Navigate(m_Directory.parent_path());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(130.0f);
+    if (ImGui::BeginCombo("##places", "Places")) {
+        for (const std::filesystem::path& place : m_Places)
+            if (ImGui::Selectable(Utf8(place).c_str()))
+                Navigate(place);
+        ImGui::EndCombo();
     }
     ImGui::SameLine();
     ImGui::TextUnformatted(Utf8(m_Directory).c_str());
@@ -122,11 +179,17 @@ std::optional<std::filesystem::path> FileDialog::Draw()
         for (const Item& item : m_Items) {
             const std::string label    = item.directory ? "[" + item.label + "]" : item.label;
             const bool        selected = !item.directory && item.label == m_FileName;
+            if (m_Mode == Mode::Folder && !item.directory) {
+                ImGui::TextDisabled("%s", label.c_str()); // files for orientation only
+                continue;
+            }
             if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick)) {
+                m_Overwrite.clear();
                 if (item.directory) {
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                        m_Directory = item.path;
-                        Refresh();
+                        const std::filesystem::path next = item.path;
+                        m_FileName.clear();
+                        Navigate(next);
                         break; // m_Items changed
                     }
                 } else {
@@ -139,14 +202,38 @@ std::optional<std::filesystem::path> FileDialog::Draw()
     }
     ImGui::EndChild();
 
-    ImGui::SetNextItemWidth(-160.0f);
-    const bool enter = ImGui::InputText("##name", &m_FileName, ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    if (ImGui::Button(m_Mode == Mode::Open ? "Open" : "Save", ImVec2(70.0f, 0.0f)) || enter)
-        result = Confirm();
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(70.0f, 0.0f)))
-        m_Open = false;
+    if (!m_Overwrite.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "'%s' exists. Overwrite?", Utf8(m_Overwrite.filename()).c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Overwrite"))
+            result = m_Overwrite;
+        ImGui::SameLine();
+        if (ImGui::Button("Keep"))
+            m_Overwrite.clear();
+    } else {
+        const char* action = m_Mode == Mode::Open ? "Open" : m_Mode == Mode::Save ? "Save" : "Select";
+        ImGui::SetNextItemWidth(m_Mode == Mode::Folder ? -250.0f : -160.0f);
+        const bool enter = ImGui::InputText("##name", &m_FileName, ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemEdited())
+            m_Error.clear();
+        ImGui::SameLine();
+        if (ImGui::Button(action, ImVec2(70.0f, 0.0f)) || enter)
+            result = Confirm();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(70.0f, 0.0f)))
+            m_Open = false;
+        if (m_Mode == Mode::Folder) {
+            ImGui::SameLine();
+            if (ImGui::Button("New folder", ImVec2(90.0f, 0.0f)) && !m_FileName.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(m_Directory / FromUtf8(m_FileName), ec);
+                if (ec)
+                    m_Error = ec.message();
+                else
+                    Refresh();
+            }
+        }
+    }
     if (!m_Error.empty())
         ImGui::TextColored(ImVec4(0.95f, 0.3f, 0.25f, 1.0f), "%s", m_Error.c_str());
     else if (!m_Extensions.empty()) {

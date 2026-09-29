@@ -84,6 +84,7 @@ FetchContent_Declare(meshoptimizer
     GIT_SHALLOW    TRUE
     SYSTEM)
 set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(MESHOPT_INSTALL           OFF CACHE BOOL "" FORCE) # our install/package holds only the tools
 FetchContent_MakeAvailable(meshoptimizer)
 
 # --- bc7enc_rdo (BC7 + BC4/BC5 block encoders / decoders; MIT or public domain, pinned commit) ---

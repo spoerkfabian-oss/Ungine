@@ -1,0 +1,5 @@
+{
+  "name": "Basic Scene",
+  "description": "Floor, a rotating cube (Blueprint), a falling sphere, a light and a camera.",
+  "startScene": "Content/Scenes/Main.scene.json"
+}

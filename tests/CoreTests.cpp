@@ -3,6 +3,7 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Assets/MeshOptimizer.h"
+#include "Engine/Assets/Model.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Assets/TextureCooker.h"
 #include "Engine/Core/ThreadPool.h"
@@ -27,6 +28,7 @@
 #include <cmath>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <latch>
 #include <numeric>
@@ -861,13 +863,138 @@ TEST_CASE(Physics_CharacterWalksClimbsAndJumps)
     CHECK(!f.physics.HasBody(player) && f.physics.Stats().characters == 0);
 }
 
+TEST_CASE(Physics_InterpolationAndContinuousCollision)
+{
+    PhysicsFixture f;
+    f.Ground();
+    const Entity ball = f.Body("Ball", {0.0f, 5.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.5f));
+    f.Run(0.5f);
+    const float before = f.WorldPosition(ball).y;
+    f.physics.Step(f.scene, 1.0f / 60.0f);
+    const float after = f.WorldPosition(ball).y;
+    CHECK(after < before);
+    f.physics.Interpolate(f.scene, 0.5f); // shown halfway between the last two steps
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f * (before + after)) < 1e-4f);
+    CHECK(f.scene.CountStaleTransforms() == 0);
+    // The interpolated pose is no teleport: the next step continues from the simulation.
+    f.physics.Step(f.scene, 1.0f / 60.0f);
+    CHECK(f.WorldPosition(ball).y < after && f.physics.LinearVelocity(ball).y < -4.0f);
+    f.physics.Interpolate(f.scene, 1.0f);
+    // Falls asleep while shown between two steps: the next Interpolate shows the final pose.
+    for (int i = 0; i < 300; ++i) {
+        f.physics.Step(f.scene, 1.0f / 60.0f);
+        f.physics.Interpolate(f.scene, 0.3f);
+    }
+    CHECK(f.physics.Activity(ball) == BodyActivity::Sleeping);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f) < 0.03f);
+    f.physics.settings.interpolate = false;
+    f.physics.Interpolate(f.scene, 0.3f);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f) < 0.03f);
+
+    // A fast bullet against a thin wall (5 m per step, never inside it at a step): discrete
+    // tunnels, continuous stops.
+    Collider wall;
+    wall.halfExtents = {0.05f, 2.0f, 2.0f};
+    f.Body("Wall", {10.0f, 2.0f, 0.0f}, BodyType::Static, wall);
+    const auto shoot = [&](bool continuous, float z) {
+        const Entity bullet = f.Body("Bullet", {4.3f, 2.0f, z}, BodyType::Dynamic, PhysicsFixture::Sphere(0.1f));
+        auto&        body   = f.scene.GetRegistry().Get<RigidBody>(bullet);
+        body.gravityFactor  = 0.0f;
+        body.continuous     = continuous;
+        f.physics.Sync(f.scene);
+        f.physics.SetLinearVelocity(bullet, {300.0f, 0.0f, 0.0f});
+        f.Run(0.1f);
+        return f.WorldPosition(bullet).x;
+    };
+    CHECK(shoot(false, -1.0f) > 10.5f);
+    CHECK(shoot(true, 1.0f) < 10.0f);
+}
+
+TEST_CASE(Physics_LayersAndDynamicHierarchy)
+{
+    PhysicsFixture f;
+    const Entity ground = f.Ground();
+    Collider     sphere = PhysicsFixture::Sphere(0.5f);
+    sphere.layer        = 1;
+    const Entity ghost  = f.Body("Ghost", {0.0f, 2.0f, 0.0f}, BodyType::Dynamic, sphere);
+    const Entity solid  = f.Body("Solid", {3.0f, 2.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.5f));
+    f.physics.settings.SetLayerCollision(0, 1, false);
+    CHECK(!f.physics.settings.LayersCollide(1, 0) && f.physics.settings.LayersCollide(1, 1));
+    f.Run(1.5f);
+    CHECK(f.WorldPosition(ghost).y < -2.0f); // fell through the ground (layer 0)
+    CHECK(std::abs(f.WorldPosition(solid).y - 0.5f) < 0.03f);
+    CHECK(f.Count(true, false) == 1); // only the solid ball touched the ground
+
+    // Raycast layer mask: layer 0 excluded -> misses the ground.
+    const auto hit = f.physics.Raycast({3.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 20.0f, NullEntity, 0xFFFE);
+    CHECK(!hit);
+    const auto all = f.physics.Raycast({-3.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 20.0f);
+    CHECK(all && all->entity == ground);
+
+    // Dynamic child of a dynamic parent: both simulated; the child's local transform is written
+    // against the parent's new pose, so its world pose matches its body.
+    Collider box;
+    box.halfExtents     = {0.5f, 0.5f, 0.5f};
+    const Entity parent = f.Body("Parent", {-4.0f, 3.0f, 0.0f}, BodyType::Dynamic, box);
+    f.scene.EditTransform(parent).rotation = glm::angleAxis(0.3f, glm::vec3(0.0f, 1.0f, 0.0f));
+    const Entity child = f.Body("Child", {2.0f, 1.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.4f), parent);
+    f.Run(0.3f);
+    for (int i = 0; i < 3; ++i)
+        f.physics.Interpolate(f.scene, 0.25f * static_cast<float>(i + 1));
+    f.Run(3.0f);
+    CHECK(f.scene.CountStaleTransforms() == 0);
+    const glm::vec3 c    = f.WorldPosition(child);
+    const auto      down = f.physics.Raycast(c + glm::vec3(0.0f, 3.0f, 0.0f), {0.0f, -1.0f, 0.0f}, 10.0f, parent);
+    CHECK(down && down->entity == child && std::abs(down->point.y - (c.y + 0.4f)) < 0.01f);
+    CHECK(std::abs(c.y - 0.4f) < 0.03f && std::abs(f.WorldPosition(parent).y - 0.5f) < 0.03f);
+}
+
+TEST_CASE(Physics_CharacterContactEvents)
+{
+    PhysicsFixture f;
+    const Entity ground = f.Ground();
+    Collider     zone;
+    zone.halfExtents  = {0.5f, 1.0f, 1.0f};
+    zone.trigger      = true;
+    const Entity trigger = f.Body("Zone", {2.0f, 1.0f, 0.0f}, BodyType::Static, zone);
+    Collider wall;
+    wall.halfExtents = {0.2f, 2.0f, 2.0f};
+    const Entity blocker = f.Body("Wall", {5.0f, 2.0f, 0.0f}, BodyType::Static, wall);
+
+    const Entity player = f.scene.CreateEntity("Player");
+    f.scene.EditTransform(player).position = {0.0f, 0.05f, 0.0f};
+    f.scene.GetRegistry().Emplace<CharacterController>(player);
+    const auto count = [&](Entity other, bool begin, bool isTrigger) {
+        return std::count_if(f.events.begin(), f.events.end(), [&](const CollisionEvent& e) {
+            return e.a == player && e.b == other && e.begin == begin && e.trigger == isTrigger;
+        });
+    };
+    f.Run(1.0f);
+    CHECK(count(ground, true, false) == 1); // standing: one Begin, no flicker
+    CHECK(count(ground, false, false) == 0);
+
+    f.physics.SetCharacterInput(player, {2.0f, 0.0f, 0.0f}, false);
+    f.Run(1.2f); // x ~ 2.4: inside the trigger
+    CHECK(count(trigger, true, true) == 1);
+    f.Run(2.0f); // through the trigger, against the wall
+    CHECK(count(trigger, false, true) == 1);
+    CHECK(count(blocker, true, false) == 1);
+    CHECK(count(ground, false, false) == 0);
+
+    // Removing the character ends its contacts.
+    f.scene.GetRegistry().Remove<CharacterController>(player);
+    f.physics.Sync(f.scene);
+    CHECK(count(ground, false, false) == 1 && count(blocker, false, false) == 1);
+}
+
 TEST_CASE(SceneSerializer_PhysicsComponents)
 {
     Scene        scene;
     const Entity e = scene.CreateEntity("Body");
     Registry&    r = scene.GetRegistry();
     r.Emplace<RigidBody>(e, RigidBody{.type = BodyType::Kinematic, .mass = 3.0f, .linearDamping = 0.2f,
-                                      .angularDamping = 0.3f, .gravityFactor = 0.5f, .allowSleeping = false});
+                                      .angularDamping = 0.3f, .gravityFactor = 0.5f, .allowSleeping = false,
+                                      .continuous = true});
     Collider c;
     c.shape       = ColliderShape::Capsule;
     c.halfExtents = {1.0f, 2.0f, 3.0f};
@@ -877,6 +1004,7 @@ TEST_CASE(SceneSerializer_PhysicsComponents)
     c.friction    = 0.9f;
     c.restitution = 0.4f;
     c.trigger     = true;
+    c.layer       = 5;
     r.Emplace<Collider>(e, c);
     r.Emplace<CharacterController>(e, CharacterController{.radius = 0.4f, .height = 2.0f, .maxSlope = 0.5f,
                                                           .stepHeight = 0.25f, .jumpSpeed = 6.0f});
@@ -897,6 +1025,36 @@ TEST_CASE(SceneSerializer_PhysicsComponents)
     r.Get<RigidBody>(e).mass = 9.0f;
     ApplyEntityState(scene, e, state);
     CHECK(r.Has<Collider>(e) && r.Get<Collider>(e) == c && r.Get<RigidBody>(e).mass == 3.0f);
+}
+
+TEST_CASE(SceneSerializer_EntityStateDiff)
+{
+    // Multi-editing: only what changed on one entity is applied to another.
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    const Entity a = scene.CreateEntity("A");
+    const Entity b = scene.CreateEntity("B");
+    scene.EditTransform(a).position = {1.0f, 2.0f, 3.0f};
+    scene.EditTransform(b).position = {7.0f, 8.0f, 9.0f};
+    r.Emplace<Light>(a, Light{.intensity = 5.0f});
+    r.Emplace<Collider>(a);
+    r.Emplace<Collider>(b, Collider{.friction = 0.9f});
+    r.Emplace<RigidBody>(b, RigidBody{.mass = 4.0f});
+
+    const std::string before = SnapshotEntityState(scene, a);
+    scene.EditTransform(a).position.x = 5.0f;   // one vector element
+    r.Get<Collider>(a).restitution    = 0.5f;   // one field of a shared component
+    r.Remove<Light>(a);                         // removed
+    r.Emplace<CharacterController>(a);          // added
+    r.Get<Name>(a).value = "Renamed";           // identity: not shared
+    const std::string after = SnapshotEntityState(scene, a);
+
+    CHECK(ApplyEntityStateDiff(scene, b, before, after));
+    CHECK(scene.GetTransform(b).position == glm::vec3(5.0f, 8.0f, 9.0f));
+    CHECK(r.Get<Collider>(b).restitution == 0.5f && r.Get<Collider>(b).friction == 0.9f);
+    CHECK(r.Has<CharacterController>(b) && !r.Has<Light>(b) && r.Get<RigidBody>(b).mass == 4.0f);
+    CHECK(r.Get<Name>(b).value == "B");
+    CHECK(!ApplyEntityStateDiff(scene, b, before, after)); // idempotent
 }
 
 TEST_CASE(RangeAllocator_FirstFitMergeGrow)
@@ -1152,4 +1310,101 @@ TEST_CASE(ShaderHotReload_CompileDebounceAndErrors)
     CHECK(!reload.Poll(std::chrono::seconds(0)) && reload.Failures() == 1);
     CHECK(!fs::exists(fs::path(spv) += ".tmp"));
     fs::remove_all(dir);
+}
+
+TEST_CASE(ModelInstance_RefreshFollowsNodeChanges)
+{
+    // A model reloaded with different nodes: instances are re-synced by node index.
+    Model model;
+    model.name = "Robot";
+    model.meshes.resize(3);
+    model.nodes = {{.name = "Body", .local = {}, .mesh = 0, .parent = -1, .light = std::nullopt},
+                   {.name = "Arm", .local = {.position = {1.0f, 0.0f, 0.0f}}, .mesh = 1, .parent = 0, .light = std::nullopt},
+                   {.name = "Lamp", .local = {}, .mesh = -1, .parent = 1, .light = Light{}}};
+    const ModelHandle handle{3, 1};
+    Scene             scene;
+    Registry&         r    = scene.GetRegistry();
+    const Entity      root = InstantiateModel(scene, handle, model);
+    scene.EditTransform(root).position = {5.0f, 0.0f, 0.0f}; // user placement stays
+    const Entity arm = r.Get<Hierarchy>(r.Get<Hierarchy>(root).children.at(0)).children.at(0);
+    const Entity mine = scene.CreateEntity("Attached", arm); // user entity under a model node
+    CHECK(r.Has<ModelInstance>(root) && r.Get<ModelNodeRef>(arm).node == 1);
+
+    // New version: the arm is gone, the lamp hangs from the body, a new wheel with mesh 2.
+    model.nodes = {{.name = "Body", .local = {.position = {0.0f, 1.0f, 0.0f}}, .mesh = 0, .parent = -1, .light = std::nullopt},
+                   {.name = "Wheel", .local = {}, .mesh = 2, .parent = 0, .light = std::nullopt}};
+    CHECK(RefreshModelInstances(scene, handle, model) == 1);
+    scene.UpdateTransforms();
+    CHECK(!r.Valid(arm) && r.Valid(mine) && r.Get<Hierarchy>(mine).parent == root);
+    const Entity body = r.Get<Hierarchy>(root).children.at(0);
+    CHECK(r.Get<Name>(body).value == "Body" && r.Get<Transform>(body).position.y == 1.0f);
+    CHECK(r.Get<Transform>(root).position.x == 5.0f);
+    const auto& bodyChildren = r.Get<Hierarchy>(body).children;
+    CHECK(bodyChildren.size() == 1);
+    const Entity wheel = bodyChildren.at(0);
+    CHECK(r.Get<Name>(wheel).value == "Wheel" && r.Get<MeshRenderer>(wheel).meshIndex == 2 && !r.Has<Light>(wheel));
+    CHECK(r.Get<ModelNodeRef>(wheel).node == 1);
+    CHECK(scene.CountStaleTransforms() == 0);
+    // Other models' instances are untouched.
+    CHECK(RefreshModelInstances(scene, ModelHandle{4, 1}, model) == 0);
+}
+
+TEST_CASE(TextureCache_PruneOldestFirst)
+{
+    const fs::path dir = fs::temp_directory_path() / "ungine_cache_prune_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto now = fs::file_time_type::clock::now();
+    for (int i = 0; i < 5; ++i) {
+        const fs::path file = dir / std::format("{}.ktx2", i);
+        std::ofstream(file, std::ios::binary) << std::string(1000, 'x');
+        fs::last_write_time(file, now - std::chrono::hours(10 - i)); // 0 oldest
+    }
+    std::ofstream(dir / "other.txt") << "kept";
+    TextureCacheStats stats = PruneTextureCache(dir, 2500);
+    CHECK(stats.removed == 3 && stats.files == 2 && stats.bytes == 2000);
+    CHECK(!fs::exists(dir / "0.ktx2") && !fs::exists(dir / "2.ktx2") && fs::exists(dir / "3.ktx2") && fs::exists(dir / "4.ktx2"));
+    CHECK(fs::exists(dir / "other.txt"));
+    stats = PruneTextureCache(dir, 0);
+    CHECK(stats.files == 0 && stats.removed == 2);
+    fs::remove_all(dir);
+}
+
+TEST_CASE(Gltf_ExternalBufferUnicodePath)
+{
+    const fs::path dir = fs::temp_directory_path() / fs::path(u8"ungine_gltf_ünicöde");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const float         positions[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+    const std::uint16_t indices[]   = {0, 1, 2};
+    {
+        std::ofstream bin(dir / fs::path(u8"däta.bin"), std::ios::binary);
+        bin.write(reinterpret_cast<const char*>(positions), sizeof(positions));
+        bin.write(reinterpret_cast<const char*>(indices), sizeof(indices));
+        std::ofstream(dir / "tri.gltf") << R"({"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+  "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+  "buffers": [{"byteLength": 42, "uri": "d%C3%A4ta.bin"}],
+  "bufferViews": [{"buffer": 0, "byteLength": 36}, {"buffer": 0, "byteOffset": 36, "byteLength": 6}],
+  "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}]})";
+    }
+    const ModelData data = LoadGltf(dir / "tri.gltf");
+    CHECK(data.vertices.size() == 3 && data.indices.size() == 3 && data.vertices[1].position.x == 1.0f);
+    CHECK(data.dependencies.size() == 1 && data.dependencies[0].filename() == fs::path(u8"däta.bin"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE(EventBus_MoveOnlyHandlers)
+{
+    EventBus     bus;
+    struct Ping {
+        int value = 0;
+    };
+    auto         owned = std::make_unique<int>(0);
+    int*         seen  = owned.get();
+    Subscription sub   = bus.Subscribe<Ping>([owned = std::move(owned)](const Ping& p) { *owned += p.value; });
+    bus.Publish(Ping{2});
+    bus.Enqueue(Ping{3});
+    bus.Flush();
+    CHECK(*seen == 5);
 }

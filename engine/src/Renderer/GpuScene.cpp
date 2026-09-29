@@ -1,5 +1,6 @@
 #include "GpuScene.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Core/Log.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Scene.h"
@@ -80,15 +81,15 @@ GpuScene::~GpuScene()
 
 // --- CPU side -----------------------------------------------------------------------------------
 
-std::uint32_t SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
-                        std::uint32_t forced)
+LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera, std::uint32_t forced)
 {
+    constexpr float kFadeBand = 0.2f; // LOD_FADE_BAND
     if (submesh.lodCount <= 1)
-        return 0;
+        return {};
     if (forced > 0)
-        return std::min(forced - 1, submesh.lodCount - 1);
+        return {.lod = std::min(forced - 1, submesh.lodCount - 1), .fade = 0};
     if (lodCamera.w <= 0.0f)
-        return 0;
+        return {};
     const glm::vec3 c      = (submesh.boundsMin + submesh.boundsMax) * 0.5f;
     const glm::vec3 e      = (submesh.boundsMax - submesh.boundsMin) * 0.5f;
     const glm::vec3 center = glm::vec3(model * glm::vec4(c, 1.0f));
@@ -98,12 +99,17 @@ std::uint32_t SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const
                                      glm::length(glm::vec3(model[2]))});
     const float distance = glm::length(glm::vec3(lodCamera) - center) - glm::length(extent);
     if (distance <= 0.0f)
-        return 0;
-    std::uint32_t lod = 0;
+        return {};
+    LodChoice choice;
     for (std::uint32_t l = 1; l < submesh.lodCount; ++l)
         if (submesh.lodError[static_cast<glm::length_t>(l)] * scale * lodCamera.w <= distance)
-            lod = l;
-    return lod;
+            choice.lod = l;
+    if (choice.lod + 1 < submesh.lodCount) {
+        const float next = submesh.lodError[static_cast<glm::length_t>(choice.lod + 1)] * scale * lodCamera.w;
+        const float t    = (distance / next - (1.0f - kFadeBand)) / kFadeBand;
+        choice.fade      = t > 0.0f ? std::min(static_cast<std::uint32_t>(t * 128.0f), 127u) : 0u;
+    }
+    return choice;
 }
 
 void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets)
@@ -239,12 +245,23 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
         const auto          count = static_cast<std::uint32_t>(mesh.submeshes.size());
         std::optional<std::uint32_t> first = m_DrawRanges.Allocate(count);
         if (!first) {
-            const std::uint32_t capacity = std::max({m_DrawRanges.Capacity() * 2, m_DrawRanges.Capacity() + count, 1024u});
-            m_DrawRanges.Grow(capacity);
-            m_Draws.resize(capacity);
-            m_DrawSubmeshes.resize(capacity);
-            m_DrawDirty.resize(capacity, false);
+            // Visible entries address records with 22 bits (and one culling dispatch covers them).
+            const std::uint32_t capacity = std::min(
+                std::max({m_DrawRanges.Capacity() * 2, m_DrawRanges.Capacity() + count, 1024u}), kMaxDrawRecords);
+            if (capacity > m_DrawRanges.Capacity()) {
+                m_DrawRanges.Grow(capacity);
+                m_Draws.resize(capacity);
+                m_DrawSubmeshes.resize(capacity);
+                m_DrawDirty.resize(capacity, false);
+            }
             first = m_DrawRanges.Allocate(count);
+            if (!first) {
+                if (!std::exchange(m_ReportedFull, true))
+                    ENGINE_ERROR("GPU scene: more than {} draw records - further meshes are not drawn", kMaxDrawRecords);
+                data.drawCount = 0;
+                MarkInstance(index);
+                return;
+            }
         }
         data.firstDraw = *first;
         data.drawCount = count;
@@ -253,6 +270,7 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
             const std::uint32_t submeshId = mesh.firstGpuSubmesh + k;
             const std::uint32_t d         = *first + k;
             m_DrawSubmeshes[d] = model->gpuSubmeshes[submeshId - model->submeshes.offset];
+            m_BlendDraws += (m_DrawSubmeshes[d].flags & kMaterialAlphaBlend) != 0 ? 1u : 0u;
             m_Draws[d] = {.instance = index,
                           .submesh  = submeshId,
                           .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored),
@@ -285,6 +303,7 @@ void GpuScene::ReleaseDraws(std::uint32_t instance)
 {
     GpuInstance& data = m_InstanceData[instance];
     for (std::uint32_t d = data.firstDraw; d < data.firstDraw + data.drawCount; ++d) {
+        m_BlendDraws -= (m_DrawSubmeshes[d].flags & kMaterialAlphaBlend) != 0 ? 1u : 0u;
         ReleaseBatch(m_Draws[d].batch);
         m_Draws[d] = {};
         MarkDraw(d);
@@ -321,8 +340,11 @@ std::uint32_t GpuScene::AcquireBatch(const GpuSubmesh& submesh, std::uint32_t su
                                .firstIndex   = submesh.lodFirstIndex[i],
                                .vertexOffset = submesh.vertexOffset,
                                .instanceBase = 0,
-                               .cameraBucket = ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u),
-                               .shadowBucket = (submesh.flags & kMaterialAlphaMask) != 0 ? 1u : 0u,
+                               .cameraBucket = (submesh.flags & kMaterialAlphaBlend) != 0
+                                                   ? kCameraBucketBlend
+                                                   : ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u),
+                               // Blended surfaces cast alpha-tested shadows (cutoff alphaCutoff).
+                               .shadowBucket = (submesh.flags & (kMaterialAlphaMask | kMaterialAlphaBlend)) != 0 ? 1u : 0u,
                                .pad0         = 0,
                                .pad1         = 0};
         m_BatchRefs[base + l] = 1;

@@ -287,6 +287,38 @@ TextureImage FromKtx2(std::span<const std::byte> source, TextureKind kind, bool 
 
 } // namespace
 
+TextureCacheStats PruneTextureCache(const std::filesystem::path& directory, std::uint64_t maxBytes)
+{
+    namespace fs = std::filesystem;
+    struct File {
+        fs::path           path;
+        std::uint64_t      size = 0;
+        fs::file_time_type time;
+    };
+    std::vector<File> files;
+    TextureCacheStats stats;
+    std::error_code   ec;
+    for (const fs::directory_entry& entry : fs::directory_iterator(directory, ec)) {
+        if (entry.path().extension() != ".ktx2" || !entry.is_regular_file(ec))
+            continue;
+        File f{.path = entry.path(), .size = entry.file_size(ec), .time = entry.last_write_time(ec)};
+        stats.bytes += f.size;
+        ++stats.files;
+        files.push_back(std::move(f));
+    }
+    std::ranges::sort(files, [](const File& a, const File& b) { return a.time < b.time; }); // oldest first
+    for (const File& f : files) {
+        if (stats.bytes <= maxBytes)
+            break;
+        if (fs::remove(f.path, ec)) {
+            stats.bytes -= f.size;
+            --stats.files;
+            ++stats.removed;
+        }
+    }
+    return stats;
+}
+
 const char* FormatName(VkFormat format)
 {
     const FormatInfo* info = Info(format);
@@ -339,7 +371,10 @@ CookResult CookTexture(std::span<const std::byte> source, TextureKind kind, cons
         cacheFile = settings.cacheDirectory / std::format("{:016x}.ktx2", hash);
         if (const std::vector<std::byte> cached = ReadWholeFile(cacheFile); !cached.empty()) {
             try {
-                return {std::make_shared<TextureImage>(ReadKtx2(cached)), true};
+                auto image = std::make_shared<TextureImage>(ReadKtx2(cached));
+                std::error_code ec; // last use = timestamp: PruneTextureCache drops the oldest first
+                std::filesystem::last_write_time(cacheFile, std::filesystem::file_time_type::clock::now(), ec);
+                return {std::move(image), true};
             } catch (const std::exception& e) {
                 ENGINE_WARN("Texture cache: ignoring '{}': {}", cacheFile.string(), e.what());
             }

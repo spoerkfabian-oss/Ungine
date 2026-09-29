@@ -49,6 +49,16 @@ struct MeshRenderer {
     std::uint32_t meshIndex = 0;
 };
 
+// Root entity of an instantiated model (InstantiateModel). Its node entities carry ModelNodeRef;
+// RefreshModelInstances re-syncs them when the model is reloaded with a different structure.
+struct ModelInstance {
+    ModelHandle model;
+};
+
+struct ModelNodeRef {
+    std::uint32_t node = 0; // index into Model::nodes
+};
+
 enum class LightType : std::uint8_t { Point, Spot };
 
 // Punctual light with KHR_lights_punctual semantics. Position and direction (local -Z) come from
@@ -77,6 +87,7 @@ struct RigidBody {
     float    angularDamping = 0.05f;
     float    gravityFactor  = 1.0f;
     bool     allowSleeping  = true;
+    bool     continuous     = false; // dynamic: swept collision (no tunneling of fast bodies), costs more
 
     bool operator==(const RigidBody&) const = default;
 };
@@ -95,6 +106,7 @@ struct Collider {
     float         friction    = 0.5f;
     float         restitution = 0.0f;
     bool          trigger     = false; // sensor: reports CollisionEvents, no collision response
+    std::uint8_t  layer       = 0;     // collision layer 0..15 (PhysicsSettings::layerCollision)
 
     bool operator==(const Collider&) const = default;
 };
@@ -110,6 +122,24 @@ struct CharacterController {
     float jumpSpeed  = 5.0f;  // m/s
 
     bool operator==(const CharacterController&) const = default;
+};
+
+// Game camera: UnginePlayer renders through the first primary one (looking down local -Z).
+struct CameraComponent {
+    float fovY      = 1.0471976f; // radians (60 degrees)
+    float nearPlane = 0.05f;
+    bool  primary   = true;
+
+    bool operator==(const CameraComponent&) const = default;
+};
+
+// Visual script (.ugraph, see Script/ScriptGraph.h) run by ScriptSystem while playing. graph: file
+// path (absolute or relative to the working directory at runtime; scene files store it relative
+// to the scene file).
+struct ScriptComponent {
+    std::string graph;
+
+    bool operator==(const ScriptComponent&) const = default;
 };
 
 // Illuminance below which a light without explicit range is cut off (lights need a finite range

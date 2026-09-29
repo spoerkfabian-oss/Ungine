@@ -28,8 +28,11 @@ class FlyCamera;
 class History;
 class ImGuiLayer;
 class PhysicsWorld;
+class Project;
 class Scene;
 class SceneRenderer;
+class ScriptGraphEditor;
+class ScriptSystem;
 class Window;
 enum class LightType : std::uint8_t;
 enum class PrimitiveShape : std::uint8_t;
@@ -47,6 +50,12 @@ struct EditorContext {
     std::vector<ModelHandle>& modelRefs;
     // Optional: Play mode, collider overlay, physics inspector. The editor steps it only while playing.
     PhysicsWorld* physics = nullptr;
+    // Optional: visual scripts run while playing (Begin on Play, Update per frame, End on Stop).
+    ScriptSystem* scripts = nullptr;
+    // Optional: the open project (Content browser root, project settings, Build & Run, packaging).
+    Project* project = nullptr;
+    // ImGui layout file (empty: not saved).
+    std::filesystem::path layoutFile = "editor.ini";
 };
 
 enum class PlayState : std::uint8_t { Edit, Playing, Paused };
@@ -68,8 +77,9 @@ public:
     // Fixed-rate tick: steps the physics while playing (or once after StepOnce). In edit mode the
     // bodies only follow the scene (Sync in Update).
     void FixedUpdate(float dt);
-    // Scene into the viewport texture, then the UI into the swapchain image.
-    void Render(const FrameContext& frame);
+    // Scene into the viewport texture, then the UI into the swapchain image. physicsAlpha: time
+    // since the last fixed step / fixed step (PhysicsWorld::Interpolate while playing).
+    void Render(const FrameContext& frame, float physicsAlpha = 1.0f);
 
     // Scene camera input should only be processed while this is true.
     [[nodiscard]] bool ViewportHovered() const { return m_ViewportHovered; }
@@ -81,6 +91,9 @@ public:
     [[nodiscard]] std::span<const Entity> Selection() const { return m_Selection; }
     void                                  Select(Entity entity); // single selection; NullEntity clears
     void                                  ToggleSelection(Entity entity);
+    // Box selection (viewport drag): meshes whose world-bounds center and lights whose position
+    // project into the rectangle (viewport pixels). additive: added to the selection.
+    void SelectInRect(glm::vec2 min, glm::vec2 max, bool additive);
 
     // Edit operations (menu / hotkeys), all undoable.
     void DuplicateSelection(); // Ctrl+D
@@ -98,6 +111,21 @@ public:
     void                    Pause();
     void                    Stop();     // back to the snapshot
     void                    StepOnce(); // paused: one fixed step
+
+    // Blueprint (visual script) editor window.
+    [[nodiscard]] ScriptGraphEditor& Blueprints() { return *m_Graphs; }
+
+    // Project: Content browser root (the project's Content/, else the working directory), Build &
+    // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
+    [[nodiscard]] std::filesystem::path ContentRoot() const;
+    bool BuildAndRun();
+    bool PackageProject(const std::filesystem::path& outputDirectory);
+    bool SaveAll(); // scene (if it has a file) + open blueprints
+    // Window close request: true if the application may quit now; with unsaved changes it asks
+    // (Save all / Discard / Cancel) and closes the window itself once decided.
+    bool ConfirmQuit();
+    // Content browser actions (also double-click / drag & drop).
+    void OpenAsset(const std::filesystem::path& file); // scene, blueprint or model (instantiated)
 
     // Scene files. New/Open replace the scene and release the editor's model refs.
     void NewScene();
@@ -138,6 +166,10 @@ private:
     [[nodiscard]] std::uint64_t TexturePreview(TextureHandle handle); // ImTextureID, 0: none
     void ReleaseTexturePreviews(bool all); // all: shutdown; else those not shown this frame / outdated
     void DrawDialogs();
+    void DrawContentBrowser();
+    void DrawProjectSettings();
+    void RefreshContent();
+    void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
     void HandleHotkeys();
     void EnsureViewportTarget(std::uint32_t width, std::uint32_t height);
     void FocusSelected();
@@ -158,6 +190,7 @@ private:
     Entity CreateLight(LightType type, Entity parent);                        // + undo
     Entity CreatePrimitiveEntity(PrimitiveShape shape);                       // + undo
     void   Reparent(Entity child, Entity parent);                             // keeps the world transform, + undo
+    void   AssignScript(Entity entity, const std::filesystem::path& graph);  // Script component, + undo
     void   DestroyByUuids(std::span<const std::uint64_t> uuids);
     [[nodiscard]] std::uint64_t UuidOf(Entity entity) const;
 
@@ -169,6 +202,7 @@ private:
     std::unique_ptr<ImGuiLayer> m_ImGui;
     std::unique_ptr<History>    m_History;
     std::unique_ptr<FileDialog> m_FileDialog;
+    std::unique_ptr<ScriptGraphEditor> m_Graphs;
 
     // Viewport render target (RGBA8 sRGB, sampled by ImGui).
     Image         m_ViewportImage;
@@ -180,8 +214,14 @@ private:
     };
     std::unordered_map<TextureHandle, Preview> m_TexturePreviews; // Assets panel thumbnails
     bool          m_ViewportHovered = false;
+    bool          m_ViewportVisible = false; // drawn this frame (else the scene render is skipped)
+    int           m_FocusViewport   = 0; // frames until the viewport tab is brought to front (default layout)
     bool          m_ViewportFocused = false;
     bool          m_PickAdditive    = false; // a pick request is pending: Ctrl was held
+    // Left button pressed in the viewport: click (pick on release) or box selection (dragged).
+    bool      m_ViewportPress = false;
+    bool      m_BoxSelecting  = false;
+    glm::vec2 m_PressPos{0.0f}; // viewport pixels
 
     std::vector<Entity> m_Selection;
     std::vector<Entity> m_PendingDelete;              // hierarchy context menu
@@ -195,6 +235,7 @@ private:
     bool                m_ShowBvh         = false; // BVH nodes + selection bounds in the viewport
     int                 m_BvhDepth        = 8;
     bool                m_ShowColliders   = true;
+    bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
     // Play mode
     PlayState   m_PlayState = PlayState::Edit;
@@ -203,7 +244,7 @@ private:
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
     std::optional<std::vector<StateEdit>> m_GizmoEdit;
-    std::optional<StateEdit>              m_InspectorEdit;
+    std::optional<std::vector<StateEdit>> m_InspectorEdit; // primary first, then the multi-edited others
     std::string                           m_InspectorFrameState; // primary entity at the start of the inspector
 
     // Euler angles shown in the inspector: kept while the rotation is only edited through them, so
@@ -214,7 +255,24 @@ private:
 
     // Panels
     bool m_ShowHierarchy = true, m_ShowInspector = true, m_ShowRenderer = true, m_ShowStats = true;
-    bool m_ShowAssets = true, m_ShowDemo = false;
+    bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
+    bool m_ShowProjectSettings = false;
+    bool m_AskQuit = false, m_QuitConfirmed = false;
+
+    // Content browser
+    struct ContentItem {
+        std::filesystem::path path;
+        std::string           label;
+        enum class Kind { Folder, Scene, Blueprint, Model, Texture, Other } kind = Kind::Other;
+    };
+    std::filesystem::path                             m_ContentDir;     // shown directory
+    std::vector<ContentItem>                          m_ContentItems;
+    double                                            m_ContentScanTime = -1.0; // ImGui time of the last scan
+    std::string                                       m_ContentFilter;
+    std::filesystem::path                             m_ContentSelected;
+    std::filesystem::path                             m_RenameTarget, m_DeleteTarget;
+    std::string                                       m_RenameText;
+    std::vector<std::pair<ModelHandle, glm::vec3>>    m_PendingInstances; // loading, then placed
 
     // Frame time history (ms) for the diagnostics graph.
     static constexpr std::size_t kHistory = 240;
@@ -226,7 +284,8 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, Package } m_DialogPurpose = DialogPurpose::None;
+    Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";
 };
 

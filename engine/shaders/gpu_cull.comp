@@ -19,6 +19,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define VIEW_CAMERA_LATE  4u
 #define VIEW_OCCLUSION    8u // camera views: two-phase occlusion culling
 #define VIEW_SPHERE       16u // local light: also test the range sphere
+#define VIEW_SHADOW_OCCLUSION 32u // sun cascade culled in the late phase: casters whose shadow volume
+                                  // (box extruded along sphere.xyz by sphere.w) is behind the camera Hi-Z
 
 #define STAT_TESTED    0u // camera: draw records tested
 #define STAT_FRUSTUM   1u // camera: outside the frustum
@@ -29,7 +31,10 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define STAT_COMMANDS  6u // indirect commands, all views
 #define STAT_TRIANGLES 7u // camera triangles
 #define STAT_LOD       8u // camera: draws emitted with a LOD > 0
-#define STAT_COUNT     9u
+#define STAT_SHADOW_OCCLUDED 9u // cascades: casters whose shadow nobody sees
+#define STAT_COUNT     10u
+
+#define CAMERA_BUCKETS 4u // cameraBucket 4 = alpha-blended (no indirect command)
 
 struct CullView {
     mat4 viewProj;
@@ -74,6 +79,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Cu
     uvec4 depthSize; // xy: depth target size (pixels)
     vec4  lodCamera; // xyz: camera position, w: pixels per unit of error at distance 1 / threshold
     uvec4 lodInfo;   // x: forced LOD + 1 (0: by distance)
+    vec4  shadowRegionMin; // VIEW_SHADOW_OCCLUSION: camera frustum up to the shadow distance (world box)
+    vec4  shadowRegionMax;
 };
 
 layout(push_constant) uniform CullPush {
@@ -151,11 +158,24 @@ bool Occluded(CullView view, mat4 model, vec3 bmin, vec3 bmax)
     return nearest < farthest;
 }
 
-void Emit(CullView view, GpuDraw draw, uint record, uint lod)
+void EmitOne(CullView view, GpuDraw draw, uint entry, uint lod)
 {
     const uint batch = draw.batch + lod;
     const uint slot  = atomicAdd(pc.data.counters.u[view.counterBase + batch], 1u);
-    pc.data.visible.u[view.listBase + pc.data.batches.b[batch].instanceBase + slot] = record | (lod << VISIBLE_LOD_SHIFT);
+    pc.data.visible.u[view.listBase + pc.data.batches.b[batch].instanceBase + slot] = entry;
+}
+
+// Camera views cross-fade between LODs (both levels drawn with complementary dither masks);
+// shadow views use the finer level alone.
+void Emit(CullView view, GpuDraw draw, uint record, uvec2 lod)
+{
+    if (lod.y == 0u || (view.flags & VIEW_SHADOW) != 0u) {
+        EmitOne(view, draw, record | (lod.x << VISIBLE_LOD_SHIFT), lod.x);
+        return;
+    }
+    EmitOne(view, draw, record | (lod.x << VISIBLE_LOD_SHIFT) | (lod.y << VISIBLE_FADE_SHIFT), lod.x);
+    EmitOne(view, draw, record | ((lod.x + 1u) << VISIBLE_LOD_SHIFT) | (lod.y << VISIBLE_FADE_SHIFT) | VISIBLE_FADE_IN,
+            lod.x + 1u);
 }
 
 void BuildCommand(uint batchIndex, uint viewIndex)
@@ -169,6 +189,8 @@ void BuildCommand(uint batchIndex, uint viewIndex)
         return;
     const GpuBatch batch  = data.batches.b[batchIndex];
     const uint     bucket = (view.flags & VIEW_SHADOW) != 0u ? batch.shadowBucket : batch.cameraBucket;
+    if (bucket >= CAMERA_BUCKETS)
+        return; // alpha-blended: drawn sorted by the transparent pass (CPU)
     const uint     index  = atomicAdd(data.drawCounts.u[viewIndex * 4u + bucket], 1u);
     data.commands.c[view.commandBase + bucket * data.batchCapacity + index] =
         DrawCommand(batch.indexCount, count, batch.firstIndex, batch.vertexOffset, view.listBase + batch.instanceBase);
@@ -194,7 +216,8 @@ void main()
     if (index < data.drawCount) {
         const GpuDraw draw = data.draws.d[index];
         const CullView view = data.views.v[viewIndex];
-        const bool early = pc.phase == 0u && (view.flags & VIEW_CAMERA_LATE) == 0u;
+        const bool shadowOcclusion = (view.flags & VIEW_SHADOW_OCCLUSION) != 0u; // late phase only
+        const bool early = pc.phase == 0u && (view.flags & (VIEW_CAMERA_LATE | VIEW_SHADOW_OCCLUSION)) == 0u;
         const bool late  = pc.phase == 1u;
         if (draw.instance != DRAW_FREE && (early || late)) {
             const GpuInstance inst = data.instances.i[draw.instance];
@@ -206,9 +229,24 @@ void main()
             const bool inside = InFrustum(view, center, extent);
             const bool occlusion = (view.flags & VIEW_OCCLUSION) != 0u;
             const float scale = max(max(length(inst.model[0].xyz), length(inst.model[1].xyz)), length(inst.model[2].xyz));
-            const uint  lod   = SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
+            const uvec2 lod   = SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
 
-            if (late) {
+            if (late && shadowOcclusion) {
+                // Visible receivers lie on the Hi-Z surface: a shadow volume entirely behind it
+                // darkens nothing the camera sees (conservative, also for late-visible receivers).
+                // Only receivers inside the shadowed part of the view matter: clip the volume to it.
+                const vec3 bmin = max(min(center - extent, center - extent + view.sphere.xyz * view.sphere.w),
+                                      data.shadowRegionMin.xyz);
+                const vec3 bmax = min(max(center + extent, center + extent + view.sphere.xyz * view.sphere.w),
+                                      data.shadowRegionMax.xyz);
+                if (!inside) {
+                } else if (any(greaterThan(bmin, bmax)) || Occluded(data.views.v[1], mat4(1.0), bmin, bmax)) {
+                    atomicAdd(sStats[STAT_SHADOW_OCCLUDED], 1u);
+                } else {
+                    Emit(view, draw, index, lod);
+                    atomicAdd(sStats[STAT_SHADOW], 1u);
+                }
+            } else if (late) {
                 if (!inside) {
                     data.visibility.u[index] = 0u;
                 } else if (Occluded(view, inst.model, sm.boundsMin, sm.boundsMax)) {
@@ -218,7 +256,7 @@ void main()
                     if (data.visibility.u[index] == 0u) {
                         Emit(view, draw, index, lod);
                         atomicAdd(sStats[STAT_LATE], 1u);
-                        if (lod > 0u)
+                        if (lod.x > 0u || lod.y > 0u)
                             atomicAdd(sStats[STAT_LOD], 1u);
                     }
                     data.visibility.u[index] = 1u;
@@ -230,7 +268,7 @@ void main()
                 } else if (!occlusion || data.visibility.u[index] != 0u) {
                     Emit(view, draw, index, lod);
                     atomicAdd(sStats[STAT_EARLY], 1u);
-                    if (lod > 0u)
+                    if (lod.x > 0u || lod.y > 0u)
                         atomicAdd(sStats[STAT_LOD], 1u);
                 }
             } else if (inside) { // shadow view

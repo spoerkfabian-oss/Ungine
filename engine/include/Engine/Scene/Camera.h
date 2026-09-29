@@ -17,6 +17,9 @@ struct CameraData {
 // Y is not flipped here: the engine uses a negative-height viewport instead.
 [[nodiscard]] glm::mat4 PerspectiveReverseZ(float fovY, float aspect, float zNear);
 
+// Camera looking down the local -Z of a world matrix (scale ignored), e.g. a CameraComponent entity.
+[[nodiscard]] CameraData CameraFromWorld(const glm::mat4& world, float fovY, float nearPlane, float aspect);
+
 // Free-fly editor camera. Hold RMB to look, WASD/QE to move, Shift = fast, scroll = speed.
 class FlyCamera {
 public:

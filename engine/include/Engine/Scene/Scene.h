@@ -46,6 +46,9 @@ public:
     [[nodiscard]] std::size_t SiblingIndex(Entity entity) const; // 0 for roots
 
     [[nodiscard]] Entity FindByUuid(std::uint64_t uuid) const; // NullEntity if unknown
+    // The game camera: the primary CameraComponent with the lowest UUID (stable across save/load),
+    // else any CameraComponent; NullEntity if there is none.
+    [[nodiscard]] Entity FindPrimaryCamera();
     [[nodiscard]] bool   IsAncestor(Entity ancestor, Entity entity) const;
 
     [[nodiscard]] const Transform& GetTransform(Entity entity) const { return m_Registry.Get<Transform>(entity); }

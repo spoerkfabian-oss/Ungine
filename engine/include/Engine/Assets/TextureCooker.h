@@ -10,6 +10,12 @@
 
 namespace Engine {
 
+struct TextureCacheStats {
+    std::uint64_t bytes   = 0; // left in the cache
+    std::uint32_t files   = 0;
+    std::uint32_t removed = 0;
+};
+
 struct TextureCookSettings {
     // BC7 (color / linear) and BC5 (normals). Off, or without device support: RGBA8.
     bool compress = true;
@@ -17,6 +23,8 @@ struct TextureCookSettings {
     std::filesystem::path cacheDirectory;
     // Encoder effort: 0 = fastest. BC7 partition search grows with it.
     std::uint32_t quality = 0;
+    // PruneTextureCache limit applied by the AssetManager at startup (least recently used first).
+    std::uint64_t cacheLimitBytes = 4ull << 30;
 };
 
 struct CookResult {
@@ -29,6 +37,10 @@ struct CookResult {
 // to RGBA8 when compression is off). Thread-safe; throws std::runtime_error on bad input.
 [[nodiscard]] CookResult CookTexture(std::span<const std::byte> source, TextureKind kind,
                                      const TextureCookSettings& settings);
+
+// Deletes the least recently used cooked files (cache hits refresh the timestamp) until the
+// directory holds at most `maxBytes`; 0 clears it.
+TextureCacheStats PruneTextureCache(const std::filesystem::path& directory, std::uint64_t maxBytes);
 
 // KTX 2.0 container without supercompression: RGBA8, BC1, BC3, BC4, BC5, BC7 (UNORM / SRGB).
 [[nodiscard]] bool                   IsKtx2(std::span<const std::byte> bytes);

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ungine Editor
+GenericName=Game Engine Editor
+Comment=Create and edit Ungine game projects
+Exec="@BIN@/UngineEditor" %f
+Icon=ungine
+Terminal=false
+Categories=Development;Game;
+MimeType=application/x-ungine-project;

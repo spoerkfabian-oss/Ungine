@@ -1,6 +1,7 @@
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -120,7 +121,8 @@ json RigidBodyToJson(const RigidBody& b)
 {
     return {{"type", EnumToJson(b.type, kBodyTypes)}, {"mass", b.mass},
             {"linearDamping", b.linearDamping},       {"angularDamping", b.angularDamping},
-            {"gravityFactor", b.gravityFactor},       {"allowSleeping", b.allowSleeping}};
+            {"gravityFactor", b.gravityFactor},       {"allowSleeping", b.allowSleeping},
+            {"continuous", b.continuous}};
 }
 
 RigidBody RigidBodyFromJson(const json& j)
@@ -132,6 +134,7 @@ RigidBody RigidBodyFromJson(const json& j)
     Read(j, "angularDamping", b.angularDamping);
     Read(j, "gravityFactor", b.gravityFactor);
     Read(j, "allowSleeping", b.allowSleeping);
+    Read(j, "continuous", b.continuous);
     return b;
 }
 
@@ -144,7 +147,8 @@ json ColliderToJson(const Collider& c)
             {"center", ToJson(c.center)},
             {"friction", c.friction},
             {"restitution", c.restitution},
-            {"trigger", c.trigger}};
+            {"trigger", c.trigger},
+            {"layer", c.layer}};
 }
 
 Collider ColliderFromJson(const json& j)
@@ -158,7 +162,32 @@ Collider ColliderFromJson(const json& j)
     Read(j, "friction", c.friction);
     Read(j, "restitution", c.restitution);
     Read(j, "trigger", c.trigger);
+    Read(j, "layer", c.layer);
+    c.layer = static_cast<std::uint8_t>(std::min<unsigned>(c.layer, 15u));
     return c;
+}
+
+json PhysicsSettingsToJson(const PhysicsSettings& p)
+{
+    return {{"gravity", ToJson(p.gravity)},
+            {"collisionSteps", p.collisionSteps},
+            {"airControl", p.airControl},
+            {"interpolate", p.interpolate},
+            {"layerCollision", p.layerCollision}};
+}
+
+void PhysicsSettingsFromJson(const json& j, PhysicsSettings& p)
+{
+    Read(j, "gravity", p.gravity);
+    Read(j, "collisionSteps", p.collisionSteps);
+    p.collisionSteps = std::clamp(p.collisionSteps, 1, 16);
+    Read(j, "airControl", p.airControl);
+    Read(j, "interpolate", p.interpolate);
+    if (const auto it = j.find("layerCollision"); it != j.end() && it->is_array() && it->size() == kPhysicsLayers)
+        for (std::uint32_t a = 0; a < kPhysicsLayers; ++a)
+            for (std::uint32_t b = 0; b < kPhysicsLayers; ++b) // symmetric by construction
+                p.SetLayerCollision(a, b, ((it->at(a).get<std::uint32_t>() >> b) & 1u) != 0 &&
+                                              ((it->at(b).get<std::uint32_t>() >> a) & 1u) != 0);
 }
 
 json CharacterToJson(const CharacterController& c)
@@ -225,6 +254,24 @@ struct ModelRefs {
         return nullptr;
     }
 
+    // Other files (scripts): relative to the scene file when saving, back to absolute on load.
+    [[nodiscard]] std::string WritePath(const std::string& path) const
+    {
+        if (Memory() || path.empty())
+            return path;
+        std::error_code             ec;
+        const std::filesystem::path absolute = std::filesystem::absolute(FromUtf8(path), ec);
+        const std::filesystem::path relative = std::filesystem::relative(absolute, baseDir, ec);
+        return ToUtf8(ec || relative.empty() ? absolute : relative);
+    }
+    [[nodiscard]] std::string ReadPath(const std::string& path) const
+    {
+        std::filesystem::path file = FromUtf8(path);
+        if (Memory() || path.empty() || !file.is_relative())
+            return path;
+        return ToUtf8((baseDir / file).lexically_normal());
+    }
+
     ModelHandle Read(const json& j)
     {
         if (Memory()) {
@@ -263,12 +310,23 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
     }
     if (const auto* light = r.TryGet<Light>(e))
         j["light"] = LightToJson(*light);
+    if (const auto* instance = r.TryGet<ModelInstance>(e)) {
+        json model = models.Write(instance->model);
+        if (!model.is_null())
+            j["modelInstance"] = {{"model", std::move(model)}};
+    }
+    if (const auto* node = r.TryGet<ModelNodeRef>(e))
+        j["modelNode"] = node->node;
     if (const auto* body = r.TryGet<RigidBody>(e))
         j["rigidBody"] = RigidBodyToJson(*body);
     if (const auto* collider = r.TryGet<Collider>(e))
         j["collider"] = ColliderToJson(*collider);
     if (const auto* character = r.TryGet<CharacterController>(e))
         j["character"] = CharacterToJson(*character);
+    if (const auto* cam = r.TryGet<CameraComponent>(e))
+        j["cameraComponent"] = {{"fovY", cam->fovY}, {"nearPlane", cam->nearPlane}, {"primary", cam->primary}};
+    if (const auto* script = r.TryGet<ScriptComponent>(e))
+        j["script"] = {{"graph", models.WritePath(script->graph)}};
     return j;
 }
 
@@ -304,9 +362,32 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         r.EmplaceOrReplace<Light>(e, LightFromJson(*it));
     else
         r.Remove<Light>(e);
+    if (const auto it = j.find("modelInstance"); it != j.end())
+        r.EmplaceOrReplace<ModelInstance>(e, ModelInstance{.model = models.Read(it->at("model"))});
+    else
+        r.Remove<ModelInstance>(e);
+    if (const auto it = j.find("modelNode"); it != j.end())
+        r.EmplaceOrReplace<ModelNodeRef>(e, ModelNodeRef{.node = it->get<std::uint32_t>()});
+    else
+        r.Remove<ModelNodeRef>(e);
     ApplyOptional<RigidBody>(r, e, j, "rigidBody", RigidBodyFromJson);
     ApplyOptional<Collider>(r, e, j, "collider", ColliderFromJson);
     ApplyOptional<CharacterController>(r, e, j, "character", CharacterFromJson);
+    ApplyOptional<CameraComponent>(r, e, j, "cameraComponent", [](const json& c) {
+        CameraComponent cam;
+        Read(c, "fovY", cam.fovY);
+        Read(c, "nearPlane", cam.nearPlane);
+        Read(c, "primary", cam.primary);
+        cam.fovY      = std::clamp(cam.fovY, 0.05f, 3.0f);
+        cam.nearPlane = std::max(cam.nearPlane, 1e-4f);
+        return cam;
+    });
+    ApplyOptional<ScriptComponent>(r, e, j, "script", [&](const json& s) {
+        ScriptComponent script;
+        Read(s, "graph", script.graph);
+        script.graph = models.ReadPath(script.graph);
+        return script;
+    });
     scene.MarkChanged(e); // bounds / shadow caches
 }
 
@@ -487,6 +568,8 @@ void SaveSceneFile(const std::filesystem::path& file, const Scene& scene, const 
         root["renderer"] = RendererToJson(*options.renderer);
     if (options.camera)
         root["camera"] = CameraToJson(*options.camera);
+    if (options.physics)
+        root["physics"] = PhysicsSettingsToJson(*options.physics);
 
     // Write next to the target, then replace it: a failed save never truncates the old file.
     std::filesystem::path temp = file;
@@ -544,6 +627,9 @@ std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene&
         if (options.camera)
             if (const auto it = root.find("camera"); it != root.end())
                 CameraFromJson(*it, *options.camera);
+        if (options.physics)
+            if (const auto it = root.find("physics"); it != root.end())
+                PhysicsSettingsFromJson(*it, *options.physics);
     } catch (const std::exception& e) {
         for (auto it = created.rbegin(); it != created.rend(); ++it)
             scene.DestroyEntity(*it);
@@ -622,6 +708,50 @@ void ApplyEntityState(Scene& scene, Entity entity, const std::string& state)
 {
     ModelRefs models;
     ApplyComponents(scene, entity, json::parse(state), models);
+}
+
+namespace {
+// Writes the differences between before and after into target (same structure).
+void MergeDiff(const json& before, const json& after, json& target)
+{
+    if (after.is_object() && before.is_object() && target.is_object()) {
+        for (auto it = after.begin(); it != after.end(); ++it) {
+            const auto old = before.find(it.key());
+            if (old == before.end())
+                target[it.key()] = *it; // added
+            else if (const auto t = target.find(it.key()); t != target.end())
+                MergeDiff(*old, *it, *t);
+            // else: a component the target does not have: skipped
+        }
+        for (auto it = before.begin(); it != before.end(); ++it)
+            if (!after.contains(it.key()))
+                target.erase(it.key()); // removed
+    } else if (after.is_array() && before.is_array() && target.is_array() && after.size() == before.size() &&
+               after.size() == target.size()) {
+        for (std::size_t i = 0; i < after.size(); ++i)
+            MergeDiff(before[i], after[i], target[i]);
+    } else if (after != before) {
+        target = after;
+    }
+}
+} // namespace
+
+bool ApplyEntityStateDiff(Scene& scene, Entity target, const std::string& before, const std::string& after)
+{
+    json from = json::parse(before);
+    json to   = json::parse(after);
+    for (const char* key : {"uuid", "name"}) { // identity is never shared
+        from.erase(key);
+        to.erase(key);
+    }
+    ModelRefs  models;
+    json       state    = EntityToJson(scene.GetRegistry(), target, models);
+    const json original = state;
+    MergeDiff(from, to, state);
+    if (state == original)
+        return false;
+    ApplyComponents(scene, target, state, models);
+    return true;
 }
 
 } // namespace Engine

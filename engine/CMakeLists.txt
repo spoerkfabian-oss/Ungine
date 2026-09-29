@@ -7,6 +7,8 @@ add_library(Engine STATIC
     src/Assets/MeshOptimizer.cpp
     src/Core/Application.cpp
     src/Core/Input.cpp
+    src/Core/Platform.cpp
+    src/Core/Project.cpp
     src/Core/ThreadPool.cpp
     src/Core/Window.cpp
     src/Events/EventBus.cpp
@@ -37,6 +39,9 @@ add_library(Engine STATIC
     src/Scene/SceneSerializer.cpp
     src/Scene/SpatialIndex.cpp
     src/Physics/PhysicsWorld.cpp
+    src/Script/ScriptGraph.cpp
+    src/Script/ScriptNodes.cpp
+    src/Script/ScriptSystem.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
 target_include_directories(Engine PUBLIC include PRIVATE src)
@@ -44,7 +49,11 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc)
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc
+            $<$<PLATFORM_ID:Windows>:shell32>)
+
+# Project templates (installed next to the executables, see the root CMakeLists).
+target_compile_definitions(Engine PRIVATE ENGINE_TEMPLATE_DIR="${CMAKE_SOURCE_DIR}/templates")
 
 target_compile_definitions(Engine PUBLIC
     GLFW_INCLUDE_NONE
@@ -75,6 +84,7 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/lights.glsl
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
+    shaders/include/mesh_shading.glsl
     shaders/include/pbr.glsl
     shaders/include/scene_common.glsl
     shaders/include/shadow.glsl
@@ -101,6 +111,7 @@ engine_add_shaders(Engine SOURCES
     shaders/light_cull.comp
     shaders/luminance_histogram.comp
     shaders/mesh.frag
+    shaders/mesh_blend.frag
     shaders/mesh.vert
     shaders/scatter.comp
     shaders/shadow.vert

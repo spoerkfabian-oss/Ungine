@@ -8,7 +8,7 @@ layout(location = 2) out vec2 outUV;
 layout(location = 3) out vec4 outTangent;
 layout(location = 4) flat out uint outMaterial;
 layout(location = 5) flat out uint outEntity;
-layout(location = 6) flat out uint outLod;
+layout(location = 6) flat out uint outLodFade;
 
 // The depth prepass and the main pass (depth test EQUAL) must produce bit-identical depth.
 invariant gl_Position;
@@ -28,6 +28,6 @@ void main()
     outUV       = vec2(v.uvX, v.uvY);
     outMaterial = frame.submeshes.s[draw.submesh].material;
     outEntity   = inst.entityId;
-    outLod      = entry >> VISIBLE_LOD_SHIFT;
+    outLodFade  = entry >> VISIBLE_LOD_SHIFT;
     gl_Position = frame.viewProj * world;
 }

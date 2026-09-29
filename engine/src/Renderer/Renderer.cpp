@@ -4,6 +4,7 @@
 #include "Engine/Events/Events.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <stdexcept>
@@ -11,8 +12,11 @@
 namespace Engine {
 
 Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const RendererDesc& desc)
-    : m_Ctx(ctx), m_Window(window)
+    : m_Ctx(ctx), m_Window(window), m_PresentFences(ctx.SupportsSwapchainMaintenance())
 {
+    // Started minimized: a swapchain needs a non-empty surface, so wait until the window shows.
+    while (window.IsMinimized())
+        window.WaitEvents();
     m_Swapchain = std::make_unique<Swapchain>(ctx, window.FramebufferExtent(), SwapchainDesc{.vsync = desc.vsync});
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
     m_Upload    = std::make_unique<UploadQueue>(ctx, desc.upload);
@@ -42,7 +46,8 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
                                         .memory    = MemoryUsage::Upload,
                                         .debugName = "FrameTransient"});
     }
-    GrowRenderFinishedSemaphores();
+    if (!m_PresentFences)
+        GrowRenderFinishedSemaphores();
 
     m_ResizeSub = events.Subscribe<FramebufferResizeEvent>(
         [this](const FramebufferResizeEvent&) { m_ResizePending = true; });
@@ -53,6 +58,7 @@ Renderer::~Renderer()
     m_Ctx.WaitIdle();
     for (FrameData& f : m_Frames)
         CollectGarbage(f); // may reference the bindless registry / geometry pool -> run first
+    RetirePresents(true);
     m_Geometry.reset();
     m_Profiler.reset();
     m_Upload.reset();
@@ -66,6 +72,11 @@ Renderer::~Renderer()
     }
     for (VkSemaphore s : m_RenderFinished)
         vkDestroySemaphore(dev, s, nullptr);
+    for (VkSemaphore s : m_FreeRenderSemaphores)
+        vkDestroySemaphore(dev, s, nullptr);
+    for (VkFence f : m_FreePresentFences)
+        vkDestroyFence(dev, f, nullptr);
+    m_RetiredSwapchains.clear();
     m_Swapchain.reset();
 }
 
@@ -84,6 +95,8 @@ std::optional<FrameContext> Renderer::BeginFrame()
     // 1) CPU waits until the GPU finished the frame that last used this slot.
     VK_CHECK(vkWaitForFences(dev, 1, &f.inFlight, VK_TRUE, UINT64_MAX));
     CollectGarbage(f); // everything this slot's last submission could touch is now free
+    ++m_FrameCounter;
+    RetirePresents(false);
     f.transientOffset = 0;
     m_Profiler->BeginFrame(m_FrameIndex); // this slot's timestamps are complete now
     UpdateTextureTable(f);
@@ -161,7 +174,24 @@ void Renderer::EndFrame(const FrameContext& frame)
     if (f.transientOffset > 0) // no-op on HOST_COHERENT memory
         f.transient.Flush(0, f.transientOffset);
 
-    VkSemaphore renderFinished = m_RenderFinished[frame.imageIndex];
+    VkSemaphore renderFinished = VK_NULL_HANDLE;
+    VkFence     presentFence   = VK_NULL_HANDLE;
+    if (m_PresentFences) { // recycled once this present is done (see RetirePresents)
+        if (m_FreeRenderSemaphores.empty()) {
+            renderFinished = MakeSemaphore(m_Ctx.Device());
+        } else {
+            renderFinished = m_FreeRenderSemaphores.back();
+            m_FreeRenderSemaphores.pop_back();
+        }
+        if (m_FreePresentFences.empty()) {
+            presentFence = MakeFence(m_Ctx.Device(), false);
+        } else {
+            presentFence = m_FreePresentFences.back();
+            m_FreePresentFences.pop_back();
+        }
+    } else {
+        renderFinished = m_RenderFinished[frame.imageIndex];
+    }
 
     std::array<VkSemaphoreSubmitInfo, 2> waits{};
     waits[0].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -202,8 +232,17 @@ void Renderer::EndFrame(const FrameContext& frame)
     present.swapchainCount     = 1;
     present.pSwapchains        = &swapchain;
     present.pImageIndices      = &frame.imageIndex;
+    VkSwapchainPresentFenceInfoEXT fenceInfo{};
+    if (m_PresentFences) {
+        fenceInfo.sType          = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
+        fenceInfo.swapchainCount = 1;
+        fenceInfo.pFences        = &presentFence;
+        present.pNext            = &fenceInfo;
+    }
 
     const VkResult result = vkQueuePresentKHR(m_Ctx.PresentQueue().handle, &present);
+    if (m_PresentFences) // signaled even for OUT_OF_DATE / SUBOPTIMAL (the semaphore wait still runs)
+        m_PendingPresents.push_back({.fence = presentFence, .semaphore = renderFinished, .swapchain = m_SwapchainId});
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
         m_ResizePending = true;
     else
@@ -337,10 +376,45 @@ void Renderer::RecreateSwapchain()
     if (extent.width == 0 || extent.height == 0)
         return; // minimized: stay pending
 
-    m_Ctx.WaitIdle(); // simple + safe; VK_EXT_swapchain_maintenance1 could avoid the stall
-    m_Swapchain->Recreate(extent);
-    GrowRenderFinishedSemaphores();
+    if (m_PresentFences) {
+        // No stall: the driver retires the old swapchain; it is destroyed once its presents are
+        // done and no frame in flight can still reference its images (RetirePresents).
+        auto fresh = std::make_unique<Swapchain>(m_Ctx, extent, m_Swapchain->Desc(), m_Swapchain->Handle());
+        m_RetiredSwapchains.push_back({.swapchain = std::move(m_Swapchain), .id = m_SwapchainId, .retiredAt = m_FrameCounter});
+        m_Swapchain = std::move(fresh);
+        ++m_SwapchainId;
+    } else {
+        m_Ctx.WaitIdle();
+        m_Swapchain->Recreate(extent);
+        GrowRenderFinishedSemaphores();
+    }
     m_ResizePending = false;
+}
+
+void Renderer::RetirePresents(bool wait)
+{
+    const VkDevice dev = m_Ctx.Device();
+    std::erase_if(m_PendingPresents, [&](const PendingPresent& p) {
+        const VkResult status = wait ? vkWaitForFences(dev, 1, &p.fence, VK_TRUE, 1'000'000'000ull)
+                                     : vkGetFenceStatus(dev, p.fence);
+        if (status != VK_SUCCESS)
+            return false;
+        VK_CHECK(vkResetFences(dev, 1, &p.fence));
+        m_FreePresentFences.push_back(p.fence);
+        m_FreeRenderSemaphores.push_back(p.semaphore);
+        return true;
+    });
+    std::erase_if(m_RetiredSwapchains, [&](const RetiredSwapchain& r) {
+        const bool presenting = std::ranges::any_of(m_PendingPresents, [&](const PendingPresent& p) { return p.swapchain == r.id; });
+        return wait || (!presenting && m_FrameCounter - r.retiredAt >= kFramesInFlight);
+    });
+    if (wait) // shutdown: whatever did not signal in time is dropped with the device
+        for (const PendingPresent& p : m_PendingPresents) {
+            vkDestroyFence(dev, p.fence, nullptr);
+            vkDestroySemaphore(dev, p.semaphore, nullptr);
+        }
+    if (wait)
+        m_PendingPresents.clear();
 }
 
 void Renderer::GrowRenderFinishedSemaphores()

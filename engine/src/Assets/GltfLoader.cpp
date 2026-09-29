@@ -7,6 +7,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -389,29 +390,61 @@ private:
 
 } // namespace
 
+namespace {
+std::string Utf8(const std::filesystem::path& path)
+{
+    const std::u8string s = path.u8string();
+    return {s.begin(), s.end()};
+}
+
+// cgltf resolves external buffers by concatenating the .gltf path (we pass UTF-8) and the URI;
+// reading through std::filesystem keeps non-ASCII paths working on Windows (fopen would not).
+cgltf_result ReadUtf8File(const cgltf_memory_options*, const cgltf_file_options*, const char* path, cgltf_size* size,
+                          void** data)
+{
+    const std::vector<std::uint8_t> bytes = ReadFile(Utf8Path(path));
+    if (bytes.empty())
+        return cgltf_result_file_not_found;
+    void* copy = std::malloc(bytes.size());
+    if (!copy)
+        return cgltf_result_out_of_memory;
+    std::memcpy(copy, bytes.data(), bytes.size());
+    *size = bytes.size();
+    *data = copy;
+    return cgltf_result_success;
+}
+
+void ReleaseFile(const cgltf_memory_options*, const cgltf_file_options*, void* data)
+{
+    std::free(data);
+}
+} // namespace
+
 ModelData LoadGltf(const std::filesystem::path& path)
 {
     const std::vector<std::uint8_t> file = ReadFile(path);
     if (file.empty())
-        throw std::runtime_error(std::format("glTF: cannot read '{}'", path.string()));
+        throw std::runtime_error(std::format("glTF: cannot read '{}'", Utf8(path)));
 
     cgltf_options options{};
+    options.file.read    = ReadUtf8File;
+    options.file.release = ReleaseFile;
     cgltf_data*   raw = nullptr;
     if (const cgltf_result r = cgltf_parse(&options, file.data(), file.size(), &raw); r != cgltf_result_success)
-        throw std::runtime_error(std::format("glTF: parse error {} in '{}'", static_cast<int>(r), path.string()));
+        throw std::runtime_error(std::format("glTF: parse error {} in '{}'", static_cast<int>(r), Utf8(path)));
     CgltfPtr data{raw};
 
-    // External .bin files are resolved relative to the .gltf (cgltf uses fopen here; ASCII paths only).
-    if (const cgltf_result r = cgltf_load_buffers(&options, data.get(), path.string().c_str());
+    // External .bin files are resolved relative to the .gltf (through ReadUtf8File).
+    if (const cgltf_result r = cgltf_load_buffers(&options, data.get(), Utf8(path).c_str());
         r != cgltf_result_success)
         throw std::runtime_error(std::format("glTF: failed to load buffers ({}) for '{}'", static_cast<int>(r),
-                                             path.string()));
+                                             Utf8(path)));
     if (const cgltf_result r = cgltf_validate(data.get()); r != cgltf_result_success)
         throw std::runtime_error(std::format("glTF: validation failed ({}) for '{}'", static_cast<int>(r),
-                                             path.string()));
+                                             Utf8(path)));
 
     ModelData out;
-    out.name = path.stem().string();
+    out.name = Utf8(path.stem());
     Parser{path, options, *data}.Run(out);
     for (cgltf_size i = 0; i < data->buffers_count; ++i) { // external .bin files
         const char* uri = data->buffers[i].uri;

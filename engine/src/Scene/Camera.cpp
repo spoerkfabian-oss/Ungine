@@ -71,6 +71,20 @@ void FlyCamera::Update(Input& input, const Window& window, float dt)
     }
 }
 
+CameraData CameraFromWorld(const glm::mat4& world, float fovY, float nearPlane, float aspect)
+{
+    const glm::vec3 position(world[3]);
+    const glm::vec3 forward = -glm::vec3(world[2]);
+    const glm::vec3 up      = glm::vec3(world[1]);
+    const float     f       = glm::length(forward);
+    const glm::vec3 dir     = f > 1e-8f ? forward / f : glm::vec3(0.0f, 0.0f, -1.0f);
+    const glm::vec3 upDir   = glm::length(up) > 1e-8f ? glm::normalize(up) : glm::vec3(0.0f, 1.0f, 0.0f);
+    return {.view       = glm::lookAt(position, position + dir, upDir),
+            .projection = PerspectiveReverseZ(fovY, aspect, nearPlane),
+            .position   = position,
+            .nearPlane  = nearPlane};
+}
+
 CameraData FlyCamera::GetData(float aspect) const
 {
     return {.view       = glm::lookAt(position, position + Forward(), glm::vec3{0.0f, 1.0f, 0.0f}),
