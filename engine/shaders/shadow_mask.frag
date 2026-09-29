@@ -11,7 +11,7 @@ layout(location = 1) flat in uint inMaterial;
 void main()
 {
     const Material m     = pc.frame.materials.m[inMaterial];
-    const float    alpha = m.baseColorFactor.a * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV).a;
+    const float    alpha = m.baseColorFactor.a * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV).a;
     if (alpha < m.alphaCutoff)
         discard;
 }

@@ -2,10 +2,14 @@
 
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/GltfLoader.h"
+#include "Engine/Assets/MeshOptimizer.h"
+#include "Engine/Assets/Primitives.h"
+#include "Engine/Assets/TextureCooker.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/RangeAllocator.h"
+#include "Engine/Renderer/ShaderReload.h"
 #include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
@@ -15,6 +19,8 @@
 #include "Engine/Scene/SceneSerializer.h"
 
 #include <glm/gtc/epsilon.hpp>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <atomic>
@@ -31,6 +37,7 @@
 
 using namespace Engine;
 using namespace std::chrono_literals;
+namespace fs = std::filesystem;
 
 TEST_CASE(ThreadPool_SubmitReturnsResults)
 {
@@ -919,4 +926,230 @@ TEST_CASE(RangeAllocator_FirstFitMergeGrow)
     ranges.Grow(200);
     CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 100); // [0, 100) and [150, 200)
     CHECK(!ranges.Allocate(0).has_value());
+}
+
+// --- Texture cooking ---------------------------------------------------------------------------
+
+namespace {
+std::vector<std::byte> EncodePng(const std::vector<std::uint8_t>& rgba, int w, int h)
+{
+    std::vector<std::byte> png;
+    stbi_write_png_to_func(
+        [](void* context, void* data, int size) {
+            auto* out = static_cast<std::vector<std::byte>*>(context);
+            const auto* p = static_cast<const std::byte*>(data);
+            out->insert(out->end(), p, p + size);
+        },
+        &png, w, h, 4, rgba.data(), w * 4);
+    return png;
+}
+
+double MeanError(const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b, int channels)
+{
+    double sum = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (static_cast<int>(i % 4) < channels)
+            sum += std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
+    return sum / static_cast<double>(a.size() / 4 * static_cast<std::size_t>(channels));
+}
+} // namespace
+
+TEST_CASE(TextureCooker_Bc7Bc5MipsKtx2AndCache)
+{
+    constexpr int W = 64, H = 48; // not square, not a multiple of 4 at the lower levels
+    std::vector<std::uint8_t> color(W * H * 4), normal(W * H * 4);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            std::uint8_t* c = &color[(y * W + x) * 4];
+            c[0] = static_cast<std::uint8_t>(x * 4);
+            c[1] = static_cast<std::uint8_t>(y * 5);
+            c[2] = static_cast<std::uint8_t>(((x / 8 + y / 8) & 1) ? 200 : 40);
+            c[3] = 255;
+            // Gentle bumps: unit normals in [0, 1] encoding.
+            const glm::vec3 n = glm::normalize(glm::vec3(std::sin(x * 0.3f) * 0.4f, std::cos(y * 0.25f) * 0.4f, 1.0f));
+            std::uint8_t* p = &normal[(y * W + x) * 4];
+            p[0] = static_cast<std::uint8_t>((n.x * 0.5f + 0.5f) * 255.0f + 0.5f);
+            p[1] = static_cast<std::uint8_t>((n.y * 0.5f + 0.5f) * 255.0f + 0.5f);
+            p[2] = static_cast<std::uint8_t>((n.z * 0.5f + 0.5f) * 255.0f + 0.5f);
+            p[3] = 255;
+        }
+    const std::vector<std::byte> colorPng = EncodePng(color, W, H), normalPng = EncodePng(normal, W, H);
+
+    const fs::path cache = fs::temp_directory_path() / "ungine_texture_cache_test";
+    fs::remove_all(cache);
+    const TextureCookSettings settings{.compress = true, .cacheDirectory = cache, .quality = 0};
+
+    // Color: BC7 sRGB with a full mip chain, close to the source.
+    const CookResult first = CookTexture(colorPng, TextureKind::Color, settings);
+    CHECK(first.image && !first.cacheHit);
+    const TextureImage& img = *first.image;
+    CHECK(img.format == VK_FORMAT_BC7_SRGB_BLOCK && img.width == W && img.height == H);
+    CHECK(img.levels.size() == 7); // 64x48 ... 1x1
+    for (std::size_t i = 0; i < img.levels.size(); ++i) {
+        CHECK(img.levels[i].offset % 16 == 0);
+        CHECK(img.levels[i].size == LevelBytes(img.format, img.levels[i].width, img.levels[i].height));
+    }
+    CHECK(img.levels[6].width == 1 && img.levels[6].height == 1 && img.levels[3].width == 8 && img.levels[3].height == 6);
+    CHECK(MeanError(DecodeLevel(img, 0), color, 4) < 4.0);
+
+    // Second cook of the same bytes: from the cache, identical data.
+    const CookResult second = CookTexture(colorPng, TextureKind::Color, settings);
+    CHECK(second.cacheHit && second.image->data == img.data && second.image->format == img.format);
+    // The kind is part of the key.
+    CHECK(!CookTexture(colorPng, TextureKind::Linear, settings).cacheHit);
+
+    // Normal map: BC5 (X, Y), mips renormalized.
+    const CookResult nrm = CookTexture(normalPng, TextureKind::Normal, settings);
+    CHECK(nrm.image->format == VK_FORMAT_BC5_UNORM_BLOCK && nrm.image->levels.size() == 7);
+    CHECK(MeanError(DecodeLevel(*nrm.image, 0), normal, 2) < 2.0);
+
+    // KTX2 round trip, and KTX2 as a source is taken as it is.
+    const std::vector<std::byte> ktx = WriteKtx2(img);
+    CHECK(IsKtx2(ktx) && !IsKtx2(colorPng));
+    const TextureImage back = ReadKtx2(ktx);
+    CHECK(back.format == img.format && back.levels.size() == img.levels.size() && back.data == img.data);
+    const CookResult fromKtx = CookTexture(ktx, TextureKind::Color, settings);
+    CHECK(fromKtx.image->data == img.data);
+
+    // Without compression: RGBA8 with CPU mips; a BC7 KTX2 source is decompressed.
+    const TextureCookSettings plain{.compress = false, .cacheDirectory = {}, .quality = 0};
+    const CookResult rgba = CookTexture(colorPng, TextureKind::Color, plain);
+    CHECK(rgba.image->format == VK_FORMAT_R8G8B8A8_SRGB && rgba.image->levels.size() == 7);
+    CHECK(DecodeLevel(*rgba.image, 0) == color);
+    CHECK(CookTexture(ktx, TextureKind::Color, plain).image->format == VK_FORMAT_R8G8B8A8_SRGB);
+
+    // Broken input throws.
+    bool threw = false;
+    try {
+        const std::vector<std::byte> junk(100, std::byte{7});
+        (void)CookTexture(junk, TextureKind::Color, settings);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+    std::vector<std::byte> truncated(ktx.begin(), ktx.begin() + 90);
+    threw = false;
+    try {
+        (void)ReadKtx2(truncated);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+    fs::remove_all(cache);
+}
+
+namespace {
+double SurfaceArea(const ModelData& data, const Submesh& sm, std::uint32_t firstIndex, std::uint32_t indexCount)
+{
+    double area = 0.0;
+    for (std::uint32_t i = 0; i + 2 < indexCount; i += 3) {
+        const auto p = [&](std::uint32_t k) {
+            return data.vertices[static_cast<std::size_t>(sm.vertexOffset) + data.indices[firstIndex + i + k]].position;
+        };
+        area += 0.5 * static_cast<double>(glm::length(glm::cross(p(1) - p(0), p(2) - p(0))));
+    }
+    return area;
+}
+} // namespace
+
+TEST_CASE(MeshOptimizer_LodChainAndReordering)
+{
+    ModelData       data     = MakeCapsule("Ball", 1.0f, 0.0f, MaterialData{}, 96, 48);
+    const ModelData original = data;
+    const Submesh   before   = data.meshes[0].submeshes[0];
+    const double    area     = SurfaceArea(original, before, before.firstIndex, before.indexCount);
+
+    const MeshOptimizeStats stats = OptimizeMeshes(data, {});
+    const Submesh&          sm    = data.meshes[0].submeshes[0];
+    CHECK(stats.submeshes == 1 && stats.reorderedMeshes == 1);
+    CHECK(sm.lodCount == 4 && stats.lodLevels == 3);
+    CHECK(sm.lods[0].firstIndex == sm.firstIndex && sm.lods[0].indexCount == sm.indexCount && sm.lods[0].error == 0.0f);
+    // LOD 0: same triangles (reordered), same surface.
+    CHECK(sm.indexCount == before.indexCount);
+    CHECK(std::abs(SurfaceArea(data, sm, sm.firstIndex, sm.indexCount) - area) < area * 1e-5);
+    std::uint32_t vertexCount = 0;
+    for (std::uint32_t i = 0; i < before.indexCount; ++i)
+        vertexCount = std::max(vertexCount, original.indices[before.firstIndex + i] + 1);
+    for (std::uint32_t l = 1; l < sm.lodCount; ++l) {
+        const SubmeshLod& lod = sm.lods[l];
+        CHECK(lod.indexCount > 0 && lod.indexCount % 3 == 0 && lod.indexCount < sm.lods[l - 1].indexCount);
+        CHECK(lod.error >= sm.lods[l - 1].error && lod.error < 0.1f); // absolute (object space), radius 1
+        CHECK(std::uint64_t{lod.firstIndex} + lod.indexCount <= data.indices.size());
+        bool inRange = true;
+        for (std::uint32_t i = 0; i < lod.indexCount; ++i)
+            inRange = inRange && data.indices[lod.firstIndex + i] < vertexCount;
+        CHECK(inRange);
+        // A coarser sphere, but still the sphere.
+        CHECK(std::abs(SurfaceArea(data, sm, lod.firstIndex, lod.indexCount) - area) < area * 0.08);
+    }
+    CHECK(sm.lods[3].indexCount < before.indexCount / 4);
+
+    // Submeshes sharing their vertices keep the vertex order (only indices are optimized).
+    ModelData shared = MakeCapsule("Pair", 0.5f, 0.5f, MaterialData{}, 16, 8);
+    shared.meshes[0].submeshes.push_back(shared.meshes[0].submeshes[0]);
+    std::vector<glm::vec3> positions;
+    for (const Vertex& v : shared.vertices)
+        positions.push_back(v.position);
+    const MeshOptimizeStats sharedStats = OptimizeMeshes(shared, {.lodCount = 1});
+    CHECK(sharedStats.reorderedMeshes == 0 && sharedStats.lodLevels == 0);
+    bool same = true;
+    for (std::size_t i = 0; i < positions.size(); ++i)
+        same = same && shared.vertices[i].position == positions[i];
+    CHECK(same);
+
+    // Small meshes get no LODs; everything off leaves the data untouched.
+    ModelData box = MakeBox("Box", 1.0f, MaterialData{});
+    CHECK(OptimizeMeshes(box, {}).lodLevels == 0 && box.meshes[0].submeshes[0].lodCount == 1);
+    ModelData untouched = MakeCapsule("Ball", 1.0f, 0.0f, MaterialData{}, 32, 16);
+    const std::vector<std::uint32_t> indices = untouched.indices;
+    (void)OptimizeMeshes(untouched, {.optimize = false, .lodCount = 1});
+    CHECK(untouched.indices == indices);
+}
+
+TEST_CASE(ShaderHotReload_CompileDebounceAndErrors)
+{
+    ShaderHotReload reload;
+    if (!reload.Available()) {
+        std::puts("  (no shader compiler: skipped)");
+        return;
+    }
+    CHECK(reload.WatchedShaders() > 10); // the engine's shaders, from their depfiles
+
+    const fs::path dir = fs::temp_directory_path() / "ungine_shader_reload_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path source = dir / "probe.comp", spv = dir / "probe.comp.spv";
+    const auto     write  = [&](const char* text, int seconds) {
+        std::ofstream(source, std::ios::trunc) << text;
+        if (seconds != 0) // beyond the file system's timestamp resolution
+            fs::last_write_time(source, fs::last_write_time(source) + std::chrono::seconds(seconds));
+    };
+    const auto read = [](const fs::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+
+    write("#version 460\nlayout(local_size_x = 1) in;\nvoid main() {}\n", 0);
+    CHECK(reload.Watch(source, spv) && fs::exists(spv));
+    const std::string first = read(spv);
+    CHECK(!first.empty() && reload.Generation() == 0);
+
+    // A change is compiled once it has been stable for one poll.
+    write("#version 460\nlayout(local_size_x = 1) in;\nlayout(std430, binding = 0) buffer B { uint v; };\n"
+          "void main() { v = 7u; }\n", 5);
+    CHECK(!reload.Poll(std::chrono::seconds(0)));
+    CHECK(reload.Poll(std::chrono::seconds(0)) && reload.Generation() == 1);
+    const std::string second = read(spv);
+    CHECK(second != first && reload.LastError().empty());
+    // The depfile names the real output (build tools check it), not the temporary one.
+    CHECK(read(fs::path(spv) += ".d").starts_with(spv.string() + ":"));
+
+    // Broken source: reported, the old SPIR-V stays, no new generation; not retried until changed.
+    write("#version 460\nvoid main() { nope }\n", 10);
+    (void)reload.Poll(std::chrono::seconds(0));
+    CHECK(!reload.Poll(std::chrono::seconds(0)));
+    CHECK(reload.Generation() == 1 && reload.Failures() == 1 && !reload.LastError().empty() && read(spv) == second);
+    CHECK(!reload.Poll(std::chrono::seconds(0)) && reload.Failures() == 1);
+    CHECK(!fs::exists(fs::path(spv) += ".tmp"));
+    fs::remove_all(dir);
 }

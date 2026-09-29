@@ -71,18 +71,9 @@ void Dispatch(VkCommandBuffer cmd, VkPipelineLayout layout, const Pipeline& pipe
 Environment::Environment(Renderer& renderer)
     : m_Renderer(renderer)
 {
-    const VulkanContext&   ctx      = renderer.GetContext();
-    const VkDevice         device   = ctx.Device();
-    BindlessRegistry&      bindless = renderer.GetBindless();
-    const VkPipelineLayout layout   = bindless.PipelineLayout();
-
-    const auto compute = [&](const char* spv, const char* name) {
-        return CreateComputePipeline(device, layout, ShaderPath(spv), name);
-    };
-    m_SkyPipeline        = compute("ibl_sky.comp.spv", "IblSky");
-    m_IrradiancePipeline = compute("ibl_irradiance.comp.spv", "IblIrradiance");
-    m_PrefilterPipeline  = compute("ibl_prefilter.comp.spv", "IblPrefilter");
-    m_BrdfPipeline       = compute("ibl_brdf.comp.spv", "IblBrdfLut");
+    const VulkanContext& ctx      = renderer.GetContext();
+    BindlessRegistry&    bindless = renderer.GetBindless();
+    CreatePipelines();
 
     // The environment mip chain is built with blits.
     m_EnvCube = MakeCube(ctx, kEnvSize, MipCount(kEnvSize),
@@ -136,6 +127,33 @@ Environment::~Environment()
     r->DeferRelease(std::move(m_BrdfPipeline));
 }
 
+void Environment::CreatePipelines()
+{
+    const VkDevice         device  = m_Renderer.GetContext().Device();
+    const VkPipelineLayout layout  = m_Renderer.GetBindless().PipelineLayout();
+    const auto             compute = [&](const char* spv, const char* name) {
+        return CreateComputePipeline(device, layout, ShaderPath(spv), name);
+    };
+    Pipeline sky        = compute("ibl_sky.comp.spv", "IblSky");
+    Pipeline irradiance = compute("ibl_irradiance.comp.spv", "IblIrradiance");
+    Pipeline prefilter  = compute("ibl_prefilter.comp.spv", "IblPrefilter");
+    Pipeline brdf       = compute("ibl_brdf.comp.spv", "IblBrdfLut");
+    for (Pipeline* old : {&m_SkyPipeline, &m_IrradiancePipeline, &m_PrefilterPipeline, &m_BrdfPipeline})
+        if (*old)
+            m_Renderer.DeferRelease(std::move(*old));
+    m_SkyPipeline        = std::move(sky);
+    m_IrradiancePipeline = std::move(irradiance);
+    m_PrefilterPipeline  = std::move(prefilter);
+    m_BrdfPipeline       = std::move(brdf);
+}
+
+void Environment::RebuildPipelines()
+{
+    CreatePipelines();
+    m_Generated.reset();
+    m_LutReady = false;
+}
+
 void Environment::Update(VkCommandBuffer cmd, const SkySettings& sky)
 {
     const bool needLut   = !m_LutReady;
@@ -153,9 +171,11 @@ void Environment::Update(VkCommandBuffer cmd, const SkySettings& sky)
 void Environment::GenerateBrdfLut(VkCommandBuffer cmd)
 {
     constexpr VkPipelineStageFlags2 kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    // srcStage: frames in flight may still sample the LUT (regeneration after a shader reload).
     Barriers(cmd, {MakeImageBarrier({.image     = m_BrdfLut.Handle(),
                                      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                                      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                     .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                      .dstStage  = kCompute,
                                      .dstAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT})});
 

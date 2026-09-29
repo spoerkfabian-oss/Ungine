@@ -19,7 +19,7 @@ struct Material {
     float roughness;
     float alphaCutoff;
     uint  flags;
-    uint  baseColorTexture;
+    uint  baseColorTexture; // texture table entries
     uint  normalTexture;
     uint  metallicRoughnessTexture;
     uint  emissiveTexture;
@@ -29,20 +29,28 @@ struct Material {
     float occlusionStrength;
 };
 
+// Material texture fields are texture table entries; the table maps them to bindless slots.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TextureTable {
+    uint slot[];
+};
+
 #define MATERIAL_ALPHA_MASK   1u
 #define MATERIAL_DOUBLE_SIDED 2u
 #define MATERIAL_ALPHA_BLEND  4u
 
 // One submesh of a model; offsets are absolute pool indices.
 struct GpuSubmesh {
-    uint firstIndex;
-    uint indexCount;
-    int  vertexOffset;
-    uint material;
-    vec3 boundsMin; // object space
-    uint flags;     // material flags
-    vec3 boundsMax;
-    uint pad;
+    uint  firstIndex; // LOD 0
+    uint  indexCount;
+    int   vertexOffset;
+    uint  material;
+    vec3  boundsMin; // object space
+    uint  flags;     // material flags
+    vec3  boundsMax;
+    uint  lodCount;
+    uvec4 lodFirstIndex; // per LOD (up to 4), absolute
+    uvec4 lodIndexCount;
+    vec4  lodError;      // object-space deviation from LOD 0
 };
 
 // One MeshRenderer entity.
@@ -88,6 +96,31 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Dr
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BatchBuffer    { GpuBatch    b[]; };
 // Draw record per drawn instance (indexed by gl_InstanceIndex: firstInstance selects the slice).
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer VisibleBuffer   { uint        v[]; };
+
+// Visible list entries: draw record | LOD << 30 (the LOD picks the batch's index range; the
+// shaders only need it for the LOD debug view).
+#define VISIBLE_RECORD_MASK 0x3FFFFFFFu
+#define VISIBLE_LOD_SHIFT   30u
+
+// LOD whose object-space error, seen from the camera, stays below the pixel threshold.
+// lodCamera: xyz camera position, w: pixels per unit of error at distance 1 (0: always LOD 0).
+uint SelectLod(GpuSubmesh sm, vec3 center, vec3 extent, float scale, vec4 lodCamera, uint forced)
+{
+    if (sm.lodCount <= 1u)
+        return 0u;
+    if (forced > 0u)
+        return min(forced - 1u, sm.lodCount - 1u);
+    if (lodCamera.w <= 0.0)
+        return 0u;
+    const float distance = length(lodCamera.xyz - center) - length(extent);
+    if (distance <= 0.0)
+        return 0u;
+    uint lod = 0u;
+    for (uint l = 1u; l < sm.lodCount; ++l)
+        if (sm.lodError[l] * scale * lodCamera.w <= distance)
+            lod = l;
+    return lod;
+}
 // Hi-Z pyramid (min depth, reverse-Z = farthest occluder), all levels packed one after another.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer HiZBuffer       { float       d[]; };
 

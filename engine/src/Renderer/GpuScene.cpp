@@ -62,6 +62,14 @@ GpuScene::GpuScene(Renderer& renderer) : m_Renderer(renderer)
                                       ShaderPath("scatter.comp.spv"), "Scatter");
 }
 
+void GpuScene::RebuildPipelines()
+{
+    Pipeline scatter = CreateComputePipeline(m_Renderer.GetContext().Device(), m_Renderer.GetBindless().PipelineLayout(),
+                                             ShaderPath("scatter.comp.spv"), "Scatter");
+    m_Renderer.DeferRelease(std::move(m_Scatter));
+    m_Scatter = std::move(scatter);
+}
+
 GpuScene::~GpuScene()
 {
     m_Renderer.DeferRelease(std::move(m_Scatter));
@@ -72,18 +80,57 @@ GpuScene::~GpuScene()
 
 // --- CPU side -----------------------------------------------------------------------------------
 
+std::uint32_t SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
+                        std::uint32_t forced)
+{
+    if (submesh.lodCount <= 1)
+        return 0;
+    if (forced > 0)
+        return std::min(forced - 1, submesh.lodCount - 1);
+    if (lodCamera.w <= 0.0f)
+        return 0;
+    const glm::vec3 c      = (submesh.boundsMin + submesh.boundsMax) * 0.5f;
+    const glm::vec3 e      = (submesh.boundsMax - submesh.boundsMin) * 0.5f;
+    const glm::vec3 center = glm::vec3(model * glm::vec4(c, 1.0f));
+    const glm::vec3 extent = glm::mat3(glm::abs(glm::vec3(model[0])), glm::abs(glm::vec3(model[1])),
+                                       glm::abs(glm::vec3(model[2]))) * e;
+    const float scale    = std::max({glm::length(glm::vec3(model[0])), glm::length(glm::vec3(model[1])),
+                                     glm::length(glm::vec3(model[2]))});
+    const float distance = glm::length(glm::vec3(lodCamera) - center) - glm::length(extent);
+    if (distance <= 0.0f)
+        return 0;
+    std::uint32_t lod = 0;
+    for (std::uint32_t l = 1; l < submesh.lodCount; ++l)
+        if (submesh.lodError[static_cast<glm::length_t>(l)] * scale * lodCamera.w <= distance)
+            lod = l;
+    return lod;
+}
+
 void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets)
 {
-    // Models released while instances still use them: their pool ranges are freed a few frames
-    // from now, so the instances must go now.
-    std::vector<ModelHandle> released;
-    for (const auto& [model, count] : m_ModelUse)
-        if (!assets.Get(model))
+    // Released models: their pool ranges are freed a few frames from now, so the instances must
+    // go now. Reloaded / failed / retried models (new revision): rebuild their draws. Both before
+    // any other upsert, so a batch of a freed submesh record is never reused by a new model.
+    std::vector<ModelHandle> released, changed;
+    for (const auto& [model, use] : m_ModelUse) {
+        if (assets.State(model) == AssetState::Invalid)
             released.push_back(model);
-    if (!released.empty())
-        for (std::uint32_t i = 0; i < m_Instances.size(); ++i)
-            if (m_Instances[i].entity != NullEntity && std::ranges::find(released, m_Instances[i].model) != released.end())
+        else if (assets.Revision(model) != use.revision)
+            changed.push_back(model);
+    }
+    if (!released.empty() || !changed.empty())
+        for (std::uint32_t i = 0; i < m_Instances.size(); ++i) {
+            const Instance& inst = m_Instances[i];
+            if (inst.entity == NullEntity)
+                continue;
+            if (std::ranges::find(released, inst.model) != released.end())
                 RemoveInstance(i);
+            else if (std::ranges::find(changed, inst.model) != changed.end())
+                Upsert(scene, assets, inst.entity);
+        }
+    for (ModelHandle model : changed)
+        if (const auto it = m_ModelUse.find(model); it != m_ModelUse.end())
+            it->second.revision = assets.Revision(model);
 
     if (spatial.LastSync().rebuilt) {
         for (std::uint32_t i = 0; i < m_Instances.size(); ++i)
@@ -101,6 +148,20 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
     }
 }
 
+void GpuScene::UseModel(const AssetManager& assets, ModelHandle model)
+{
+    ModelUse& use = m_ModelUse[model];
+    ++use.instances;
+    use.revision = assets.Revision(model); // every instance of it is (re)built with this revision
+}
+
+void GpuScene::UnuseModel(ModelHandle model)
+{
+    const auto it = m_ModelUse.find(model);
+    if (it != m_ModelUse.end() && --it->second.instances == 0)
+        m_ModelUse.erase(it);
+}
+
 const GpuInstance* GpuScene::FindInstance(Entity entity) const
 {
     const std::uint32_t slot = EntityIndex(entity);
@@ -114,11 +175,13 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
 {
     const Registry&     registry = scene.GetRegistry();
     const MeshRenderer* renderer = registry.Valid(entity) ? registry.TryGet<MeshRenderer>(entity) : nullptr;
-    const Model*        model    = renderer ? assets.Get(renderer->model) : nullptr;
-    if (!model || renderer->meshIndex >= model->meshes.size() || model->meshes[renderer->meshIndex].submeshes.empty()) {
+    const ResolvedMesh  resolved = renderer ? assets.ResolveMesh(renderer->model, renderer->meshIndex) : ResolvedMesh{};
+    const Model*        model    = resolved.model; // the placeholder for failed models
+    if (!model || model->meshes[resolved.meshIndex].submeshes.empty()) {
         Remove(entity);
         return;
     }
+    const std::uint32_t revision = assets.Revision(renderer->model);
     const glm::mat4& world    = registry.Get<WorldTransform>(entity).matrix;
     const glm::mat3  linear   = glm::mat3(world);
     const bool       mirrored = glm::determinant(linear) < 0.0f; // glTF: flips the winding
@@ -145,18 +208,22 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
             m_InstanceOf.resize(std::max<std::size_t>(slot + 1, m_InstanceOf.size() * 2), kNone);
         m_InstanceOf[slot] = index;
         ++m_LiveInstances;
-        ++m_ModelUse[renderer->model];
+        UseModel(assets, renderer->model);
     } else {
         const Instance& old = m_Instances[index];
-        newGeometry = old.model != renderer->model || old.meshIndex != renderer->meshIndex || old.mirrored != mirrored;
+        newGeometry = old.model != renderer->model || old.meshIndex != renderer->meshIndex ||
+                      old.mirrored != mirrored || old.revision != revision;
         if (newGeometry) {
             ReleaseDraws(index);
-            if (--m_ModelUse[old.model] == 0)
-                m_ModelUse.erase(old.model);
-            ++m_ModelUse[renderer->model];
+            UnuseModel(old.model);
+            UseModel(assets, renderer->model);
         }
     }
-    m_Instances[index] = {.entity = entity, .model = renderer->model, .meshIndex = renderer->meshIndex, .mirrored = mirrored};
+    m_Instances[index] = {.entity    = entity,
+                          .model     = renderer->model,
+                          .meshIndex = renderer->meshIndex,
+                          .revision  = revision,
+                          .mirrored  = mirrored};
 
     GpuInstance&    data   = m_InstanceData[index];
     const glm::mat3 normal = glm::transpose(glm::inverse(linear));
@@ -168,7 +235,7 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
     data.flags     = mirrored ? kInstanceMirrored : 0u;
 
     if (newGeometry) {
-        const Mesh&         mesh  = model->meshes[renderer->meshIndex];
+        const Mesh&         mesh  = model->meshes[resolved.meshIndex];
         const auto          count = static_cast<std::uint32_t>(mesh.submeshes.size());
         std::optional<std::uint32_t> first = m_DrawRanges.Allocate(count);
         if (!first) {
@@ -183,17 +250,9 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
         data.drawCount = count;
         m_LiveDraws += count;
         for (std::uint32_t k = 0; k < count; ++k) {
-            const Submesh&      sm        = mesh.submeshes[k];
             const std::uint32_t submeshId = mesh.firstGpuSubmesh + k;
             const std::uint32_t d         = *first + k;
-            m_DrawSubmeshes[d] = {.firstIndex   = model->indices.offset + sm.firstIndex,
-                                  .indexCount   = sm.indexCount,
-                                  .vertexOffset = static_cast<std::int32_t>(model->vertices.offset) + sm.vertexOffset,
-                                  .material     = model->materials.offset + sm.material,
-                                  .boundsMin    = sm.boundsMin,
-                                  .flags        = model->materialFlags[sm.material],
-                                  .boundsMax    = sm.boundsMax,
-                                  .pad          = 0};
+            m_DrawSubmeshes[d] = model->gpuSubmeshes[submeshId - model->submeshes.offset];
             m_Draws[d] = {.instance = index,
                           .submesh  = submeshId,
                           .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored),
@@ -215,8 +274,7 @@ void GpuScene::RemoveInstance(std::uint32_t index)
 {
     Instance& inst = m_Instances[index];
     ReleaseDraws(index);
-    if (--m_ModelUse[inst.model] == 0)
-        m_ModelUse.erase(inst.model);
+    UnuseModel(inst.model);
     m_InstanceOf[EntityIndex(inst.entity)] = kNone;
     inst = {};
     m_FreeInstances.push_back(index);
@@ -241,41 +299,53 @@ std::uint32_t GpuScene::AcquireBatch(const GpuSubmesh& submesh, std::uint32_t su
     const std::uint64_t key = (std::uint64_t{submeshIndex} << 1) | (mirrored ? 1u : 0u);
     m_BatchesDirty          = true; // capacities (instance bases) change
     if (const auto it = m_BatchOf.find(key); it != m_BatchOf.end()) {
-        ++m_BatchRefs[it->second];
+        for (std::uint32_t l = 0; l < m_BatchSizes[it->second]; ++l)
+            ++m_BatchRefs[it->second + l];
         return it->second;
     }
-    std::uint32_t id;
-    if (!m_FreeBatches.empty()) {
-        id = m_FreeBatches.back();
-        m_FreeBatches.pop_back();
-    } else {
-        id = static_cast<std::uint32_t>(m_Batches.size());
-        m_Batches.emplace_back();
-        m_BatchRefs.push_back(0);
-        m_BatchKeys.push_back(0);
+    const std::uint32_t lods  = std::clamp(submesh.lodCount, 1u, kMaxLods);
+    std::optional<std::uint32_t> first = m_BatchRanges.Allocate(lods);
+    if (!first) {
+        const std::uint32_t capacity = std::max({m_BatchRanges.Capacity() * 2, m_BatchRanges.Capacity() + lods, 256u});
+        m_BatchRanges.Grow(capacity);
+        m_Batches.resize(capacity);
+        m_BatchRefs.resize(capacity, 0);
+        m_BatchKeys.resize(capacity, 0);
+        m_BatchSizes.resize(capacity, 0);
+        first = m_BatchRanges.Allocate(lods);
     }
-    m_BatchKeys[id] = key;
-    m_Batches[id] = {.indexCount   = submesh.indexCount,
-                     .firstIndex   = submesh.firstIndex,
-                     .vertexOffset = submesh.vertexOffset,
-                     .instanceBase = 0,
-                     .cameraBucket = ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u),
-                     .shadowBucket = (submesh.flags & kMaterialAlphaMask) != 0 ? 1u : 0u,
-                     .pad0         = 0,
-                     .pad1         = 0};
-    m_BatchRefs[id] = 1;
-    m_BatchOf.emplace(key, id);
-    return id;
+    const std::uint32_t base = *first;
+    for (std::uint32_t l = 0; l < lods; ++l) {
+        const auto i = static_cast<glm::length_t>(l);
+        m_Batches[base + l] = {.indexCount   = submesh.lodIndexCount[i],
+                               .firstIndex   = submesh.lodFirstIndex[i],
+                               .vertexOffset = submesh.vertexOffset,
+                               .instanceBase = 0,
+                               .cameraBucket = ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u),
+                               .shadowBucket = (submesh.flags & kMaterialAlphaMask) != 0 ? 1u : 0u,
+                               .pad0         = 0,
+                               .pad1         = 0};
+        m_BatchRefs[base + l] = 1;
+    }
+    m_BatchKeys[base]  = key;
+    m_BatchSizes[base] = lods;
+    m_BatchOf.emplace(key, base);
+    return base;
 }
 
 void GpuScene::ReleaseBatch(std::uint32_t batch)
 {
-    m_BatchesDirty = true;
-    if (--m_BatchRefs[batch] > 0)
+    m_BatchesDirty          = true;
+    const std::uint32_t lods = m_BatchSizes[batch];
+    for (std::uint32_t l = 0; l < lods; ++l)
+        --m_BatchRefs[batch + l];
+    if (m_BatchRefs[batch] > 0)
         return;
     m_BatchOf.erase(m_BatchKeys[batch]);
-    m_Batches[batch] = {}; // indexCount 0: never produces a command
-    m_FreeBatches.push_back(batch);
+    for (std::uint32_t l = 0; l < lods; ++l)
+        m_Batches[batch + l] = {}; // indexCount 0: never produces a command
+    m_BatchSizes[batch] = 0;
+    m_BatchRanges.Free(batch, lods);
 }
 
 void GpuScene::MarkInstance(std::uint32_t index)
@@ -340,6 +410,7 @@ void GpuScene::Upload(VkCommandBuffer cmd)
             m_Batches[b].instanceBase = base;
             base += m_BatchRefs[b];
         }
+        m_VisibleCapacity = base;
     }
 
     const bool newInstances = Ensure(m_Renderer, m_InstanceBuffer, m_InstanceData.size(), sizeof(GpuInstance), "GpuInstances");

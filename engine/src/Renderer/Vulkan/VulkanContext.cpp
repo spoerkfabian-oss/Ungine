@@ -110,6 +110,12 @@ void VulkanContext::SelectPhysicalDevice()
 
 void VulkanContext::CreateDevice()
 {
+    VkPhysicalDeviceFeatures optional{};
+    optional.textureCompressionBC = VK_TRUE; // cooked textures; RGBA8 fallback without it
+    m_TextureCompressionBC        = m_PhysicalDevice.enable_features_if_present(optional);
+    if (!m_TextureCompressionBC)
+        ENGINE_WARN("GPU without BC texture compression: textures stay uncompressed (RGBA8)");
+
     m_Device = Expect(vkb::DeviceBuilder{m_PhysicalDevice}.build(), "Device creation failed");
     volkLoadDevice(m_Device.device); // direct device dispatch, skips loader trampoline
 

@@ -9,7 +9,7 @@ namespace Engine {
 
 namespace {
 constexpr std::uint32_t kGroupSize     = 64; // gpu_cull.comp
-constexpr std::uint32_t kStatCount     = 8;
+constexpr std::uint32_t kStatCount     = 9;
 constexpr std::uint32_t kCommandStride = sizeof(VkDrawIndexedIndirectCommand);
 static_assert(kCommandStride == 20);
 
@@ -84,6 +84,18 @@ GpuCulling::GpuCulling(Renderer& renderer) : m_Renderer(renderer)
                                                    .debugName = "CullStats"});
 }
 
+void GpuCulling::RebuildPipelines()
+{
+    const VkDevice         device = m_Renderer.GetContext().Device();
+    const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
+    Pipeline cull = CreateComputePipeline(device, layout, ShaderPath("gpu_cull.comp.spv"), "GpuCull");
+    Pipeline hiz  = CreateComputePipeline(device, layout, ShaderPath("hiz.comp.spv"), "HiZBuild");
+    m_Renderer.DeferRelease(std::move(m_Cull));
+    m_Renderer.DeferRelease(std::move(m_HiZBuild));
+    m_Cull     = std::move(cull);
+    m_HiZBuild = std::move(hiz);
+}
+
 GpuCulling::~GpuCulling()
 {
     m_Renderer.DeferRelease(std::move(m_Cull));
@@ -102,7 +114,7 @@ void GpuCulling::ReadStats(std::uint32_t frameIndex)
     readback.Invalidate(0, VK_WHOLE_SIZE);
     std::uint32_t values[kStatCount];
     std::memcpy(values, readback.Mapped(), sizeof(values));
-    m_Stats = {values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]};
+    m_Stats = {values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]};
 }
 
 void GpuCulling::Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_t firstView, std::uint32_t viewCount,
@@ -117,7 +129,7 @@ void GpuCulling::Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_
 }
 
 void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span<const GpuCullView> views,
-                           VkExtent2D depthExtent)
+                           VkExtent2D depthExtent, const GpuLodParams& lod)
 {
     m_IndirectCalls = 0;
     m_ViewCount     = 0;
@@ -128,7 +140,7 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
     m_ViewCount = static_cast<std::uint32_t>(views.size());
 
     // Per view: a visible list (one slice per batch), batch counters, 4 command buckets.
-    const std::uint32_t listSize = scene.LiveDraws();
+    const std::uint32_t listSize = scene.VisibleCapacity();
     m_Views.assign(views.begin(), views.end());
     for (std::uint32_t v = 0; v < m_ViewCount; ++v) {
         m_Views[v].listBase    = v * listSize;
@@ -164,7 +176,9 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
                         .batchCapacity = m_BatchCapacity,
                         .pad           = 0,
                         .hizInfo       = glm::uvec4(m_HiZSize, m_HiZLevels, 0u),
-                        .depthSize     = glm::uvec4(depthExtent.width, depthExtent.height, 0u, 0u)};
+                        .depthSize     = glm::uvec4(depthExtent.width, depthExtent.height, 0u, 0u),
+                        .lodCamera     = lod.camera,
+                        .lodInfo       = glm::uvec4(lod.forced, 0u, 0u, 0u)};
     m_CullData = m_Renderer.PushTransient(m_Data, 16);
 
     // Earlier frames: indirect reads, vertex shader reads of the lists, culling (WAR / WAW), stats copy.

@@ -9,7 +9,9 @@
 //                       early pass's depth; emits draws that became visible, updates the visibility.
 //   phase 2 (commands): x = batch, y = view. One indexed indirect command per batch with visible
 //                       draws (instanceCount = their number), appended to the view's bucket.
-// Visible draws are appended per batch: visible[listBase + batch.instanceBase + slot] = record.
+// Visible draws are appended per batch: visible[listBase + batch.instanceBase + slot] = record | LOD << 30.
+// A submesh with LODs owns one batch per level (draw.batch + lod); every view picks the LOD from
+// the camera's distance, so shadows match the camera's geometry.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #define VIEW_SHADOW       1u // commands grouped by shadowBucket (else cameraBucket)
@@ -26,7 +28,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define STAT_SHADOW    5u // shadow views: draws emitted
 #define STAT_COMMANDS  6u // indirect commands, all views
 #define STAT_TRIANGLES 7u // camera triangles
-#define STAT_COUNT     8u
+#define STAT_LOD       8u // camera: draws emitted with a LOD > 0
+#define STAT_COUNT     9u
 
 struct CullView {
     mat4 viewProj;
@@ -69,6 +72,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Cu
     uint  pad;
     uvec4 hizInfo;   // xy: level 0 size, z: level count
     uvec4 depthSize; // xy: depth target size (pixels)
+    vec4  lodCamera; // xyz: camera position, w: pixels per unit of error at distance 1 / threshold
+    uvec4 lodInfo;   // x: forced LOD + 1 (0: by distance)
 };
 
 layout(push_constant) uniform CullPush {
@@ -146,10 +151,11 @@ bool Occluded(CullView view, mat4 model, vec3 bmin, vec3 bmax)
     return nearest < farthest;
 }
 
-void Emit(CullView view, GpuDraw draw, uint record)
+void Emit(CullView view, GpuDraw draw, uint record, uint lod)
 {
-    const uint slot = atomicAdd(pc.data.counters.u[view.counterBase + draw.batch], 1u);
-    pc.data.visible.u[view.listBase + pc.data.batches.b[draw.batch].instanceBase + slot] = record;
+    const uint batch = draw.batch + lod;
+    const uint slot  = atomicAdd(pc.data.counters.u[view.counterBase + batch], 1u);
+    pc.data.visible.u[view.listBase + pc.data.batches.b[batch].instanceBase + slot] = record | (lod << VISIBLE_LOD_SHIFT);
 }
 
 void BuildCommand(uint batchIndex, uint viewIndex)
@@ -199,6 +205,8 @@ void main()
             const vec3 extent = mat3(abs(inst.model[0].xyz), abs(inst.model[1].xyz), abs(inst.model[2].xyz)) * e;
             const bool inside = InFrustum(view, center, extent);
             const bool occlusion = (view.flags & VIEW_OCCLUSION) != 0u;
+            const float scale = max(max(length(inst.model[0].xyz), length(inst.model[1].xyz)), length(inst.model[2].xyz));
+            const uint  lod   = SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
 
             if (late) {
                 if (!inside) {
@@ -208,8 +216,10 @@ void main()
                     atomicAdd(sStats[STAT_OCCLUDED], 1u);
                 } else {
                     if (data.visibility.u[index] == 0u) {
-                        Emit(view, draw, index);
+                        Emit(view, draw, index, lod);
                         atomicAdd(sStats[STAT_LATE], 1u);
+                        if (lod > 0u)
+                            atomicAdd(sStats[STAT_LOD], 1u);
                     }
                     data.visibility.u[index] = 1u;
                 }
@@ -218,11 +228,13 @@ void main()
                 if (!inside) {
                     atomicAdd(sStats[STAT_FRUSTUM], 1u);
                 } else if (!occlusion || data.visibility.u[index] != 0u) {
-                    Emit(view, draw, index);
+                    Emit(view, draw, index, lod);
                     atomicAdd(sStats[STAT_EARLY], 1u);
+                    if (lod > 0u)
+                        atomicAdd(sStats[STAT_LOD], 1u);
                 }
             } else if (inside) { // shadow view
-                Emit(view, draw, index);
+                Emit(view, draw, index, lod);
                 atomicAdd(sStats[STAT_SHADOW], 1u);
             }
         }

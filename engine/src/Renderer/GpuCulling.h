@@ -45,6 +45,13 @@ struct GpuCullStats {
     std::uint32_t shadow    = 0; // shadow views: draws emitted
     std::uint32_t commands  = 0; // indirect commands, all views
     std::uint32_t triangles = 0; // camera
+    std::uint32_t lodDraws  = 0; // camera: draws with a LOD > 0
+};
+
+// LOD selection of a frame (see SelectLod).
+struct GpuLodParams {
+    glm::vec4     camera{0.0f}; // xyz: camera position, w: pixels per unit of error at distance 1 / threshold (0: off)
+    std::uint32_t forced = 0;   // forced LOD + 1 (debug), 0: by distance
 };
 
 // GPU-driven culling of a GpuScene: per-view visible lists, instance batching and indirect
@@ -58,6 +65,8 @@ public:
     GpuCulling(const GpuCulling&)            = delete;
     GpuCulling& operator=(const GpuCulling&) = delete;
 
+    void RebuildPipelines(); // shader hot reload
+
     // Frame start (after this slot's fence): counters of the frame that last used the slot.
     void ReadStats(std::uint32_t frameIndex);
     [[nodiscard]] const GpuCullStats& Stats() const { return m_Stats; }
@@ -65,7 +74,7 @@ public:
     // views[0] = camera early, views[1] = camera late (only culled by CullLate), then shadow views.
     // Culls every view but the late one and builds their commands. The scene must be uploaded.
     void CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span<const GpuCullView> views,
-                   VkExtent2D depthExtent);
+                   VkExtent2D depthExtent, const GpuLodParams& lod);
     // Hi-Z pyramid of the depth target (bindless slot, DEPTH_READ_ONLY_OPTIMAL). Kept (not
     // rebuilt) while `keep` is set: frozen culling.
     void BuildHiZ(VkCommandBuffer cmd, std::uint32_t depthSlot, VkExtent2D extent, bool keep);
@@ -91,8 +100,10 @@ private:
         std::uint32_t drawCount = 0, batchCount = 0, batchCapacity = 0, pad = 0;
         glm::uvec4    hizInfo{0};
         glm::uvec4    depthSize{0};
+        glm::vec4     lodCamera{0.0f};
+        glm::uvec4    lodInfo{0};
     };
-    static_assert(sizeof(CullData) == 144);
+    static_assert(sizeof(CullData) == 176);
 
     void RecordDraw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucket);
     void Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_t firstView, std::uint32_t viewCount,

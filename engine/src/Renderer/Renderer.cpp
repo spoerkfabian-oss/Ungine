@@ -1,4 +1,5 @@
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Core/Log.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Events/Events.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
@@ -14,7 +15,7 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
 {
     m_Swapchain = std::make_unique<Swapchain>(ctx, window.FramebufferExtent(), SwapchainDesc{.vsync = desc.vsync});
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
-    m_Upload    = std::make_unique<UploadQueue>(ctx);
+    m_Upload    = std::make_unique<UploadQueue>(ctx, desc.upload);
     m_Profiler  = std::make_unique<GpuProfiler>(ctx, kFramesInFlight);
     m_Geometry  = std::make_unique<GeometryPool>(ctx, *m_Upload, desc.geometry);
     CreateDefaultTextures();
@@ -71,6 +72,12 @@ Renderer::~Renderer()
 std::optional<FrameContext> Renderer::BeginFrame()
 {
     assert(!m_FrameActive && "BeginFrame called twice without EndFrame");
+    if (m_ShaderHotReload)
+        (void)m_ShaderReload->Poll();
+    if (m_ShaderReload && m_ShaderReload->Generation() != m_ReloadGeneration) { // polled or recompiled directly
+        m_ReloadGeneration = m_ShaderReload->Generation();
+        ++m_ShaderGeneration;
+    }
     const VkDevice dev = m_Ctx.Device();
     FrameData&     f   = m_Frames[m_FrameIndex];
 
@@ -79,6 +86,7 @@ std::optional<FrameContext> Renderer::BeginFrame()
     CollectGarbage(f); // everything this slot's last submission could touch is now free
     f.transientOffset = 0;
     m_Profiler->BeginFrame(m_FrameIndex); // this slot's timestamps are complete now
+    UpdateTextureTable(f);
 
     // Hand everything workers recorded since the last frame to the transfer queue.
     m_Upload->Submit();
@@ -219,21 +227,92 @@ TransientAllocation Renderer::AllocateTransient(VkDeviceSize size, VkDeviceSize 
 
 void Renderer::CreateDefaultTextures()
 {
-    // RGBA8 little-endian (0xAABBGGRR). Flat normal = (0.5, 0.5, 1.0).
-    constexpr std::array<std::uint32_t, kDefaultTextureCount> texels{0xFFFFFFFFu, 0xFF000000u, 0xFFFF8080u};
-    constexpr std::array<const char*, kDefaultTextureCount>   names{"DefaultWhite", "DefaultBlack", "DefaultNormal"};
+    // RGBA8 little-endian (0xAABBGGRR). Flat normal = (0.5, 0.5, 1.0). Error: magenta/black checker.
+    constexpr std::uint32_t kErrorSize = 8;
+    std::array<std::uint32_t, kErrorSize * kErrorSize> checker{};
+    for (std::uint32_t y = 0; y < kErrorSize; ++y)
+        for (std::uint32_t x = 0; x < kErrorSize; ++x)
+            checker[y * kErrorSize + x] = ((x / 2 + y / 2) & 1) != 0 ? 0xFF000000u : 0xFFFF00FFu;
+    constexpr std::array<std::uint32_t, 3>                  texels{0xFFFFFFFFu, 0xFF000000u, 0xFFFF8080u};
+    constexpr std::array<const char*, kDefaultTextureCount> names{"DefaultWhite", "DefaultBlack", "DefaultNormal",
+                                                                  "DefaultError"};
     UploadTicket ticket = 0;
     for (std::size_t i = 0; i < kDefaultTextureCount; ++i) {
-        m_DefaultTextures[i] = m_Upload->CreateTexture2D({.pixels       = &texels[i],
-                                                          .width        = 1,
-                                                          .height       = 1,
+        const bool error = i == static_cast<std::size_t>(DefaultTexture::Error);
+        m_DefaultTextures[i] = m_Upload->CreateTexture2D({.pixels       = error ? checker.data() : &texels[i],
+                                                          .width        = error ? kErrorSize : 1,
+                                                          .height       = error ? kErrorSize : 1,
                                                           .format       = VK_FORMAT_R8G8B8A8_UNORM,
-                                                          .generateMips = false,
+                                                          .generateMips = error,
                                                           .debugName    = names[i]},
                                                          ticket);
         m_DefaultTextureSlots[i] = m_Bindless->AddSampledImage(m_DefaultTextures[i].View());
+        m_TextureTable.push_back(m_DefaultTextureSlots[i]); // entry i
     }
     m_Upload->Flush(); // resident before the first frame
+}
+
+void Renderer::SetShaderHotReload(bool enabled)
+{
+    if (enabled && !m_ShaderReload)
+        m_ShaderReload = std::make_unique<ShaderHotReload>();
+    m_ShaderHotReload = enabled && m_ShaderReload->Available();
+    if (enabled && !m_ShaderHotReload)
+        ENGINE_WARN("Shader hot reload unavailable (no shader compiler)");
+}
+
+std::uint32_t Renderer::AllocateTextureEntry(std::uint32_t bindlessSlot)
+{
+    std::uint32_t entry = 0;
+    if (!m_FreeTextureEntries.empty()) {
+        entry = m_FreeTextureEntries.back();
+        m_FreeTextureEntries.pop_back();
+        m_TextureTable[entry] = bindlessSlot;
+    } else {
+        entry = static_cast<std::uint32_t>(m_TextureTable.size());
+        m_TextureTable.push_back(bindlessSlot);
+    }
+    ++m_TextureTableVersion;
+    return entry;
+}
+
+void Renderer::SetTextureEntry(std::uint32_t entry, std::uint32_t bindlessSlot)
+{
+    assert(entry < m_TextureTable.size());
+    if (m_TextureTable[entry] == bindlessSlot)
+        return;
+    m_TextureTable[entry] = bindlessSlot;
+    ++m_TextureTableVersion;
+}
+
+void Renderer::FreeTextureEntry(std::uint32_t entry)
+{
+    assert(entry >= kDefaultTextureCount && entry < m_TextureTable.size());
+    DeferCall([this, entry] {
+        m_TextureTable[entry] = m_DefaultTextureSlots[static_cast<std::size_t>(DefaultTexture::Error)];
+        m_FreeTextureEntries.push_back(entry);
+        ++m_TextureTableVersion;
+    });
+}
+
+VkDeviceAddress Renderer::TextureTableAddress() const
+{
+    assert(m_FrameActive && "The texture table is per frame");
+    return m_Frames[m_FrameIndex].textureTable.Address();
+}
+
+void Renderer::UpdateTextureTable(FrameData& frame)
+{
+    if (frame.textureTableVersion == m_TextureTableVersion)
+        return;
+    const VkDeviceSize bytes = m_TextureTable.size() * sizeof(std::uint32_t);
+    if (!frame.textureTable || frame.textureTable.Size() < bytes) // this slot's GPU work is done
+        frame.textureTable = Buffer(m_Ctx, {.size      = std::max<VkDeviceSize>(bytes * 2, 4096),
+                                            .usage     = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                            .memory    = MemoryUsage::Upload,
+                                            .debugName = "TextureTable"});
+    frame.textureTable.Write(m_TextureTable.data(), bytes);
+    frame.textureTableVersion = m_TextureTableVersion;
 }
 
 Renderer::FrameData& Renderer::GarbageSlot()

@@ -16,7 +16,7 @@ struct GeometryPoolDesc {
     std::uint32_t maxVertices  = 4u << 20;  // 48 B each (192 MB)
     std::uint32_t maxIndices   = 16u << 20; // 4 B each (64 MB)
     std::uint32_t maxMaterials = 1u << 16;  // 80 B each
-    std::uint32_t maxSubmeshes = 1u << 18;  // 48 B each (GpuSubmesh)
+    std::uint32_t maxSubmeshes = 1u << 18;  // 96 B each (GpuSubmesh, 24 MB)
 };
 
 enum class GeometryKind : std::uint32_t { Vertices, Indices, Materials, Submeshes, Count };

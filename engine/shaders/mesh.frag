@@ -12,6 +12,7 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inTangent;
 layout(location = 4) flat in uint inMaterial;
+layout(location = 6) flat in uint inLod;
 
 layout(location = 0) out vec4 outColor;
 
@@ -28,7 +29,7 @@ vec3 DirectBrdf(vec3 N, vec3 V, vec3 L, float NdotV, float NdotL, vec3 cDiff, ve
 void main()
 {
     const Material m    = pc.frame.materials.m[inMaterial];
-    const vec4     base = m.baseColorFactor * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV);
+    const vec4     base = m.baseColorFactor * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV);
 
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u && base.a < m.alphaCutoff)
         discard;
@@ -38,7 +39,7 @@ void main()
     const vec3 N   = PerturbedNormal(m, tbn, inUV);
 
     // --- Material ---
-    const vec4  mr        = SampleTexture(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
+    const vec4  mr        = SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
     const float metallic  = clamp(m.metallic * mr.b, 0.0, 1.0);
     const float roughness = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
     const float a         = roughness * roughness;
@@ -103,7 +104,7 @@ void main()
     const vec3  irradiance = SampleCube(frame.ibl.x, SAMPLER_LINEAR_CLAMP, N, 0.0).rgb;
 
     // Ambient occlusion (indirect light only): material AO and screen-space GTAO combined by min.
-    const float occlusion = SampleTexture(m.occlusionTexture, m.samplerIndex, inUV).r;
+    const float occlusion = SampleMaterial(m.occlusionTexture, m.samplerIndex, inUV).r;
     float       ao        = 1.0 + m.occlusionStrength * (occlusion - 1.0);
     if (frame.aoInfo.y != 0u)
         ao = min(ao, texelFetch(sampler2D(uTextures[nonuniformEXT(frame.aoInfo.x)], uSamplers[SAMPLER_NEAREST_CLAMP]),
@@ -112,7 +113,7 @@ void main()
     const float specAO   = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
     const vec3  indirect = (FssEss * radiance * specAO + (FmsEms + kD) * irradiance * ao) * frame.sky.y;
 
-    const vec3 emissive = m.emissiveFactor.rgb * SampleTexture(m.emissiveTexture, m.samplerIndex, inUV).rgb;
+    const vec3 emissive = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
     vec3       color    = direct + indirect + emissive;
 
     if (frame.shadowInfo.y != 0u && NdotL > 0.0 && cascade < 4u) { // debug: red, green, blue, yellow
@@ -121,5 +122,10 @@ void main()
     }
     if ((pc.flags & MESH_TINT_LATE) != 0u) // culling debug view: found by the occlusion (late) pass
         color = color * vec3(0.4, 0.25, 0.1) + vec3(0.6, 0.25, 0.02) * frame.sky.x;
+    if ((pc.flags & MESH_TINT_LOD) != 0u) { // LOD debug view: 0 as is, 1 green, 2 yellow, 3 red
+        const vec3 tint[4] = vec3[](vec3(1.0), vec3(0.2, 1.0, 0.2), vec3(1.0, 0.9, 0.1), vec3(1.0, 0.15, 0.1));
+        const vec3 t       = tint[min(inLod, 3u)];
+        color = inLod == 0u ? color : color * t + t * 0.08 * frame.sky.x;
+    }
     outColor = vec4(color, 1.0);
 }

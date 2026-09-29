@@ -2,6 +2,7 @@
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/GeometryPool.h"
 #include "Engine/Renderer/GpuProfiler.h"
+#include "Engine/Renderer/ShaderReload.h"
 #include "Engine/Renderer/Vulkan/Bindless.h"
 #include "Engine/Renderer/Vulkan/Swapchain.h"
 #include "Engine/Renderer/Vulkan/Upload.h"
@@ -25,8 +26,9 @@ inline constexpr std::uint32_t kFramesInFlight      = 2;
 inline constexpr VkFormat      kDepthFormat         = VK_FORMAT_D32_SFLOAT; // reverse-Z: clear to 0 (scene targets)
 inline constexpr VkDeviceSize  kTransientBufferSize = 8ull << 20;          // per frame in flight
 
-// 1x1 textures used when a material slot is empty.
-enum class DefaultTexture : std::uint32_t { White, Black, FlatNormal, Count };
+// Textures used when a material slot is empty (1x1) or its texture failed to load (Error: checker).
+// Their texture table entries are fixed: table index == enum value.
+enum class DefaultTexture : std::uint32_t { White, Black, FlatNormal, Error, Count };
 
 struct TransientAllocation {
     void*           cpu = nullptr;
@@ -36,6 +38,7 @@ struct TransientAllocation {
 struct RendererDesc {
     bool             vsync = true;
     GeometryPoolDesc geometry{}; // capacities of the global vertex / index / material pools
+    UploadQueueDesc  upload{};   // staging ring size, per-frame upload budget
 };
 
 // Everything a pass needs to record into the current frame.
@@ -100,6 +103,26 @@ public:
     // Same timing, arbitrary cleanup (e.g. freeing a bindless slot).
     void DeferCall(std::function<void()> fn) { GarbageSlot().deferred.push_back(std::move(fn)); }
 
+    // Texture table: materials store table indices, the table maps them to bindless slots, so a
+    // texture can be swapped (reload, streaming, placeholder) without touching any material.
+    // Main thread. Entries [0, DefaultTexture::Count) are the default textures.
+    [[nodiscard]] std::uint32_t AllocateTextureEntry(std::uint32_t bindlessSlot);
+    void SetTextureEntry(std::uint32_t entry, std::uint32_t bindlessSlot); // visible from the next frame on
+    void FreeTextureEntry(std::uint32_t entry); // deferred: in-flight frames may still read it
+    [[nodiscard]] std::uint32_t TextureEntry(std::uint32_t entry) const { return m_TextureTable[entry]; }
+    [[nodiscard]] std::uint32_t TextureEntryCount() const { return static_cast<std::uint32_t>(m_TextureTable.size()); }
+    // uint[] of this frame (BeginFrame .. EndFrame): FrameUniforms::textureTable.
+    [[nodiscard]] VkDeviceAddress TextureTableAddress() const;
+
+    // Shader hot reload (development): BeginFrame polls the GLSL sources and recompiles changed
+    // shaders; owners of pipelines rebuild them when ShaderGeneration() changes. Main thread.
+    void SetShaderHotReload(bool enabled);
+    [[nodiscard]] bool ShaderHotReloadEnabled() const { return m_ShaderHotReload; }
+    [[nodiscard]] ShaderHotReload*       ShaderReloader() { return m_ShaderReload.get(); } // null until enabled
+    [[nodiscard]] const ShaderHotReload* ShaderReloader() const { return m_ShaderReload.get(); }
+    [[nodiscard]] std::uint64_t ShaderGeneration() const { return m_ShaderGeneration; }
+    void NotifyShadersChanged() { ++m_ShaderGeneration; } // SPIR-V replaced by other means: rebuild pipelines
+
 private:
     struct FrameData {
         VkCommandPool   pool           = VK_NULL_HANDLE;
@@ -113,6 +136,8 @@ private:
         VkDeviceSize                         transientOffset = 0;
         std::uint64_t                        uploadWait      = 0; // upload timeline value to wait on
         std::uint32_t                        frameScope      = ~0u;
+        Buffer                               textureTable;         // copy of m_TextureTable
+        std::uint64_t                        textureTableVersion = 0;
     };
 
     FrameData& GarbageSlot();
@@ -121,6 +146,7 @@ private:
     void RecreateSwapchain();
     void CreateDefaultTextures();
     void GrowRenderFinishedSemaphores();
+    void UpdateTextureTable(FrameData& frame);
 
     VulkanContext&             m_Ctx;
     Window&                    m_Window;
@@ -133,6 +159,15 @@ private:
     static constexpr std::size_t kDefaultTextureCount = static_cast<std::size_t>(DefaultTexture::Count);
     std::array<Image, kDefaultTextureCount>         m_DefaultTextures;
     std::array<std::uint32_t, kDefaultTextureCount> m_DefaultTextureSlots{};
+
+    std::vector<std::uint32_t> m_TextureTable; // entry -> bindless slot
+    std::vector<std::uint32_t> m_FreeTextureEntries;
+    std::uint64_t              m_TextureTableVersion = 1;
+
+    std::unique_ptr<ShaderHotReload> m_ShaderReload;
+    bool                             m_ShaderHotReload  = false;
+    std::uint64_t                    m_ShaderGeneration = 0;
+    std::uint64_t                    m_ReloadGeneration = 0; // m_ShaderReload->Generation() already counted
 
     std::array<FrameData, kFramesInFlight> m_Frames{};
     // Per swapchain IMAGE, not per frame: presentation may still hold the semaphore

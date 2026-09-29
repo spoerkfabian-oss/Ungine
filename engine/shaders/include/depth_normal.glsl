@@ -23,7 +23,7 @@ void main()
 {
     const Material m = pc.frame.materials.m[inMaterial];
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u) {
-        const float alpha = m.baseColorFactor.a * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV).a;
+        const float alpha = m.baseColorFactor.a * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV).a;
         if (alpha < m.alphaCutoff)
             discard;
     }

@@ -56,6 +56,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress instances; // GPU scene
     VkDeviceAddress draws;
     VkDeviceAddress hiz;
+    VkDeviceAddress textureTable; // material texture entry -> bindless slot
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -65,6 +66,7 @@ struct MeshPush { // mirrors MeshPush in mesh_common.glsl
     std::uint32_t   flags;   // MESH_TINT_LATE
 };
 constexpr std::uint32_t kMeshTintLate = 1;
+constexpr std::uint32_t kMeshTintLod  = 2;
 static_assert(sizeof(MeshPush) <= kPushConstantSize);
 
 struct TonemapPush { // mirrors TonemapPush in tonemap.frag
@@ -209,6 +211,7 @@ const char* ToString(DebugView v)
     case DebugView::ShadowAtlas:      return "Shadow atlas";
     case DebugView::HiZ:              return "Hi-Z";
     case DebugView::Culling:          return "Culling (late = orange)";
+    case DebugView::Lod:              return "LOD (1 green, 2 yellow, 3 red)";
     default:                          return "?";
     }
 }
@@ -226,84 +229,8 @@ const char* ToString(Tonemapper t)
 SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets)
     : m_Renderer(renderer), m_Assets(assets), m_Environment(renderer)
 {
-    const VkDevice         device = ctx.Device();
-    const VkPipelineLayout layout = renderer.GetBindless().PipelineLayout();
-
-    // Prepass writes depth + view normals; the lighting pass then only shades the visible
-    // surface (depth EQUAL, no writes). Both use mesh.vert with an invariant gl_Position.
-    m_Prepass = GraphicsPipelineBuilder{}
-                    .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("depth_normal.frag.spv"))
-                    .AddColorAttachment(kNormalFormat)
-                    .SetDepthFormat(kDepthFormat)
-                    .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL) // reverse-Z
-                    .SetDynamicCulling(true)
-                    .SetDebugName("DepthNormalPrepass")
-                    .Build(device, layout);
-    m_PrepassPicking = GraphicsPipelineBuilder{}
-                           .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("depth_normal_id.frag.spv"))
-                           .AddColorAttachment(kNormalFormat)
-                           .AddColorAttachment(kEntityIdFormat)
-                           .SetDepthFormat(kDepthFormat)
-                           .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
-                           .SetDynamicCulling(true)
-                           .SetDebugName("DepthNormalIdPrepass")
-                           .Build(device, layout);
-    m_Mesh = GraphicsPipelineBuilder{}
-                 .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("mesh.frag.spv"))
-                 .AddColorAttachment(kHdrFormat)
-                 .SetDepthFormat(kDepthFormat)
-                 .SetDepth(true, false, VK_COMPARE_OP_EQUAL)
-                 .SetDynamicCulling(true)
-                 .SetDebugName("MeshPbr")
-                 .Build(device, layout);
-
-    // Depth 0 = infinity: passes only where no geometry was drawn. No depth writes.
-    m_Sky = GraphicsPipelineBuilder{}
-                .SetShaders(ShaderPath("fullscreen.vert.spv"), ShaderPath("sky.frag.spv"))
-                .AddColorAttachment(kHdrFormat)
-                .SetDepthFormat(kDepthFormat)
-                .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
-                .SetDebugName("Sky")
-                .Build(device, layout);
-
-
-    // Shadow casters: no culling (thin/open meshes cast from both sides), reverse-Z, depth clamp
-    // (pancaking of casters in front of a cascade), slope-scaled bias set per frame.
-    GraphicsPipelineBuilder shadow;
-    shadow.SetShaders(ShaderPath("shadow.vert.spv"))
-        .SetDepthFormat(kShadowFormat)
-        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
-        .SetDepthClamp(true)
-        .SetDynamicDepthBias(true)
-        .SetDebugName("ShadowDepth");
-    m_Shadow       = shadow.Build(device, layout);
-    m_ShadowMasked = shadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
-                         .SetDebugName("ShadowDepthMasked")
-                         .Build(device, layout);
-
-    // Local lights: perspective views, no depth clamp (casters behind the light must not pancake
-    // onto its near plane).
-    GraphicsPipelineBuilder localShadow;
-    localShadow.SetShaders(ShaderPath("shadow.vert.spv"))
-        .SetDepthFormat(kShadowFormat)
-        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
-        .SetDynamicDepthBias(true)
-        .SetDebugName("LocalShadowDepth");
-    m_LocalShadow       = localShadow.Build(device, layout);
-    m_LocalShadowMasked = localShadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
-                              .SetDebugName("LocalShadowDepthMasked")
-                              .Build(device, layout);
-
-    const auto compute = [&](const char* spv, const char* name) {
-        return CreateComputePipeline(device, layout, ShaderPath(spv), name);
-    };
-    m_BloomDown       = compute("bloom_downsample.comp.spv", "BloomDownsample");
-    m_BloomUp         = compute("bloom_upsample.comp.spv", "BloomUpsample");
-    m_Gtao            = compute("gtao.comp.spv", "Gtao");
-    m_GtaoDenoise     = compute("gtao_denoise.comp.spv", "GtaoDenoise");
-    m_Histogram       = compute("luminance_histogram.comp.spv", "LuminanceHistogram");
-    m_ExposureAverage = compute("exposure_average.comp.spv", "ExposureAverage");
-    m_LightCull       = compute("light_cull.comp.spv", "LightCull");
+    CreatePipelines();
+    m_ShaderGeneration = renderer.ShaderGeneration();
 
     constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m_LuminanceHistogram = Buffer(ctx, {.size = 256 * sizeof(std::uint32_t), .usage = kStorage,
@@ -320,6 +247,131 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                          .debugName = "ExposureReadback"});
     m_GpuScene   = std::make_unique<GpuScene>(renderer);
     m_GpuCulling = std::make_unique<GpuCulling>(renderer);
+}
+
+void SceneRenderer::CreatePipelines()
+{
+    // Built completely before anything is replaced: a failure keeps the old pipelines.
+    struct {
+        Pipeline Prepass, PrepassPicking, Mesh, Sky, Shadow, ShadowMasked, LocalShadow, LocalShadowMasked, BloomDown,
+            BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull;
+    } built;
+    const VkDevice         device = m_Renderer.GetContext().Device();
+    const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
+
+    // Prepass writes depth + view normals; the lighting pass then only shades the visible
+    // surface (depth EQUAL, no writes). Both use mesh.vert with an invariant gl_Position.
+    built.Prepass = GraphicsPipelineBuilder{}
+                        .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("depth_normal.frag.spv"))
+                        .AddColorAttachment(kNormalFormat)
+                        .SetDepthFormat(kDepthFormat)
+                        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL) // reverse-Z
+                        .SetDynamicCulling(true)
+                        .SetDebugName("DepthNormalPrepass")
+                        .Build(device, layout);
+    built.PrepassPicking = GraphicsPipelineBuilder{}
+                               .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("depth_normal_id.frag.spv"))
+                               .AddColorAttachment(kNormalFormat)
+                               .AddColorAttachment(kEntityIdFormat)
+                               .SetDepthFormat(kDepthFormat)
+                               .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                               .SetDynamicCulling(true)
+                               .SetDebugName("DepthNormalIdPrepass")
+                               .Build(device, layout);
+    built.Mesh = GraphicsPipelineBuilder{}
+                     .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("mesh.frag.spv"))
+                     .AddColorAttachment(kHdrFormat)
+                     .SetDepthFormat(kDepthFormat)
+                     .SetDepth(true, false, VK_COMPARE_OP_EQUAL)
+                     .SetDynamicCulling(true)
+                     .SetDebugName("MeshPbr")
+                     .Build(device, layout);
+
+    // Depth 0 = infinity: passes only where no geometry was drawn. No depth writes.
+    built.Sky = GraphicsPipelineBuilder{}
+                    .SetShaders(ShaderPath("fullscreen.vert.spv"), ShaderPath("sky.frag.spv"))
+                    .AddColorAttachment(kHdrFormat)
+                    .SetDepthFormat(kDepthFormat)
+                    .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                    .SetDebugName("Sky")
+                    .Build(device, layout);
+
+
+    // Shadow casters: no culling (thin/open meshes cast from both sides), reverse-Z, depth clamp
+    // (pancaking of casters in front of a cascade), slope-scaled bias set per frame.
+    GraphicsPipelineBuilder shadow;
+    shadow.SetShaders(ShaderPath("shadow.vert.spv"))
+        .SetDepthFormat(kShadowFormat)
+        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+        .SetDepthClamp(true)
+        .SetDynamicDepthBias(true)
+        .SetDebugName("ShadowDepth");
+    built.Shadow       = shadow.Build(device, layout);
+    built.ShadowMasked = shadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
+                             .SetDebugName("ShadowDepthMasked")
+                             .Build(device, layout);
+
+    // Local lights: perspective views, no depth clamp (casters behind the light must not pancake
+    // onto its near plane).
+    GraphicsPipelineBuilder localShadow;
+    localShadow.SetShaders(ShaderPath("shadow.vert.spv"))
+        .SetDepthFormat(kShadowFormat)
+        .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+        .SetDynamicDepthBias(true)
+        .SetDebugName("LocalShadowDepth");
+    built.LocalShadow       = localShadow.Build(device, layout);
+    built.LocalShadowMasked = localShadow.SetShaders(ShaderPath("shadow.vert.spv"), ShaderPath("shadow_mask.frag.spv"))
+                                  .SetDebugName("LocalShadowDepthMasked")
+                                  .Build(device, layout);
+
+    const auto compute = [&](const char* spv, const char* name) {
+        return CreateComputePipeline(device, layout, ShaderPath(spv), name);
+    };
+    built.BloomDown       = compute("bloom_downsample.comp.spv", "BloomDownsample");
+    built.BloomUp         = compute("bloom_upsample.comp.spv", "BloomUpsample");
+    built.Gtao            = compute("gtao.comp.spv", "Gtao");
+    built.GtaoDenoise     = compute("gtao_denoise.comp.spv", "GtaoDenoise");
+    built.Histogram       = compute("luminance_histogram.comp.spv", "LuminanceHistogram");
+    built.ExposureAverage = compute("exposure_average.comp.spv", "ExposureAverage");
+    built.LightCull       = compute("light_cull.comp.spv", "LightCull");
+
+
+    const auto replace = [&](Pipeline& current, Pipeline& fresh) {
+        if (current)
+            m_Renderer.DeferRelease(std::move(current)); // frames in flight may still use it
+        current = std::move(fresh);
+    };
+    replace(m_Prepass, built.Prepass);
+    replace(m_PrepassPicking, built.PrepassPicking);
+    replace(m_Mesh, built.Mesh);
+    replace(m_Sky, built.Sky);
+    replace(m_Shadow, built.Shadow);
+    replace(m_ShadowMasked, built.ShadowMasked);
+    replace(m_LocalShadow, built.LocalShadow);
+    replace(m_LocalShadowMasked, built.LocalShadowMasked);
+    replace(m_BloomDown, built.BloomDown);
+    replace(m_BloomUp, built.BloomUp);
+    replace(m_Gtao, built.Gtao);
+    replace(m_GtaoDenoise, built.GtaoDenoise);
+    replace(m_Histogram, built.Histogram);
+    replace(m_ExposureAverage, built.ExposureAverage);
+    replace(m_LightCull, built.LightCull);
+    for (auto& [format, pipeline] : m_Tonemap) // rebuilt on demand
+        m_Renderer.DeferRelease(std::move(pipeline));
+    m_Tonemap.clear();
+}
+
+void SceneRenderer::RebuildPipelines()
+{
+    try {
+        CreatePipelines();
+        m_Environment.RebuildPipelines();
+        m_GpuScene->RebuildPipelines();
+        m_GpuCulling->RebuildPipelines();
+        ENGINE_INFO("Scene renderer: pipelines rebuilt (shader generation {})", m_Renderer.ShaderGeneration());
+    } catch (const std::exception& e) {
+        ENGINE_ERROR("Scene renderer: pipeline rebuild failed, keeping the old ones: {}", e.what());
+    }
 }
 
 SceneRenderer::~SceneRenderer()
@@ -519,7 +571,8 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
                 if (!frustum.Intersects(box) || (range && !near(box)))
                     continue;
             }
-            out.draws.push_back(d);
+            const std::uint32_t lod = SelectLod(m_GpuScene->DrawSubmesh(d), inst->model, m_LodCamera, m_LodForced);
+            out.draws.push_back(d | (lod << kVisibleLodShift));
         }
     });
     if (!out.draws.empty()) { // visible list of the pass: firstInstance = position in it
@@ -530,28 +583,31 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
     m_Stats.drawItems += static_cast<std::uint32_t>(out.draws.size());
 }
 
-void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats)
+void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats,
+                                  std::uint32_t flags)
 {
     if (list.draws.empty())
         return;
     const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
-    const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = 0, .flags = 0};
+    const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = 0, .flags = flags};
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
     std::uint32_t bucket = ~0u;
     for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
-        const std::uint32_t d  = list.draws[i];
-        const GpuSubmesh&   sm = m_GpuScene->DrawSubmesh(d);
-        const std::uint32_t b  = m_GpuScene->Batch(m_GpuScene->Draw(d).batch).cameraBucket;
+        const std::uint32_t d   = list.draws[i] & kVisibleRecordMask;
+        const auto          lod = static_cast<glm::length_t>(list.draws[i] >> kVisibleLodShift);
+        const GpuSubmesh&   sm  = m_GpuScene->DrawSubmesh(d);
+        const std::uint32_t b   = m_GpuScene->Batch(m_GpuScene->Draw(d).batch).cameraBucket;
         if (b != bucket) {
             vkCmdSetCullMode(cmd, (b & 1u) != 0 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
             vkCmdSetFrontFace(cmd, (b & 2u) != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
             bucket = b;
         }
-        vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, i);
+        vkCmdDrawIndexed(cmd, sm.lodIndexCount[lod], 1, sm.lodFirstIndex[lod], sm.vertexOffset, i);
         if (countStats) {
             ++m_Stats.drawCalls;
-            m_Stats.triangles += sm.indexCount / 3;
+            m_Stats.triangles += sm.lodIndexCount[lod] / 3;
+            m_Stats.lodDraws += lod > 0 ? 1u : 0u;
         }
     }
 }
@@ -567,14 +623,15 @@ void SceneRenderer::DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkD
     vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
     VkPipeline bound = VK_NULL_HANDLE;
     for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
-        const std::uint32_t d        = list.draws[i];
+        const std::uint32_t d        = list.draws[i] & kVisibleRecordMask;
+        const auto          lod      = static_cast<glm::length_t>(list.draws[i] >> kVisibleLodShift);
         const GpuSubmesh&   sm       = m_GpuScene->DrawSubmesh(d);
         const VkPipeline    pipeline = (sm.flags & kMaterialAlphaMask) != 0 ? masked.Handle() : plain.Handle();
         if (pipeline != bound) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             bound = pipeline;
         }
-        vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, i);
+        vkCmdDrawIndexed(cmd, sm.lodIndexCount[lod], 1, sm.lodFirstIndex[lod], sm.vertexOffset, i);
         ++drawCounter;
     }
 }
@@ -635,7 +692,7 @@ void SceneRenderer::CullGpu(VkCommandBuffer cmd, const CameraData& camera,
         view.sphere      = glm::vec4(tile.lightPosition, tile.lightRange);
         views.push_back(view);
     }
-    m_GpuCulling->CullEarly(cmd, *m_GpuScene, views, extent);
+    m_GpuCulling->CullEarly(cmd, *m_GpuScene, views, extent, {.camera = m_LodCamera, .forced = m_LodForced});
 }
 
 const Pipeline& SceneRenderer::TonemapPipeline(VkFormat outputFormat)
@@ -663,6 +720,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
 {
     m_Stats = {};
     const VkCommandBuffer cmd = frame.cmd;
+    if (m_Renderer.ShaderGeneration() != m_ShaderGeneration) { // shader hot reload
+        m_ShaderGeneration = m_Renderer.ShaderGeneration();
+        RebuildPipelines();
+    }
     const SkySettings&    sky = lighting.sky;
 
     const auto  now       = std::chrono::steady_clock::now();
@@ -696,6 +757,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const glm::mat4 viewProj = camera.projection * camera.view;
     const Frustum   frustum  = Frustum::FromViewProjection(viewProj);
     const auto      cullStart = std::chrono::steady_clock::now();
+    // LOD: projected error in pixels = error / distance * pixelsPerUnit (vertical, at distance 1).
+    const float pixelsPerUnit = 0.5f * static_cast<float>(extent.height) * std::abs(camera.projection[1][1]);
+    m_LodCamera = glm::vec4(camera.position,
+                            culling.lod && culling.lodPixelError > 0.0f ? pixelsPerUnit / culling.lodPixelError : 0.0f);
+    m_LodForced = culling.forceLod >= 0 ? static_cast<std::uint32_t>(culling.forceLod) + 1u : 0u;
     if (!m_GpuFrame) {
         GatherDraws(frustum, glm::vec4(0.0f), m_CameraDraws);
         m_Stats.culled = static_cast<std::uint32_t>(m_Spatial.SubmeshCount() -
@@ -753,7 +819,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .submeshes       = m_Renderer.Geometry().Address(GeometryKind::Submeshes),
           .instances       = m_GpuScene->InstanceAddress(),
           .draws           = m_GpuScene->DrawAddress(),
-          .hiz             = m_GpuCulling->HiZAddress()};
+          .hiz             = m_GpuCulling->HiZAddress(),
+          .textureTable    = m_Renderer.TextureTableAddress()};
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
         uniforms.cascadeSplits[c]   = cascades[c].splitFar;
@@ -834,6 +901,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         m_Stats.gpuEarly         = gpu.early;
         m_Stats.gpuLate          = gpu.late;
         m_Stats.gpuCommands      = gpu.commands;
+        m_Stats.lodDraws         = gpu.lodDraws;
     }
 
     // --- Tone mapping into the swapchain image ---
@@ -1361,7 +1429,7 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, VkDevi
         vkCmdEndRendering(cmd);
     };
     if (!m_GpuFrame) {
-        drawPass([&] { DrawCpuCamera(cmd, m_CameraDraws, frameAddress, false); });
+        drawPass([&] { DrawCpuCamera(cmd, m_CameraDraws, frameAddress, false, 0); });
     } else {
         // Early: what was visible last frame (or everything in the frustum without occlusion culling).
         drawPass([&] { DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0); });
@@ -1553,12 +1621,14 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceA
     bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     SetViewportScissor(cmd, extent);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Mesh.Handle());
+    const std::uint32_t lodTint = post.debugView == DebugView::Lod ? kMeshTintLod : 0u;
     if (m_GpuFrame) {
-        DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0);
+        DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, lodTint);
         if (culling.occlusion)
-            DrawGpuCamera(cmd, kCameraLateView, frameAddress, post.debugView == DebugView::Culling ? kMeshTintLate : 0u);
+            DrawGpuCamera(cmd, kCameraLateView, frameAddress,
+                          (post.debugView == DebugView::Culling ? kMeshTintLate : 0u) | lodTint);
     } else {
-        DrawCpuCamera(cmd, m_CameraDraws, frameAddress, true);
+        DrawCpuCamera(cmd, m_CameraDraws, frameAddress, true, lodTint);
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());

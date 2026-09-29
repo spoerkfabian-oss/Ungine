@@ -66,6 +66,7 @@ Editor::~Editor()
         m_ImGui->RemoveTexture(m_ViewportTexture);
         m_Ctx.renderer.DeferRelease(std::move(m_ViewportImage));
     }
+    ReleaseTexturePreviews(true);
     m_ImGui.reset(); // waits for the device, frees pending textures, shuts the backends down
 }
 
