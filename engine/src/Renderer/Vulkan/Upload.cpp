@@ -134,6 +134,20 @@ UploadTicket UploadQueue::Record(Buffer staging, const PendingAcquire& acquire,
         m_Open        = AcquireBatchLocked();
         m_Open->value = m_NextValue++; // opened in submission order -> values stay monotonic
         BeginOneTimeCommands(m_Open->cmd);
+        // Staging buffers and pool ranges may reuse memory that earlier (fenced, finished) work
+        // wrote. That is safe, but sync validation does not follow host fence waits across memory
+        // reuse: order the batch after all earlier writes on this queue explicitly.
+        VkMemoryBarrier2 barrier{};
+        barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        barrier.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo dep{};
+        dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers    = &barrier;
+        vkCmdPipelineBarrier2(m_Open->cmd, &dep);
     }
     record(m_Open->cmd);
     m_Open->staging.push_back(std::move(staging));
@@ -162,6 +176,22 @@ Buffer UploadQueue::CreateBuffer(std::span<const std::byte> data, VkBufferUsageF
     });
     ticket = std::max(ticket, t);
     return buffer;
+}
+
+void UploadQueue::WriteBuffer(VkBuffer dst, VkDeviceSize dstOffset, std::span<const std::byte> data,
+                              UploadTicket& ticket)
+{
+    assert(!data.empty());
+    Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           .memory = MemoryUsage::Upload, .debugName = "staging"});
+    staging.Write(data.data(), data.size());
+    const VkBuffer     src  = staging.Handle();
+    const VkDeviceSize size = data.size();
+    const UploadTicket t    = Record(std::move(staging), {}, [&](VkCommandBuffer cmd) {
+        const VkBufferCopy region{0, dstOffset, size};
+        vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    });
+    ticket = std::max(ticket, t);
 }
 
 Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket)
@@ -357,6 +387,8 @@ void UploadQueue::RecordBatchEndBarriers(const Batch& batch) const
     std::vector<VkBufferMemoryBarrier2> buffers;
     std::vector<VkImageMemoryBarrier2>  images;
     for (const PendingAcquire& a : batch.acquires) {
+        if (!a.buffer && !a.image)
+            continue; // concurrent buffer write: the timeline semaphore is enough
         if (a.buffer) {
             VkBufferMemoryBarrier2& b = buffers.emplace_back();
             b.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
@@ -395,6 +427,8 @@ void UploadQueue::RecordAcquireBarriers(VkCommandBuffer cmd, const Batch& batch)
     std::vector<VkBufferMemoryBarrier2> buffers;
     std::vector<VkImageMemoryBarrier2>  images;
     for (const PendingAcquire& a : batch.acquires) {
+        if (!a.buffer && !a.image)
+            continue;
         if (a.buffer) {
             VkBufferMemoryBarrier2& b = buffers.emplace_back();
             b.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;

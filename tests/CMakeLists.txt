@@ -25,6 +25,8 @@ if(ENGINE_GPU_TESTS)
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     add_test(NAME SandboxPhysicsSmoke COMMAND Sandbox assets/models/WaterBottle.glb --frames 120 --physics 300
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(NAME SandboxCpuCullingSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 60 --instances 2000 --lights 64 --cpu-culling
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     add_test(NAME SandboxPhysicsEditorSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 60 --editor --physics 100
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

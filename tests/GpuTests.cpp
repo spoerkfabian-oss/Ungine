@@ -14,10 +14,12 @@
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
+#include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <optional>
@@ -239,6 +241,7 @@ TEST_CASE(Render_PbrFrameAndFrustumCulling)
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
     renderer.shadows.resolution  = 1024; // lavapipe rasterizes on the CPU
     renderer.shadows.maxDistance = 50.0f;
+    renderer.culling.gpuDriven   = false; // exact per-submesh draw counts (GPU path: Render_GpuDriven*)
 
     const glm::vec3 center = (model->boundsMin + model->boundsMax) * 0.5f;
     const float     radius = glm::length(model->boundsMax - model->boundsMin) * 0.5f;
@@ -554,6 +557,7 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     SceneRenderer settings(*F().renderer, *F().context, *F().assets);
     settings.post.tonemapper      = Tonemapper::Aces;
     settings.localShadows.maxLights = 3;
+    settings.culling.occlusion      = false;
     FlyCamera camera;
     camera.position = glm::vec3(4.0f, 5.0f, 6.0f);
     camera.yaw      = 1.25f;
@@ -584,6 +588,7 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     CHECK(r2.Has<Light>(lamp2) && r2.Get<Light>(lamp2).intensity == 9.0f && r2.Get<Light>(lamp2).outerConeAngle == 0.5f);
     CHECK(!r2.Has<MeshRenderer>(gen2)); // generated models cannot be saved
     CHECK(settings2.post.tonemapper == Tonemapper::Aces && settings2.localShadows.maxLights == 3);
+    CHECK(!settings2.culling.occlusion && settings2.culling.gpuDriven);
     CHECK(camera2.position == glm::vec3(4.0f, 5.0f, 6.0f) && camera2.yaw == 1.25f);
 
     // Broken files throw and leave the scene alone.
@@ -896,6 +901,152 @@ TEST_CASE(Physics_MeshColliderAndEditorPlayStop)
     for (ModelHandle ref : modelRefs)
         F().assets->Release(ref);
     F().assets->Release(h);
+}
+
+namespace {
+// Renders `frames` frames of `camera` into an offscreen RGBA8 target and returns the last one.
+std::vector<std::uint8_t> RenderImage(SceneRenderer& renderer, Scene& scene, const CameraData& camera, int frames)
+{
+    constexpr VkExtent2D kExtent{160, 120};
+    constexpr VkFormat   kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    Image  target(*F().context, {.extent    = {kExtent.width, kExtent.height, 1},
+                                 .format    = kFormat,
+                                 .usage     = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                 .debugName = "TestTarget"});
+    Buffer readback(*F().context, {.size      = VkDeviceSize{kExtent.width} * kExtent.height * 4,
+                                   .usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   .memory    = MemoryUsage::Readback,
+                                   .debugName = "TestReadback"});
+    for (int i = 0, attempts = 0; i < frames && attempts < frames * 10; ++attempts) {
+        auto frame = F().renderer->BeginFrame();
+        if (!frame)
+            continue;
+        ++i;
+        CmdImageBarrier(frame->cmd, {.image     = target.Handle(),
+                                     .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                     .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                     .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+                                     .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, // previous frame (WAW)
+                                     .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
+        renderer.Render(*frame, scene, camera, {.image = target.Handle(), .view = target.View(), .format = kFormat, .extent = kExtent});
+        if (i == frames) {
+            CmdImageBarrier(frame->cmd, {.image     = target.Handle(),
+                                         .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                         .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                         .dstStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                         .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT});
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent      = {kExtent.width, kExtent.height, 1};
+            vkCmdCopyImageToBuffer(frame->cmd, target.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+        }
+        F().renderer->EndFrame(*frame);
+    }
+    F().context->WaitIdle();
+    readback.Invalidate(0, VK_WHOLE_SIZE);
+    const auto* bytes = static_cast<const std::uint8_t*>(readback.Mapped());
+    return {bytes, bytes + readback.Size()};
+}
+} // namespace
+
+TEST_CASE(Render_GpuDrivenMatchesCpu)
+{
+    // Instanced boxes behind a wall (occlusion), a mirrored box (clockwise bucket), the spheres
+    // model (many batches): the GPU-driven path must produce the CPU path's image.
+    const ModelHandle box     = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    const ModelHandle spheres = F().assets->LoadModel(kSpheres);
+    CHECK(F().Pump([&] { return Settled(box) && Settled(spheres); }));
+    const Model* spheresModel = F().assets->Get(spheres);
+    CHECK(spheresModel != nullptr && F().assets->Get(box) != nullptr);
+    if (!spheresModel)
+        return;
+
+    Scene     scene;
+    Registry& r = scene.GetRegistry();
+    const auto addBox = [&](glm::vec3 position, glm::vec3 scale) {
+        const Entity e = scene.CreateEntity("Box");
+        r.Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+        scene.EditTransform(e).position = position;
+        scene.EditTransform(e).scale    = scale;
+        return e;
+    };
+    for (int x = 0; x < 6; ++x)
+        for (int z = 0; z < 6; ++z)
+            addBox({static_cast<float>(x) * 1.5f - 3.75f, 0.5f, -2.0f - static_cast<float>(z) * 1.5f}, glm::vec3(1.0f));
+    addBox({0.0f, 2.0f, 1.0f}, {12.0f, 4.0f, 0.5f});  // wall hiding the grid
+    addBox({-4.0f, 0.5f, 4.0f}, {-1.0f, 1.0f, 1.0f}); // mirrored
+    const Entity sphereRoot = InstantiateModel(scene, spheres, *spheresModel);
+    scene.EditTransform(sphereRoot).position = {5.0f, 1.0f, 3.0f};
+    scene.EditTransform(sphereRoot).scale    = glm::vec3(0.3f);
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.shadows.resolution = 512;
+    renderer.post.autoExposure  = false; // adaptation depends on wall-clock frame times
+    const glm::vec3  eye{0.0f, 2.0f, 12.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+
+    renderer.culling.gpuDriven       = false;
+    const std::vector<std::uint8_t> cpu = RenderImage(renderer, scene, camera, 3);
+    const SceneRenderStats          cpuStats = renderer.Stats();
+    renderer.culling.gpuDriven       = true;
+    // Frame 1 draws everything late (no history), frame 2 early; counters lag two frames.
+    const std::vector<std::uint8_t> gpu = RenderImage(renderer, scene, camera, 6);
+    const SceneRenderStats          stats = renderer.Stats();
+
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < cpu.size(); ++i)
+        differing += std::abs(static_cast<int>(cpu[i]) - static_cast<int>(gpu[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0);
+    CHECK(cpuStats.drawCalls > 0 && !cpuStats.gpuDriven);
+
+    // Steady state (counters are two frames old): everything tested, the grid behind the wall
+    // occluded, nothing newly visible, instances of one submesh batched.
+    const auto meshNodes = static_cast<std::uint32_t>(
+        std::ranges::count_if(spheresModel->nodes, [](const ModelNode& n) { return n.mesh >= 0; }));
+    CHECK(stats.gpuDriven && stats.instances == 38 + meshNodes);
+    CHECK(stats.gpuTested == stats.draws);
+    CHECK(stats.gpuOccluded >= 18 && stats.gpuLate == 0);
+    CHECK(stats.gpuEarly + stats.gpuOccluded + stats.gpuFrustumCulled == stats.gpuTested);
+    CHECK(stats.batches < stats.draws && stats.gpuCommands > 0 && stats.drawCalls > 0);
+
+    // Without occlusion culling everything in the frustum is drawn early.
+    renderer.culling.occlusion = false;
+    (void)RenderImage(renderer, scene, camera, 3);
+    CHECK(renderer.Stats().gpuOccluded == 0 && renderer.Stats().gpuEarly + renderer.Stats().gpuFrustumCulled == stats.draws);
+    renderer.culling.occlusion = true;
+
+    // Frozen culling keeps the visible set of the freeze camera while looking elsewhere.
+    renderer.culling.freeze = true;
+    (void)RenderImage(renderer, scene, camera, 3);
+    const std::uint32_t frozenEarly = renderer.Stats().gpuEarly;
+    const CameraData    away{.view       = glm::lookAt(eye, eye + glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                             .projection = camera.projection,
+                             .position   = eye};
+    (void)RenderImage(renderer, scene, away, 3);
+    CHECK(frozenEarly > 0 && renderer.Stats().gpuEarly == frozenEarly);
+    renderer.culling.freeze = false;
+    (void)RenderImage(renderer, scene, away, 3);
+    CHECK(renderer.Stats().gpuEarly == 0 && renderer.Stats().gpuLate == 0 && renderer.Stats().gpuFrustumCulled == stats.draws);
+
+    // Debug views of the GPU path.
+    for (DebugView view : {DebugView::HiZ, DebugView::Culling}) {
+        renderer.post.debugView = view;
+        (void)RenderImage(renderer, scene, camera, 2);
+    }
+    renderer.post.debugView = DebugView::None;
+
+    // A released model's instances leave the GPU scene before its geometry is freed.
+    const std::uint32_t before = renderer.Stats().instances;
+    F().assets->Release(spheres);
+    (void)RenderImage(renderer, scene, camera, 3);
+    CHECK(renderer.Stats().instances == 38 && renderer.Stats().instances < before);
+    F().assets->Release(box);
 }
 
 int main(int argc, char** argv)

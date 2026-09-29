@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -21,13 +22,15 @@ namespace Engine {
 
 class AssetManager;
 class Frustum;
+class GpuCulling;
+class GpuScene;
 class Scene;
-struct Mesh;
-struct Model;
 
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
 
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, Count }; // tonemap.frag
+// tonemap.frag. HiZ: occlusion pyramid (level CullingSettings::hizDebugLevel), Culling: draws that
+// only the late (occlusion) pass found visible are tinted orange.
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Count };
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -88,6 +91,17 @@ struct LocalShadowSettings {
     float         filterRadius = 1.5f; // PCF radius, in shadow texels
 };
 
+// Visibility determination and draw submission.
+struct CullingSettings {
+    // GPU: compute culling of every draw (instance x submesh) per view, instances of the same
+    // submesh batched into one indirect command, vkCmdDrawIndexedIndirectCount per state bucket.
+    // CPU: BVH queries + one vkCmdDrawIndexed per visible submesh (fallback / comparison).
+    bool          gpuDriven     = true;
+    bool          occlusion     = true;  // GPU: two-phase Hi-Z occlusion culling of the camera view
+    bool          freeze        = false; // GPU: keep culling with the camera + Hi-Z of the moment it was set (debug)
+    std::uint32_t hizDebugLevel = 0;     // DebugView::HiZ
+};
+
 // Mirrors GpuShadowView in lights.glsl.
 struct GpuShadowView {
     glm::mat4 viewProj{1.0f};
@@ -120,20 +134,34 @@ struct SelectionOverlay {
 };
 
 struct SceneRenderStats {
-    std::uint32_t drawCalls   = 0;
-    std::uint32_t culled      = 0; // submeshes rejected by frustum culling (camera)
-    std::uint32_t shadowDraws = 0; // over all cascades
+    std::uint32_t drawCalls   = 0; // CPU: draw commands recorded; GPU: indirect multi-draws recorded
+    std::uint32_t culled      = 0; // submeshes rejected by frustum (and occlusion) culling (camera)
+    std::uint32_t shadowDraws = 0; // over all cascades (GPU: draws emitted by the culling pass)
     std::uint64_t triangles   = 0;
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
     std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
     std::uint32_t shadowTilesRendered = 0; // views re-rendered this frame (the rest came from the cache)
-    std::uint32_t localShadowDraws = 0;
+    std::uint32_t localShadowDraws = 0; // CPU: draw calls; GPU: indirect multi-draws
     // CPU side
     double        cpuSpatialMs  = 0.0; // SpatialIndex::Sync (scene changes -> BVH)
+    double        cpuGpuSceneMs = 0.0; // GPU scene update: instance / draw record changes + upload recording
     double        cpuCullingMs  = 0.0; // camera + light queries, draw item setup
-    std::uint32_t drawItems     = 0;   // meshes needed by any view this frame
+    std::uint32_t drawItems     = 0;   // CPU path: draws (instance x submesh) submitted by any view
+    // GPU scene / GPU-driven culling (counters are kFramesInFlight frames old)
+    bool          gpuDriven       = false;
+    std::uint32_t instances       = 0; // mesh instances on the GPU
+    std::uint32_t draws           = 0; // draw records (instance x submesh)
+    std::uint32_t batches         = 0; // unique submesh + winding combinations (indirect commands at most)
+    std::uint32_t gpuTested       = 0;
+    std::uint32_t gpuFrustumCulled = 0;
+    std::uint32_t gpuOccluded     = 0;
+    std::uint32_t gpuEarly        = 0; // drawn by the early pass (visible last frame)
+    std::uint32_t gpuLate         = 0; // newly visible, drawn by the late pass
+    std::uint32_t gpuCommands     = 0; // indirect commands written, all views
+    std::uint32_t geometryVertices = 0, geometryVertexCapacity = 0; // geometry pool use
+    std::uint32_t geometryIndices  = 0, geometryIndexCapacity  = 0;
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
     float         averageLuminance = 0.0f; // adapted scene luminance (auto exposure only)
 };
@@ -150,9 +178,13 @@ struct RenderOutput {
 
 // Per frame:
 //   (IBL regeneration if the sky changed, compute)
-//   cascaded shadow maps: depth-only per cascade, culled against each cascade
+//   GPU scene update: changed instances / draw records / batches (compute scatter)
+//   GPU culling (GPU path): frustum culling of every draw for the camera, cascades and local
+//     shadow views, instance batching, indirect commands (compute)
+//   cascaded shadow maps: depth-only per cascade (indirect draws, or CPU-culled draws)
 //   local light shadows: atlas tiles for the most important spot / point lights
-//   depth + view-normal prepass (frustum-culled per submesh)
+//   depth + view-normal prepass: early draws (visible last frame) -> Hi-Z -> late culling against
+//     it -> newly visible draws (GPU path with occlusion; CPU path: BVH-culled draws)
 //   GTAO + depth-aware denoise (compute)
 //   clustered light assignment (compute, 16 x 9 x 24 froxels)
 //   forward PBR pass (sun + cluster lights, depth test EQUAL, no overdraw) -> HDR target (RGBA16F)
@@ -178,6 +210,7 @@ public:
     LightSettings                         lights;
     LocalShadowSettings                   localShadows;
     SelectionOverlay                      overlay;
+    CullingSettings                       culling;
 
     // Picking (overlay.picking): the entity under pixel (x, y) of the output, top-left origin.
     // The answer arrives kFramesInFlight frames later: poll TakePickResult() every frame.
@@ -189,24 +222,26 @@ public:
     [[nodiscard]] const SpatialIndex&     Spatial() const { return m_Spatial; }
 
 private:
-    // One instantiated mesh this frame, shared by the shadow and main passes.
-    struct DrawItem {
-        Entity          entity = NullEntity;
-        const Model*    model = nullptr;
-        const Mesh*     mesh  = nullptr;
-        glm::mat4       world{1.0f};
-        VkDeviceAddress drawData = 0;
-        VkFrontFace     frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // A list of draw records for one view of the CPU path, uploaded as the pass's visible list.
+    struct DrawList {
+        std::vector<std::uint32_t> draws;
+        VkDeviceAddress            address = 0;
     };
 
     void EnsureTargets(VkExtent2D extent);
     void EnsureShadowMap();
-    static constexpr std::uint32_t kNoDrawItem = ~0u;
-    // Draw items (matrices uploaded once) are built on demand for meshes some view needs.
-    [[nodiscard]] std::uint32_t DrawItemFor(const SpatialIndex::MeshProxy& proxy);
-    void                        ResetDrawItems();
-    template <class Keep>
-    void GatherMeshes(const Frustum& frustum, std::vector<std::uint32_t>& out, Keep&& keep);
+    // CPU path: draws of the meshes the BVH finds in the frustum (+ within `sphere` if radius > 0).
+    void GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out);
+    void DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats);
+    void DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t cascade,
+                       const Pipeline& plain, const Pipeline& masked, std::uint32_t& drawCounter);
+    // GPU path: the indirect draws of a culled view.
+    void DrawGpuCamera(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress, std::uint32_t flags);
+    void DrawGpuShadow(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress, std::uint32_t cascade,
+                       const Pipeline& plain, const Pipeline& masked);
+    void CullGpu(VkCommandBuffer cmd, const CameraData& camera, const std::array<Cascade, kMaxCascades>& cascades,
+                 std::uint32_t cascadeCount, VkExtent2D extent);
+    [[nodiscard]] bool GpuPath() const;
     void CollectLights(Scene& scene, const Frustum& frustum);
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
@@ -216,15 +251,13 @@ private:
     void RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     void RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,
                        const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount);
-    void DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress, bool countStats);
-    void RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress,
-                       std::uint32_t frameIndex);
+    void RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress, std::uint32_t frameIndex);
     void EnsurePickingTarget(VkExtent2D extent);
     void ReleasePickingTarget();
     void ReadPick(const Scene& scene, std::uint32_t frameIndex);
     [[nodiscard]] std::pair<VkDeviceAddress, std::uint32_t> PushOutlineBits(); // address, word count
     void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
-    void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum, VkDeviceAddress frameAddress);
+    void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
@@ -269,11 +302,13 @@ private:
     std::vector<ImageView>                  m_ShadowViews;
     std::array<std::uint32_t, kMaxCascades> m_ShadowSlots{};
 
-    std::vector<DrawItem>      m_DrawItems;
-    std::vector<std::uint32_t> m_DrawItemOf;   // entity index -> draw item this frame
-    std::vector<std::uint32_t> m_CameraItems;  // prepass + lighting pass (same list, same order)
-    SpatialIndex               m_Spatial;
-    const Scene*               m_FrameScene = nullptr; // during Render only
+    SpatialIndex                m_Spatial;
+    std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
+    std::unique_ptr<GpuCulling> m_GpuCulling;
+    DrawList                    m_CameraDraws; // CPU path: prepass + lighting pass
+    bool                        m_GpuFrame = false; // this frame uses the GPU path
+    // Frozen culling (debug): camera of the moment `culling.freeze` was set.
+    std::optional<glm::mat4>    m_FrozenViewProj;
     // Picking: entity IDs, per-slot single-pixel readback.
     Image                                m_EntityIds;
     std::uint32_t                        m_EntityIdSlot = 0;
@@ -298,6 +333,7 @@ private:
         bool          render     = true; // not cached: draw this frame
         std::uint32_t cacheEntry = 0;
         std::uint32_t face       = 0;
+        std::uint32_t gpuView    = 0; // GPU path: culling view of this tile (render only)
     };
     // Shadow cache: each shadowed light keeps its atlas tiles (buddy allocator) across frames; a view
     // is re-rendered only when its matrix changes or a caster in the light's range changed.

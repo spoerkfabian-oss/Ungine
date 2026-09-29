@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// dst[indices[i]] = src[i] for elements of strideWords 32-bit words (GPU scene updates).
+// indices == 0: contiguous, element i goes to i. 2D dispatch for large uploads.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint u[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { uint u[]; };
+
+layout(push_constant) uniform ScatterPush {
+    Words src;
+    Words indices;
+    Out   dst;
+    uint  count;
+    uint  strideWords;
+    uint  useIndices;
+} pc;
+
+void main()
+{
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
+    if (i >= pc.count * pc.strideWords)
+        return;
+    const uint element = i / pc.strideWords;
+    const uint target  = pc.useIndices != 0u ? pc.indices.u[element] : element;
+    pc.dst.u[target * pc.strideWords + i % pc.strideWords] = pc.src.u[i];
+}

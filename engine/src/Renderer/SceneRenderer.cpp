@@ -1,4 +1,6 @@
 #include "Engine/Renderer/SceneRenderer.h"
+#include "GpuCulling.h"
+#include "GpuScene.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
 #include "Engine/Renderer/ShadowAtlas.h"
@@ -44,26 +46,25 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::uvec4 lightInfo;     // x: light count
     glm::uvec4 localShadowInfo;   // x: atlas slot, y: atlas size
     glm::vec4  localShadowParams; // x: normal bias (texels), y: PCF radius (texels)
+    glm::uvec4 hizInfo;           // xy: Hi-Z level 0 size, z: levels, w: debug level
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
     VkDeviceAddress shadowViews;
-};
-
-struct DrawData { // mirrors DrawData in mesh_common.glsl
-    glm::mat4     model;
-    glm::mat4     normalMatrix;
-    std::uint32_t entityId; // slot index + 1 (picking)
-    std::uint32_t pad[3];
+    VkDeviceAddress vertices;  // geometry pool
+    VkDeviceAddress materials;
+    VkDeviceAddress submeshes;
+    VkDeviceAddress instances; // GPU scene
+    VkDeviceAddress draws;
+    VkDeviceAddress hiz;
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
     VkDeviceAddress frame;
-    VkDeviceAddress vertices;
-    VkDeviceAddress materials;
-    VkDeviceAddress draw;
-    std::uint32_t   materialIndex;
+    VkDeviceAddress visible; // draw record per instance (gl_InstanceIndex)
     std::uint32_t   cascade;
+    std::uint32_t   flags;   // MESH_TINT_LATE
 };
+constexpr std::uint32_t kMeshTintLate = 1;
 static_assert(sizeof(MeshPush) <= kPushConstantSize);
 
 struct TonemapPush { // mirrors TonemapPush in tonemap.frag
@@ -206,6 +207,8 @@ const char* ToString(DebugView v)
     case DebugView::Normals:          return "Normals";
     case DebugView::LightClusters:    return "Light clusters";
     case DebugView::ShadowAtlas:      return "Shadow atlas";
+    case DebugView::HiZ:              return "Hi-Z";
+    case DebugView::Culling:          return "Culling (late = orange)";
     default:                          return "?";
     }
 }
@@ -315,10 +318,14 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
     for (Buffer& b : m_ExposureReadback)
         b = Buffer(ctx, {.size = 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .memory = MemoryUsage::Readback,
                          .debugName = "ExposureReadback"});
+    m_GpuScene   = std::make_unique<GpuScene>(renderer);
+    m_GpuCulling = std::make_unique<GpuCulling>(renderer);
 }
 
 SceneRenderer::~SceneRenderer()
 {
+    m_GpuCulling.reset();
+    m_GpuScene.reset();
     ReleaseTargets();
     ReleaseShadowMap();
     ReleaseShadowAtlas();
@@ -483,56 +490,152 @@ void SceneRenderer::ReleaseShadowAtlas()
     m_TileAllocator = {};
 }
 
-void SceneRenderer::ResetDrawItems()
+bool SceneRenderer::GpuPath() const
 {
-    for (const DrawItem& item : m_DrawItems)
-        m_DrawItemOf[EntityIndex(item.entity)] = kNoDrawItem;
-    m_DrawItems.clear();
+    return culling.gpuDriven;
 }
 
-std::uint32_t SceneRenderer::DrawItemFor(const SpatialIndex::MeshProxy& proxy)
+void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out)
 {
-    const std::uint32_t slot = EntityIndex(proxy.entity);
-    if (slot < m_DrawItemOf.size() && m_DrawItemOf[slot] != kNoDrawItem)
-        return m_DrawItemOf[slot];
-
-    const Registry&     registry = m_FrameScene->GetRegistry();
-    const MeshRenderer* renderer = registry.Valid(proxy.entity) ? registry.TryGet<MeshRenderer>(proxy.entity) : nullptr;
-    const Model*        model    = renderer ? m_Assets.Get(renderer->model) : nullptr; // released meanwhile
-    if (!model || renderer->meshIndex >= model->meshes.size())
-        return kNoDrawItem;
-
-    const glm::mat4& world  = registry.Get<WorldTransform>(proxy.entity).matrix;
-    const glm::mat3  linear = glm::mat3(world);
-    const DrawData   data{.model        = world,
-                          .normalMatrix = glm::mat4(glm::transpose(glm::inverse(linear))),
-                          .entityId     = slot + 1,
-                          .pad          = {}};
-    const auto index = static_cast<std::uint32_t>(m_DrawItems.size());
-    m_DrawItems.push_back({.entity    = proxy.entity,
-                           .model     = model,
-                           .mesh      = &model->meshes[renderer->meshIndex],
-                           .world     = world,
-                           .drawData  = m_Renderer.PushTransient(data, 16),
-                           // Mirrored transforms flip the winding (glTF: negative determinant).
-                           .frontFace = glm::determinant(linear) < 0.0f ? VK_FRONT_FACE_CLOCKWISE
-                                                                        : VK_FRONT_FACE_COUNTER_CLOCKWISE});
-    if (slot >= m_DrawItemOf.size())
-        m_DrawItemOf.resize(std::max<std::size_t>(slot + 1, m_DrawItemOf.size() * 2), kNoDrawItem);
-    m_DrawItemOf[slot] = index;
-    return index;
-}
-
-template <class Keep>
-void SceneRenderer::GatherMeshes(const Frustum& frustum, std::vector<std::uint32_t>& out, Keep&& keep)
-{
-    out.clear();
+    out.draws.clear();
+    out.address       = 0;
+    const bool  range = sphere.w > 0.0f;
+    const auto  near  = [&](const Aabb& box) {
+        const glm::vec3 closest = glm::clamp(glm::vec3(sphere), box.min, box.max);
+        return glm::dot(closest - glm::vec3(sphere), closest - glm::vec3(sphere)) <= sphere.w * sphere.w;
+    };
     m_Spatial.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& proxy) {
-        if (!keep(proxy))
+        if (range && !near(proxy.bounds))
             return;
-        if (const std::uint32_t item = DrawItemFor(proxy); item != kNoDrawItem)
-            out.push_back(item);
+        const GpuInstance* inst = m_GpuScene->FindInstance(proxy.entity);
+        if (!inst)
+            return; // model released meanwhile
+        // Whole meshes were culled by the BVH; multi-part meshes (and light ranges) also per submesh.
+        const bool perSubmesh = inst->drawCount > 1 || range;
+        for (std::uint32_t d = inst->firstDraw; d < inst->firstDraw + inst->drawCount; ++d) {
+            if (perSubmesh) {
+                const GpuSubmesh& sm  = m_GpuScene->DrawSubmesh(d);
+                const Aabb        box = TransformAabb({sm.boundsMin, sm.boundsMax}, inst->model);
+                if (!frustum.Intersects(box) || (range && !near(box)))
+                    continue;
+            }
+            out.draws.push_back(d);
+        }
     });
+    if (!out.draws.empty()) { // visible list of the pass: firstInstance = position in it
+        const TransientAllocation a = m_Renderer.AllocateTransient(out.draws.size() * sizeof(std::uint32_t), 16);
+        std::memcpy(a.cpu, out.draws.data(), out.draws.size() * sizeof(std::uint32_t));
+        out.address = a.gpu;
+    }
+    m_Stats.drawItems += static_cast<std::uint32_t>(out.draws.size());
+}
+
+void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats)
+{
+    if (list.draws.empty())
+        return;
+    const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
+    const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = 0, .flags = 0};
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+    std::uint32_t bucket = ~0u;
+    for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
+        const std::uint32_t d  = list.draws[i];
+        const GpuSubmesh&   sm = m_GpuScene->DrawSubmesh(d);
+        const std::uint32_t b  = m_GpuScene->Batch(m_GpuScene->Draw(d).batch).cameraBucket;
+        if (b != bucket) {
+            vkCmdSetCullMode(cmd, (b & 1u) != 0 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+            vkCmdSetFrontFace(cmd, (b & 2u) != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+            bucket = b;
+        }
+        vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, i);
+        if (countStats) {
+            ++m_Stats.drawCalls;
+            m_Stats.triangles += sm.indexCount / 3;
+        }
+    }
+}
+
+void SceneRenderer::DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress,
+                                  std::uint32_t cascade, const Pipeline& plain, const Pipeline& masked,
+                                  std::uint32_t& drawCounter)
+{
+    if (list.draws.empty())
+        return;
+    const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = cascade, .flags = 0};
+    vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+    VkPipeline bound = VK_NULL_HANDLE;
+    for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
+        const std::uint32_t d        = list.draws[i];
+        const GpuSubmesh&   sm       = m_GpuScene->DrawSubmesh(d);
+        const VkPipeline    pipeline = (sm.flags & kMaterialAlphaMask) != 0 ? masked.Handle() : plain.Handle();
+        if (pipeline != bound) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            bound = pipeline;
+        }
+        vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, i);
+        ++drawCounter;
+    }
+}
+
+void SceneRenderer::DrawGpuCamera(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress,
+                                  std::uint32_t flags)
+{
+    const MeshPush push{.frame = frameAddress, .visible = m_GpuCulling->VisibleAddress(), .cascade = 0, .flags = flags};
+    vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+    m_GpuCulling->Draw(cmd, view, kCameraBuckets, [&](std::uint32_t bucket) {
+        vkCmdSetCullMode(cmd, (bucket & 1u) != 0 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+        vkCmdSetFrontFace(cmd, (bucket & 2u) != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    });
+}
+
+void SceneRenderer::DrawGpuShadow(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress,
+                                  std::uint32_t cascade, const Pipeline& plain, const Pipeline& masked)
+{
+    const MeshPush push{.frame = frameAddress, .visible = m_GpuCulling->VisibleAddress(), .cascade = cascade, .flags = 0};
+    vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+    m_GpuCulling->Draw(cmd, view, kShadowBuckets, [&](std::uint32_t bucket) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bucket != 0 ? masked.Handle() : plain.Handle());
+    });
+}
+
+void SceneRenderer::CullGpu(VkCommandBuffer cmd, const CameraData& camera,
+                            const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount,
+                            VkExtent2D extent)
+{
+    const auto makeView = [](const glm::mat4& viewProj, bool clipNear, std::uint32_t flags) {
+        GpuCullView view;
+        view.viewProj = viewProj;
+        view.planes   = Frustum::FromViewProjection(viewProj, clipNear).Planes();
+        view.flags    = flags;
+        return view;
+    };
+    // Frozen culling keeps the camera of the moment it was switched on (the Hi-Z is kept too).
+    const glm::mat4 current = camera.projection * camera.view;
+    if (culling.freeze && !m_FrozenViewProj)
+        m_FrozenViewProj = current;
+    else if (!culling.freeze)
+        m_FrozenViewProj.reset();
+    const glm::mat4 cameraViewProj = m_FrozenViewProj.value_or(current);
+
+    std::vector<GpuCullView> views;
+    const std::uint32_t occlusion = culling.occlusion ? kCullViewOcclusion : 0u;
+    views.push_back(makeView(cameraViewProj, true, kCullViewCameraEarly | occlusion));
+    views.push_back(makeView(cameraViewProj, true, kCullViewCameraLate | kCullViewOcclusion));
+    for (std::uint32_t c = 0; c < cascadeCount; ++c) // casters towards the light stay (depth clamp)
+        views.push_back(makeView(cascades[c].viewProj, false, kCullViewShadow));
+    for (ShadowTile& tile : m_ShadowTiles) {
+        if (!tile.render)
+            continue;
+        tile.gpuView     = static_cast<std::uint32_t>(views.size());
+        GpuCullView view = makeView(tile.viewProj, true, kCullViewShadow | kCullViewSphere);
+        view.sphere      = glm::vec4(tile.lightPosition, tile.lightRange);
+        views.push_back(view);
+    }
+    m_GpuCulling->CullEarly(cmd, *m_GpuScene, views, extent);
 }
 
 const Pipeline& SceneRenderer::TonemapPipeline(VkFormat outputFormat)
@@ -567,6 +670,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     m_LastFrameTime       = now;
     ReadExposure(frame.frameIndex); // this slot's fence was waited on in BeginFrame
     ReadPick(scene, frame.frameIndex);
+    m_GpuCulling->ReadStats(frame.frameIndex);
 
     const VkExtent2D extent = output.extent;
     EnsureTargets(extent);
@@ -577,11 +681,14 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GpuScope scope(profiler, cmd, "Environment");
         m_Environment.Update(cmd, sky); // compute, only when the sky changed
     }
-    // Scene changes -> BVH; draw items of the last frame are gone (their transient memory too).
-    m_FrameScene = &scene;
+    // Scene changes -> BVH -> GPU scene (instances, draw records, batches: uploaded incrementally).
     m_Spatial.Sync(scene, m_Assets);
     m_Stats.cpuSpatialMs = m_Spatial.LastSync().milliseconds;
-    ResetDrawItems();
+    const auto sceneStart = std::chrono::steady_clock::now();
+    m_GpuScene->Update(scene, m_Spatial, m_Assets);
+    m_GpuScene->Upload(cmd);
+    m_Stats.cpuGpuSceneMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sceneStart).count();
+    m_GpuFrame = GpuPath();
 
     const std::uint32_t cascadeCount = shadows.enabled ? std::clamp(shadows.cascadeCount, 1u, kMaxCascades) : 0u;
     const auto          cascades     = ComputeCascades(camera, sky.sunDirection, shadows);
@@ -589,11 +696,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const glm::mat4 viewProj = camera.projection * camera.view;
     const Frustum   frustum  = Frustum::FromViewProjection(viewProj);
     const auto      cullStart = std::chrono::steady_clock::now();
-    GatherMeshes(frustum, m_CameraItems, [](const SpatialIndex::MeshProxy&) { return true; });
-    std::uint64_t visibleSubmeshes = 0;
-    for (std::uint32_t item : m_CameraItems)
-        visibleSubmeshes += m_DrawItems[item].mesh->submeshes.size();
-    m_Stats.culled = static_cast<std::uint32_t>(m_Spatial.SubmeshCount() - std::min(visibleSubmeshes, m_Spatial.SubmeshCount()));
+    if (!m_GpuFrame) {
+        GatherDraws(frustum, glm::vec4(0.0f), m_CameraDraws);
+        m_Stats.culled = static_cast<std::uint32_t>(m_Spatial.SubmeshCount() -
+                                                    std::min<std::uint64_t>(m_CameraDraws.draws.size(), m_Spatial.SubmeshCount()));
+    }
     CollectLights(scene, frustum);
     m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
@@ -637,9 +744,16 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .lightInfo       = glm::uvec4(static_cast<std::uint32_t>(m_Lights.size()), 0u, 0u, 0u),
           .localShadowInfo = glm::uvec4(m_ShadowAtlasSlot, m_ShadowAtlas ? m_ShadowAtlas.Extent().width : 0u, 0u, 0u),
           .localShadowParams = glm::vec4(localShadows.normalBias, localShadows.filterRadius, 0.0f, 0.0f),
+          .hizInfo         = glm::uvec4(m_GpuCulling->HiZSize(), m_GpuCulling->HiZLevels(), culling.hizDebugLevel),
           .lights          = lightAddress,
           .clusters        = m_Clusters.Address(),
-          .shadowViews     = shadowViewAddress};
+          .shadowViews     = shadowViewAddress,
+          .vertices        = m_Renderer.Geometry().Address(GeometryKind::Vertices),
+          .materials       = m_Renderer.Geometry().Address(GeometryKind::Materials),
+          .submeshes       = m_Renderer.Geometry().Address(GeometryKind::Submeshes),
+          .instances       = m_GpuScene->InstanceAddress(),
+          .draws           = m_GpuScene->DrawAddress(),
+          .hiz             = m_GpuCulling->HiZAddress()};
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
         uniforms.cascadeSplits[c]   = cascades[c].splitFar;
@@ -647,6 +761,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     }
     const VkDeviceAddress frameAddress = m_Renderer.PushTransient(uniforms);
 
+    if (m_GpuFrame) {
+        GpuScope scope(profiler, cmd, "GPU culling");
+        CullGpu(cmd, camera, cascades, cascadeCount, extent);
+    }
     if (cascadeCount > 0) {
         GpuScope scope(profiler, cmd, "Shadows");
         RenderShadows(cmd, frameAddress, cascades, cascadeCount);
@@ -658,7 +776,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
 
     {
         GpuScope scope(profiler, cmd, "Depth + normals");
-        RenderPrepass(cmd, extent, frustum, frameAddress, frame.frameIndex);
+        RenderPrepass(cmd, extent, frameAddress, frame.frameIndex);
     }
     if (ao.enabled) {
         GpuScope scope(profiler, cmd, "GTAO");
@@ -670,7 +788,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     }
     {
         GpuScope scope(profiler, cmd, "Lighting + sky");
-        RenderMain(cmd, extent, frustum, frameAddress);
+        RenderMain(cmd, extent, frameAddress);
     }
 
     // HDR -> sampled by bloom (compute) and tone mapping (fragment).
@@ -692,7 +810,31 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     } else
         m_Stats.exposure = post.exposure;
 
-    m_Stats.drawItems = static_cast<std::uint32_t>(m_DrawItems.size());
+    // Stats: GPU counters arrive kFramesInFlight frames late (read at the start of Render).
+    m_Stats.gpuDriven = m_GpuFrame;
+    m_Stats.instances = m_GpuScene->InstanceCount();
+    m_Stats.draws     = m_GpuScene->LiveDraws();
+    m_Stats.batches   = m_GpuScene->LiveBatches();
+    const PoolUsage vertexUse = m_Renderer.Geometry().Usage(GeometryKind::Vertices);
+    const PoolUsage indexUse  = m_Renderer.Geometry().Usage(GeometryKind::Indices);
+    m_Stats.geometryVertices  = vertexUse.used;
+    m_Stats.geometryVertexCapacity = vertexUse.capacity;
+    m_Stats.geometryIndices   = indexUse.used;
+    m_Stats.geometryIndexCapacity  = indexUse.capacity;
+    if (m_GpuFrame) {
+        const GpuCullStats& gpu  = m_GpuCulling->Stats();
+        m_GpuCulling->CopyStats(cmd, frame.frameIndex);
+        m_Stats.drawCalls        = m_GpuCulling->IndirectCalls();
+        m_Stats.culled           = gpu.frustum + gpu.occluded;
+        m_Stats.triangles        = gpu.triangles;
+        m_Stats.shadowDraws      = gpu.shadow;
+        m_Stats.gpuTested        = gpu.tested;
+        m_Stats.gpuFrustumCulled = gpu.frustum;
+        m_Stats.gpuOccluded      = gpu.occluded;
+        m_Stats.gpuEarly         = gpu.early;
+        m_Stats.gpuLate          = gpu.late;
+        m_Stats.gpuCommands      = gpu.commands;
+    }
 
     // --- Tone mapping into the swapchain image ---
     const auto& bindless  = m_Renderer.GetBindless();
@@ -928,7 +1070,6 @@ void SceneRenderer::AssignLocalShadows(const CameraData& camera)
 void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
 {
     const auto&            bindless  = m_Renderer.GetBindless();
-    const VkPipelineLayout layout    = bindless.PipelineLayout();
     const std::uint32_t    atlasSize = m_ShadowAtlas.Extent().width;
     constexpr VkPipelineStageFlags2 kDepthStages =
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -969,43 +1110,14 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
         const VkClearRect clearRect{rect, 0, 1};
         vkCmdClearAttachments(cmd, 1, &clear, 1, &clearRect);
 
-        const Frustum frustum = Frustum::FromViewProjection(tile.viewProj);
-        const float   rangeSq = tile.lightRange * tile.lightRange;
-        VkPipeline    bound   = VK_NULL_HANDLE;
-        const Model*  boundIndices = nullptr;
-        std::vector<std::uint32_t> items;
-        GatherMeshes(frustum, items, [&](const SpatialIndex::MeshProxy& proxy) {
-            const glm::vec3 closest = glm::clamp(tile.lightPosition, proxy.bounds.min, proxy.bounds.max);
-            return glm::dot(closest - tile.lightPosition, closest - tile.lightPosition) <= rangeSq;
-        });
-        for (std::uint32_t index : items) {
-            const DrawItem& item = m_DrawItems[index];
-            for (const Submesh& sm : item.mesh->submeshes) {
-                const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, item.world);
-                const glm::vec3 closest = glm::clamp(tile.lightPosition, box.min, box.max);
-                if (glm::dot(closest - tile.lightPosition, closest - tile.lightPosition) > rangeSq ||
-                    !frustum.Intersects(box))
-                    continue;
-                const bool       masked   = (item.model->materialFlags[sm.material] & kMaterialAlphaMask) != 0;
-                const VkPipeline pipeline = masked ? m_LocalShadowMasked.Handle() : m_LocalShadow.Handle();
-                if (pipeline != bound) {
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                    bound = pipeline;
-                }
-                if (item.model != boundIndices) {
-                    vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
-                    boundIndices = item.model;
-                }
-                const MeshPush push{.frame         = frameAddress,
-                                    .vertices      = item.model->vertexBuffer.Address(),
-                                    .materials     = item.model->materialBuffer.Address(),
-                                    .draw          = item.drawData,
-                                    .materialIndex = sm.material,
-                                    .cascade       = kMaxCascades + t}; // shadow.vert: local view t
-                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-                vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
-                ++m_Stats.localShadowDraws;
-            }
+        const std::uint32_t cascade = kMaxCascades + t; // shadow.vert: local view t
+        if (m_GpuFrame) {
+            DrawGpuShadow(cmd, tile.gpuView, frameAddress, cascade, m_LocalShadow, m_LocalShadowMasked);
+            m_Stats.localShadowDraws += kShadowBuckets; // indirect multi-draws
+        } else {
+            DrawList list;
+            GatherDraws(Frustum::FromViewProjection(tile.viewProj), glm::vec4(tile.lightPosition, tile.lightRange), list);
+            DrawCpuShadow(cmd, list, frameAddress, cascade, m_LocalShadow, m_LocalShadowMasked, m_Stats.localShadowDraws);
         }
     }
     vkCmdEndRendering(cmd);
@@ -1087,7 +1199,6 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
                                   const std::array<Cascade, kMaxCascades>& cascades, std::uint32_t cascadeCount)
 {
     const auto&            bindless   = m_Renderer.GetBindless();
-    const VkPipelineLayout layout     = bindless.PipelineLayout();
     const std::uint32_t    resolution = m_ShadowMap.Extent().width;
     constexpr VkPipelineStageFlags2 kDepthStages =
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -1117,36 +1228,12 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
         vkCmdSetDepthBias(cmd, -shadows.depthBias, 0.0f, -shadows.slopeBias); // reverse-Z: away from the light
 
         // Casters between the light and the cascade stay (clamped onto its near plane).
-        const Frustum frustum      = Frustum::FromViewProjection(cascades[c].viewProj, false);
-        VkPipeline    bound        = VK_NULL_HANDLE;
-        const Model*  boundIndices = nullptr;
-        std::vector<std::uint32_t> items;
-        GatherMeshes(frustum, items, [](const SpatialIndex::MeshProxy&) { return true; });
-        for (std::uint32_t index : items) {
-            const DrawItem& item = m_DrawItems[index];
-            for (const Submesh& sm : item.mesh->submeshes) {
-                if (!frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world)))
-                    continue;
-                const bool       masked   = (item.model->materialFlags[sm.material] & kMaterialAlphaMask) != 0;
-                const VkPipeline pipeline = masked ? m_ShadowMasked.Handle() : m_Shadow.Handle();
-                if (pipeline != bound) {
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                    bound = pipeline;
-                }
-                if (item.model != boundIndices) {
-                    vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
-                    boundIndices = item.model;
-                }
-                const MeshPush push{.frame         = frameAddress,
-                                    .vertices      = item.model->vertexBuffer.Address(),
-                                    .materials     = item.model->materialBuffer.Address(),
-                                    .draw          = item.drawData,
-                                    .materialIndex = sm.material,
-                                    .cascade       = c};
-                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-                vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
-                ++m_Stats.shadowDraws;
-            }
+        if (m_GpuFrame) {
+            DrawGpuShadow(cmd, kCameraLateView + 1 + c, frameAddress, c, m_Shadow, m_ShadowMasked);
+        } else {
+            DrawList list;
+            GatherDraws(Frustum::FromViewProjection(cascades[c].viewProj, false), glm::vec4(0.0f), list);
+            DrawCpuShadow(cmd, list, frameAddress, c, m_Shadow, m_ShadowMasked, m_Stats.shadowDraws);
         }
         vkCmdEndRendering(cmd);
     }
@@ -1159,57 +1246,6 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
                           .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                           .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
-}
-
-void SceneRenderer::DrawVisible(VkCommandBuffer cmd, const Frustum& frustum, VkDeviceAddress frameAddress,
-                                bool countStats)
-{
-    // Same culling and draw order in the prepass and the lighting pass (depth EQUAL relies on it).
-    const VkPipelineLayout layout     = m_Renderer.GetBindless().PipelineLayout();
-    const Model*           boundModel = nullptr;
-    VkCullModeFlags        cullMode   = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
-    VkFrontFace            frontFace  = VK_FRONT_FACE_MAX_ENUM;
-
-    for (std::uint32_t index : m_CameraItems) {
-        const DrawItem& item = m_DrawItems[index];
-        for (const Submesh& sm : item.mesh->submeshes) {
-            // Whole meshes were culled by the BVH; multi-part meshes also per submesh.
-            if (item.mesh->submeshes.size() > 1 &&
-                !frustum.Intersects(TransformAabb({sm.boundsMin, sm.boundsMax}, item.world))) {
-                m_Stats.culled += countStats ? 1u : 0u;
-                continue;
-            }
-            if (item.model != boundModel) {
-                vkCmdBindIndexBuffer(cmd, item.model->indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
-                boundModel = item.model;
-            }
-
-            const bool doubleSided     = (item.model->materialFlags[sm.material] & kMaterialDoubleSided) != 0;
-            const VkCullModeFlags cull = doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
-            if (cull != cullMode) {
-                vkCmdSetCullMode(cmd, cull);
-                cullMode = cull;
-            }
-            if (item.frontFace != frontFace) {
-                vkCmdSetFrontFace(cmd, item.frontFace);
-                frontFace = item.frontFace;
-            }
-
-            const MeshPush push{.frame         = frameAddress,
-                                .vertices      = item.model->vertexBuffer.Address(),
-                                .materials     = item.model->materialBuffer.Address(),
-                                .draw          = item.drawData,
-                                .materialIndex = sm.material,
-                                .cascade       = 0};
-            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-            vkCmdDrawIndexed(cmd, sm.indexCount, 1, sm.firstIndex, sm.vertexOffset, 0);
-
-            if (countStats) {
-                ++m_Stats.drawCalls;
-                m_Stats.triangles += sm.indexCount / 3;
-            }
-        }
-    }
 }
 
 void SceneRenderer::EnsurePickingTarget(VkExtent2D extent)
@@ -1271,8 +1307,8 @@ std::pair<VkDeviceAddress, std::uint32_t> SceneRenderer::PushOutlineBits()
     return {a.gpu, static_cast<std::uint32_t>(words.size())};
 }
 
-void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum,
-                                  VkDeviceAddress frameAddress, std::uint32_t frameIndex)
+void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress,
+                                  std::uint32_t frameIndex)
 {
     // Depth is shared by all frames in flight: earlier frames' tests, GTAO and denoise may still use it.
     constexpr VkPipelineStageFlags2 kDepthStages =
@@ -1316,12 +1352,67 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, const 
     auto depth = Attachment(m_Depth.View(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
     depth.clearValue.depthStencil = {0.0f, 0}; // reverse-Z: far = 0
 
-    BeginRendering(cmd, extent, colors.data(), &depth, picking ? 2u : 1u);
-    m_Renderer.GetBindless().Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-    SetViewportScissor(cmd, extent);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, picking ? m_PrepassPicking.Handle() : m_Prepass.Handle());
-    DrawVisible(cmd, frustum, frameAddress, false);
-    vkCmdEndRendering(cmd);
+    const auto drawPass = [&](auto&& draw) {
+        BeginRendering(cmd, extent, colors.data(), &depth, picking ? 2u : 1u);
+        m_Renderer.GetBindless().Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        SetViewportScissor(cmd, extent);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, picking ? m_PrepassPicking.Handle() : m_Prepass.Handle());
+        draw();
+        vkCmdEndRendering(cmd);
+    };
+    if (!m_GpuFrame) {
+        drawPass([&] { DrawCpuCamera(cmd, m_CameraDraws, frameAddress, false); });
+    } else {
+        // Early: what was visible last frame (or everything in the frustum without occlusion culling).
+        drawPass([&] { DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0); });
+        if (culling.occlusion) {
+            // Hi-Z of the early depth -> late culling -> draws that became visible, on top.
+            CmdImageBarrier(cmd, {.image     = m_Depth.Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                  .newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+                                  .srcStage  = kDepthStages,
+                                  .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                  .dstStage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                  .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
+            m_GpuCulling->BuildHiZ(cmd, m_DepthSlot, extent, culling.freeze);
+            m_GpuCulling->CullLate(cmd);
+            const std::array<VkImageMemoryBarrier2, 3> resume{
+                MakeImageBarrier({.image     = m_Depth.Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+                                  .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                  .srcStage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  .dstStage  = kDepthStages,
+                                  .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                               VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                  .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT}),
+                MakeImageBarrier({.image     = m_Normals.Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                  .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT}),
+                MakeImageBarrier({.image     = picking ? m_EntityIds.Handle() : m_Normals.Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                  .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT})};
+            VkDependencyInfo resumeDep{};
+            resumeDep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            resumeDep.imageMemoryBarrierCount = picking ? 3u : 2u;
+            resumeDep.pImageMemoryBarriers    = resume.data();
+            vkCmdPipelineBarrier2(cmd, &resumeDep);
+            for (VkRenderingAttachmentInfo& color : colors)
+                color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            drawPass([&] { DrawGpuCamera(cmd, kCameraLateView, frameAddress, 0); });
+        }
+    }
 
     if (picking) {
         // Requested pixel -> this slot's readback buffer (read when the slot comes around again).
@@ -1439,8 +1530,7 @@ void SceneRenderer::RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D exten
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
 
-void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, const Frustum& frustum,
-                               VkDeviceAddress frameAddress)
+void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress)
 {
     const auto&            bindless = m_Renderer.GetBindless();
     const VkPipelineLayout layout   = bindless.PipelineLayout();
@@ -1463,7 +1553,13 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, const Fru
     bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     SetViewportScissor(cmd, extent);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Mesh.Handle());
-    DrawVisible(cmd, frustum, frameAddress, true);
+    if (m_GpuFrame) {
+        DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0);
+        if (culling.occlusion)
+            DrawGpuCamera(cmd, kCameraLateView, frameAddress, post.debugView == DebugView::Culling ? kMeshTintLate : 0u);
+    } else {
+        DrawCpuCamera(cmd, m_CameraDraws, frameAddress, true);
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);

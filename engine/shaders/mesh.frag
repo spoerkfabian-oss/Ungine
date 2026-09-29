@@ -11,6 +11,7 @@ layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inTangent;
+layout(location = 4) flat in uint inMaterial;
 
 layout(location = 0) out vec4 outColor;
 
@@ -26,7 +27,7 @@ vec3 DirectBrdf(vec3 N, vec3 V, vec3 L, float NdotV, float NdotL, vec3 cDiff, ve
 
 void main()
 {
-    const Material m    = pc.materials.m[pc.materialIndex];
+    const Material m    = pc.frame.materials.m[inMaterial];
     const vec4     base = m.baseColorFactor * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV);
 
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u && base.a < m.alphaCutoff)
@@ -118,5 +119,7 @@ void main()
         const vec3 tint[4] = vec3[](vec3(1.0, 0.3, 0.3), vec3(0.3, 1.0, 0.3), vec3(0.3, 0.3, 1.0), vec3(1.0, 1.0, 0.3));
         color *= tint[cascade];
     }
+    if ((pc.flags & MESH_TINT_LATE) != 0u) // culling debug view: found by the occlusion (late) pass
+        color = color * vec3(0.4, 0.25, 0.1) + vec3(0.6, 0.25, 0.02) * frame.sky.x;
     outColor = vec4(color, 1.0);
 }

@@ -25,10 +25,11 @@ class Sandbox final : public Engine::Application {
 public:
     // exitAfterFrames > 0: close that many frames after the model finished loading (smoke tests).
     Sandbox(const Engine::ApplicationDesc& desc, std::filesystem::path modelPath, std::uint32_t exitAfterFrames,
-            bool startWithEditor, std::uint32_t lightCount, std::uint32_t instanceCount, std::uint32_t physicsCount)
+            bool startWithEditor, std::uint32_t lightCount, std::uint32_t instanceCount, std::uint32_t physicsCount,
+            bool cpuCulling)
         : Application(desc), m_ModelPath(std::move(modelPath)), m_ExitAfterFrames(exitAfterFrames),
           m_StartWithEditor(startWithEditor), m_DemoLightCount(lightCount), m_InstanceCount(instanceCount),
-          m_StartBodies(physicsCount)
+          m_StartBodies(physicsCount), m_CpuCulling(cpuCulling)
     {
         m_KeySub = GetEvents().Subscribe<Engine::KeyEvent>([this](const Engine::KeyEvent& e) {
             // Escape leaves an editor text field first.
@@ -39,11 +40,15 @@ public:
     }
 
     [[nodiscard]] bool LoadFailed() const { return m_LoadFailed; }
+    void SetStartDebugView(std::uint32_t view) { m_StartDebugView = view; } // --debug-view N (Engine::DebugView)
 
 protected:
     void OnInit() override
     {
         m_SceneRenderer = std::make_unique<Engine::SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
+        m_SceneRenderer->culling.gpuDriven = !m_CpuCulling;
+        m_SceneRenderer->post.debugView =
+            static_cast<Engine::DebugView>(std::min(m_StartDebugView, static_cast<std::uint32_t>(Engine::DebugView::Count) - 1));
         m_Physics       = std::make_unique<Engine::PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
         m_CollisionSub  = GetEvents().Subscribe<Engine::CollisionEvent>([this](const Engine::CollisionEvent& e) {
             m_Collisions += e.begin ? 1u : 0u;
@@ -104,13 +109,17 @@ protected:
             const char* status = m_LoadFailed ? " | load failed" : (m_LoadDone ? "" : " | loading...");
             const auto& phys = m_Physics->Stats();
             GetWindow().SetTitle(std::format(
-                "Sandbox | {} FPS | {:.2f} ms | {} draws ({} culled, {} shadow) | {} tris | {}/{} lights | "
+                "Sandbox | {} FPS | {:.2f} ms | {} | {} draws ({} culled, {} shadow) | {} tris | {}/{} lights | "
                 "phys {} ({} active) {:.2f} ms, {} hits | "
-                "cpu xf {:.2f} bvh {:.2f} cull {:.2f} ms | {} x{:.2f}{}{}{} | debug {}{}",
-                m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount, stats.drawCalls, stats.culled, stats.shadowDraws,
+                "cpu xf {:.2f} bvh {:.2f} scene {:.2f} cull {:.2f} ms | {} x{:.2f}{}{}{} | debug {}{}",
+                m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount,
+                stats.gpuDriven ? std::format("gpu {} inst / {} batches, {} occl.", stats.instances, stats.batches,
+                                              stats.gpuOccluded)
+                                : std::string("cpu culling"),
+                stats.drawCalls, stats.culled, stats.shadowDraws,
                 stats.triangles, stats.lights, stats.lightsTotal, phys.bodies, phys.activeBodies, phys.stepMs,
                 std::exchange(m_Collisions, 0u), m_Scene.FrameTransformUpdate().milliseconds,
-                stats.cpuSpatialMs, stats.cpuCullingMs, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
+                stats.cpuSpatialMs, stats.cpuGpuSceneMs, stats.cpuCullingMs, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
                 post.bloom ? " | bloom" : "", m_SceneRenderer->ao.enabled ? " | AO" : "",
                 Engine::ToString(post.debugView), status));
             m_FpsTimer   = 0.0;
@@ -407,7 +416,7 @@ private:
 
     // T: next tone mapper, -/=: exposure (compensation with auto exposure), X: auto exposure,
     // B: bloom, P: shadows, C: cascade colors, O: ambient occlusion, V: debug view (AO, normals, light
-    // clusters), L: light stress demo,
+    // clusters, shadow atlas, Hi-Z, culling), K: GPU-driven / CPU culling, L: light stress demo,
     // arrow keys: rotate the sun (regenerates the IBL maps).
     void UpdateLookControls(float dt)
     {
@@ -426,6 +435,8 @@ private:
             post.bloom = !post.bloom;
         if (input.WasKeyPressed(Engine::Key::X))
             post.autoExposure = !post.autoExposure;
+        if (input.WasKeyPressed(Engine::Key::K)) // GPU-driven culling <-> CPU culling
+            m_SceneRenderer->culling.gpuDriven = !m_SceneRenderer->culling.gpuDriven;
         if (input.WasKeyPressed(Engine::Key::V)) {
             const auto next = (static_cast<std::uint32_t>(post.debugView) + 1) %
                               static_cast<std::uint32_t>(Engine::DebugView::Count);
@@ -545,6 +556,8 @@ private:
     std::uint32_t                          m_Collisions = 0; // Begin events since the last title update
     static constexpr float                 kDemoBodySize = 0.35f;
     std::uint32_t                          m_StartBodies   = 0; // --physics
+    bool                                   m_CpuCulling    = false; // --cpu-culling
+    std::uint32_t                          m_StartDebugView = 0;    // --debug-view
     std::uint32_t                          m_BodiesDropped = 0;
     Engine::Entity                         m_BodyRoot      = Engine::NullEntity;
     std::array<Engine::ModelHandle, 16>    m_DemoModels{}; // shape x color
@@ -567,13 +580,15 @@ private:
 
 int main(int argc, char** argv)
 {
-    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N]
+    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N] [--cpu-culling] [--debug-view N]
     std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
     bool                  editor    = false;
     std::uint32_t         lights    = 0;
     std::uint32_t         instances = 0;
     std::uint32_t         bodies    = 0;
+    bool                  cpuCulling = false;
+    std::uint32_t         debugView  = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--frames" && i + 1 < argc)
@@ -586,11 +601,15 @@ int main(int argc, char** argv)
             instances = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (arg == "--physics" && i + 1 < argc)
             bodies = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--cpu-culling")
+            cpuCulling = true;
+        else if (arg == "--debug-view" && i + 1 < argc)
+            debugView = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else
             modelPath = arg;
     }
     if (!std::filesystem::exists(modelPath)) {
-        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N]",
+        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N] [--cpu-culling] [--debug-view N]",
                      modelPath.string());
         return 1;
     }
@@ -599,7 +618,8 @@ int main(int argc, char** argv)
     bool loadFailed = false;
     try {
         Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames, editor, lights, instances,
-                    bodies);
+                    bodies, cpuCulling);
+        app.SetStartDebugView(debugView);
         app.Run();
         loadFailed = app.LoadFailed();
     } catch (const std::exception& e) {

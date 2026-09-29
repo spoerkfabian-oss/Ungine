@@ -10,6 +10,8 @@ layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inTangent;
+layout(location = 4) flat in uint inMaterial;
+layout(location = 5) flat in uint inEntity;
 
 layout(location = 0) out vec4 outNormal; // view space, [-1, 1]
 #ifdef WRITE_ENTITY_ID
@@ -19,7 +21,7 @@ layout(location = 1) out uint outEntity; // entity slot index + 1, 0 = nothing (
 // Depth + normal prepass: everything screen-space effects need before the lighting pass.
 void main()
 {
-    const Material m = pc.materials.m[pc.materialIndex];
+    const Material m = pc.frame.materials.m[inMaterial];
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u) {
         const float alpha = m.baseColorFactor.a * SampleTexture(m.baseColorTexture, m.samplerIndex, inUV).a;
         if (alpha < m.alphaCutoff)
@@ -28,7 +30,7 @@ void main()
     const vec3 N = PerturbedNormal(m, SurfaceFrame(inNormal, inTangent, inWorldPos, inUV), inUV);
     outNormal    = vec4(normalize(mat3(pc.frame.view) * N), 0.0);
 #ifdef WRITE_ENTITY_ID
-    outEntity = pc.draw.entityId;
+    outEntity = inEntity;
 #endif
 }
 

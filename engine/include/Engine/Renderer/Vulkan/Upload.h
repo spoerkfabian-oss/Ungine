@@ -51,6 +51,9 @@ public:
     [[nodiscard]] Buffer CreateBuffer(std::span<const std::byte> data, VkBufferUsageFlags usage,
                                       UploadTicket& ticket, const char* debugName = nullptr);
     [[nodiscard]] Image  CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket);
+    // Writes into part of an existing buffer created with BufferDesc::concurrent (no ownership
+    // transfer: the frame's wait on the upload timeline makes the data visible).
+    void WriteBuffer(VkBuffer dst, VkDeviceSize dstOffset, std::span<const std::byte> data, UploadTicket& ticket);
 
     // True once the graphics-side acquire has been recorded into a frame: usable in that
     // frame's commands and every later graphics submission.
@@ -75,7 +78,7 @@ public:
 private:
     struct PendingAcquire {
         VkBuffer      buffer    = VK_NULL_HANDLE; // either a buffer ...
-        VkImage       image     = VK_NULL_HANDLE; // ... or an image (mip 0 uploaded)
+        VkImage       image     = VK_NULL_HANDLE; // ... or an image (mip 0 uploaded); neither: no barriers
         VkExtent2D    extent{};
         std::uint32_t mipLevels = 1;
     };

@@ -1,6 +1,7 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/ECS/Entity.h"
+#include "Engine/Renderer/GeometryPool.h"
 #include "Engine/Renderer/Vulkan/Buffer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
 #include "Engine/Renderer/Vulkan/Upload.h"
@@ -40,6 +41,7 @@ struct Submesh {
 struct Mesh {
     std::string          name;
     std::vector<Submesh> submeshes;
+    std::uint32_t        firstGpuSubmesh = 0; // Model: index of submeshes[0] in the geometry pool's submesh records
 };
 
 // Nodes are stored parents-before-children (topological order).
@@ -112,16 +114,31 @@ struct GpuMaterial {
 };
 static_assert(sizeof(GpuMaterial) == 80);
 
+// Submesh record in the geometry pool (GPU culling and indirect draws), mirrors GpuSubmesh in
+// scene_common.glsl. Offsets are absolute pool indices.
+struct GpuSubmesh {
+    std::uint32_t firstIndex   = 0;
+    std::uint32_t indexCount   = 0;
+    std::int32_t  vertexOffset = 0;
+    std::uint32_t material     = 0;
+    glm::vec3     boundsMin{0.0f}; // object space
+    std::uint32_t flags = 0;       // material flags (kMaterial*)
+    glm::vec3     boundsMax{0.0f};
+    std::uint32_t pad = 0;
+};
+static_assert(sizeof(GpuSubmesh) == 48);
+
 inline constexpr std::uint32_t kMaterialAlphaMask   = 1u << 0;
 inline constexpr std::uint32_t kMaterialDoubleSided = 1u << 1;
 inline constexpr std::uint32_t kMaterialAlphaBlend  = 1u << 2;
 
-// GPU-resident model: one vertex/index/material buffer for all meshes.
+// GPU-resident model: its geometry lives in ranges of the renderer's GeometryPool.
 struct Model {
     std::string                name;
-    Buffer                     vertexBuffer;
-    Buffer                     indexBuffer;
-    Buffer                     materialBuffer;
+    PoolRange                  vertices;  // Submesh::vertexOffset is relative to vertices.offset
+    PoolRange                  indices;   // Submesh::firstIndex is relative to indices.offset
+    PoolRange                  materials; // Submesh::material is relative to materials.offset
+    PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
     std::vector<Image>         textures;
     std::vector<std::uint32_t> bindlessTextures;
     std::vector<std::uint32_t> materialFlags; // CPU copy for pipeline selection

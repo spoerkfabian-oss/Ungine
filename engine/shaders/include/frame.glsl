@@ -3,6 +3,7 @@
 // Requires: #extension GL_EXT_buffer_reference : require
 // Mirrors Engine::FrameUniforms (SceneRenderer.cpp).
 #include "lights.glsl"
+#include "scene_common.glsl"
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer FrameData {
     mat4  viewProj;
@@ -34,9 +35,18 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     uvec4         localShadowInfo;   // x: atlas slot, y: atlas size (texels)
     vec4          localShadowParams; // x: normal bias (texels), y: PCF radius (texels)
 
+    // GPU-driven culling
+    uvec4 hizInfo;  // xy: level 0 size, z: level count (0 = no pyramid), w: debug view level
+
     LightBuffer      lights;
     ClusterBuffer    clusters;
     ShadowViewBuffer shadowViews;
+    VertexBuffer     vertices;  // geometry pool
+    MaterialBuffer   materials; // geometry pool
+    SubmeshBuffer    submeshes; // geometry pool
+    InstanceBuffer   instances; // GPU scene
+    DrawBuffer       draws;     // GPU scene
+    HiZBuffer        hiz;
 };
 
 #endif

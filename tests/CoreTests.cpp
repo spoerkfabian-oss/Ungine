@@ -5,6 +5,7 @@
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Renderer/RangeAllocator.h"
 #include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/ShadowCascades.h"
 #include "Engine/Scene/Camera.h"
@@ -889,4 +890,33 @@ TEST_CASE(SceneSerializer_PhysicsComponents)
     r.Get<RigidBody>(e).mass = 9.0f;
     ApplyEntityState(scene, e, state);
     CHECK(r.Has<Collider>(e) && r.Get<Collider>(e) == c && r.Get<RigidBody>(e).mass == 3.0f);
+}
+
+TEST_CASE(RangeAllocator_FirstFitMergeGrow)
+{
+    RangeAllocator ranges(100);
+    const auto a = ranges.Allocate(30);
+    const auto b = ranges.Allocate(30);
+    const auto c = ranges.Allocate(30);
+    CHECK(a == 0u && b == 30u && c == 60u && ranges.Used() == 90);
+    CHECK(!ranges.Allocate(11).has_value() && ranges.LargestFree() == 10);
+
+    // Freeing the middle leaves a hole reused first-fit; freeing the neighbors merges everything.
+    ranges.Free(*b, 30);
+    CHECK(ranges.Allocate(20) == 30u); // [30, 50) from the hole, [50, 60) left
+    CHECK(ranges.FreeBlocks() == 2);
+    ranges.Free(30, 20);
+    ranges.Free(*a, 30);
+    CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 60); // [0, 60) + [90, 100)
+    ranges.Free(*c, 30);
+    CHECK(ranges.FreeBlocks() == 1 && ranges.LargestFree() == 100 && ranges.Used() == 0);
+
+    // Growing appends free space and merges with a free tail.
+    CHECK(ranges.Allocate(100) == 0u && !ranges.Allocate(1).has_value());
+    ranges.Grow(150);
+    CHECK(ranges.Capacity() == 150 && ranges.Used() == 100 && ranges.Allocate(50) == 100u);
+    ranges.Free(0, 100);
+    ranges.Grow(200);
+    CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 100); // [0, 100) and [150, 200)
+    CHECK(!ranges.Allocate(0).has_value());
 }

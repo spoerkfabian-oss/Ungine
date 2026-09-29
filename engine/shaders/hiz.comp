@@ -1,0 +1,38 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+
+// One Hi-Z level: min (reverse-Z: farthest) depth of 2 x 2 texels of the level below, or of the
+// depth target for level 0. Odd sizes round up; the last row / column is clamped (conservative).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Src { float d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Dst { float d[]; };
+
+layout(push_constant) uniform HiZPush {
+    Src   src;       // previous level (unused for level 0)
+    Dst   dst;
+    uvec2 srcSize;
+    uvec2 dstSize;
+    uint  depthSlot; // level 0: bindless depth texture
+    uint  fromDepth;
+} pc;
+
+float Load(uvec2 p)
+{
+    if (pc.fromDepth != 0u)
+        return texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depthSlot)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                          ivec2(p), 0).r;
+    return pc.src.d[p.y * pc.srcSize.x + p.x];
+}
+
+void main()
+{
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, pc.dstSize)))
+        return;
+    const uvec2 a = min(p * 2u, pc.srcSize - 1u);
+    const uvec2 b = min(p * 2u + 1u, pc.srcSize - 1u);
+    pc.dst.d[p.y * pc.dstSize.x + p.x] = min(min(Load(a), Load(uvec2(b.x, a.y))), min(Load(uvec2(a.x, b.y)), Load(b)));
+}

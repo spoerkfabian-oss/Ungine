@@ -88,13 +88,14 @@ void VulkanContext::SelectPhysicalDevice()
     f12.shaderStorageImageArrayNonUniformIndexing    = VK_TRUE;
     f12.timelineSemaphore                            = VK_TRUE; // async transfer sync
     f12.hostQueryReset                               = VK_TRUE; // GPU timers for ImGui stats
+    f12.drawIndirectCount                            = VK_TRUE; // GPU-driven draws (count from the culling pass)
 
     VkPhysicalDeviceFeatures f10{};
     f10.samplerAnisotropy         = VK_TRUE;
     f10.depthClamp                = VK_TRUE; // CSM: avoid near-plane clipping of casters
     f10.fillModeNonSolid          = VK_TRUE; // wireframe debug view
-    f10.multiDrawIndirect         = VK_TRUE; // GPU-driven culling later
-    f10.drawIndirectFirstInstance = VK_TRUE;
+    f10.multiDrawIndirect         = VK_TRUE; // GPU-driven rendering
+    f10.drawIndirectFirstInstance = VK_TRUE; // firstInstance = offset into the visible instance list
 
     vkb::PhysicalDeviceSelector selector{m_Instance};
     m_PhysicalDevice = Expect(selector.set_minimum_version(1, 3)

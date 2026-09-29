@@ -15,6 +15,7 @@ void SpatialIndex::Sync(Scene& scene, const AssetManager& assets)
     const auto start = std::chrono::steady_clock::now();
     m_LastSync       = {};
     m_ChangedRegions.clear();
+    m_MeshUpdates.clear();
 
     SceneChanges changes = scene.TakeChanges();
     if (!m_Initialized || changes.overflow) {
@@ -63,6 +64,7 @@ void SpatialIndex::Rebuild(Scene& scene, const AssetManager& assets)
 
 void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity entity)
 {
+    m_MeshUpdates.push_back(entity);
     const Registry&     registry = scene.GetRegistry();
     const MeshRenderer* renderer = registry.Valid(entity) ? registry.TryGet<MeshRenderer>(entity) : nullptr;
     const Model*        model    = renderer ? assets.Get(renderer->model) : nullptr;
@@ -121,6 +123,7 @@ void SpatialIndex::RemoveMesh(Entity entity)
     const auto it = m_MeshIndex.find(Key(entity));
     if (it == m_MeshIndex.end())
         return;
+    m_MeshUpdates.push_back(entity);
     const std::uint32_t index = it->second;
     m_MeshIndex.erase(it);
     MeshProxy& proxy = m_Meshes[index];
@@ -194,6 +197,12 @@ std::optional<RayHit> SpatialIndex::Raycast(const glm::vec3& origin, const glm::
         return t; // only closer hits from here on
     });
     return best;
+}
+
+const SpatialIndex::MeshProxy* SpatialIndex::FindMesh(Entity entity) const
+{
+    const auto it = m_MeshIndex.find(Key(entity));
+    return it != m_MeshIndex.end() ? &m_Meshes[it->second] : nullptr;
 }
 
 std::optional<Aabb> SpatialIndex::Bounds(Entity entity) const

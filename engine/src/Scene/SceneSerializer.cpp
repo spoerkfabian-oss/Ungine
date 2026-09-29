@@ -360,6 +360,7 @@ json RendererToJson(const SceneRenderer& sr)
          {{"enabled", ls.enabled}, {"atlasSize", ls.atlasSize}, {"maxLights", ls.maxLights},
           {"maxTileSize", ls.maxTileSize}, {"minTileSize", ls.minTileSize}, {"depthBias", ls.depthBias},
           {"slopeBias", ls.slopeBias}, {"normalBias", ls.normalBias}, {"filterRadius", ls.filterRadius}}},
+        {"culling", {{"gpuDriven", sr.culling.gpuDriven}, {"occlusion", sr.culling.occlusion}}}, // no debug state
     };
 }
 
@@ -423,6 +424,10 @@ void RendererFromJson(const json& j, SceneRenderer& sr)
         Read(*it, "slopeBias", ls.slopeBias);
         Read(*it, "normalBias", ls.normalBias);
         Read(*it, "filterRadius", ls.filterRadius);
+    }
+    if (const auto it = j.find("culling"); it != j.end()) {
+        Read(*it, "gpuDriven", sr.culling.gpuDriven);
+        Read(*it, "occlusion", sr.culling.occlusion);
     }
 }
 

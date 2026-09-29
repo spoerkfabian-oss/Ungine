@@ -23,6 +23,8 @@ public:
 
     // False only if the box is completely outside one plane (may keep some invisible boxes).
     [[nodiscard]] bool Intersects(const Aabb& box) const;
+    // dot(xyz, p) + w >= 0 inside (not normalized). An unused near plane is (0, 0, 0, 1).
+    [[nodiscard]] const std::array<glm::vec4, 6>& Planes() const { return m_Planes; }
 
 private:
     std::array<glm::vec4, 6> m_Planes{}; // dot(xyz, p) + w >= 0 inside; not normalized (sign test only)

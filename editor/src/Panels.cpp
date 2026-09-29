@@ -647,6 +647,21 @@ void Editor::DrawRendererSettings()
         ImGui::EndTable();
     }
 
+    if (ImGui::CollapsingHeader("Culling (GPU-driven)") && BeginProperties("culling")) {
+        CullingSettings& c = m_Ctx.sceneRenderer.culling;
+        CheckboxRow("GPU-driven", &c.gpuDriven);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Compute culling + indirect multi-draws (off: CPU BVH culling, one draw per submesh)");
+        ImGui::BeginDisabled(!c.gpuDriven);
+        CheckboxRow("Occlusion (Hi-Z)", &c.occlusion);
+        CheckboxRow("Freeze culling", &c.freeze);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keep culling with the current camera and Hi-Z; move away to see what was culled");
+        SliderUintRow("Hi-Z debug level", &c.hizDebugLevel, 0, 12);
+        ImGui::EndDisabled();
+        ImGui::EndTable();
+    }
+
     if (ImGui::CollapsingHeader("Lights (clustered)") && BeginProperties("lights")) {
         CheckboxRow("Enabled", &sr.lights.enabled);
         DragFloatRow("Cluster far", &sr.lights.clusterFar, 1.0f, 1.0f, 100000.0f, "%.0f");
@@ -817,7 +832,7 @@ void Editor::DrawStats()
         ImGui::TableSetColumnIndex(1);
         ImGui::SeparatorText("Scene");
         const SceneRenderStats& stats = m_Ctx.sceneRenderer.Stats();
-        ImGui::Text("Draw calls     %u", stats.drawCalls);
+        ImGui::Text("Draw calls     %u%s", stats.drawCalls, stats.gpuDriven ? " (indirect multi-draws)" : "");
         ImGui::Text("Culled         %u", stats.culled);
         ImGui::Text("Shadow draws   %u", stats.shadowDraws);
         ImGui::Text("Triangles      %llu", static_cast<unsigned long long>(stats.triangles));
@@ -829,13 +844,26 @@ void Editor::DrawStats()
         if (m_Ctx.sceneRenderer.post.autoExposure)
             ImGui::Text("Avg luminance  %.4f", stats.averageLuminance);
 
+        ImGui::SeparatorText(stats.gpuDriven ? "GPU-driven culling (2 frames old)" : "GPU scene");
+        ImGui::Text("Instances      %u  (%u draws, %u batches)", stats.instances, stats.draws, stats.batches);
+        if (stats.gpuDriven) {
+            ImGui::Text("Camera         %u tested: %u frustum, %u occluded", stats.gpuTested, stats.gpuFrustumCulled,
+                        stats.gpuOccluded);
+            ImGui::Text("Drawn          %u early + %u late", stats.gpuEarly, stats.gpuLate);
+            ImGui::Text("Commands       %u  (all views)", stats.gpuCommands);
+        }
+        ImGui::Text("Geometry pool  %.1f / %.1f M vertices, %.1f / %.1f M indices",
+                    static_cast<double>(stats.geometryVertices) * 1e-6, static_cast<double>(stats.geometryVertexCapacity) * 1e-6,
+                    static_cast<double>(stats.geometryIndices) * 1e-6, static_cast<double>(stats.geometryIndexCapacity) * 1e-6);
+
         ImGui::SeparatorText("CPU (ms)");
         const TransformUpdateStats& xf      = m_Ctx.scene.FrameTransformUpdate();
         const SpatialIndex&         spatial = m_Ctx.sceneRenderer.Spatial();
         ImGui::Text("Transforms     %.3f  (%u subtrees, %u matrices)", xf.milliseconds, xf.dirtyRoots, xf.updated);
         ImGui::Text("BVH sync       %.3f  (%u changed, %u re-inserted, %u pending)", stats.cpuSpatialMs,
                     spatial.LastSync().changed, spatial.LastSync().reinserted, spatial.LastSync().pending);
-        ImGui::Text("Culling        %.3f  (%u draw items)", stats.cpuCullingMs, stats.drawItems);
+        ImGui::Text("GPU scene      %.3f  (instance updates)", stats.cpuGpuSceneMs);
+        ImGui::Text("Culling        %.3f  (%u CPU draws)", stats.cpuCullingMs, stats.drawItems);
 
         ImGui::SeparatorText("BVH");
         ImGui::Text("Meshes         %zu  (height %d, %zu nodes)", spatial.MeshCount(), spatial.MeshTree().Height(),
