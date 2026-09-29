@@ -47,6 +47,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     InstanceBuffer   instances; // GPU scene
     DrawBuffer       draws;     // GPU scene
     HiZBuffer        hiz;
+    TextureTable     textureTable; // material texture entry -> bindless slot
 };
 
 #endif

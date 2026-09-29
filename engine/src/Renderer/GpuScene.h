@@ -41,7 +41,8 @@ struct GpuDraw {
 };
 static_assert(sizeof(GpuDraw) == 16);
 
-// Mirrors GpuBatch: all draws of one submesh with the same winding -> one indirect command.
+// Mirrors GpuBatch: all draws of one submesh LOD with the same winding -> one indirect command.
+// A submesh with n LODs owns n consecutive batches (GpuDraw::batch = LOD 0, + lod per view).
 struct GpuBatch {
     std::uint32_t indexCount   = 0; // 0: unused id
     std::uint32_t firstIndex   = 0;
@@ -56,6 +57,14 @@ static_assert(sizeof(GpuBatch) == 32);
 inline constexpr std::uint32_t kCameraBuckets = 4;
 inline constexpr std::uint32_t kShadowBuckets = 2;
 
+// Visible list entry: draw record | LOD << 30 (mirrors VISIBLE_* in scene_common.glsl).
+inline constexpr std::uint32_t kVisibleRecordMask = 0x3FFFFFFFu;
+inline constexpr std::uint32_t kVisibleLodShift   = 30;
+
+// Mirrors SelectLod in scene_common.glsl (the CPU path must pick the same geometry).
+[[nodiscard]] std::uint32_t SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
+                                      std::uint32_t forced);
+
 // Persistent GPU copy of the scene's mesh instances for GPU-driven rendering (and the CPU path,
 // which draws the same records directly). Update() applies the spatial index's mesh changes on
 // the CPU; Upload() records this frame's changes (compute scatter) into the command buffer.
@@ -65,6 +74,7 @@ public:
         Entity        entity = NullEntity;
         ModelHandle   model;
         std::uint32_t meshIndex = 0;
+        std::uint32_t revision  = 0; // AssetManager::Revision of `model` when the draws were built
         bool          mirrored  = false;
     };
 
@@ -76,6 +86,7 @@ public:
 
     void Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets);
     void Upload(VkCommandBuffer cmd);
+    void RebuildPipelines(); // shader hot reload
 
     // CPU path / stats
     [[nodiscard]] const GpuInstance* FindInstance(Entity entity) const;
@@ -83,10 +94,12 @@ public:
     [[nodiscard]] const GpuSubmesh&  DrawSubmesh(std::uint32_t index) const { return m_DrawSubmeshes[index]; }
     [[nodiscard]] const GpuBatch&    Batch(std::uint32_t index) const { return m_Batches[index]; }
     [[nodiscard]] std::uint32_t InstanceCount() const { return m_LiveInstances; }
-    [[nodiscard]] std::uint32_t LiveDraws() const { return m_LiveDraws; }        // visible list size per view
+    [[nodiscard]] std::uint32_t LiveDraws() const { return m_LiveDraws; }
+    // Visible list size per view: every LOD batch has room for all draws of its submesh.
+    [[nodiscard]] std::uint32_t VisibleCapacity() const { return m_VisibleCapacity; }
     [[nodiscard]] std::uint32_t DrawCapacity() const { return m_DrawRanges.Capacity(); } // incl. free slots
     [[nodiscard]] std::uint32_t BatchCount() const { return static_cast<std::uint32_t>(m_Batches.size()); } // incl. free ids
-    [[nodiscard]] std::uint32_t LiveBatches() const { return static_cast<std::uint32_t>(m_BatchOf.size()); }
+    [[nodiscard]] std::uint32_t LiveBatches() const { return static_cast<std::uint32_t>(m_BatchOf.size()); } // blocks
 
     // GPU buffers (valid after Upload).
     [[nodiscard]] VkDeviceAddress InstanceAddress() const { return m_InstanceBuffer.Address(); }
@@ -96,6 +109,8 @@ public:
 
 private:
     void Upsert(const Scene& scene, const AssetManager& assets, Entity entity);
+    void UseModel(const AssetManager& assets, ModelHandle model);
+    void UnuseModel(ModelHandle model);
     void Remove(Entity entity);
     void RemoveInstance(std::uint32_t index);
     void ReleaseDraws(std::uint32_t instance);
@@ -124,12 +139,18 @@ private:
     std::vector<GpuSubmesh>    m_DrawSubmeshes; // CPU path: geometry of each draw
     std::uint32_t              m_LiveDraws = 0;
 
-    std::vector<GpuBatch>                            m_Batches; // mirror
-    std::vector<std::uint32_t>                       m_BatchRefs;
-    std::vector<std::uint64_t>                       m_BatchKeys;
-    std::vector<std::uint32_t>                       m_FreeBatches;
-    std::unordered_map<std::uint64_t, std::uint32_t> m_BatchOf; // (submesh << 1) | mirrored -> batch
-    std::unordered_map<ModelHandle, std::uint32_t>   m_ModelUse; // instances per model (release detection)
+    struct ModelUse {
+        std::uint32_t instances = 0;
+        std::uint32_t revision  = 0;
+    };
+    std::vector<GpuBatch>                            m_Batches;   // mirror
+    std::vector<std::uint32_t>                       m_BatchRefs; // per batch: draws of its block
+    std::vector<std::uint64_t>                       m_BatchKeys; // per block (first batch)
+    std::vector<std::uint32_t>                       m_BatchSizes; // per block: LOD count
+    RangeAllocator                                   m_BatchRanges;
+    std::unordered_map<std::uint64_t, std::uint32_t> m_BatchOf; // (submesh << 1) | mirrored -> first batch
+    std::unordered_map<ModelHandle, ModelUse>        m_ModelUse; // release / reload detection
+    std::uint32_t                                    m_VisibleCapacity = 0;
 
     // Pending uploads
     std::vector<std::uint32_t> m_DirtyInstances, m_DirtyDraws;

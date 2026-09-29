@@ -26,6 +26,15 @@ void SpatialIndex::Sync(Scene& scene, const AssetManager& assets)
             RemoveLight(e);
             m_Pending.erase(Key(e));
         }
+        // Models that were reloaded, failed or retried since the last sync: new bounds / geometry.
+        if (assets.ContentVersion() != m_ContentVersion) {
+            std::vector<Entity> stale;
+            for (const MeshProxy& proxy : m_Meshes)
+                if (assets.Revision(proxy.model) != proxy.revision)
+                    stale.push_back(proxy.entity);
+            for (Entity e : stale)
+                UpdateMesh(scene, assets, e);
+        }
         // Models that finished loading since the last sync.
         if (!m_Pending.empty()) {
             const std::vector<std::uint64_t> pending(m_Pending.begin(), m_Pending.end());
@@ -39,6 +48,7 @@ void SpatialIndex::Sync(Scene& scene, const AssetManager& assets)
         }
         m_LastSync.changed = static_cast<std::uint32_t>(changes.changed.size());
     }
+    m_ContentVersion        = assets.ContentVersion();
     m_LastSync.pending      = static_cast<std::uint32_t>(m_Pending.size());
     m_LastSync.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
@@ -67,8 +77,9 @@ void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity e
     m_MeshUpdates.push_back(entity);
     const Registry&     registry = scene.GetRegistry();
     const MeshRenderer* renderer = registry.Valid(entity) ? registry.TryGet<MeshRenderer>(entity) : nullptr;
-    const Model*        model    = renderer ? assets.Get(renderer->model) : nullptr;
-    if (!model || renderer->meshIndex >= model->meshes.size() || model->meshes[renderer->meshIndex].submeshes.empty()) {
+    const ResolvedMesh  resolved = renderer ? assets.ResolveMesh(renderer->model, renderer->meshIndex) : ResolvedMesh{};
+    const Model*        model    = resolved.model; // the placeholder box for failed models
+    if (!model || model->meshes[resolved.meshIndex].submeshes.empty()) {
         RemoveMesh(entity);
         if (renderer) {
             const AssetState state = assets.State(renderer->model);
@@ -78,8 +89,9 @@ void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity e
         return;
     }
 
-    const Mesh& mesh = model->meshes[renderer->meshIndex];
-    Aabb        local{glm::vec3(kInfinity), glm::vec3(-kInfinity)};
+    const Mesh&         mesh     = model->meshes[resolved.meshIndex];
+    const std::uint32_t revision = assets.Revision(renderer->model);
+    Aabb                local{glm::vec3(kInfinity), glm::vec3(-kInfinity)};
     for (const Submesh& sm : mesh.submeshes) {
         local.min = glm::min(local.min, sm.boundsMin);
         local.max = glm::max(local.max, sm.boundsMax);
@@ -90,7 +102,8 @@ void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity e
     if (const auto it = m_MeshIndex.find(Key(entity)); it != m_MeshIndex.end()) {
         MeshProxy& proxy = m_Meshes[it->second];
         const bool same  = proxy.bounds.min == world.min && proxy.bounds.max == world.max &&
-                           proxy.model == renderer->model && proxy.meshIndex == renderer->meshIndex;
+                           proxy.model == renderer->model && proxy.meshIndex == renderer->meshIndex &&
+                           proxy.revision == revision; // reloaded geometry: shadows must re-render
         if (same)
             return;
         m_ChangedRegions.push_back(proxy.bounds);
@@ -101,6 +114,7 @@ void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity e
         proxy.model     = renderer->model;
         proxy.meshIndex = renderer->meshIndex;
         proxy.submeshes = submeshes;
+        proxy.revision  = revision;
         m_LastSync.reinserted += m_MeshTree.Move(proxy.node, world) ? 1u : 0u;
         return;
     }
@@ -111,7 +125,8 @@ void SpatialIndex::UpdateMesh(Scene& scene, const AssetManager& assets, Entity e
                         .bounds    = world,
                         .model     = renderer->model,
                         .meshIndex = renderer->meshIndex,
-                        .submeshes = submeshes});
+                        .submeshes = submeshes,
+                        .revision  = revision});
     m_MeshIndex.emplace(Key(entity), index);
     m_Submeshes += submeshes;
     m_ChangedRegions.push_back(world);

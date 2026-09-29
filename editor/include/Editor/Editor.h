@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -132,6 +133,10 @@ private:
     void DrawRendererSettings();
     void DrawStats();
     void DrawAssets();
+    void DrawModelAssets(ModelHandle& toRelease);
+    void DrawTextureAssets();
+    [[nodiscard]] std::uint64_t TexturePreview(TextureHandle handle); // ImTextureID, 0: none
+    void ReleaseTexturePreviews(bool all); // all: shutdown; else those not shown this frame / outdated
     void DrawDialogs();
     void HandleHotkeys();
     void EnsureViewportTarget(std::uint32_t width, std::uint32_t height);
@@ -168,6 +173,12 @@ private:
     // Viewport render target (RGBA8 sRGB, sampled by ImGui).
     Image         m_ViewportImage;
     std::uint64_t m_ViewportTexture = 0; // ImTextureID
+    struct Preview {
+        std::uint64_t texture  = 0; // ImTextureID
+        std::uint32_t revision = 0; // texture content it shows
+        bool          used     = false; // drawn this frame
+    };
+    std::unordered_map<TextureHandle, Preview> m_TexturePreviews; // Assets panel thumbnails
     bool          m_ViewportHovered = false;
     bool          m_ViewportFocused = false;
     bool          m_PickAdditive    = false; // a pick request is pending: Ctrl was held

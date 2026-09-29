@@ -13,7 +13,7 @@ Application::Application(const ApplicationDesc& desc)
                                        .enableValidation = desc.enableValidation}))
     , m_Renderer(std::make_unique<Renderer>(*m_Context, *m_Window, m_Events, desc.renderer))
     , m_Jobs(std::make_unique<ThreadPool>(desc.workerThreads))
-    , m_Assets(std::make_unique<AssetManager>(*m_Renderer, *m_Jobs, m_Events))
+    , m_Assets(std::make_unique<AssetManager>(*m_Renderer, *m_Jobs, m_Events, m_Desc.assets))
 {
     ENGINE_INFO("Worker threads: {}", m_Jobs->ThreadCount());
 }

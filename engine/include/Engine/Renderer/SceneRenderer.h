@@ -30,7 +30,7 @@ enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirr
 
 // tonemap.frag. HiZ: occlusion pyramid (level CullingSettings::hizDebugLevel), Culling: draws that
 // only the late (occlusion) pass found visible are tinted orange.
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Count };
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod, Count };
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -100,6 +100,11 @@ struct CullingSettings {
     bool          occlusion     = true;  // GPU: two-phase Hi-Z occlusion culling of the camera view
     bool          freeze        = false; // GPU: keep culling with the camera + Hi-Z of the moment it was set (debug)
     std::uint32_t hizDebugLevel = 0;     // DebugView::HiZ
+    // Mesh LODs (both paths, every view): the coarsest level whose simplification error, seen from
+    // the camera, stays below lodPixelError pixels. Shadows use the camera's choice.
+    bool          lod           = true;
+    float         lodPixelError = 1.0f;
+    std::int32_t  forceLod      = -1;    // debug: >= 0 draws that level (clamped per submesh)
 };
 
 // Mirrors GpuShadowView in lights.glsl.
@@ -160,6 +165,7 @@ struct SceneRenderStats {
     std::uint32_t gpuEarly        = 0; // drawn by the early pass (visible last frame)
     std::uint32_t gpuLate         = 0; // newly visible, drawn by the late pass
     std::uint32_t gpuCommands     = 0; // indirect commands written, all views
+    std::uint32_t lodDraws        = 0; // camera draws with a LOD > 0 (GPU: counter, CPU: this frame)
     std::uint32_t geometryVertices = 0, geometryVertexCapacity = 0; // geometry pool use
     std::uint32_t geometryIndices  = 0, geometryIndexCapacity  = 0;
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
@@ -231,8 +237,11 @@ private:
     void EnsureTargets(VkExtent2D extent);
     void EnsureShadowMap();
     // CPU path: draws of the meshes the BVH finds in the frustum (+ within `sphere` if radius > 0).
+    void CreatePipelines();  // all but the per-format tone mapping ones (TonemapPipeline)
+    void RebuildPipelines(); // shader hot reload: also environment, GPU scene, culling
     void GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out);
-    void DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats);
+    void DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats,
+                       std::uint32_t flags);
     void DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t cascade,
                        const Pipeline& plain, const Pipeline& masked, std::uint32_t& drawCounter);
     // GPU path: the indirect draws of a culled view.
@@ -268,6 +277,7 @@ private:
     Renderer&           m_Renderer;
     const AssetManager& m_Assets;
     Environment         m_Environment;
+    std::uint64_t       m_ShaderGeneration = 0; // Renderer::ShaderGeneration the pipelines were built for
     Pipeline            m_Mesh; // cull mode + front face are dynamic
     Pipeline            m_Sky;
     std::vector<std::pair<VkFormat, Pipeline>> m_Tonemap; // one per output format, built on demand
@@ -305,6 +315,8 @@ private:
     SpatialIndex                m_Spatial;
     std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
     std::unique_ptr<GpuCulling> m_GpuCulling;
+    glm::vec4                   m_LodCamera{0.0f}; // this frame's LOD selection (see SelectLod)
+    std::uint32_t               m_LodForced = 0;
     DrawList                    m_CameraDraws; // CPU path: prepass + lighting pass
     bool                        m_GpuFrame = false; // this frame uses the GPU path
     // Frozen culling (debug): camera of the moment `culling.freeze` was set.

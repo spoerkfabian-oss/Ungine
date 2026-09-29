@@ -2,8 +2,6 @@
 #include "Engine/Core/Log.h"
 
 #include <cgltf.h>
-#define STBI_NO_STDIO
-#include <stb_image.h>
 
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -81,37 +79,41 @@ public:
     }
 
 private:
-    std::int32_t Texture(const cgltf_texture_view& view, bool srgb)
+    std::int32_t Texture(const cgltf_texture_view& view, TextureKind kind)
     {
         if (!view.texture)
             return kNoTexture;
         const cgltf_image* image = view.texture->image;
         if (!image) {
-            ENGINE_WARN("glTF: texture without PNG/JPEG image (basisu/webp?) - using default");
+            ENGINE_WARN("glTF: texture without PNG/JPEG/KTX2 image (basisu/webp?) - using default");
             return kNoTexture;
         }
         if (view.texcoord != 0)
             ENGINE_WARN("glTF: only TEXCOORD_0 is supported, texture will use UV0");
 
-        const auto key = (static_cast<std::uint64_t>(IndexIn(m_Data.images, image)) << 1) | (srgb ? 1u : 0u);
+        const auto key = (static_cast<std::uint64_t>(IndexIn(m_Data.images, image)) << 2) | static_cast<std::uint64_t>(kind);
         if (const auto it = m_TextureCache.find(key); it != m_TextureCache.end())
             return it->second;
 
-        const std::int32_t result = Decode(*image, srgb);
+        const std::int32_t result = Source(*image, kind);
         m_TextureCache.emplace(key, result);
         return result;
     }
 
-    std::int32_t Decode(const cgltf_image& image, bool srgb)
+    // Collects the image's source; decoding and compression happen in the texture asset's job.
+    std::int32_t Source(const cgltf_image& image, TextureKind kind)
     {
-        std::vector<std::uint8_t> owned; // file contents or decoded data URI
-        const std::uint8_t*       bytes = nullptr;
-        std::size_t               size  = 0;
+        TextureData tex;
+        tex.kind = kind;
+        tex.name = image.name ? image.name
+                              : (image.uri && std::strncmp(image.uri, "data:", 5) != 0
+                                     ? image.uri
+                                     : std::format("image{}", IndexIn(m_Data.images, &image)));
 
         if (image.buffer_view) {
-            const cgltf_buffer_view& bv = *image.buffer_view;
-            bytes = static_cast<const std::uint8_t*>(bv.buffer->data) + bv.offset;
-            size  = bv.size;
+            const cgltf_buffer_view& bv    = *image.buffer_view;
+            const auto*              bytes = static_cast<const std::byte*>(bv.buffer->data) + bv.offset;
+            tex.encoded.assign(bytes, bytes + bv.size);
         } else if (image.uri && std::strncmp(image.uri, "data:", 5) == 0) {
             const char* comma = std::strchr(image.uri, ',');
             if (comma && comma - image.uri >= 7 && std::strncmp(comma - 7, ";base64", 7) == 0) {
@@ -120,42 +122,22 @@ private:
                 const std::size_t decoded = len / 4 * 3 - padding;
                 void*             data    = nullptr;
                 if (cgltf_load_buffer_base64(&m_Options, decoded, comma + 1, &data) == cgltf_result_success) {
-                    owned.assign(static_cast<std::uint8_t*>(data), static_cast<std::uint8_t*>(data) + decoded);
+                    tex.encoded.assign(static_cast<std::byte*>(data), static_cast<std::byte*>(data) + decoded);
                     std::free(data); // default cgltf allocator
                 }
             }
-            bytes = owned.data();
-            size  = owned.size();
         } else if (image.uri) {
             std::string uri = image.uri;
             cgltf_decode_uri(uri.data()); // %20 etc.
             uri.resize(std::strlen(uri.c_str()));
-            owned = ReadFile(m_BaseDir / Utf8Path(uri));
-            bytes = owned.data();
-            size  = owned.size();
+            tex.file = (m_BaseDir / Utf8Path(uri)).lexically_normal();
         }
 
-        const std::string name = image.name ? image.name : (image.uri && std::strncmp(image.uri, "data:", 5) != 0 ? image.uri : "embedded");
-        if (!bytes || size == 0 || size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-            ENGINE_WARN("glTF: could not read image '{}'", name);
-            return kNoTexture;
+        if (tex.file.empty() && tex.encoded.empty()) {
+            ENGINE_WARN("glTF: could not read image '{}'", tex.name);
+            return kErrorTexture;
         }
-
-        int w = 0, h = 0, comp = 0;
-        stbi_uc* pixels = stbi_load_from_memory(bytes, static_cast<int>(size), &w, &h, &comp, STBI_rgb_alpha);
-        if (!pixels) {
-            ENGINE_WARN("glTF: failed to decode '{}': {}", name, stbi_failure_reason());
-            return kNoTexture;
-        }
-
-        TextureData tex;
-        tex.name   = name;
-        tex.width  = static_cast<std::uint32_t>(w);
-        tex.height = static_cast<std::uint32_t>(h);
-        tex.srgb   = srgb;
-        tex.pixels.assign(pixels, pixels + std::size_t{tex.width} * tex.height * 4);
-        stbi_image_free(pixels);
-
+        tex.hash = TextureContentHash(tex.encoded);
         m_Out->textures.push_back(std::move(tex));
         return static_cast<std::int32_t>(m_Out->textures.size() - 1);
     }
@@ -172,14 +154,14 @@ private:
                 md.baseColorFactor          = glm::make_vec4(pbr.base_color_factor);
                 md.metallic                 = pbr.metallic_factor;
                 md.roughness                = pbr.roughness_factor;
-                md.baseColorTexture         = Texture(pbr.base_color_texture, true);
-                md.metallicRoughnessTexture = Texture(pbr.metallic_roughness_texture, false);
+                md.baseColorTexture         = Texture(pbr.base_color_texture, TextureKind::Color);
+                md.metallicRoughnessTexture = Texture(pbr.metallic_roughness_texture, TextureKind::Linear);
             }
-            md.normalTexture     = Texture(m.normal_texture, false);
-            md.occlusionTexture  = Texture(m.occlusion_texture, false);
+            md.normalTexture     = Texture(m.normal_texture, TextureKind::Normal);
+            md.occlusionTexture  = Texture(m.occlusion_texture, TextureKind::Linear);
             md.normalScale       = m.normal_texture.texture ? m.normal_texture.scale : 1.0f;
             md.occlusionStrength = m.occlusion_texture.texture ? m.occlusion_texture.scale : 1.0f;
-            md.emissiveTexture  = Texture(m.emissive_texture, true);
+            md.emissiveTexture  = Texture(m.emissive_texture, TextureKind::Color);
             md.emissiveFactor   = glm::make_vec3(m.emissive_factor);
             if (m.has_emissive_strength)
                 md.emissiveFactor *= m.emissive_strength.emissive_strength;
@@ -431,6 +413,15 @@ ModelData LoadGltf(const std::filesystem::path& path)
     ModelData out;
     out.name = path.stem().string();
     Parser{path, options, *data}.Run(out);
+    for (cgltf_size i = 0; i < data->buffers_count; ++i) { // external .bin files
+        const char* uri = data->buffers[i].uri;
+        if (uri && std::strncmp(uri, "data:", 5) != 0) {
+            std::string decoded = uri;
+            cgltf_decode_uri(decoded.data());
+            decoded.resize(std::strlen(decoded.c_str()));
+            out.dependencies.push_back((path.parent_path() / Utf8Path(decoded)).lexically_normal());
+        }
+    }
 
     ENGINE_INFO("Loaded '{}': {} vertices, {} triangles, {} meshes, {} materials, {} textures, {} nodes", out.name,
                 out.vertices.size(), out.indices.size() / 3, out.meshes.size(), out.materials.size(),

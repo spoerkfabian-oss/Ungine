@@ -3,6 +3,8 @@ add_library(Engine STATIC
     src/Assets/GltfLoader.cpp
     src/Assets/Model.cpp
     src/Assets/Primitives.cpp
+    src/Assets/TextureCooker.cpp
+    src/Assets/MeshOptimizer.cpp
     src/Core/Application.cpp
     src/Core/Input.cpp
     src/Core/ThreadPool.cpp
@@ -16,6 +18,7 @@ add_library(Engine STATIC
     src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
+    src/Renderer/ShaderReload.cpp
     src/Renderer/ShadowAtlas.cpp
     src/Renderer/ShadowCascades.cpp
     src/Renderer/Vulkan/Bindless.cpp
@@ -41,7 +44,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt)
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc)
 
 target_compile_definitions(Engine PUBLIC
     GLFW_INCLUDE_NONE
@@ -53,6 +56,12 @@ target_compile_definitions(Engine PUBLIC
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1
     $<$<PLATFORM_ID:Windows>:NOMINMAX WIN32_LEAN_AND_MEAN>
     $<$<CONFIG:Debug>:ENGINE_DEBUG>)
+
+# Shader hot reload (development): recompile with the same compiler and flags as the build.
+target_compile_definitions(Engine PRIVATE
+    ENGINE_GLSLC="${GLSLC_EXECUTABLE}"
+    ENGINE_SHADER_INCLUDE_DIR="${ENGINE_SHADER_INCLUDE_DIR}"
+    ENGINE_SHADER_OPTIMIZE=$<IF:$<CONFIG:Debug>,0,1>)
 
 engine_set_warnings(Engine)
 set_target_properties(Engine PROPERTIES FOLDER "Engine")

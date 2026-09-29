@@ -47,6 +47,8 @@ public:
 
     [[nodiscard]] const std::string& DeviceName() const { return m_PhysicalDevice.name; }
     [[nodiscard]] const VkPhysicalDeviceProperties& Properties() const { return m_PhysicalDevice.properties; }
+    // Optional features, enabled when present.
+    [[nodiscard]] bool SupportsBC() const { return m_TextureCompressionBC; } // BC1-7 sampling
 
     // Keeps the original vkb objects accessible for the swapchain builder (Phase 2).
     [[nodiscard]] const vkb::Device& VkbDevice() const { return m_Device; }
@@ -65,6 +67,7 @@ private:
     VmaAllocator        m_Allocator = VK_NULL_HANDLE;
 
     Queue m_Graphics{}, m_Present{}, m_Transfer{};
+    bool  m_TextureCompressionBC = false;
 };
 
 } // namespace Engine

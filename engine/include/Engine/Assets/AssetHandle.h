@@ -16,7 +16,9 @@ struct AssetHandle {
 };
 
 struct Model;
-using ModelHandle = AssetHandle<Model>;
+struct Texture;
+using ModelHandle   = AssetHandle<Model>;
+using TextureHandle = AssetHandle<Texture>;
 
 enum class AssetState : std::uint8_t {
     Invalid,   // null or stale handle

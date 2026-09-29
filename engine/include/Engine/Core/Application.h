@@ -20,6 +20,7 @@ inline constexpr bool kDebugBuild = false;
 struct ApplicationDesc {
     WindowDesc    window{};
     RendererDesc  renderer{};
+    AssetManagerDesc assets{}; // texture import / cache, mesh LODs, hot reload
     bool          enableValidation = kDebugBuild;
     double        fixedTimestep    = 1.0 / 60.0; // physics tick (Jolt, Phase 3)
     double        maxFrameTime     = 0.25;       // clamp to avoid "spiral of death"

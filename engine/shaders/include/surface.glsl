@@ -44,8 +44,9 @@ mat3 SurfaceFrame(vec3 vertexNormal, vec4 vertexTangent, vec3 worldPos, vec2 uv)
 
 vec3 PerturbedNormal(Material m, mat3 tbn, vec2 uv)
 {
-    vec3 tn = SampleTexture(m.normalTexture, m.samplerIndex, uv).xyz * 2.0 - 1.0;
-    tn.xy *= m.normalScale;
+    // XY only (BC5 stores two channels): Z is reconstructed, the stored Z of RGBA maps ignored.
+    const vec2 xy = SampleMaterial(m.normalTexture, m.samplerIndex, uv).xy * 2.0 - 1.0;
+    const vec3 tn = vec3(xy * m.normalScale, sqrt(clamp(1.0 - dot(xy, xy), 0.0, 1.0)));
     return normalize(tbn * tn);
 }
 

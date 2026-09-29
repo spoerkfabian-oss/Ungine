@@ -10,7 +10,7 @@ layout(location = 1) flat out uint outMaterial;
 void main()
 {
     FrameData         frame    = pc.frame;
-    const GpuDraw     draw     = frame.draws.d[pc.visible.v[gl_InstanceIndex]];
+    const GpuDraw     draw     = frame.draws.d[pc.visible.v[gl_InstanceIndex] & VISIBLE_RECORD_MASK];
     const GpuInstance inst     = frame.instances.i[draw.instance];
     const Vertex      v        = frame.vertices.v[gl_VertexIndex];
     const mat4        viewProj = pc.cascade < 4u ? frame.cascadeViewProj[pc.cascade]

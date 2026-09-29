@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/GeometryPool.h"
 #include "Engine/Renderer/Vulkan/Buffer.h"
@@ -9,8 +10,12 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -29,13 +34,25 @@ struct Vertex {
 };
 static_assert(sizeof(Vertex) == 48);
 
+inline constexpr std::uint32_t kMaxLods = 4;
+
+struct SubmeshLod {
+    std::uint32_t firstIndex = 0; // like Submesh::firstIndex (relative to the model's indices)
+    std::uint32_t indexCount = 0;
+    float         error      = 0.0f; // object-space deviation from LOD 0 (0 for LOD 0)
+};
+
 struct Submesh {
-    std::uint32_t firstIndex   = 0;
+    std::uint32_t firstIndex   = 0; // LOD 0
     std::uint32_t indexCount   = 0;
     std::int32_t  vertexOffset = 0;
     std::uint32_t material     = 0;
     glm::vec3     boundsMin{0.0f}; // object space, for frustum culling
     glm::vec3     boundsMax{0.0f};
+    // Simplified index ranges over the same vertices (MeshOptimizer.h). lods[0] mirrors
+    // firstIndex / indexCount; BuildModelGeometry fills it when lodCount is 1.
+    std::uint32_t                    lodCount = 1;
+    std::array<SubmeshLod, kMaxLods> lods{};
 };
 
 struct Mesh {
@@ -53,7 +70,8 @@ struct ModelNode {
     std::optional<Light> light; // KHR_lights_punctual (point / spot)
 };
 
-inline constexpr std::int32_t kNoTexture = -1;
+inline constexpr std::int32_t kNoTexture    = -1; // the slot's default texture
+inline constexpr std::int32_t kErrorTexture = -2; // DefaultTexture::Error (placeholders)
 
 struct MaterialData {
     std::string  name;
@@ -67,19 +85,21 @@ struct MaterialData {
     bool         alphaMask         = false;
     bool         alphaBlend        = false;
     bool         doubleSided       = false;
-    std::int32_t baseColorTexture         = kNoTexture; // indices into ModelData::textures
+    std::int32_t baseColorTexture         = kNoTexture; // indices into ModelData::textures (or kNo/kErrorTexture)
     std::int32_t normalTexture            = kNoTexture;
     std::int32_t metallicRoughnessTexture = kNoTexture;
     std::int32_t emissiveTexture          = kNoTexture;
     std::int32_t occlusionTexture         = kNoTexture;
 };
 
+// Where a material texture comes from. The AssetManager turns each into a texture asset: an
+// external file is shared by path (LoadTexture), embedded bytes by content hash.
 struct TextureData {
-    std::string               name;
-    std::vector<std::uint8_t> pixels; // RGBA8
-    std::uint32_t             width  = 0;
-    std::uint32_t             height = 0;
-    bool                      srgb   = true;
+    std::string            name;
+    TextureKind            kind = TextureKind::Color;
+    std::filesystem::path  file;    // external image (PNG / JPEG / KTX2), or
+    std::vector<std::byte> encoded; // embedded image bytes (PNG / JPEG / KTX2)
+    std::uint64_t          hash = 0; // of `encoded` (TextureContentHash)
 };
 
 // CPU-side parse result. No GPU access -> can be produced on a worker thread.
@@ -93,7 +113,11 @@ struct ModelData {
     std::vector<ModelNode>     nodes;
     glm::vec3                  boundsMin{0.0f}; // world space of the default scene
     glm::vec3                  boundsMax{0.0f};
+    // Files read besides the source itself (external buffers): hot reload watches them too.
+    std::vector<std::filesystem::path> dependencies;
 };
+
+[[nodiscard]] std::uint64_t TextureContentHash(std::span<const std::byte> bytes); // FNV-1a 64
 
 // GPU material, mirrors `Material` in mesh_common.glsl.
 struct GpuMaterial {
@@ -103,7 +127,7 @@ struct GpuMaterial {
     float         roughness;
     float         alphaCutoff;
     std::uint32_t flags;
-    std::uint32_t baseColorTexture; // bindless indices
+    std::uint32_t baseColorTexture; // texture table entries (Renderer::AllocateTextureEntry)
     std::uint32_t normalTexture;
     std::uint32_t metallicRoughnessTexture;
     std::uint32_t emissiveTexture;
@@ -117,16 +141,19 @@ static_assert(sizeof(GpuMaterial) == 80);
 // Submesh record in the geometry pool (GPU culling and indirect draws), mirrors GpuSubmesh in
 // scene_common.glsl. Offsets are absolute pool indices.
 struct GpuSubmesh {
-    std::uint32_t firstIndex   = 0;
+    std::uint32_t firstIndex   = 0; // LOD 0
     std::uint32_t indexCount   = 0;
     std::int32_t  vertexOffset = 0;
     std::uint32_t material     = 0;
     glm::vec3     boundsMin{0.0f}; // object space
     std::uint32_t flags = 0;       // material flags (kMaterial*)
     glm::vec3     boundsMax{0.0f};
-    std::uint32_t pad = 0;
+    std::uint32_t lodCount = 1;
+    glm::uvec4    lodFirstIndex{0}; // per LOD, absolute
+    glm::uvec4    lodIndexCount{0};
+    glm::vec4     lodError{0.0f};   // object space
 };
-static_assert(sizeof(GpuSubmesh) == 48);
+static_assert(sizeof(GpuSubmesh) == 96);
 
 inline constexpr std::uint32_t kMaterialAlphaMask   = 1u << 0;
 inline constexpr std::uint32_t kMaterialDoubleSided = 1u << 1;
@@ -139,8 +166,8 @@ struct Model {
     PoolRange                  indices;   // Submesh::firstIndex is relative to indices.offset
     PoolRange                  materials; // Submesh::material is relative to materials.offset
     PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
-    std::vector<Image>         textures;
-    std::vector<std::uint32_t> bindlessTextures;
+    std::vector<GpuSubmesh>    gpuSubmeshes; // CPU copy of those records (index: firstGpuSubmesh - submeshes.offset)
+    std::vector<TextureHandle> textures;  // per ModelData texture; owned (released) by the AssetManager
     std::vector<std::uint32_t> materialFlags; // CPU copy for pipeline selection
     std::vector<Mesh>          meshes;
     std::vector<ModelNode>     nodes;
@@ -151,14 +178,24 @@ struct Model {
     std::vector<std::uint32_t> collisionIndices;
 };
 
-// Creates the GPU resources and records their upload on the UploadQueue; `ticket` covers all
-// of them. Thread-safe (asset worker threads). On exception `out` holds whatever was created
+// Two steps, `ticket` covers every upload of both. On exception `out` holds whatever was created
 // so far and must be released like a finished model.
+// 1) Geometry (vertices, indices, meshes, nodes, collision copy). Thread-safe: asset workers.
+void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket);
+// 2) Materials and submesh records, once the textures have table entries (`textureEntries[i]`
+//    for ModelData texture i). Thread-safe too, but texture entries are allocated on the main thread.
+void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> materials,
+                         std::span<const std::uint32_t> textureEntries, Model& out, UploadTicket& ticket);
+// Both steps (models without textures, tools, tests).
 void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket);
 
-// Main thread. Frees GPU memory and bindless slots once in-flight frames are done.
-// Precondition: the build's ticket is ready (UploadQueue::IsReady).
+// Main thread. Frees the pool ranges once in-flight frames are done (textures are separate
+// assets). Precondition: the build's ticket is ready (UploadQueue::IsReady).
 void ReleaseModel(Renderer& renderer, Model&& model);
+
+// Geometry memory of a model in the pool (bytes) and its CPU-side copies.
+[[nodiscard]] std::uint64_t ModelGpuBytes(const Model& model);
+[[nodiscard]] std::uint64_t ModelCpuBytes(const Model& model);
 
 // Creates one entity per node under a new root entity; returns the root. The entities
 // reference the model by handle only: releasing it makes them render nothing.

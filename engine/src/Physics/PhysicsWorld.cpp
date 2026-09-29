@@ -316,6 +316,7 @@ struct PhysicsWorld::Impl {
         glm::vec3     scale{1.0f};
         ModelHandle   model; // mesh colliders
         std::uint32_t meshIndex = 0;
+        std::uint32_t revision  = 0; // AssetManager::Revision(model): a reload rebuilds the shape
         Pose          last;  // entity world pose the body was last synced to
         bool          kinematicMove = false; // kinematic: target changed since the last Step
         std::uint32_t visit = 0;
@@ -379,9 +380,10 @@ struct PhysicsWorld::Impl {
 
     // --- Shapes ---
 
-    JPH::RefConst<JPH::Shape> MeshShapeFor(const Model& model, ModelHandle handle, std::uint32_t meshIndex)
+    JPH::RefConst<JPH::Shape> MeshShapeFor(const Model& model, ModelHandle handle, std::uint32_t meshIndex,
+                                           std::uint32_t revision)
     {
-        const MeshKey key{handle.index, handle.generation, meshIndex};
+        const MeshKey key{handle.index, handle.generation, meshIndex, revision};
         if (const auto it = meshShapes.find(key); it != meshShapes.end())
             return it->second;
 
@@ -409,7 +411,7 @@ struct PhysicsWorld::Impl {
     }
 
     JPH::RefConst<JPH::Shape> BuildShape(const Collider& c, const glm::vec3& scale, const Model* model,
-                                         ModelHandle handle, std::uint32_t meshIndex)
+                                         ModelHandle handle, std::uint32_t meshIndex, std::uint32_t revision)
     {
         const ScaledCollider    s = Scaled(c, scale);
         JPH::RefConst<JPH::Shape> shape;
@@ -427,7 +429,7 @@ struct PhysicsWorld::Impl {
         case ColliderShape::Mesh: {
             if (!model)
                 return nullptr;
-            shape = MeshShapeFor(*model, handle, meshIndex);
+            shape = MeshShapeFor(*model, handle, meshIndex, revision);
             if (!shape)
                 return nullptr;
             if (Rescaled(scale, glm::vec3(1.0f)))
@@ -447,7 +449,7 @@ struct PhysicsWorld::Impl {
     // False: not possible yet (mesh collider without a ready model).
     bool CreateBody(BodyRecord& r, const Pose& pose, const Model* model)
     {
-        const JPH::RefConst<JPH::Shape> shape = BuildShape(r.collider, pose.scale, model, r.model, r.meshIndex);
+        const JPH::RefConst<JPH::Shape> shape = BuildShape(r.collider, pose.scale, model, r.model, r.meshIndex, r.revision);
         if (!shape)
             return false;
 
@@ -517,13 +519,14 @@ struct PhysicsWorld::Impl {
             model = nullptr;
         const ModelHandle   handle    = renderer ? renderer->model : ModelHandle{};
         const std::uint32_t meshIndex = renderer ? renderer->meshIndex : 0;
+        const std::uint32_t revision  = renderer && assets ? assets->Revision(handle) : 0;
         const BodyType type = collider.shape == ColliderShape::Mesh && body.type == BodyType::Dynamic ? BodyType::Static : body.type;
 
         auto it = bodies.find(Key(e));
         if (it != bodies.end()) {
             BodyRecord& r      = it->second;
             const bool  remake = r.body != body || r.collider != collider || r.model != handle ||
-                                r.meshIndex != meshIndex || Rescaled(r.scale, pose.scale) ||
+                                r.meshIndex != meshIndex || r.revision != revision || Rescaled(r.scale, pose.scale) ||
                                 (collider.shape == ColliderShape::Mesh && !model);
             if (!remake) {
                 r.visit = visit;
@@ -543,6 +546,7 @@ struct PhysicsWorld::Impl {
         r.type      = type;
         r.model     = handle;
         r.meshIndex = meshIndex;
+        r.revision  = revision;
         r.visit     = visit;
         if (collider.shape == ColliderShape::Mesh && !model) {
             ++stats.pendingMeshes; // model loading (or missing): retried every Sync
@@ -765,7 +769,7 @@ struct PhysicsWorld::Impl {
     std::unordered_map<std::uint64_t, BodyRecord>      bodies;     // by entity
     std::unordered_map<std::uint64_t, CharacterRecord> characters; // by entity
     std::unordered_map<std::uint64_t, Pair>            pairs;      // by body pair
-    using MeshKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>; // model index, generation, mesh
+    using MeshKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>; // model index, generation, mesh, revision
     std::map<MeshKey, JPH::RefConst<JPH::Shape>> meshShapes; // unscaled
     std::unordered_set<JPH::uint32>              removedBodies; // since the last EndRemovedPairs
     std::vector<CollisionEvent>                  pendingEvents;

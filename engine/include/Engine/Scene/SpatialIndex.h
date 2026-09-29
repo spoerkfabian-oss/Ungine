@@ -23,7 +23,8 @@ struct RayHit {
 
 // Scene bounds in two dynamic AABB trees: mesh renderers (world AABB of their mesh) and lights
 // (box around the range sphere). Sync() applies Scene::TakeChanges() (so it must be the only
-// consumer) and retries meshes whose model was still loading. Queries use the fat tree boxes and
+// consumer), retries meshes whose model was still loading and refreshes meshes whose model was
+// reloaded (a failed model resolves to the placeholder box). Queries use the fat tree boxes and
 // then the tight bounds. Main thread only.
 class SpatialIndex {
 public:
@@ -34,6 +35,7 @@ public:
         ModelHandle   model;
         std::uint32_t meshIndex = 0;
         std::uint32_t submeshes = 0;
+        std::uint32_t revision  = 0; // AssetManager::Revision(model) of these bounds
     };
 
     struct SyncStats {
@@ -100,6 +102,7 @@ private:
     std::vector<Entity>                          m_MeshUpdates;
     std::uint64_t                                m_Submeshes = 0;
     bool                                         m_Initialized = false;
+    std::uint64_t                                m_ContentVersion = 0; // AssetManager::ContentVersion seen
     SyncStats                                    m_LastSync;
 };
 

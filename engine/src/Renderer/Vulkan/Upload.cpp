@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cstring>
 
 namespace Engine {
 
@@ -21,10 +22,11 @@ constexpr VkAccessFlags2 kBufferReadAccess = VK_ACCESS_2_INDEX_READ_BIT | VK_ACC
                                              VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
                                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT;
 
-// Layout of mip 0 once the graphics queue owns it: blit source if a mip chain follows.
-VkImageLayout Mip0Layout(std::uint32_t mipLevels)
+// Layout of the uploaded mips once the graphics queue owns them: blit source if a mip chain follows.
+template <class Acquire>
+VkImageLayout UploadedLayout(const Acquire& a)
 {
-    return mipLevels > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return a.uploadedMips < a.mipLevels ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 VkCommandPool CreatePool(VkDevice device, std::uint32_t family)
@@ -73,10 +75,17 @@ void PipelineBarriers(VkCommandBuffer cmd, const std::vector<VkBufferMemoryBarri
 }
 } // namespace
 
-UploadQueue::UploadQueue(const VulkanContext& ctx)
+UploadQueue::UploadQueue(const VulkanContext& ctx, const UploadQueueDesc& desc)
     : m_Ctx(ctx)
     , m_OwnershipTransfer(ctx.TransferQueue().family != ctx.GraphicsQueue().family)
+    , m_Desc(desc)
 {
+    if (desc.stagingRingSize > 0)
+        m_Ring = Buffer(ctx, {.size      = desc.stagingRingSize,
+                              .usage     = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              .memory    = MemoryUsage::Upload,
+                              .debugName = "StagingRing"});
+    m_Stats.ringCapacity = desc.stagingRingSize;
     const VkDevice dev = ctx.Device();
 
     VkSemaphoreTypeCreateInfo type{};
@@ -103,6 +112,8 @@ UploadQueue::~UploadQueue()
             vkDestroyCommandPool(dev, b->pool, nullptr);
     };
     destroy(m_Open);
+    for (const auto& b : m_Closed)
+        destroy(b);
     for (const auto& b : m_InFlight)
         destroy(b);
     for (const auto& b : m_FreeBatches)
@@ -126,52 +137,104 @@ std::unique_ptr<UploadQueue::Batch> UploadQueue::AcquireBatchLocked()
     return batch;
 }
 
-UploadTicket UploadQueue::Record(Buffer staging, const PendingAcquire& acquire,
-                                 const std::function<void(VkCommandBuffer)>& record)
+void UploadQueue::OpenBatchLocked()
 {
-    std::scoped_lock lock{m_Mutex};
-    if (!m_Open) {
-        m_Open        = AcquireBatchLocked();
-        m_Open->value = m_NextValue++; // opened in submission order -> values stay monotonic
-        BeginOneTimeCommands(m_Open->cmd);
-        // Staging buffers and pool ranges may reuse memory that earlier (fenced, finished) work
-        // wrote. That is safe, but sync validation does not follow host fence waits across memory
-        // reuse: order the batch after all earlier writes on this queue explicitly.
-        VkMemoryBarrier2 barrier{};
-        barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        barrier.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        barrier.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        VkDependencyInfo dep{};
-        dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dep.memoryBarrierCount = 1;
-        dep.pMemoryBarriers    = &barrier;
-        vkCmdPipelineBarrier2(m_Open->cmd, &dep);
+    m_Open        = AcquireBatchLocked();
+    m_Open->value = m_NextValue++; // opened in submission order -> values stay monotonic
+    BeginOneTimeCommands(m_Open->cmd);
+    // Staging memory and pool ranges may reuse memory that earlier (fenced, finished) work
+    // wrote. That is safe, but sync validation does not follow host fence waits across memory
+    // reuse: order the batch after all earlier writes on this queue explicitly.
+    VkMemoryBarrier2 barrier{};
+    barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo dep{};
+    dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers    = &barrier;
+    vkCmdPipelineBarrier2(m_Open->cmd, &dep);
+}
+
+std::optional<VkDeviceSize> UploadQueue::RingAllocateLocked(VkDeviceSize size, Batch& batch)
+{
+    const VkDeviceSize capacity = m_Ring ? m_Ring.Size() : 0;
+    if (size == 0 || size > capacity / 2) // large uploads would starve the ring
+        return std::nullopt;
+    if (m_RingUsed == 0)
+        m_RingHead = m_RingTail = 0;
+    constexpr VkDeviceSize kAlign = 16; // BCn block size, 4-byte copy rule
+    VkDeviceSize start = (m_RingHead + kAlign - 1) / kAlign * kAlign;
+    VkDeviceSize waste = 0;
+    if (m_RingHead >= m_RingTail) { // free: [head, capacity) and [0, tail)
+        if (m_RingUsed > 0 && m_RingHead == m_RingTail)
+            return std::nullopt; // full
+        if (start + size <= capacity) {
+            waste = start - m_RingHead;
+        } else if (size <= m_RingTail) { // wrap: the end of the ring is skipped
+            waste = capacity - m_RingHead;
+            start = 0;
+        } else {
+            return std::nullopt;
+        }
+    } else { // free: [head, tail)
+        if (start + size > m_RingTail)
+            return std::nullopt;
+        waste = start - m_RingHead;
     }
-    record(m_Open->cmd);
-    m_Open->staging.push_back(std::move(staging));
-    m_Open->acquires.push_back(acquire);
-    return m_Open->value;
+    m_RingHead = start + size;
+    m_RingUsed += waste + size;
+    batch.ringBytes += waste + size;
+    batch.ringEnd = m_RingHead;
+    return start;
+}
+
+UploadTicket UploadQueue::Record(std::span<const std::byte> data, const PendingAcquire& acquire,
+                                 const std::function<void(VkCommandBuffer, VkBuffer, VkDeviceSize)>& record)
+{
+    assert(!data.empty());
+    std::scoped_lock lock{m_Mutex};
+    // Budget: a full batch is closed; Submit() sends at most frameBudget bytes per frame.
+    if (m_Open && m_Open->bytes > 0 && m_Open->bytes + data.size() > m_Desc.frameBudget)
+        m_Closed.push_back(std::move(m_Open));
+    if (!m_Open)
+        OpenBatchLocked();
+    Batch& batch = *m_Open;
+
+    VkBuffer     src    = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    if (const std::optional<VkDeviceSize> at = RingAllocateLocked(data.size(), batch)) {
+        std::memcpy(static_cast<std::byte*>(m_Ring.Mapped()) + *at, data.data(), data.size());
+        m_Ring.Flush(*at, data.size());
+        src    = m_Ring.Handle();
+        offset = *at;
+    } else {
+        Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               .memory = MemoryUsage::Upload, .debugName = "staging"});
+        staging.Write(data.data(), data.size());
+        src = staging.Handle();
+        batch.staging.push_back(std::move(staging));
+        ++m_Stats.dedicatedStaging;
+    }
+    record(batch.cmd, src, offset);
+    batch.acquires.push_back(acquire);
+    batch.bytes += data.size();
+    m_Stats.totalBytes += data.size();
+    return batch.value;
 }
 
 Buffer UploadQueue::CreateBuffer(std::span<const std::byte> data, VkBufferUsageFlags usage, UploadTicket& ticket,
                                  const char* debugName)
 {
     assert(!data.empty());
-    // Allocation and memcpy happen on the calling thread; only the copy command is recorded under the lock.
-    Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                           .memory = MemoryUsage::Upload, .debugName = "staging"});
-    staging.Write(data.data(), data.size());
-
     Buffer buffer(m_Ctx, {.size = data.size(), .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                           .memory = MemoryUsage::GpuOnly, .debugName = debugName});
-
-    const VkBuffer     src  = staging.Handle();
     const VkBuffer     dst  = buffer.Handle();
     const VkDeviceSize size = data.size();
-    const UploadTicket t    = Record(std::move(staging), {.buffer = dst}, [&](VkCommandBuffer cmd) {
-        const VkBufferCopy region{0, 0, size};
+    const UploadTicket t    = Record(data, {.buffer = dst}, [&](VkCommandBuffer cmd, VkBuffer src, VkDeviceSize offset) {
+        const VkBufferCopy region{offset, 0, size};
         vkCmdCopyBuffer(cmd, src, dst, 1, &region);
     });
     ticket = std::max(ticket, t);
@@ -181,14 +244,9 @@ Buffer UploadQueue::CreateBuffer(std::span<const std::byte> data, VkBufferUsageF
 void UploadQueue::WriteBuffer(VkBuffer dst, VkDeviceSize dstOffset, std::span<const std::byte> data,
                               UploadTicket& ticket)
 {
-    assert(!data.empty());
-    Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                           .memory = MemoryUsage::Upload, .debugName = "staging"});
-    staging.Write(data.data(), data.size());
-    const VkBuffer     src  = staging.Handle();
     const VkDeviceSize size = data.size();
-    const UploadTicket t    = Record(std::move(staging), {}, [&](VkCommandBuffer cmd) {
-        const VkBufferCopy region{0, dstOffset, size};
+    const UploadTicket t    = Record(data, {}, [&](VkCommandBuffer cmd, VkBuffer src, VkDeviceSize offset) {
+        const VkBufferCopy region{offset, dstOffset, size};
         vkCmdCopyBuffer(cmd, src, dst, 1, &region);
     });
     ticket = std::max(ticket, t);
@@ -211,10 +269,6 @@ Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket
             ENGINE_WARN("Format {} can't be linearly blitted; skipping mip generation", static_cast<int>(desc.format));
     }
 
-    Buffer staging(m_Ctx, {.size = byteSize, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                           .memory = MemoryUsage::Upload, .debugName = "staging"});
-    staging.Write(desc.pixels, byteSize);
-
     Image image(m_Ctx, {.extent    = {desc.width, desc.height, 1},
                         .format    = desc.format,
                         .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -223,11 +277,10 @@ Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket
                         .debugName = desc.debugName});
 
     // Transfer queue: mip 0 only. Blits need a graphics queue -> the mip chain is built in RecordAcquires.
-    const VkBuffer     src = staging.Handle();
     const VkImage      dst = image.Handle();
-    const UploadTicket t   = Record(std::move(staging),
+    const UploadTicket t   = Record({static_cast<const std::byte*>(desc.pixels), byteSize},
                                     {.image = dst, .extent = {desc.width, desc.height}, .mipLevels = mipLevels},
-                                    [&](VkCommandBuffer cmd) {
+                                    [&](VkCommandBuffer cmd, VkBuffer src, VkDeviceSize offset) {
         CmdImageBarrier(cmd, {.image     = dst,
                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                               .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -236,6 +289,7 @@ Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket
                               .baseMip   = 0,
                               .mipCount  = 1});
         VkBufferImageCopy copy{};
+        copy.bufferOffset     = offset;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent      = {desc.width, desc.height, 1};
         vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -244,16 +298,69 @@ Image UploadQueue::CreateTexture2D(const TextureDesc& desc, UploadTicket& ticket
     return image;
 }
 
+Image UploadQueue::CreateTexture(VkFormat format, std::uint32_t width, std::uint32_t height,
+                                 std::span<const std::byte> data, std::span<const UploadMip> mips, UploadTicket& ticket,
+                                 const char* debugName)
+{
+    assert(!mips.empty() && !data.empty());
+    const auto levels = static_cast<std::uint32_t>(mips.size());
+    Image      image(m_Ctx, {.extent    = {width, height, 1},
+                             .format    = format,
+                             .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             .mipLevels = levels,
+                             .debugName = debugName});
+    const VkImage      dst = image.Handle();
+    const UploadTicket t   = Record(data, {.image = dst, .extent = {width, height}, .mipLevels = levels, .uploadedMips = levels},
+                                    [&](VkCommandBuffer cmd, VkBuffer src, VkDeviceSize offset) {
+        CmdImageBarrier(cmd, {.image     = dst,
+                              .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              .dstStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
+                              .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                              .baseMip   = 0,
+                              .mipCount  = levels});
+        std::vector<VkBufferImageCopy> regions(levels);
+        for (std::uint32_t i = 0; i < levels; ++i) {
+            regions[i].bufferOffset     = offset + mips[i].offset;
+            regions[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+            regions[i].imageExtent      = {mips[i].width, mips[i].height, 1};
+        }
+        vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, regions.data());
+    });
+    ticket = std::max(ticket, t);
+    return image;
+}
+
 void UploadQueue::Submit()
 {
-    std::unique_ptr<Batch> batch;
+    SubmitBatches(false);
+}
+
+void UploadQueue::SubmitBatches(bool all)
+{
+    std::vector<std::unique_ptr<Batch>> batches;
+    VkDeviceSize                        sent = 0;
     {
         std::scoped_lock lock{m_Mutex};
-        batch = std::move(m_Open); // workers open a fresh batch from here on
+        // Oldest first; always at least one batch so large uploads make progress.
+        const auto fits = [&](const Batch& b) { return all || sent == 0 || sent + b.bytes <= m_Desc.frameBudget; };
+        while (!m_Closed.empty() && fits(*m_Closed.front())) {
+            sent += m_Closed.front()->bytes;
+            batches.push_back(std::move(m_Closed.front()));
+            m_Closed.pop_front();
+        }
+        if (m_Closed.empty() && m_Open && fits(*m_Open)) { // workers open a fresh batch from here on
+            sent += m_Open->bytes;
+            batches.push_back(std::move(m_Open));
+        }
+        m_Stats.submittedLastFrame = sent;
     }
-    if (!batch)
-        return;
+    for (std::unique_ptr<Batch>& batch : batches)
+        SubmitBatch(std::move(batch));
+}
 
+void UploadQueue::SubmitBatch(std::unique_ptr<Batch> batch)
+{
     RecordBatchEndBarriers(*batch);
     VK_CHECK(vkEndCommandBuffer(batch->cmd));
 
@@ -278,6 +385,24 @@ void UploadQueue::Submit()
     m_InFlight.push_back(std::move(batch));
 }
 
+void UploadQueue::RecycleBatch(std::unique_ptr<Batch> batch)
+{
+    // The transfer queue is done with it: staging memory and the command pool are reused.
+    batch->staging.clear();
+    batch->acquires.clear();
+    batch->value = 0;
+    batch->bytes = 0;
+    VK_CHECK(vkResetCommandPool(m_Ctx.Device(), batch->pool, 0));
+    std::scoped_lock lock{m_Mutex};
+    if (batch->ringBytes > 0) { // batches complete in ring order
+        m_RingUsed -= batch->ringBytes;
+        m_RingTail = batch->ringEnd;
+    }
+    batch->ringBytes = 0;
+    batch->ringEnd   = 0;
+    m_FreeBatches.push_back(std::move(batch));
+}
+
 std::uint64_t UploadQueue::RecordAcquires(VkCommandBuffer graphicsCmd)
 {
     if (m_InFlight.empty())
@@ -293,17 +418,10 @@ std::uint64_t UploadQueue::RecordAcquires(VkCommandBuffer graphicsCmd)
 
         RecordAcquireBarriers(graphicsCmd, *batch);
         for (const PendingAcquire& a : batch->acquires)
-            if (a.image && a.mipLevels > 1)
+            if (a.image && a.uploadedMips < a.mipLevels)
                 RecordMipChain(graphicsCmd, a);
         acquired = batch->value;
-
-        // The transfer queue is done with it: recycle immediately.
-        batch->staging.clear();
-        batch->acquires.clear();
-        batch->value = 0;
-        VK_CHECK(vkResetCommandPool(m_Ctx.Device(), batch->pool, 0));
-        std::scoped_lock lock{m_Mutex};
-        m_FreeBatches.push_back(std::move(batch));
+        RecycleBatch(std::move(batch));
     }
 
     if (acquired == 0)
@@ -314,7 +432,7 @@ std::uint64_t UploadQueue::RecordAcquires(VkCommandBuffer graphicsCmd)
 
 void UploadQueue::Flush()
 {
-    Submit();
+    SubmitBatches(true);
     if (m_InFlight.empty())
         return;
 
@@ -327,6 +445,16 @@ void UploadQueue::Flush()
     VK_CHECK(vkWaitSemaphores(m_Ctx.Device(), &wait, UINT64_MAX));
 
     ImmediateSubmit([this](VkCommandBuffer cmd) { (void)RecordAcquires(cmd); }, last);
+}
+
+UploadStats UploadQueue::Stats() const
+{
+    std::scoped_lock lock{m_Mutex};
+    UploadStats stats     = m_Stats;
+    stats.ringUsed        = m_RingUsed;
+    stats.queuedBatches   = static_cast<std::uint32_t>(m_Closed.size()) + (m_Open ? 1u : 0u);
+    stats.inFlightBatches = static_cast<std::uint32_t>(m_InFlight.size()); // main thread only (Stats caller)
+    return stats;
 }
 
 void UploadQueue::ImmediateSubmit(const std::function<void(VkCommandBuffer)>& record, std::uint64_t waitValue)
@@ -402,12 +530,12 @@ void UploadQueue::RecordBatchEndBarriers(const Batch& batch) const
         } else {
             images.push_back(MakeImageBarrier({.image     = a.image,
                                                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                               .newLayout = Mip0Layout(a.mipLevels),
+                                               .newLayout = UploadedLayout(a),
                                                .srcStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
                                                .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                                .dstStage  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                .baseMip   = 0,
-                                               .mipCount  = 1,
+                                               .mipCount  = a.uploadedMips,
                                                .srcFamily = transfer,
                                                .dstFamily = graphics}));
         }
@@ -443,17 +571,17 @@ void UploadQueue::RecordAcquireBarriers(VkCommandBuffer cmd, const Batch& batch)
             continue;
         }
 
-        const bool mips = a.mipLevels > 1;
+        const bool mips = a.uploadedMips < a.mipLevels; // the rest is blitted below
         images.push_back(MakeImageBarrier({.image     = a.image,
                                            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                           .newLayout = Mip0Layout(a.mipLevels),
+                                           .newLayout = UploadedLayout(a),
                                            .srcStage  = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                                            .srcAccess = srcAccess,
                                            .dstStage  = mips ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : kShaderStages,
                                            .dstAccess = mips ? VK_ACCESS_2_TRANSFER_READ_BIT
                                                              : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                                            .baseMip   = 0,
-                                           .mipCount  = 1,
+                                           .mipCount  = a.uploadedMips,
                                            .srcFamily = srcFamily,
                                            .dstFamily = dstFamily}));
         if (mips) {

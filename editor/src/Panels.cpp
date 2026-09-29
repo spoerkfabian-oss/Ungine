@@ -2,6 +2,7 @@
 #include "Editor/Editor.h"
 #include "FileDialog.h"
 #include "History.h"
+#include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -659,6 +660,17 @@ void Editor::DrawRendererSettings()
             ImGui::SetTooltip("Keep culling with the current camera and Hi-Z; move away to see what was culled");
         SliderUintRow("Hi-Z debug level", &c.hizDebugLevel, 0, 12);
         ImGui::EndDisabled();
+        CheckboxRow("Mesh LODs", &c.lod);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Coarsest level whose simplification error stays below the pixel threshold (both paths, "
+                              "shadows follow the camera)");
+        ImGui::BeginDisabled(!c.lod);
+        SliderFloatRow("LOD pixel error", &c.lodPixelError, 0.25f, 32.0f, "%.2f px", ImGuiSliderFlags_Logarithmic);
+        ImGui::EndDisabled();
+        PropertyRow("Force LOD");
+        ImGui::SliderInt("##v", &c.forceLod, -1, static_cast<int>(kMaxLods) - 1, c.forceLod < 0 ? "auto" : "LOD %d",
+                         ImGuiSliderFlags_AlwaysClamp);
+        ImGui::PopID();
         ImGui::EndTable();
     }
 
@@ -852,6 +864,7 @@ void Editor::DrawStats()
             ImGui::Text("Drawn          %u early + %u late", stats.gpuEarly, stats.gpuLate);
             ImGui::Text("Commands       %u  (all views)", stats.gpuCommands);
         }
+        ImGui::Text("LOD > 0        %u camera draws", stats.lodDraws);
         ImGui::Text("Geometry pool  %.1f / %.1f M vertices, %.1f / %.1f M indices",
                     static_cast<double>(stats.geometryVertices) * 1e-6, static_cast<double>(stats.geometryVertexCapacity) * 1e-6,
                     static_cast<double>(stats.geometryIndices) * 1e-6, static_cast<double>(stats.geometryIndexCapacity) * 1e-6);
@@ -908,10 +921,36 @@ void Editor::DrawStats()
 // Assets
 // ---------------------------------------------------------------------------------------------
 
+namespace {
+std::string Bytes(std::uint64_t bytes)
+{
+    char text[32];
+    if (bytes >= (1ull << 20))
+        std::snprintf(text, sizeof(text), "%.1f MB", static_cast<double>(bytes) / (1 << 20));
+    else
+        std::snprintf(text, sizeof(text), "%.1f KB", static_cast<double>(bytes) / (1 << 10));
+    return text;
+}
+
+// State plus "reloading" and the error of a failed reload (the old content stays in use).
+void StateCell(AssetState state, bool reloading, const std::string& error)
+{
+    ImGui::TextColored(StateColor(state), "%s%s", ToString(state), reloading ? " ..." : "");
+    if (!error.empty() && state == AssetState::Ready) {
+        ImGui::SameLine(0.0f, 4.0f);
+        ImGui::TextColored(StateColor(AssetState::Failed), "(!)");
+    }
+    if (ImGui::IsItemHovered() && (!error.empty() || reloading))
+        ImGui::SetTooltip("%s%s%s", reloading ? "Reloading - the current content stays in use\n" : "",
+                          state == AssetState::Ready && !error.empty() ? "Last reload failed:\n" : "", error.c_str());
+}
+} // namespace
+
 void Editor::DrawAssets()
 {
     if (!ImGui::Begin("Assets", &m_ShowAssets)) {
         ImGui::End();
+        ReleaseTexturePreviews(false);
         return;
     }
 
@@ -934,45 +973,116 @@ void Editor::DrawAssets()
                            {".glb", ".gltf"});
     }
 
-    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("models", 4, flags)) {
-        ImGui::End();
-        return;
+    // Hot reload of assets and shaders, import settings, upload queue.
+    bool hotReload = m_Ctx.assets.HotReload();
+    if (ImGui::Checkbox("Hot reload", &hotReload)) {
+        m_Ctx.assets.SetHotReload(hotReload);
+        m_Ctx.renderer.SetShaderHotReload(hotReload);
     }
-    ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-    ImGui::TableSetupColumn("Refs", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-    ImGui::TableHeadersRow();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Watch model, texture and shader sources: changed files are reloaded / recompiled live");
+    if (const ShaderHotReload* shaders = m_Ctx.renderer.ShaderReloader(); shaders && m_Ctx.renderer.ShaderHotReloadEnabled()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("shaders: %zu watched, %u recompiled", shaders->WatchedShaders(), shaders->Recompiled());
+        if (!shaders->LastError().empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(StateColor(AssetState::Failed), "compile error");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", shaders->LastError().c_str());
+        }
+    }
+    const UploadStats upload = m_Ctx.renderer.GetUploader().Stats();
+    ImGui::TextDisabled("Textures: %s  |  staging ring %s / %s, %u queued, %u in flight, %u direct  |  %u jobs",
+                        m_Ctx.assets.CookSettings().compress ? "BC7 / BC5" : "RGBA8", Bytes(upload.ringUsed).c_str(),
+                        Bytes(upload.ringCapacity).c_str(), upload.queuedBatches, upload.inFlightBatches,
+                        static_cast<unsigned>(upload.dedicatedStaging), m_Ctx.assets.JobsInFlight());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Staging ring: recorded uploads not yet consumed by the transfer queue.\n"
+                          "Queued: batches held back by the per-frame upload budget.\n"
+                          "Direct: uploads larger than half the ring (own staging buffer).");
 
     ModelHandle toRelease;
+    if (ImGui::BeginTabBar("assetTabs")) {
+        if (ImGui::BeginTabItem("Models")) {
+            DrawModelAssets(toRelease);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Textures")) {
+            DrawTextureAssets();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+    ReleaseTexturePreviews(false);
+
+    if (toRelease) { // entities that still use it render nothing
+        m_Ctx.modelRefs.erase(std::ranges::find(m_Ctx.modelRefs, toRelease));
+        m_Ctx.assets.Release(toRelease);
+    }
+}
+
+void Editor::DrawModelAssets(ModelHandle& toRelease)
+{
+    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    if (!ImGui::BeginTable("models", 6, flags))
+        return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Refs", ImGuiTableColumnFlags_WidthFixed, 35.0f);
+    ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+    ImGui::TableSetupColumn("Memory", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+    ImGui::TableHeadersRow();
+
+    std::uint64_t gpuTotal = 0;
     for (const ModelInfo& info : m_Ctx.assets.Models()) {
         ImGui::PushID(static_cast<int>(info.handle.index));
         ImGui::TableNextRow();
+        gpuTotal += info.gpuBytes;
 
         ImGui::TableSetColumnIndex(0);
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(info.path.c_str());
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", info.path.c_str());
+            ImGui::SetTooltip("%s\nrevision %u, %u texture(s)", info.path.c_str(), info.revision, info.textures);
 
         ImGui::TableSetColumnIndex(1);
-        ImGui::TextColored(StateColor(info.state), "%s", ToString(info.state));
-        if (info.state == AssetState::Failed && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", info.error.c_str());
+        StateCell(info.state, info.reloading, info.error);
 
         ImGui::TableSetColumnIndex(2);
         ImGui::Text("%u", info.refCount);
 
         ImGui::TableSetColumnIndex(3);
+        if (info.state == AssetState::Ready)
+            ImGui::Text("%u (+%u LODs)", info.triangles, info.lodLevels);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("LOD 0 triangles; simplified levels generated over all submeshes");
+
+        ImGui::TableSetColumnIndex(4);
+        if (info.state == AssetState::Ready) {
+            ImGui::TextUnformatted(Bytes(info.gpuBytes).c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("GPU (geometry pool): %s\nCPU (collision copy, meshes): %s",
+                                  Bytes(info.gpuBytes).c_str(), Bytes(info.cpuBytes).c_str());
+        }
+
+        ImGui::TableSetColumnIndex(5);
         if (const Model* model = m_Ctx.assets.Get(info.handle)) {
             if (ImGui::SmallButton("Instantiate")) {
                 const Entity roots[] = {InstantiateModel(m_Ctx.scene, info.handle, *model)};
                 PushCreated("Instantiate " + model->name, roots);
                 Select(roots[0]);
             }
+            ImGui::SameLine();
+        }
+        if (info.reloadable && (info.state == AssetState::Ready || info.state == AssetState::Failed)) {
+            ImGui::BeginDisabled(info.reloading);
+            if (ImGui::SmallButton(info.state == AssetState::Failed ? "Retry" : "Reload"))
+                (void)m_Ctx.assets.Reload(info.handle);
+            ImGui::EndDisabled();
             ImGui::SameLine();
         }
         if (std::ranges::find(m_Ctx.modelRefs, info.handle) != m_Ctx.modelRefs.end()) {
@@ -986,12 +1096,119 @@ void Editor::DrawAssets()
         ImGui::PopID();
     }
     ImGui::EndTable();
-    ImGui::End();
+    ImGui::TextDisabled("Geometry: %s GPU", Bytes(gpuTotal).c_str());
+}
 
-    if (toRelease) { // entities that still use it render nothing
-        m_Ctx.modelRefs.erase(std::ranges::find(m_Ctx.modelRefs, toRelease));
-        m_Ctx.assets.Release(toRelease);
+void Editor::DrawTextureAssets()
+{
+    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    const float footer = ImGui::GetTextLineHeightWithSpacing();
+    if (!ImGui::BeginTable("textures", 8, flags, ImVec2(0.0f, -footer)))
+        return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+    ImGui::TableSetupColumn("Texture", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+    ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, 205.0f);
+    ImGui::TableSetupColumn("Memory", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Refs", ImGuiTableColumnFlags_WidthFixed, 35.0f);
+    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+    ImGui::TableHeadersRow();
+
+    std::uint64_t gpuTotal = 0;
+    std::uint32_t cached   = 0, count = 0;
+    for (const TextureInfo& info : m_Ctx.assets.Textures()) {
+        ImGui::PushID(static_cast<int>(info.handle.index));
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, 34.0f);
+        gpuTotal += info.gpuBytes;
+        cached += info.cacheHit ? 1u : 0u;
+        ++count;
+
+        ImGui::TableSetColumnIndex(0);
+        if (const std::uint64_t preview = TexturePreview(info.handle)) {
+            ImGui::Image(ImTextureRef(preview), ImVec2(32.0f, 32.0f));
+            if (ImGui::BeginItemTooltip()) {
+                const float scale = 256.0f / static_cast<float>(std::max({info.width, info.height, 1u}));
+                ImGui::Image(ImTextureRef(preview), ImVec2(static_cast<float>(info.width) * scale,
+                                                           static_cast<float>(info.height) * scale));
+                ImGui::EndTooltip();
+            }
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(info.path.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n%s, table entry %u, revision %u", info.path.c_str(),
+                              info.embedded ? "embedded in its model (reloads with it)" : "file", info.tableEntry,
+                              info.revision);
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted(ToString(info.kind));
+
+        ImGui::TableSetColumnIndex(3);
+        if (info.state == AssetState::Ready) {
+            ImGui::Text("%s %ux%u, %u mips", FormatName(info.format), info.width, info.height, info.mipLevels);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", info.cacheHit ? "Cooked data from the texture cache"
+                                                      : "Cooked now (written to the texture cache)");
+        }
+
+        ImGui::TableSetColumnIndex(4);
+        if (info.state == AssetState::Ready)
+            ImGui::Text("%s%s", Bytes(info.gpuBytes).c_str(), info.cacheHit ? "" : "*");
+
+        ImGui::TableSetColumnIndex(5);
+        StateCell(info.state, info.reloading, info.error);
+
+        ImGui::TableSetColumnIndex(6);
+        ImGui::Text("%u", info.refCount);
+
+        ImGui::TableSetColumnIndex(7);
+        if (!info.embedded && (info.state == AssetState::Ready || info.state == AssetState::Failed)) {
+            ImGui::BeginDisabled(info.reloading);
+            if (ImGui::SmallButton(info.state == AssetState::Failed ? "Retry" : "Reload"))
+                (void)m_Ctx.assets.Reload(info.handle);
+            ImGui::EndDisabled();
+        }
+        ImGui::PopID();
     }
+    ImGui::EndTable();
+    ImGui::TextDisabled("%u textures, %s GPU, %u from the cache (* = cooked this session)", count,
+                        Bytes(gpuTotal).c_str(), cached);
+}
+
+std::uint64_t Editor::TexturePreview(TextureHandle handle)
+{
+    const Texture* texture = m_Ctx.assets.Get(handle);
+    if (!texture)
+        return 0;
+    Preview&            preview  = m_TexturePreviews[handle];
+    const std::uint32_t revision = m_Ctx.assets.Revision(handle);
+    if (preview.texture && preview.revision != revision) { // reloaded: the old image goes away
+        m_ImGui->RemoveTexture(preview.texture);
+        preview.texture = 0;
+    }
+    if (!preview.texture) {
+        preview.texture  = m_ImGui->AddTexture(texture->image.View(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        preview.revision = revision;
+    }
+    preview.used = true;
+    return preview.texture;
+}
+
+void Editor::ReleaseTexturePreviews(bool all)
+{
+    // Unused this frame, or showing a released / replaced image: freed after the frames in flight.
+    std::erase_if(m_TexturePreviews, [&](auto& entry) {
+        Preview&   p     = entry.second;
+        const bool stale = all || !p.used || m_Ctx.assets.Revision(entry.first) != p.revision;
+        p.used           = false;
+        if (stale && p.texture)
+            m_ImGui->RemoveTexture(p.texture);
+        return stale;
+    });
 }
 
 } // namespace Engine

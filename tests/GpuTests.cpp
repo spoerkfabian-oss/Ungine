@@ -18,15 +18,21 @@
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
 #include <glm/gtc/matrix_transform.hpp>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <format>
 #include <fstream>
 #include <optional>
 #include <string_view>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <random>
 #include <vector>
 
 using namespace Engine;
@@ -65,10 +71,11 @@ struct Fixture {
         jobs.reset();
     }
 
-    // Runs frames (asset update + empty frame) until `done` or the frame budget is spent.
-    bool Pump(const std::function<bool()>& done, int maxFrames = 2000)
+    // Runs frames (asset update + empty frame) until `done`, the frame budget or 120 s are spent.
+    bool Pump(const std::function<bool()>& done, int maxFrames = 1000000)
     {
-        for (int i = 0; i < maxFrames; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < maxFrames && std::chrono::steady_clock::now() - start < std::chrono::seconds(120); ++i) {
             window->PollEvents();
             events.Flush();
             assets->Update();
@@ -1046,7 +1053,401 @@ TEST_CASE(Render_GpuDrivenMatchesCpu)
     F().assets->Release(spheres);
     (void)RenderImage(renderer, scene, camera, 3);
     CHECK(renderer.Stats().instances == 38 && renderer.Stats().instances < before);
+    CHECK(renderer.Spatial().MeshCount() == 38); // released: the BVH drops its meshes too
     F().assets->Release(box);
+}
+
+namespace {
+std::vector<std::byte> EncodePng(const std::vector<std::uint8_t>& rgba, int w, int h)
+{
+    std::vector<std::byte> out;
+    stbi_write_png_to_func(
+        [](void* context, void* data, int size) {
+            auto* bytes = static_cast<std::vector<std::byte>*>(context);
+            bytes->insert(bytes->end(), static_cast<std::byte*>(data), static_cast<std::byte*>(data) + size);
+        },
+        &out, w, h, 4, rgba.data(), w * 4);
+    return out;
+}
+
+std::vector<std::byte> SolidPng(std::uint8_t r, std::uint8_t g, std::uint8_t b)
+{
+    std::vector<std::uint8_t> pixels;
+    for (int i = 0; i < 16 * 16; ++i)
+        pixels.insert(pixels.end(), {r, g, b, 255});
+    return EncodePng(pixels, 16, 16);
+}
+
+void WriteFile(const fs::path& path, std::string_view text, int ageSeconds = 0)
+{
+    std::ofstream(path, std::ios::binary | std::ios::trunc).write(text.data(), static_cast<std::streamsize>(text.size()));
+    // Pushed forward: a change must stay visible within the file system's timestamp resolution.
+    if (ageSeconds != 0)
+        fs::last_write_time(path, fs::last_write_time(path) + std::chrono::seconds(ageSeconds));
+}
+
+void WriteFile(const fs::path& path, const std::vector<std::byte>& bytes, int ageSeconds = 0)
+{
+    WriteFile(path, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()), ageSeconds);
+}
+
+std::string Base64(const std::vector<std::uint8_t>& bytes)
+{
+    static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const std::uint32_t n = (std::uint32_t{bytes[i]} << 16) |
+                                (i + 1 < bytes.size() ? std::uint32_t{bytes[i + 1]} << 8 : 0u) |
+                                (i + 2 < bytes.size() ? std::uint32_t{bytes[i + 2]} : 0u);
+        out += kTable[(n >> 18) & 63];
+        out += kTable[(n >> 12) & 63];
+        out += i + 1 < bytes.size() ? kTable[(n >> 6) & 63] : '=';
+        out += i + 2 < bytes.size() ? kTable[n & 63] : '=';
+    }
+    return out;
+}
+
+// Square of half-size `s` in the XY plane facing +Z; base color from `image` (none if empty).
+std::string QuadGltf(float s, const std::string& image)
+{
+    std::vector<std::uint8_t> buffer;
+    const auto put = [&](const void* data, std::size_t bytes) {
+        const auto* p = static_cast<const std::uint8_t*>(data);
+        buffer.insert(buffer.end(), p, p + bytes);
+    };
+    const float         positions[] = {-s, -s, 0.0f, s, -s, 0.0f, s, s, 0.0f, -s, s, 0.0f};
+    const float         normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const float         uvs[]       = {0, 1, 1, 1, 1, 0, 0, 0};
+    const std::uint16_t indices[]   = {0, 1, 2, 0, 2, 3};
+    put(positions, sizeof(positions));
+    put(normals, sizeof(normals));
+    put(uvs, sizeof(uvs));
+    put(indices, sizeof(indices));
+    const std::string material = image.empty()
+                                     ? R"({"pbrMetallicRoughness": {"metallicFactor": 0.0}})"
+                                     : R"({"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "metallicFactor": 0.0}})";
+    const std::string textures =
+        image.empty() ? std::string{} : std::format(R"("images": [{{"uri": "{}"}}], "textures": [{{"source": 0}}],)", image);
+    return std::format(R"({{
+  "asset": {{"version": "2.0"}}, "scene": 0, "scenes": [{{"nodes": [0]}}], "nodes": [{{"mesh": 0}}],
+  "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}}, "indices": 3, "material": 0}}]}}],
+  "materials": [{}], {}
+  "buffers": [{{"byteLength": {}, "uri": "data:application/octet-stream;base64,{}"}}],
+  "bufferViews": [{{"buffer": 0, "byteOffset": 0, "byteLength": 48}}, {{"buffer": 0, "byteOffset": 48, "byteLength": 48}},
+                  {{"buffer": 0, "byteOffset": 96, "byteLength": 32}}, {{"buffer": 0, "byteOffset": 128, "byteLength": 12}}],
+  "accessors": [
+    {{"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [{}, {}, 0], "max": [{}, {}, 0]}},
+    {{"bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3"}},
+    {{"bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC2"}},
+    {{"bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR"}}]
+}})",
+                       material, textures, buffer.size(), Base64(buffer), -s, -s, s, s);
+}
+
+CameraData FrontCamera(float distance)
+{
+    const glm::vec3 eye{0.0f, 0.0f, distance};
+    return {.view       = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+            .position   = eye};
+}
+
+glm::ivec3 CenterPixel(const std::vector<std::uint8_t>& image)
+{
+    const std::size_t i = (60 * 160 + 80) * 4;
+    return {image[i], image[i + 1], image[i + 2]};
+}
+} // namespace
+
+TEST_CASE(Asset_TexturesSharedCompressedAndHotReloaded)
+{
+    const fs::path dir = fs::temp_directory_path() / "ungine_asset_reload_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    WriteFile(dir / "albedo.png", SolidPng(255, 0, 0));
+    WriteFile(dir / "quad.gltf", QuadGltf(1.0f, "albedo.png"));
+
+    AssetManagerDesc desc;
+    desc.textures.cacheDirectory = dir / "cache";
+    desc.hotReload               = true;
+    desc.pollSeconds             = 0.0;
+    std::vector<TextureHandle> textureReloads;
+    std::vector<ModelHandle>   modelReloads;
+    Subscription s1 = F().events.Subscribe<AssetReloadedEvent<Texture>>([&](const auto& e) { textureReloads.push_back(e.handle); });
+    Subscription s2 = F().events.Subscribe<AssetReloadedEvent<Model>>([&](const auto& e) { modelReloads.push_back(e.handle); });
+    {
+        AssetManager assets(*F().renderer, *F().jobs, F().events, desc);
+        const auto   pump = [&](const std::function<bool()>& done) {
+            return F().Pump([&] {
+                assets.Update();
+                return done();
+            });
+        };
+
+        // The model's external image and the same file loaded directly are one texture asset.
+        const ModelHandle quad = assets.LoadModel(dir / "quad.gltf");
+        CHECK(pump([&] { return assets.State(quad) == AssetState::Ready; }));
+        const Model* model = assets.Get(quad);
+        CHECK(model && model->textures.size() == 1);
+        if (!model || model->textures.empty())
+            return;
+        const TextureHandle albedo = model->textures[0];
+        CHECK(assets.LoadTexture(dir / "albedo.png", TextureKind::Color) == albedo && assets.RefCount(albedo) == 2);
+        assets.Release(albedo);
+        const Texture* texture = assets.Get(albedo);
+        const VkFormat format  = F().context->SupportsBC() ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_R8G8B8A8_SRGB;
+        CHECK(texture && texture->format == format && texture->mipLevels == 5 && !texture->cacheHit);
+        const std::uint32_t entry = assets.TableEntry(albedo);
+        CHECK(texture && entry >= static_cast<std::uint32_t>(DefaultTexture::Count) &&
+              F().renderer->TextureEntry(entry) == texture->bindlessSlot);
+
+        Scene scene;
+        const Entity root = InstantiateModel(scene, quad, *model);
+        scene.UpdateTransforms();
+        const Entity  node = scene.GetRegistry().Get<Hierarchy>(root).children.at(0);
+        SceneRenderer renderer(*F().renderer, *F().context, assets);
+        renderer.post.autoExposure = false;
+        glm::ivec3 center = CenterPixel(RenderImage(renderer, scene, FrontCamera(3.0f), 3));
+        CHECK(center.r > center.g + 40 && center.r > center.b + 40); // red
+
+        // Texture hot reload: new image under the same table entry; the model is untouched.
+        const std::uint32_t modelRevision = assets.Revision(quad), textureRevision = assets.Revision(albedo);
+        WriteFile(dir / "albedo.png", SolidPng(0, 255, 0), 5);
+        CHECK(pump([&] { return assets.Revision(albedo) != textureRevision; }));
+        CHECK(assets.State(albedo) == AssetState::Ready && assets.TableEntry(albedo) == entry);
+        CHECK(textureReloads.size() == 1 && textureReloads[0] == albedo && assets.Revision(quad) == modelRevision);
+        CHECK(assets.Get(albedo) && F().renderer->TextureEntry(entry) == assets.Get(albedo)->bindlessSlot);
+        center = CenterPixel(RenderImage(renderer, scene, FrontCamera(3.0f), 3));
+        CHECK(center.g > center.r + 40 && center.g > center.b + 40); // green
+
+        // Model hot reload: a larger quad; the texture asset carries over to the new version.
+        WriteFile(dir / "quad.gltf", QuadGltf(2.0f, "albedo.png"), 5);
+        CHECK(pump([&] { return assets.Revision(quad) != modelRevision; }));
+        model = assets.Get(quad);
+        CHECK(model && model->boundsMax.x == 2.0f && model->textures.size() == 1 && model->textures[0] == albedo);
+        CHECK(modelReloads.size() == 1 && modelReloads[0] == quad && assets.RefCount(albedo) == 1);
+        (void)RenderImage(renderer, scene, FrontCamera(3.0f), 3);
+        const auto bounds = renderer.Spatial().Bounds(node);
+        CHECK(bounds && std::abs(bounds->max.x - 2.0f) < 1e-4f);
+        CHECK(renderer.Stats().instances == 1);
+
+        // A broken file keeps the loaded version and reports the error.
+        F().failed.clear();
+        WriteFile(dir / "quad.gltf", std::string_view("{ broken"), 10);
+        CHECK(pump([&] { return !assets.Error(quad).empty(); }));
+        CHECK(assets.State(quad) == AssetState::Ready && assets.Get(quad) == model);
+        CHECK(F().failed.size() == 1 && F().failed[0] == quad);
+
+        // A missing image: the model loads, the texture fails (placeholder) and recovers by
+        // itself once the file appears (hot reload polls missing files too).
+        WriteFile(dir / "quad.gltf", QuadGltf(1.0f, "late.png"), 15);
+        CHECK(pump([&] { return assets.Get(quad) && assets.Get(quad)->boundsMax.x == 1.0f; }));
+        const TextureHandle late = assets.Get(quad)->textures.at(0);
+        CHECK(assets.State(late) == AssetState::Failed && assets.State(albedo) == AssetState::Invalid);
+        CHECK(F().renderer->TextureEntry(assets.TableEntry(late)) ==
+              F().renderer->DefaultTextureIndex(DefaultTexture::Error));
+        center = CenterPixel(RenderImage(renderer, scene, FrontCamera(3.0f), 3));
+        WriteFile(dir / "late.png", SolidPng(0, 0, 255));
+        CHECK(pump([&] { return assets.State(late) == AssetState::Ready; }));
+        center = CenterPixel(RenderImage(renderer, scene, FrontCamera(3.0f), 3));
+        CHECK(center.b > center.r + 40 && center.b > center.g + 40); // blue
+        CHECK(F().renderer->TextureEntry(assets.TableEntry(late)) == assets.Get(late)->bindlessSlot);
+        assets.Release(quad);
+    }
+
+    // The cooked images are cached: a new manager does not encode them again.
+    {
+        AssetManager        assets(*F().renderer, *F().jobs, F().events, desc);
+        const TextureHandle t = assets.LoadTexture(dir / "late.png", TextureKind::Color);
+        CHECK(F().Pump([&] {
+            assets.Update();
+            return assets.State(t) == AssetState::Ready;
+        }));
+        CHECK(assets.Get(t) && assets.Get(t)->cacheHit);
+        assets.Release(t);
+    }
+    F().Pump([] { return false; }, 4);
+    fs::remove_all(dir);
+}
+
+TEST_CASE(Asset_FailedModelPlaceholderAndRetry)
+{
+    const fs::path dir = fs::temp_directory_path() / "ungine_asset_retry_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path path = dir / "late.gltf";
+
+    const ModelHandle h = F().assets->LoadModel(path);
+    CHECK(F().Pump([&] { return Settled(h); }) && F().assets->State(h) == AssetState::Failed);
+    const ResolvedMesh placeholder = F().assets->ResolveMesh(h, 3);
+    CHECK(placeholder.placeholder && placeholder.model && placeholder.meshIndex == 0 && !F().assets->Get(h));
+    const std::uint32_t failedRevision = F().assets->Revision(h);
+    CHECK(failedRevision > 0);
+
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Missing");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = h, .meshIndex = 0});
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    glm::ivec3 center = CenterPixel(RenderImage(renderer, scene, FrontCamera(3.0f), 3));
+    CHECK(renderer.Stats().instances == 1 && renderer.Spatial().MeshCount() == 1); // the placeholder box
+    CHECK(center.r > center.g + 20 && center.b > center.g + 20);                  // magenta checker
+
+    // Retry once the file exists: the real model replaces the placeholder.
+    WriteFile(path, QuadGltf(0.25f, ""));
+    F().loaded.clear();
+    CHECK(F().assets->Reload(h));
+    CHECK(F().Pump([&] { return F().assets->State(h) == AssetState::Ready; }));
+    CHECK(F().loaded.size() == 1 && F().loaded[0] == h && F().assets->Revision(h) != failedRevision);
+    CHECK(!F().assets->ResolveMesh(h, 0).placeholder && F().assets->Error(h).empty());
+    (void)RenderImage(renderer, scene, FrontCamera(3.0f), 3);
+    const auto bounds = renderer.Spatial().Bounds(e);
+    CHECK(bounds && std::abs(bounds->max.x - 0.25f) < 1e-4f && renderer.Stats().instances == 1);
+    // Generated models have no source to reload.
+    const ModelHandle generated = F().assets->CreateModel(MakeBox("Box", 1.0f, MaterialData{}));
+    CHECK(!F().assets->Reload(generated) && F().assets->Reload(h));
+    CHECK(F().Pump([&] { return Settled(generated) && Settled(h) && F().assets->Models().size() >= 2; }));
+    F().assets->Release(generated);
+    F().assets->Release(h);
+    F().Pump([] { return false; }, 4);
+    fs::remove_all(dir);
+}
+
+TEST_CASE(Render_MeshLodSelection)
+{
+    const ModelHandle h = F().assets->CreateModel(
+        MakeCapsule("LodBall", 1.0f, 0.0f, MaterialData{.name = "Ball", .metallic = 0.0f, .roughness = 0.5f}, 128, 64));
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model != nullptr);
+    if (!model)
+        return;
+    const Submesh& sm = model->meshes[0].submeshes[0];
+    CHECK(sm.lodCount == kMaxLods);
+
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Ball");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = h, .meshIndex = 0});
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.shadows.resolution = 512;
+
+    struct Result {
+        std::uint32_t lodDraws  = 0;
+        std::uint64_t triangles = 0;
+    };
+    const auto measure = [&](bool gpu, float distance) { // GPU counters: two frames old
+        renderer.culling.gpuDriven = gpu;
+        (void)RenderImage(renderer, scene, FrontCamera(distance), gpu ? 5 : 1);
+        return Result{renderer.Stats().lodDraws, renderer.Stats().triangles};
+    };
+    const std::uint64_t full = sm.indexCount / 3, coarsest = sm.lods[sm.lodCount - 1].indexCount / 3;
+    const Result nearGpu = measure(true, 1.75f), farGpu = measure(true, 400.0f);
+    const Result nearCpu = measure(false, 1.75f), farCpu = measure(false, 400.0f);
+    CHECK(nearGpu.lodDraws == 0 && nearGpu.triangles == full);
+    CHECK(farGpu.lodDraws == 1 && farGpu.triangles == coarsest && coarsest < full / 4);
+    CHECK(nearCpu.lodDraws == 0 && nearCpu.triangles == full);
+    CHECK(farCpu.lodDraws == 1 && farCpu.triangles == coarsest);
+
+    renderer.culling.forceLod = 2;
+    CHECK(measure(true, 1.75f).triangles == sm.lods[2].indexCount / 3);
+    CHECK(measure(false, 1.75f).triangles == sm.lods[2].indexCount / 3);
+    renderer.culling.forceLod = -1;
+    renderer.culling.lod      = false;
+    CHECK(measure(true, 400.0f).triangles == full && measure(false, 400.0f).lodDraws == 0);
+    renderer.culling.lod    = true;
+    renderer.post.debugView = DebugView::Lod;
+    (void)measure(true, 20.0f);
+    (void)measure(false, 20.0f);
+    F().assets->Release(h);
+}
+
+TEST_CASE(Render_ShaderReloadRebuildsPipelines)
+{
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    CHECK(F().Pump([&] { return Settled(box); }));
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Box");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    const std::vector<std::uint8_t> before = RenderImage(renderer, scene, FrontCamera(3.0f), 3);
+
+    // Every pipeline (scene, IBL, GPU scene, culling) rebuilt from the same SPIR-V: same image.
+    const std::uint64_t generation = F().renderer->ShaderGeneration();
+    F().renderer->NotifyShadersChanged();
+    const std::vector<std::uint8_t> after = RenderImage(renderer, scene, FrontCamera(3.0f), 3);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < before.size(); ++i)
+        differing += std::abs(static_cast<int>(before[i]) - static_cast<int>(after[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0 && F().renderer->ShaderGeneration() == generation + 1);
+
+    // A real recompile (same source) goes through the watcher and bumps the generation.
+    F().renderer->SetShaderHotReload(true);
+    if (ShaderHotReload* reload = F().renderer->ShaderReloader(); reload && reload->Available()) {
+        CHECK(reload->Recompile(ShaderPath("sky.frag.spv")));
+        (void)RenderImage(renderer, scene, FrontCamera(3.0f), 2);
+        CHECK(F().renderer->ShaderGeneration() == generation + 2);
+    }
+    F().renderer->SetShaderHotReload(false);
+    F().assets->Release(box);
+}
+
+TEST_CASE(Upload_RingBudgetAndLargeUploads)
+{
+    // Small ring + budget: uploads wrap / overflow into own staging buffers and batches are
+    // held back per Submit(); the data must arrive intact either way.
+    constexpr VkDeviceSize kRing = 1u << 20, kBudget = 256u << 10;
+    UploadQueue            queue(*F().context, {.stagingRingSize = kRing, .frameBudget = kBudget});
+    std::mt19937           rng(7);
+    std::vector<std::vector<std::byte>> contents;
+    std::vector<Buffer>                 buffers;
+    UploadTicket                        ticket = 0;
+    for (const std::size_t size : {200u << 10, 200u << 10, 200u << 10, 700u << 10, 200u << 10, 200u << 10, 200u << 10,
+                                   200u << 10, 64u, 3u}) {
+        std::vector<std::byte> data(size);
+        for (std::byte& b : data)
+            b = static_cast<std::byte>(rng());
+        buffers.push_back(queue.CreateBuffer(data, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, ticket));
+        contents.push_back(std::move(data));
+    }
+    const UploadStats recorded = queue.Stats();
+    CHECK(recorded.ringCapacity == kRing && recorded.ringUsed > 0 && recorded.ringUsed <= kRing);
+    CHECK(recorded.dedicatedStaging >= 2); // the large one + what no longer fit the ring
+    CHECK(recorded.queuedBatches >= 8);    // one 200 KB upload per batch (budget 256 KB)
+    queue.Submit();
+    const UploadStats submitted = queue.Stats();
+    CHECK(submitted.submittedLastFrame > 0 && submitted.submittedLastFrame <= kBudget);
+    CHECK(submitted.queuedBatches == recorded.queuedBatches - 1 && !queue.IsReady(ticket));
+
+    queue.Flush();
+    CHECK(queue.IsReady(ticket) && queue.Stats().ringUsed == 0 && queue.Stats().queuedBatches == 0);
+    VkDeviceSize total = 0;
+    for (const auto& c : contents)
+        total += c.size();
+    Buffer readback(*F().context, {.size = total, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   .memory = MemoryUsage::Readback, .debugName = "UploadReadback"});
+    queue.ImmediateSubmit([&](VkCommandBuffer cmd) {
+        VkDeviceSize offset = 0;
+        for (std::size_t i = 0; i < buffers.size(); ++i) {
+            const VkBufferCopy region{0, offset, contents[i].size()};
+            vkCmdCopyBuffer(cmd, buffers[i].Handle(), readback.Handle(), 1, &region);
+            offset += contents[i].size();
+        }
+    });
+    readback.Invalidate(0, VK_WHOLE_SIZE);
+    const auto*  bytes  = static_cast<const std::byte*>(readback.Mapped());
+    bool         intact = true;
+    VkDeviceSize offset = 0;
+    for (const auto& c : contents) {
+        intact = intact && std::memcmp(bytes + offset, c.data(), c.size()) == 0;
+        offset += c.size();
+    }
+    CHECK(intact);
+    F().context->WaitIdle();
 }
 
 int main(int argc, char** argv)

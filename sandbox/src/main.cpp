@@ -47,6 +47,8 @@ protected:
     {
         m_SceneRenderer = std::make_unique<Engine::SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
         m_SceneRenderer->culling.gpuDriven = !m_CpuCulling;
+        if (GetAssets().HotReload()) // --hot-reload: shaders too
+            GetRenderer().SetShaderHotReload(true);
         m_SceneRenderer->post.debugView =
             static_cast<Engine::DebugView>(std::min(m_StartDebugView, static_cast<std::uint32_t>(Engine::DebugView::Count) - 1));
         m_Physics       = std::make_unique<Engine::PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
@@ -60,14 +62,17 @@ protected:
 
         m_LoadedSub = GetEvents().Subscribe<Engine::AssetLoadedEvent<Engine::Model>>(
             [this](const Engine::AssetLoadedEvent<Engine::Model>& e) {
-                if (e.handle == m_Model)
+                if (e.handle == m_Model) {
+                    m_LoadFailed = false; // F5 retried a failed load
                     OnModelLoaded();
+                }
                 else if (e.handle == m_Ground)
                     OnGroundLoaded();
             });
         m_FailedSub = GetEvents().Subscribe<Engine::AssetFailedEvent<Engine::Model>>(
             [this](const Engine::AssetFailedEvent<Engine::Model>& e) {
-                if (e.handle == m_Model) {
+                // A failed reload keeps the loaded model (state stays Ready).
+                if (e.handle == m_Model && GetAssets().State(m_Model) == Engine::AssetState::Failed) {
                     m_LoadFailed = true;
                     m_LoadDone   = true;
                 }
@@ -78,6 +83,8 @@ protected:
     {
         if (GetInput().WasKeyPressed(Engine::Key::F1))
             SetEditorEnabled(!m_Editor);
+        if (GetInput().WasKeyPressed(Engine::Key::F5) && m_Model) // reload (or retry) the model and its textures
+            (void)GetAssets().Reload(m_Model);
 
         // With the editor, the camera only reacts to the viewport (or while it is looking around).
         if (m_CharacterMode)
@@ -111,7 +118,7 @@ protected:
             GetWindow().SetTitle(std::format(
                 "Sandbox | {} FPS | {:.2f} ms | {} | {} draws ({} culled, {} shadow) | {} tris | {}/{} lights | "
                 "phys {} ({} active) {:.2f} ms, {} hits | "
-                "cpu xf {:.2f} bvh {:.2f} scene {:.2f} cull {:.2f} ms | {} x{:.2f}{}{}{} | debug {}{}",
+                "cpu xf {:.2f} bvh {:.2f} scene {:.2f} cull {:.2f} ms | {} lod | {} x{:.2f}{}{}{} | debug {}{}",
                 m_FrameCount, 1000.0 * m_FpsTimer / m_FrameCount,
                 stats.gpuDriven ? std::format("gpu {} inst / {} batches, {} occl.", stats.instances, stats.batches,
                                               stats.gpuOccluded)
@@ -119,7 +126,8 @@ protected:
                 stats.drawCalls, stats.culled, stats.shadowDraws,
                 stats.triangles, stats.lights, stats.lightsTotal, phys.bodies, phys.activeBodies, phys.stepMs,
                 std::exchange(m_Collisions, 0u), m_Scene.FrameTransformUpdate().milliseconds,
-                stats.cpuSpatialMs, stats.cpuGpuSceneMs, stats.cpuCullingMs, Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
+                stats.cpuSpatialMs, stats.cpuGpuSceneMs, stats.cpuCullingMs, stats.lodDraws,
+                Engine::ToString(post.tonemapper), stats.exposure, post.autoExposure ? " (auto)" : "",
                 post.bloom ? " | bloom" : "", m_SceneRenderer->ao.enabled ? " | AO" : "",
                 Engine::ToString(post.debugView), status));
             m_FpsTimer   = 0.0;
@@ -580,7 +588,8 @@ private:
 
 int main(int argc, char** argv)
 {
-    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N] [--cpu-culling] [--debug-view N]
+    // Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N]
+    //                [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed]
     std::filesystem::path modelPath = "assets/models/WaterBottle.glb";
     std::uint32_t         frames    = 0;
     bool                  editor    = false;
@@ -589,6 +598,7 @@ int main(int argc, char** argv)
     std::uint32_t         bodies    = 0;
     bool                  cpuCulling = false;
     std::uint32_t         debugView  = 0;
+    Engine::AssetManagerDesc assets;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--frames" && i + 1 < argc)
@@ -605,11 +615,16 @@ int main(int argc, char** argv)
             cpuCulling = true;
         else if (arg == "--debug-view" && i + 1 < argc)
             debugView = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--hot-reload")
+            assets.hotReload = true;
+        else if (arg == "--uncompressed") // textures stay RGBA8 (e.g. software rasterizers: slow BC decoding)
+            assets.textures.compress = false;
         else
             modelPath = arg;
     }
     if (!std::filesystem::exists(modelPath)) {
-        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] [--instances N] [--physics N] [--cpu-culling] [--debug-view N]",
+        ENGINE_ERROR("Model not found: '{}'. Usage: Sandbox [path/to/model.gltf|.glb] [--frames N] [--editor] [--lights N] "
+                     "[--instances N] [--physics N] [--cpu-culling] [--debug-view N] [--hot-reload] [--uncompressed]",
                      modelPath.string());
         return 1;
     }
@@ -617,7 +632,8 @@ int main(int argc, char** argv)
     // Exit code: 0 ok, 1 fatal error or model failed to load, 2 validation errors (incl. teardown).
     bool loadFailed = false;
     try {
-        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}}, modelPath, frames, editor, lights, instances,
+        Sandbox app({.window = {.title = "Sandbox"}, .renderer = {.vsync = true}, .assets = assets}, modelPath, frames, editor,
+                    lights, instances,
                     bodies, cpuCulling);
         app.SetStartDebugView(debugView);
         app.Run();

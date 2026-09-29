@@ -6,3 +6,4 @@ out/
 CMakeUserPresets.json
 *.user
 editor.ini
+asset_cache/
