@@ -4,6 +4,7 @@
 #include "Editor/Editor.h"
 #include "Editor/ProjectLauncher.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
@@ -71,7 +72,9 @@ protected:
     {
         m_SceneRenderer = std::make_unique<SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
         m_Physics       = std::make_unique<PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
-        m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets());
+        m_Audio         = std::make_unique<AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
+        m_Audio->Apply(m_Project.settings.audio);
+        m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
         m_Editor        = std::make_unique<Editor>(EditorContext{.window        = GetWindow(),
                                                                  .renderer      = GetRenderer(),
                                                                  .scene         = m_Scene,
@@ -81,6 +84,7 @@ protected:
                                                                  .modelRefs     = m_ModelRefs,
                                                                  .physics       = m_Physics.get(),
                                                                  .scripts       = m_Scripts.get(),
+                                                                 .audio         = m_Audio.get(),
                                                                  .project       = &m_Project,
                                                                  .layoutFile    = m_Project.SavedDirectory() / "EditorLayout.ini"});
         std::error_code ec;
@@ -117,6 +121,7 @@ protected:
     {
         m_Editor.reset(); // stops playing
         m_Scripts->End(m_Scene);
+        m_Audio.reset(); // releases its sounds
         m_Scene.Clear();
         for (ModelHandle h : m_ModelRefs)
             if (GetAssets().State(h) != AssetState::Invalid)
@@ -135,6 +140,7 @@ private:
     std::vector<ModelHandle>       m_ModelRefs;
     std::unique_ptr<SceneRenderer> m_SceneRenderer;
     std::unique_ptr<PhysicsWorld>  m_Physics;
+    std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;
     std::unique_ptr<Editor>        m_Editor; // references the members above: declared after them
 };

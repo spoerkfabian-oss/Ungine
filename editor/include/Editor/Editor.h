@@ -23,6 +23,7 @@
 namespace Engine {
 
 class AssetManager;
+class AudioSystem;
 class FileDialog;
 class FlyCamera;
 class History;
@@ -52,6 +53,8 @@ struct EditorContext {
     PhysicsWorld* physics = nullptr;
     // Optional: visual scripts run while playing (Begin on Play, Update per frame, End on Stop).
     ScriptSystem* scripts = nullptr;
+    // Optional: scene audio while playing (Begin on Play, End on Stop), previews, audio settings.
+    AudioSystem* audio = nullptr;
     // Optional: the open project (Content browser root, project settings, Build & Run, packaging).
     Project* project = nullptr;
     // ImGui layout file (empty: not saved).
@@ -163,6 +166,10 @@ private:
     void DrawAssets();
     void DrawModelAssets(ModelHandle& toRelease);
     void DrawTextureAssets();
+    void DrawSoundAssets();
+    void DrawAudioSettings(); // mixer + occlusion (saved with the project)
+    // Audio source icons (click selects), distance spheres of selected sources, reverb zone boxes.
+    bool DrawAudioOverlay(float x, float y, float width, float height, bool clicked);
     [[nodiscard]] std::uint64_t TexturePreview(TextureHandle handle); // ImTextureID, 0: none
     void ReleaseTexturePreviews(bool all); // all: shutdown; else those not shown this frame / outdated
     void DrawDialogs();
@@ -191,6 +198,8 @@ private:
     Entity CreatePrimitiveEntity(PrimitiveShape shape);                       // + undo
     void   Reparent(Entity child, Entity parent);                             // keeps the world transform, + undo
     void   AssignScript(Entity entity, const std::filesystem::path& graph);  // Script component, + undo
+    void   AssignSound(Entity entity, const std::filesystem::path& sound);   // Audio Source (added if missing), + undo
+    Entity CreateAudioEntity(const std::filesystem::path& sound, const glm::vec3& position); // + undo
     void   DestroyByUuids(std::span<const std::uint64_t> uuids);
     [[nodiscard]] std::uint64_t UuidOf(Entity entity) const;
 
@@ -235,6 +244,7 @@ private:
     bool                m_ShowBvh         = false; // BVH nodes + selection bounds in the viewport
     int                 m_BvhDepth        = 8;
     bool                m_ShowColliders   = true;
+    bool                m_ShowAudio       = true; // audio source icons / ranges, reverb zones
     bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
     // Play mode
@@ -257,13 +267,14 @@ private:
     bool m_ShowHierarchy = true, m_ShowInspector = true, m_ShowRenderer = true, m_ShowStats = true;
     bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
     bool m_ShowProjectSettings = false;
+    bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
     bool m_AskQuit = false, m_QuitConfirmed = false;
 
     // Content browser
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Model, Texture, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Model, Texture, Sound, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -284,8 +295,9 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, Package } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
+    Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";
 };
 

@@ -166,6 +166,7 @@ struct ScriptSystem::Impl {
         double             Time() const override { return m_Impl.time; }
         PhysicsWorld*      Physics() override { return m_Impl.physics; }
         AssetManager*      Assets() override { return m_Impl.assets; }
+        AudioSystem*       Audio() override { return m_Impl.audio; }
         const Input*       GetInput() override { return m_Impl.acceptInput ? m_Impl.input : nullptr; }
         ScriptValue*       Variable(const std::string& name) override
         {
@@ -195,8 +196,8 @@ struct ScriptSystem::Impl {
         Instance& m_Instance;
     };
 
-    Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am)
-        : events(bus), input(in), physics(phys), assets(am)
+    Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am, AudioSystem* au)
+        : events(bus), input(in), physics(phys), assets(am), audio(au)
     {
         collisionSub = events.Subscribe<CollisionEvent>([this](const CollisionEvent& e) {
             if (running)
@@ -440,6 +441,7 @@ struct ScriptSystem::Impl {
     const Input*  input;
     PhysicsWorld* physics;
     AssetManager* assets;
+    AudioSystem*  audio;
     Subscription  collisionSub;
 
     bool          running     = false;
@@ -460,8 +462,9 @@ struct ScriptSystem::Impl {
     ScriptStats                                                     stats;
 };
 
-ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* physics, AssetManager* assets)
-    : m_Impl(std::make_unique<Impl>(events, input, physics, assets))
+ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* physics, AssetManager* assets,
+                           AudioSystem* audio)
+    : m_Impl(std::make_unique<Impl>(events, input, physics, assets, audio))
 {
 }
 

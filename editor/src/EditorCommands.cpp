@@ -4,6 +4,7 @@
 #include "History.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
@@ -338,6 +339,7 @@ void Editor::DrawDialogs()
             }
             break;
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
+        case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
         case DialogPurpose::Package:
             if (m_Ctx.project)
                 PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
@@ -413,12 +415,40 @@ void Editor::AssignScript(Entity entity, const std::filesystem::path& graph)
     PushStateChange("Assign script", {StateEdit{UuidOf(entity), std::move(before)}});
 }
 
+void Editor::AssignSound(Entity entity, const std::filesystem::path& sound)
+{
+    Registry& r = m_Ctx.scene.GetRegistry();
+    if (!r.Valid(entity))
+        return;
+    std::error_code ec;
+    std::string     before = SnapshotEntityState(m_Ctx.scene, entity);
+    AudioSource     source = r.Has<AudioSource>(entity) ? r.Get<AudioSource>(entity) : AudioSource{};
+    source.sound           = PathToUtf8(std::filesystem::absolute(sound, ec).lexically_normal());
+    r.EmplaceOrReplace<AudioSource>(entity, source);
+    PushStateChange("Assign sound", {StateEdit{UuidOf(entity), std::move(before)}});
+}
+
+Entity Editor::CreateAudioEntity(const std::filesystem::path& sound, const glm::vec3& position)
+{
+    std::error_code ec;
+    const Entity    e = m_Ctx.scene.CreateEntity(sound.empty() ? std::string("Audio Source") : PathToUtf8(sound.stem()));
+    m_Ctx.scene.EditTransform(e).position = position;
+    m_Ctx.scene.GetRegistry().Emplace<AudioSource>(
+        e, AudioSource{.sound = sound.empty() ? std::string() : PathToUtf8(std::filesystem::absolute(sound, ec).lexically_normal())});
+    const Entity roots[] = {e};
+    PushCreated("Create audio source", roots);
+    Select(e);
+    return e;
+}
+
 void Editor::Play()
 {
-    if (!m_Ctx.physics && !m_Ctx.scripts)
+    if (!m_Ctx.physics && !m_Ctx.scripts && !m_Ctx.audio)
         return;
     if (m_PlayState == PlayState::Paused) {
         m_PlayState = PlayState::Playing;
+        if (m_Ctx.audio)
+            m_Ctx.audio->SetPaused(false);
         return;
     }
     if (m_PlayState != PlayState::Edit)
@@ -440,6 +470,10 @@ void Editor::Play()
         m_Ctx.physics->Reset(); // fresh bodies: no velocities or sleep state from editing
         m_Ctx.physics->Sync(m_Ctx.scene); // bodies exist for BeginPlay (impulses, raycasts)
     }
+    if (m_Ctx.audio) {
+        m_Ctx.audio->StopPreview();
+        m_Ctx.audio->Begin(m_Ctx.scene); // before BeginPlay: scripts may play sources right away
+    }
     if (m_Ctx.scripts) {
         m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
         m_Ctx.scripts->Begin(m_Ctx.scene);
@@ -451,14 +485,17 @@ void Editor::Play()
 
 void Editor::Pause()
 {
-    if (m_PlayState == PlayState::Playing)
+    if (m_PlayState == PlayState::Playing) {
         m_PlayState = PlayState::Paused;
+        if (m_Ctx.audio)
+            m_Ctx.audio->SetPaused(true);
+    }
 }
 
 void Editor::StepOnce()
 {
     if (m_PlayState == PlayState::Playing)
-        m_PlayState = PlayState::Paused;
+        Pause();
     if (m_PlayState == PlayState::Paused)
         m_StepRequested = true;
 }
@@ -474,6 +511,10 @@ void Editor::Stop()
 
     if (m_Ctx.scripts)
         m_Ctx.scripts->End(m_Ctx.scene); // EndPlay, spawned models released
+    if (m_Ctx.audio) {
+        m_Ctx.audio->End(m_Ctx.scene);
+        m_Ctx.audio->SetPaused(false);
+    }
     m_Ctx.scene.Clear();
     (void)RestoreEntities(m_Ctx.scene, m_PlaySnapshot, RestoreMode::Original);
     m_Ctx.scene.UpdateTransforms();

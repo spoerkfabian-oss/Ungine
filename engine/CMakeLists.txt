@@ -1,5 +1,8 @@
 add_library(Engine STATIC
     src/Assets/AssetManager.cpp
+    src/Audio/AudioEngine.cpp
+    src/Audio/AudioSystem.cpp
+    src/Audio/Sound.cpp
     src/Assets/GltfLoader.cpp
     src/Assets/Model.cpp
     src/Assets/Primitives.cpp
@@ -49,7 +52,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio
             $<$<PLATFORM_ID:Windows>:shell32>)
 
 # Project templates (installed next to the executables, see the root CMakeLists).

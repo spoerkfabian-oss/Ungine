@@ -1,4 +1,6 @@
 #pragma once
+#include "Engine/Audio/AudioTypes.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -18,6 +20,7 @@ struct ProjectSettings {
     std::uint32_t windowHeight = 900;
     bool          fullscreen   = false;
     bool          vsync        = true;
+    AudioSettings audio;        // mixer (bus volumes / mutes), occlusion
 };
 
 struct ProjectTemplate {

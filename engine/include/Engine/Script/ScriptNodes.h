@@ -9,6 +9,7 @@
 namespace Engine {
 
 class AssetManager;
+class AudioSystem;
 class Input;
 class PhysicsWorld;
 class Scene;
@@ -60,6 +61,7 @@ public:
     [[nodiscard]] virtual double        Time() const = 0; // seconds since the script system began
     [[nodiscard]] virtual PhysicsWorld* Physics() = 0;    // may be null
     [[nodiscard]] virtual AssetManager* Assets() = 0;     // may be null
+    [[nodiscard]] virtual AudioSystem*  Audio() = 0;      // may be null
     [[nodiscard]] virtual const Input*  GetInput() = 0;   // null while the game does not have the input
     [[nodiscard]] virtual ScriptValue*  Variable(const std::string& name) = 0; // null: no such variable
 

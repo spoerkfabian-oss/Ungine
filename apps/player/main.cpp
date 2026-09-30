@@ -1,8 +1,9 @@
-// UnginePlayer: runs a project's start scene as the game (physics, visual scripts, the scene's
-// primary Camera component). Started by the editor (Build & Run) with the project file, or as a
+// UnginePlayer: runs a project's start scene as the game (physics, visual scripts, audio, the
+// scene's primary Camera component). Started by the editor (Build & Run) with the project file, or as a
 // packaged game that finds the .ungineproj next to the executable.
 // Keys: Esc quits, F11 toggles fullscreen.
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
@@ -51,7 +52,9 @@ protected:
     {
         m_SceneRenderer = std::make_unique<SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
         m_Physics       = std::make_unique<PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
-        m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets());
+        m_Audio         = std::make_unique<AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
+        m_Audio->Apply(m_Project.settings.audio);
+        m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
 
         const fs::path scene = m_Project.StartScene();
         try {
@@ -65,6 +68,7 @@ protected:
         }
         m_Scene.UpdateTransforms();
         m_Physics->Sync(m_Scene);
+        m_Audio->Begin(m_Scene);
         m_Scripts->Begin(m_Scene);
         ENGINE_INFO("Playing '{}' ({})", m_Project.settings.name, PathToUtf8(scene));
     }
@@ -81,6 +85,9 @@ protected:
             return;
         m_Scripts->Update(m_Scene, static_cast<float>(dt));
         m_Scene.UpdateTransforms();
+        // Heard from an Audio Listener, else the primary camera, else the saved camera.
+        const CameraData view = m_FallbackCamera.GetData(1.0f);
+        m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
         if (m_ExitAfterFrames > 0 && ++m_Frames >= m_ExitAfterFrames) // smoke tests
             GetWindow().RequestClose();
     }
@@ -102,6 +109,12 @@ protected:
     void OnShutdown() override
     {
         m_Scripts->End(m_Scene);
+        const AudioSystemStats& audio = m_Audio->Stats();
+        ENGINE_INFO("Audio: {} source(s), {} playing, {} voice(s) on '{}'", audio.sources, audio.playing,
+                    m_Audio->Engine().Stats().voices,
+                    GetAudio().HasDevice() ? GetAudio().DeviceName() : std::string("no device"));
+        m_Audio->End(m_Scene);
+        m_Audio.reset(); // releases its sounds
         m_Scene.Clear();
         for (ModelHandle h : m_Models)
             GetAssets().Release(h);
@@ -118,6 +131,7 @@ private:
     std::vector<ModelHandle>       m_Models;
     std::unique_ptr<SceneRenderer> m_SceneRenderer;
     std::unique_ptr<PhysicsWorld>  m_Physics;
+    std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;
 };
 
@@ -162,8 +176,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Caches: the project's Saved/ during development (shared with the editor), else per user.
+    // Relative paths in scripts (e.g. "Content/Sounds/hit.wav") start at the project root, as in the editor.
     std::error_code ec;
+    fs::current_path(project->Root(), ec);
+
+    // Caches: the project's Saved/ during development (shared with the editor), else per user.
     const fs::path  saved = fs::is_directory(project->SavedDirectory(), ec)
                                 ? project->SavedDirectory()
                                 : UserConfigDirectory() / "Games" / PathFromUtf8(project->settings.name);

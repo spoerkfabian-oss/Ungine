@@ -109,6 +109,17 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
             s.fullscreen   = w->value("fullscreen", s.fullscreen);
             s.vsync        = w->value("vsync", s.vsync);
         }
+        if (const auto a = root->find("audio"); a != root->end() && a->is_object()) {
+            if (const auto buses = a->find("buses"); buses != a->end() && buses->is_object())
+                for (std::size_t i = 0; i < kAudioBusCount; ++i)
+                    if (const auto b = buses->find(ToString(static_cast<AudioBus>(i))); b != buses->end()) {
+                        s.audio.volume[i] = std::clamp(b->value("volume", s.audio.volume[i]), 0.0f, 4.0f);
+                        s.audio.muted[i]  = b->value("muted", s.audio.muted[i]);
+                    }
+            s.audio.occlusion         = a->value("occlusion", s.audio.occlusion);
+            s.audio.occlusionStrength = std::clamp(a->value("occlusionStrength", s.audio.occlusionStrength), 0.0f, 1.0f);
+            s.audio.occlusionRays     = std::min(a->value("occlusionRays", s.audio.occlusionRays), 4096u);
+        }
         return project;
     } catch (const json::exception& e) {
         SetError(error, "'" + PathToUtf8(file) + "': " + e.what());
@@ -118,6 +129,9 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
 
 bool Project::Save(std::string* error) const
 {
+    json buses = json::object();
+    for (std::size_t i = 0; i < kAudioBusCount; ++i)
+        buses[ToString(static_cast<AudioBus>(i))] = {{"volume", settings.audio.volume[i]}, {"muted", settings.audio.muted[i]}};
     const json root{{"version", kProjectVersion},
                     {"engine", "Ungine"},
                     {"name", settings.name},
@@ -126,7 +140,12 @@ bool Project::Save(std::string* error) const
                      {{"width", settings.windowWidth},
                       {"height", settings.windowHeight},
                       {"fullscreen", settings.fullscreen},
-                      {"vsync", settings.vsync}}}};
+                      {"vsync", settings.vsync}}},
+                    {"audio",
+                     {{"buses", std::move(buses)},
+                      {"occlusion", settings.audio.occlusion},
+                      {"occlusionStrength", settings.audio.occlusionStrength},
+                      {"occlusionRays", settings.audio.occlusionRays}}}};
     return WriteText(m_File, root.dump(2), error);
 }
 

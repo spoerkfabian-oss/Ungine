@@ -22,7 +22,8 @@ endforeach()
 install(TARGETS UngineEditor UnginePlayer RUNTIME DESTINATION bin)
 install(DIRECTORY "${ENGINE_SHADER_OUTPUT_DIR}/" DESTINATION bin/shaders FILES_MATCHING PATTERN "*.spv")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/templates/" DESTINATION bin/templates)
-install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/models" "${CMAKE_SOURCE_DIR}/assets/scripts" DESTINATION bin/samples)
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/models" "${CMAKE_SOURCE_DIR}/assets/scripts" "${CMAKE_SOURCE_DIR}/assets/sounds"
+        DESTINATION bin/samples)
 install(FILES "${CMAKE_SOURCE_DIR}/resources/ungine.png" "${CMAKE_SOURCE_DIR}/resources/ungine.ico" DESTINATION bin/resources)
 if(UNIX AND NOT APPLE)
     install(FILES "${CMAKE_SOURCE_DIR}/resources/linux/ungine-editor.desktop.in"

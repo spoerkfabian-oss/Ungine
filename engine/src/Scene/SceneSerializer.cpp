@@ -207,6 +207,85 @@ CharacterController CharacterFromJson(const json& j)
     return c;
 }
 
+json AudioSourceToJson(const AudioSource& a, const std::string& sound)
+{
+    return {{"sound", sound},
+            {"bus", ToString(a.bus)},
+            {"volume", a.volume},
+            {"pitch", a.pitch},
+            {"loop", a.loop},
+            {"playOnStart", a.playOnStart},
+            {"stream", a.stream},
+            {"fadeIn", a.fadeIn},
+            {"spatial", a.spatial},
+            {"attenuation", ToString(a.attenuation)},
+            {"minDistance", a.minDistance},
+            {"maxDistance", a.maxDistance},
+            {"rolloff", a.rolloff},
+            {"doppler", a.doppler},
+            {"occlusion", a.occlusion}};
+}
+
+AudioSource AudioSourceFromJson(const json& j)
+{
+    AudioSource a;
+    Read(j, "sound", a.sound);
+    if (const auto it = j.find("bus"); it != j.end() && it->is_string())
+        a.bus = AudioBusFromString(it->get<std::string>()).value_or(AudioBus::World);
+    if (a.bus == AudioBus::Master)
+        a.bus = AudioBus::World;
+    Read(j, "volume", a.volume);
+    Read(j, "pitch", a.pitch);
+    Read(j, "loop", a.loop);
+    Read(j, "playOnStart", a.playOnStart);
+    Read(j, "stream", a.stream);
+    Read(j, "fadeIn", a.fadeIn);
+    Read(j, "spatial", a.spatial);
+    if (const auto it = j.find("attenuation"); it != j.end() && it->is_string())
+        a.attenuation = AttenuationFromString(it->get<std::string>()).value_or(Attenuation::Inverse);
+    Read(j, "minDistance", a.minDistance);
+    Read(j, "maxDistance", a.maxDistance);
+    Read(j, "rolloff", a.rolloff);
+    Read(j, "doppler", a.doppler);
+    Read(j, "occlusion", a.occlusion);
+    a.volume      = std::max(a.volume, 0.0f);
+    a.pitch       = std::clamp(a.pitch, 0.01f, 16.0f);
+    a.minDistance = std::max(a.minDistance, 0.01f);
+    a.maxDistance = std::max(a.maxDistance, a.minDistance);
+    return a;
+}
+
+json ReverbToJson(const ReverbParams& p)
+{
+    return {{"roomSize", p.roomSize}, {"damping", p.damping}, {"wet", p.wet}, {"width", p.width}};
+}
+
+ReverbParams ReverbFromJson(const json& j, ReverbParams p)
+{
+    Read(j, "roomSize", p.roomSize);
+    Read(j, "damping", p.damping);
+    Read(j, "wet", p.wet);
+    Read(j, "width", p.width);
+    return p;
+}
+
+json ReverbZoneToJson(const ReverbZone& z)
+{
+    return {{"halfExtents", ToJson(z.halfExtents)}, {"blendDistance", z.blendDistance}, {"reverb", ReverbToJson(z.reverb)}};
+}
+
+ReverbZone ReverbZoneFromJson(const json& j)
+{
+    ReverbZone z;
+    Read(j, "halfExtents", z.halfExtents);
+    Read(j, "blendDistance", z.blendDistance);
+    if (const auto it = j.find("reverb"); it != j.end())
+        z.reverb = ReverbFromJson(*it, z.reverb);
+    z.halfExtents   = glm::max(z.halfExtents, glm::vec3(0.0f));
+    z.blendDistance = std::max(z.blendDistance, 0.0f);
+    return z;
+}
+
 json PrimitiveToJson(const PrimitiveDesc& p)
 {
     return {{"shape", ToString(p.shape)}, {"size", p.size},          {"baseColor", ToJson(p.baseColor)},
@@ -327,6 +406,12 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["cameraComponent"] = {{"fovY", cam->fovY}, {"nearPlane", cam->nearPlane}, {"primary", cam->primary}};
     if (const auto* script = r.TryGet<ScriptComponent>(e))
         j["script"] = {{"graph", models.WritePath(script->graph)}};
+    if (const auto* source = r.TryGet<AudioSource>(e))
+        j["audioSource"] = AudioSourceToJson(*source, models.WritePath(source->sound));
+    if (r.Has<AudioListener>(e))
+        j["audioListener"] = json::object();
+    if (const auto* zone = r.TryGet<ReverbZone>(e))
+        j["reverbZone"] = ReverbZoneToJson(*zone);
     return j;
 }
 
@@ -388,6 +473,13 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         script.graph = models.ReadPath(script.graph);
         return script;
     });
+    ApplyOptional<AudioSource>(r, e, j, "audioSource", [&](const json& a) {
+        AudioSource source = AudioSourceFromJson(a);
+        source.sound       = models.ReadPath(source.sound);
+        return source;
+    });
+    ApplyOptional<AudioListener>(r, e, j, "audioListener", [](const json&) { return AudioListener{}; });
+    ApplyOptional<ReverbZone>(r, e, j, "reverbZone", ReverbZoneFromJson);
     scene.MarkChanged(e); // bounds / shadow caches
 }
 

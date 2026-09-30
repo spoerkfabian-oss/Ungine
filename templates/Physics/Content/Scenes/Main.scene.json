@@ -55,6 +55,46 @@
           -0.5,
           0
         ]
+      },
+      "script": {
+        "graph": "../Scripts/ImpactSound.ugraph"
+      }
+    },
+    {
+      "uuid": 1030,
+      "parent": 0,
+      "name": "Hall Reverb",
+      "transform": {
+        "position": [
+          0,
+          4.0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "reverbZone": {
+        "halfExtents": [
+          12.0,
+          6.0,
+          12.0
+        ],
+        "blendDistance": 4.0,
+        "reverb": {
+          "roomSize": 0.65,
+          "damping": 0.45,
+          "wet": 0.3,
+          "width": 1.0
+        }
       }
     },
     {

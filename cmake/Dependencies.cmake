@@ -98,9 +98,28 @@ add_library(bc7enc STATIC "${bc7enc_SOURCE_DIR}/bc7enc.cpp" "${bc7enc_SOURCE_DIR
 target_include_directories(bc7enc SYSTEM PUBLIC "${bc7enc_SOURCE_DIR}")
 set_target_properties(bc7enc PROPERTIES FOLDER "ThirdParty")
 
+# --- miniaudio (devices, mixing, 3D spatialization, decoders; public domain / MIT-0) ---
+# Built as our own static library together with stb_vorbis (OGG) and the reverb node
+# (verblib, MIT-0), both shipped in miniaudio's extras. See engine/src/ThirdParty/miniaudio_impl.c.
+FetchContent_Declare(miniaudio
+    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+    GIT_TAG        0.11.22
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _none) # its CMakeLists builds several libraries we do not need
+FetchContent_MakeAvailable(miniaudio)
+add_library(miniaudio STATIC "${CMAKE_SOURCE_DIR}/engine/src/ThirdParty/miniaudio_impl.c")
+# No resource manager (and its job thread): the engine decodes through its own AssetManager.
+target_compile_definitions(miniaudio PUBLIC MA_NO_RESOURCE_MANAGER)
+target_include_directories(miniaudio SYSTEM PUBLIC "${miniaudio_SOURCE_DIR}"
+                                                   "${miniaudio_SOURCE_DIR}/extras/nodes/ma_reverb_node")
+if(UNIX AND NOT APPLE)
+    target_link_libraries(miniaudio PUBLIC ${CMAKE_DL_LIBS} pthread m) # backends are loaded at runtime
+endif()
+set_target_properties(miniaudio PROPERTIES FOLDER "ThirdParty")
+
 # Texture encoding and mesh simplification run on asset workers even in Debug builds: optimize
 # them (GCC / Clang; MSVC Debug keeps /RTC1, which /O2 conflicts with).
-foreach(target bc7enc meshoptimizer)
+foreach(target bc7enc meshoptimizer miniaudio)
     if(NOT MSVC)
         target_compile_options(${target} PRIVATE -O2 -w)
     endif()

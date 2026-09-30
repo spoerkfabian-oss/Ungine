@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Audio/AudioTypes.h"
 #include "Engine/ECS/Entity.h"
 
 #include <glm/glm.hpp>
@@ -140,6 +141,44 @@ struct ScriptComponent {
     std::string graph;
 
     bool operator==(const ScriptComponent&) const = default;
+};
+
+// Sound emitter played by AudioSystem while playing (play mode, player). sound: file path like
+// ScriptComponent::graph. Spatial sources follow the entity (doppler from its motion) and are
+// low-passed when physics geometry blocks the line to the listener (occlusion).
+struct AudioSource {
+    std::string sound;
+    AudioBus    bus         = AudioBus::World;
+    float       volume      = 1.0f;
+    float       pitch       = 1.0f;
+    bool        loop        = false;
+    bool        playOnStart = true;
+    bool        stream      = false; // always stream from the file (long files stream anyway)
+    float       fadeIn      = 0.0f;  // seconds
+    bool        spatial     = true;
+    Attenuation attenuation = Attenuation::Inverse;
+    float       minDistance = 1.0f;
+    float       maxDistance = 50.0f;
+    float       rolloff     = 1.0f;
+    float       doppler     = 1.0f;
+    bool        occlusion   = true;
+
+    bool operator==(const AudioSource&) const = default;
+};
+
+// Where the scene is heard from (the first one; without, the primary camera, else the view).
+struct AudioListener {
+    bool operator==(const AudioListener&) const = default;
+};
+
+// Box (entity transform, halfExtents in local space) with its own room reverb. The listener
+// blends the zones it is in (full weight inside, fading out over blendDistance around the box).
+struct ReverbZone {
+    glm::vec3    halfExtents{5.0f};
+    float        blendDistance = 2.0f;
+    ReverbParams reverb{.roomSize = 0.7f, .damping = 0.5f, .wet = 0.5f, .width = 1.0f};
+
+    bool operator==(const ReverbZone&) const = default;
 };
 
 // Illuminance below which a light without explicit range is cut off (lights need a finite range

@@ -1,6 +1,7 @@
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
@@ -692,6 +693,72 @@ std::vector<NodeDesc> BuildRegistry()
                  if (const Light* light = e ? c.GetScene().GetRegistry().TryGet<Light>(*e) : nullptr)
                      c.Out(1, light->intensity);
              }));
+
+    // Audio. Sound paths: absolute or relative to the working directory (the project root).
+    const auto busParam = [](NodeDesc desc, const char* fallback) {
+        return WithParam(std::move(desc), ParamKind::Choice, "Bus", fallback, {"world", "music", "ui", "ambient"});
+    };
+    const auto bus = [](ScriptContext& c, AudioBus fallback) { return AudioBusFromString(c.Param()).value_or(fallback); };
+    add(busParam(WithDefaults(Action("Audio.PlaySound", "Play Sound 2D", "Audio", {In("Sound", P::String), In("Volume", P::Float)},
+                                     [bus](ScriptContext& c) {
+                                         if (!c.Audio())
+                                             return c.Error("No audio system");
+                                         if (!c.Audio()->Play2D(c.InString(2), c.InFloat(3), bus(c, AudioBus::Ui)))
+                                             c.Error("Cannot play '" + c.InString(2) + "'");
+                                     }, "Non-positional one-shot (UI, music stingers)"),
+                              {{"Volume", 1.0f}}),
+                 "ui"));
+    add(busParam(WithDefaults(Action("Audio.PlaySoundAt", "Play Sound at Location", "Audio",
+                                     {In("Sound", P::String), In("Location", P::Vec3), In("Volume", P::Float), In("Pitch", P::Float)},
+                                     [bus](ScriptContext& c) {
+                                         if (!c.Audio())
+                                             return c.Error("No audio system");
+                                         if (!c.Audio()->PlayAt(c.InString(2), c.InVec3(3), c.InFloat(4), c.InFloat(5), bus(c, AudioBus::World)))
+                                             c.Error("Cannot play '" + c.InString(2) + "'");
+                                     }, "3D one-shot at a point (impacts, footsteps)"),
+                              {{"Volume", 1.0f}, {"Pitch", 1.0f}}),
+                 "world"));
+    add(Action("Audio.Play", "Play Audio Source", "Audio", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        const auto e = Target(c, 2);
+        if (!e || !c.Audio())
+            return;
+        if (!c.GetScene().GetRegistry().Has<AudioSource>(*e))
+            return c.Error("Target has no Audio Source");
+        c.Audio()->Play(*e);
+    }, "(Re)starts the entity's Audio Source"));
+    add(Action("Audio.Stop", "Stop Audio Source", "Audio", {In("Target", P::Entity), In("Fade Out", P::Float)},
+               [](ScriptContext& c) {
+                   if (const auto e = Target(c, 2); e && c.Audio())
+                       c.Audio()->Stop(*e, std::max(c.InFloat(3), 0.0f));
+               }, "Fade Out in seconds"));
+    add(Pure("Audio.IsPlaying", "Is Audio Playing", "Audio", {In("Target", P::Entity), Out("Playing", P::Bool)},
+             [](ScriptContext& c) {
+                 const auto e = Target(c, 0);
+                 c.Out(1, e && c.Audio() && c.Audio()->IsPlaying(*e));
+             }));
+    add(Action("Audio.SetVolume", "Set Audio Volume", "Audio", {In("Target", P::Entity), In("Volume", P::Float)},
+               [](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   if (AudioSource* a = e ? c.GetScene().GetRegistry().TryGet<AudioSource>(*e) : nullptr)
+                       a->volume = std::max(c.InFloat(3), 0.0f);
+                   else if (e)
+                       c.Error("Target has no Audio Source");
+               }, "Audio Source volume (applied smoothly while playing)"));
+    add(Action("Audio.SetPitch", "Set Audio Pitch", "Audio", {In("Target", P::Entity), In("Pitch", P::Float)},
+               [](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   if (AudioSource* a = e ? c.GetScene().GetRegistry().TryGet<AudioSource>(*e) : nullptr)
+                       a->pitch = std::clamp(c.InFloat(3), 0.01f, 16.0f);
+                   else if (e)
+                       c.Error("Target has no Audio Source");
+               }, "Playback rate: 2 = one octave up"));
+    add(busParam(WithDefaults(Action("Audio.SetBusVolume", "Set Bus Volume", "Audio", {In("Volume", P::Float)},
+                                     [bus](ScriptContext& c) {
+                                         if (c.Audio())
+                                             c.Audio()->Engine().SetBusVolume(bus(c, AudioBus::Music), std::max(c.InFloat(2), 0.0f));
+                                     }, "Mixer bus volume until play stops (options menus, ducking)"),
+                              {{"Volume", 1.0f}}),
+                 "music"));
     return r;
 }
 

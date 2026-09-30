@@ -5,6 +5,7 @@
 #include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Core/Window.h"
@@ -147,6 +148,11 @@ void Editor::Update(float dt)
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
+    // Audio follows the scene (while playing) and the editor camera (previews, no listener entity).
+    if (m_Ctx.audio) {
+        const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
+        m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
+    }
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)
         m_Ctx.physics->Sync(m_Ctx.scene);
@@ -373,6 +379,17 @@ void Editor::DrawViewport()
                     AssignScript(Selected(), file);
                 else
                     m_Status = "Select an entity to give it the script";
+            } else if (IsSoundFile(file)) { // a new audio source where the cursor points
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                    target = cam.position + dir * hit->distance;
+                CreateAudioEntity(file, target);
             } else {
                 const std::size_t before = m_PendingInstances.size();
                 OpenAsset(file);
@@ -398,7 +415,9 @@ void Editor::DrawViewport()
     m_ViewportHovered  = ImGui::IsItemHovered();
     m_ViewportFocused  = ImGui::IsWindowFocused();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
-    const bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    if (m_ShowAudio)
+        iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics)
@@ -478,6 +497,8 @@ void Editor::DrawViewport()
         m_ShowBvh = !m_ShowBvh;
     if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
         m_ShowColliders = !m_ShowColliders;
+    if (toolButton("Audio", m_ShowAudio))
+        m_ShowAudio = !m_ShowAudio;
     if (toolButton("Game cam", m_GameCamera))
         m_GameCamera = !m_GameCamera;
     if (ImGui::IsItemHovered())
@@ -656,6 +677,70 @@ bool Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
                 cone(light.innerConeAngle, LightColor(light, 0.35f));
         }
     }
+    list->PopClipRect();
+    return clicked && hit != NullEntity;
+}
+
+bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool clicked)
+{
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+
+    // Reverb zones: oriented boxes (entity transform).
+    registry.ViewOf<ReverbZone, WorldTransform>().Each([&](Entity e, ReverbZone& zone, WorldTransform& world) {
+        const glm::vec3& h = zone.halfExtents;
+        glm::vec3        c[8];
+        for (int i = 0; i < 8; ++i)
+            c[i] = glm::vec3(world.matrix * glm::vec4((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z, 1.0f));
+        static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                              {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        const ImU32 color = IsSelected(e) ? IM_COL32(90, 255, 220, 255) : IM_COL32(60, 190, 170, 140);
+        for (const auto& edge : kEdges)
+            projector.Line(list, c[edge[0]], c[edge[1]], color);
+    });
+
+    // Sources: speaker icons (click selects), distance spheres of the selected ones.
+    constexpr float kIcon       = 7.0f;
+    const ImVec2    mouse       = ImGui::GetIO().MousePos;
+    Entity          hit         = NullEntity;
+    float           hitDistance = kIcon + 3.0f;
+    registry.ViewOf<AudioSource, WorldTransform>().Each([&](Entity e, AudioSource& source, WorldTransform& world) {
+        const glm::vec3 pos = world.matrix[3];
+        ImVec2          p;
+        if (!projector.Project(pos, p))
+            return;
+        const bool  selected = IsSelected(e);
+        const bool  playing  = m_Ctx.audio && m_Ctx.audio->Running() && m_Ctx.audio->IsPlaying(e);
+        const ImU32 fill     = playing ? IM_COL32(120, 230, 120, 240) : IM_COL32(120, 190, 255, 230);
+        const ImU32 outline  = selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(0, 0, 0, 200);
+        // Speaker: box + cone.
+        const ImVec2 box0(p.x - kIcon, p.y - kIcon * 0.4f), box1(p.x - kIcon * 0.3f, p.y + kIcon * 0.4f);
+        list->AddRectFilled(box0, box1, fill);
+        list->AddTriangleFilled(ImVec2(box1.x, p.y - kIcon * 0.4f), ImVec2(p.x + kIcon, p.y - kIcon),
+                                ImVec2(p.x + kIcon, p.y + kIcon), fill);
+        list->AddQuadFilled(ImVec2(box1.x, p.y - kIcon * 0.4f), ImVec2(p.x + kIcon, p.y - kIcon),
+                            ImVec2(p.x + kIcon, p.y + kIcon), ImVec2(box1.x, p.y + kIcon * 0.4f), fill);
+        list->AddCircle(p, kIcon + 3.0f, outline, 0, selected ? 2.5f : 1.0f);
+        if (!source.spatial)
+            list->AddText(ImVec2(p.x + kIcon + 4.0f, p.y - kIcon), IM_COL32(200, 200, 200, 200), "2D");
+        const float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+        if (d < hitDistance) {
+            hitDistance = d;
+            hit         = e;
+        }
+        if (selected && source.spatial)
+            for (const auto& [radius, color] : {std::pair{source.minDistance, IM_COL32(120, 190, 255, 200)},
+                                                std::pair{source.maxDistance, IM_COL32(120, 190, 255, 90)}}) {
+                projector.Circle(list, pos, {1, 0, 0}, {0, 1, 0}, radius, color);
+                projector.Circle(list, pos, {1, 0, 0}, {0, 0, 1}, radius, color);
+                projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, radius, color);
+            }
+    });
+    if (clicked && hit != NullEntity)
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
     list->PopClipRect();
     return clicked && hit != NullEntity;
 }
@@ -947,6 +1032,11 @@ void Editor::SelectInRect(glm::vec2 min, glm::vec2 max, bool additive)
     });
     if (m_ShowLightIcons)
         registry.ViewOf<Light, WorldTransform>().Each([&](Entity e, Light&, WorldTransform& world) {
+            if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
+                hits.push_back(e);
+        });
+    if (m_ShowAudio)
+        registry.ViewOf<AudioSource, WorldTransform>().Each([&](Entity e, AudioSource&, WorldTransform& world) {
             if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
                 hits.push_back(e);
         });

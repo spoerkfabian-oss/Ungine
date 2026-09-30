@@ -3,6 +3,7 @@
 #include "FileDialog.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
@@ -56,11 +57,12 @@ ImVec4 KindColor(int kind)
     case 2: return {0.40f, 0.65f, 1.00f, 1.0f}; // blueprint
     case 3: return {0.95f, 0.55f, 0.30f, 1.0f}; // model
     case 4: return {0.85f, 0.45f, 0.85f, 1.0f}; // texture
+    case 5: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "MODEL", "TEX", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "MODEL", "TEX", "SND", "FILE"};
 
 } // namespace
 
@@ -81,6 +83,13 @@ bool Editor::SaveAll()
     if (!m_ScenePath.empty() && m_PlayState == PlayState::Edit)
         ok = SaveScene(m_ScenePath) && ok;
     ok = m_Graphs->SaveAll() && ok;
+    if (m_Ctx.project && m_ProjectDirty) {
+        std::string error;
+        if (m_Ctx.project->Save(&error))
+            m_ProjectDirty = false;
+        else
+            ok = false;
+    }
     if (ok)
         m_Status = "Saved all";
     return ok;
@@ -88,7 +97,7 @@ bool Editor::SaveAll()
 
 bool Editor::ConfirmQuit()
 {
-    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty()))
+    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty))
         return true;
     m_AskQuit = true;
     return false;
@@ -154,6 +163,13 @@ void Editor::OpenAsset(const fs::path& file)
         m_Ctx.modelRefs.push_back(handle);
         m_PendingInstances.emplace_back(handle, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
         m_Status = "Loading " + PathToUtf8(file.filename());
+    } else if (IsSoundFile(file) && m_Ctx.audio) { // double-click: listen
+        if (m_Ctx.audio->Previewing()) {
+            m_Ctx.audio->StopPreview();
+        } else {
+            m_Ctx.audio->Preview(file);
+            m_Status = "Preview " + PathToUtf8(file.filename());
+        }
     }
 }
 
@@ -208,6 +224,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::Model;
         else if (EndsWith(lower, ".png") || EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".ktx2"))
             item.kind = ContentItem::Kind::Texture;
+        else if (IsSoundFile(path))
+            item.kind = ContentItem::Kind::Sound;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -308,7 +326,7 @@ void Editor::DrawContentBrowser()
                 if (ImGui::BeginPopupContextItem("item")) {
                     m_ContentSelected = item.path;
                     if (item.kind != ContentItem::Kind::Other && item.kind != ContentItem::Kind::Texture &&
-                        ImGui::MenuItem(item.kind == ContentItem::Kind::Folder ? "Open" : "Open / place")) {
+                        item.kind != ContentItem::Kind::Sound && ImGui::MenuItem(item.kind == ContentItem::Kind::Folder ? "Open" : "Open / place")) {
                         if (item.kind == ContentItem::Kind::Folder)
                             enter = item.path;
                         else
@@ -322,6 +340,14 @@ void Editor::DrawContentBrowser()
                     if (item.kind == ContentItem::Kind::Blueprint && Selected() != NullEntity &&
                         ImGui::MenuItem("Assign to selection"))
                         AssignScript(Selected(), item.path);
+                    if (item.kind == ContentItem::Kind::Sound) {
+                        if (m_Ctx.audio && ImGui::MenuItem(m_Ctx.audio->Previewing() ? "Stop preview" : "Preview"))
+                            OpenAsset(item.path);
+                        if (ImGui::MenuItem("Place audio source"))
+                            CreateAudioEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+                        if (Selected() != NullEntity && ImGui::MenuItem("Assign to selection"))
+                            AssignSound(Selected(), item.path);
+                    }
                     if (ImGui::MenuItem("Rename...")) {
                         m_RenameTarget = item.path;
                         m_RenameText   = item.label;
@@ -430,17 +456,24 @@ void Editor::DrawProjectSettings()
     ImGui::Checkbox("Fullscreen", &s.fullscreen);
     ImGui::SameLine();
     ImGui::Checkbox("VSync", &s.vsync);
+    ImGui::TextDisabled("Audio mixer: Renderer panel > Audio (stored here too).");
     ImGui::Separator();
     ImGui::BeginDisabled(!IsValidProjectName(s.name));
     if (ImGui::Button("Save")) {
         std::string error;
-        m_Status = project.Save(&error) ? "Project saved" : "Project save failed: " + error;
+        const bool  saved = project.Save(&error);
+        m_ProjectDirty    = m_ProjectDirty && !saved;
+        m_Status          = saved ? "Project saved" : "Project save failed: " + error;
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Reload from file"))
-        if (const auto loaded = Project::Load(project.File()))
+        if (const auto loaded = Project::Load(project.File())) {
             project.settings = loaded->settings;
+            if (m_Ctx.audio)
+                m_Ctx.audio->Apply(project.settings.audio);
+            m_ProjectDirty = false;
+        }
     ImGui::End();
 }
 

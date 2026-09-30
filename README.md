@@ -1,7 +1,7 @@
 # Ungine
 
-C++20/Vulkan-1.3-Engine mit Editor (UE-/Unity-artig), Blueprint-Visual-Scripting, Jolt-Physik
-und einem Player für fertige Spiele.
+C++20/Vulkan-1.3-Engine mit Editor (UE-/Unity-artig), Blueprint-Visual-Scripting, Jolt-Physik,
+3D-Audio (miniaudio) und einem Player für fertige Spiele.
 
 ## Bauen (Windows, Visual Studio 2022)
 
@@ -45,6 +45,12 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    Projekt, Content).
 7. Der Player rendert durch die primäre **Camera**-Komponente der Startszene (*File → Project
    settings…*). Im Editor zeigt *Game cam* diese Sicht.
+8. **Audio**: Sounds (WAV/OGG/MP3/FLAC) nach `Content/` kopieren. Doppelklick im Content-Browser
+   spielt sie an; in den Viewport ziehen legt eine **Audio Source** an (3D, Loop, Bus, Reichweite,
+   Occlusion – Inspector). **Reverb Zone** und **Audio Listener** über *Add component*. Mixer
+   (Master/World/Music/UI/Ambient) und Occlusion: Renderer-Panel → *Audio* (im Projekt gespeichert).
+   Blueprints: Kategorie *Audio* (Play Sound 2D, Play Sound at Location, Play/Stop Audio Source, …;
+   Pfade relativ zum Projektordner, z. B. `Content/Sounds/impact.wav`).
 
 ## Entwicklung
 

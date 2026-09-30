@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioEngine.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
@@ -21,6 +22,7 @@ struct ApplicationDesc {
     WindowDesc    window{};
     RendererDesc  renderer{};
     AssetManagerDesc assets{}; // texture import / cache, mesh LODs, hot reload
+    AudioEngineDesc  audio{};  // falls back to offline mixing without an output device
     std::filesystem::path pipelineCache = "asset_cache/pipelines.bin"; // empty: not persisted
     bool          enableValidation = kDebugBuild;
     double        fixedTimestep    = 1.0 / 60.0; // physics tick (Jolt, Phase 3)
@@ -52,11 +54,12 @@ protected:
     [[nodiscard]] Renderer&      GetRenderer() { return *m_Renderer; }
     [[nodiscard]] ThreadPool&    GetJobs()     { return *m_Jobs; }
     [[nodiscard]] AssetManager&  GetAssets()   { return *m_Assets; }
+    [[nodiscard]] AudioEngine&   GetAudio()    { return *m_Audio; }
 
 private:
     ApplicationDesc m_Desc;
     // Declaration order = reverse destruction order:
-    // assets -> jobs -> renderer -> context -> window -> input -> event bus.
+    // audio -> assets -> jobs -> renderer -> context -> window -> input -> event bus.
     EventBus                       m_Events;
     Input                          m_Input{m_Events};
     std::unique_ptr<Window>        m_Window;
@@ -64,6 +67,7 @@ private:
     std::unique_ptr<Renderer>      m_Renderer;
     std::unique_ptr<ThreadPool>    m_Jobs;
     std::unique_ptr<AssetManager>  m_Assets; // waits for its jobs, defers GPU frees to the renderer
+    std::unique_ptr<AudioEngine>   m_Audio;
 };
 
 } // namespace Engine

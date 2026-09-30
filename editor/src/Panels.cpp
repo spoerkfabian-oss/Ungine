@@ -6,6 +6,9 @@
 #include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Core/Project.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
@@ -155,6 +158,34 @@ bool ComboRow(const char* label, E* value, const char* const (&names)[N])
 }
 
 constexpr const char* kBodyTypeNames[]      = {"Static", "Kinematic", "Dynamic"};
+constexpr const char* kAttenuationNames[]   = {"Inverse", "Linear", "Exponential"};
+
+// Buses a sound can play on (Master is the sum).
+bool BusComboRow(const char* label, AudioBus* bus)
+{
+    PropertyRow(label);
+    bool changed = false;
+    if (ImGui::BeginCombo("##v", ToString(*bus))) {
+        for (AudioBus option : {AudioBus::World, AudioBus::Music, AudioBus::Ui, AudioBus::Ambient})
+            if (ImGui::Selectable(ToString(option), option == *bus)) {
+                *bus    = option;
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+bool ReverbRows(ReverbParams* r)
+{
+    bool changed = false;
+    changed |= SliderFloatRow("Room size", &r->roomSize, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Damping", &r->damping, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Wet", &r->wet, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Width", &r->width, 0.0f, 1.0f);
+    return changed;
+}
 constexpr const char* kColliderShapeNames[] = {"Box", "Sphere", "Capsule", "Mesh"};
 constexpr const char* kActivityNames[]      = {"-", "static", "kinematic", "active", "sleeping", "character"};
 
@@ -208,6 +239,17 @@ void Editor::DrawHierarchy()
             Select(CreateLight(LightType::Point, NullEntity));
         if (ImGui::MenuItem("Spot Light"))
             Select(CreateLight(LightType::Spot, NullEntity));
+        ImGui::Separator();
+        if (ImGui::MenuItem("Audio Source"))
+            CreateAudioEntity({}, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+        if (ImGui::MenuItem("Reverb Zone")) {
+            const Entity e = m_Ctx.scene.CreateEntity("Reverb Zone");
+            m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<ReverbZone>(e);
+            const Entity roots[] = {e};
+            PushCreated("Create reverb zone", roots);
+            Select(e);
+        }
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -576,6 +618,83 @@ void Editor::DrawInspector()
             registry.Remove<ScriptComponent>(e);
     }
 
+    if (AudioSource* audio = registry.TryGet<AudioSource>(e);
+        audio && ImGui::CollapsingHeader("Audio Source", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##sound", "path/to/sound.wav", &audio->sound);
+        const std::filesystem::path dir = !audio->sound.empty() ? PathFromUtf8(audio->sound).parent_path()
+                                                                : ContentRoot();
+        if (ImGui::Button("Browse...##sound")) {
+            m_SoundTarget   = e;
+            m_DialogPurpose = DialogPurpose::AssignSound;
+            m_FileDialog->Open("Choose sound", FileDialog::Mode::Open, dir, {".wav", ".ogg", ".mp3", ".flac"});
+        }
+        if (m_Ctx.audio) {
+            ImGui::SameLine();
+            if (m_Ctx.audio->Previewing()) {
+                if (ImGui::Button("Stop preview"))
+                    m_Ctx.audio->StopPreview();
+            } else if (ImGui::Button("Preview") && !audio->sound.empty()) {
+                m_Ctx.audio->Preview(audio->sound);
+            }
+        }
+        if (BeginProperties("audio")) {
+            BusComboRow("Bus", &audio->bus);
+            DragFloatRow("Volume", &audio->volume, 0.01f, 0.0f, 4.0f);
+            DragFloatRow("Pitch", &audio->pitch, 0.01f, 0.01f, 16.0f);
+            CheckboxRow("Loop", &audio->loop);
+            CheckboxRow("Play on start", &audio->playOnStart);
+            CheckboxRow("Stream", &audio->stream);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Always stream from the file (music); longer than %.0f s streams anyway",
+                                  kSoundStreamThresholdSeconds);
+            DragFloatRow("Fade in", &audio->fadeIn, 0.01f, 0.0f, 60.0f, "%.2f s");
+            CheckboxRow("3D (spatial)", &audio->spatial);
+            if (audio->spatial) {
+                ComboRow("Attenuation", &audio->attenuation, kAttenuationNames);
+                DragFloatRow("Min distance", &audio->minDistance, 0.01f, 0.01f, 1e4f);
+                DragFloatRow("Max distance", &audio->maxDistance, 0.1f, audio->minDistance, 1e5f);
+                DragFloatRow("Rolloff", &audio->rolloff, 0.01f, 0.0f, 10.0f);
+                DragFloatRow("Doppler", &audio->doppler, 0.01f, 0.0f, 10.0f);
+                CheckboxRow("Occlusion", &audio->occlusion);
+            }
+            if (m_Ctx.audio && m_Ctx.audio->Running()) {
+                PropertyRow("State");
+                ImGui::TextUnformatted(m_Ctx.audio->IsPlaying(e) ? "playing" : "stopped");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (m_Ctx.audio && m_Ctx.audio->Running()) {
+            if (ImGui::Button("Play"))
+                m_Ctx.audio->Play(e);
+            ImGui::SameLine();
+            if (ImGui::Button("Stop"))
+                m_Ctx.audio->Stop(e, 0.1f);
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Remove audio source"))
+            registry.Remove<AudioSource>(e);
+    }
+
+    if (registry.Has<AudioListener>(e) && ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("The scene is heard from here (else from the primary camera).");
+        if (ImGui::Button("Remove listener"))
+            registry.Remove<AudioListener>(e);
+    }
+
+    if (ReverbZone* zone = registry.TryGet<ReverbZone>(e);
+        zone && ImGui::CollapsingHeader("Reverb Zone", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("reverb")) {
+        Vec3Row("Half extents", &zone->halfExtents, 0.01f, 5.0f);
+        zone->halfExtents = glm::max(zone->halfExtents, glm::vec3(0.0f));
+        DragFloatRow("Blend distance", &zone->blendDistance, 0.01f, 0.0f, 100.0f);
+        ReverbRows(&zone->reverb);
+        ImGui::EndTable();
+        ImGui::TextDisabled("World-bus sounds get this room while the listener is inside.");
+        if (ImGui::Button("Remove reverb zone"))
+            registry.Remove<ReverbZone>(e);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -614,6 +733,13 @@ void Editor::DrawInspector()
             registry.Emplace<ScriptComponent>(e);
         if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
             registry.Emplace<CameraComponent>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Audio Source", nullptr, false, !registry.Has<AudioSource>(e)))
+            registry.Emplace<AudioSource>(e);
+        if (ImGui::MenuItem("Audio Listener", nullptr, false, !registry.Has<AudioListener>(e)))
+            registry.Emplace<AudioListener>(e);
+        if (ImGui::MenuItem("Reverb Zone", nullptr, false, !registry.Has<ReverbZone>(e)))
+            registry.Emplace<ReverbZone>(e);
         ImGui::EndPopup();
     }
 
@@ -844,6 +970,8 @@ void Editor::DrawRendererSettings()
         ImGui::EndTable();
     }
 
+    DrawAudioSettings();
+
     if (m_Ctx.physics && ImGui::CollapsingHeader("Physics") && BeginProperties("physics")) {
         PhysicsSettings& ps = m_Ctx.physics->settings;
         Vec3Row("Gravity", &ps.gravity, 0.05f, 0.0f);
@@ -1018,6 +1146,16 @@ void Editor::DrawStats()
             ImGui::Text("Last frame     %u events, %u nodes, %u waiting", ss.eventsFired, ss.nodesExecuted, ss.waiting);
             ImGui::Text("Errors         %u", ss.errors);
         }
+        if (m_Ctx.audio) {
+            const AudioSystemStats& as = m_Ctx.audio->Stats();
+            const AudioStats&       es = m_Ctx.audio->Engine().Stats();
+            ImGui::SeparatorText("Audio");
+            ImGui::Text("Voices         %u  (%u streamed, %u dropped)", es.voices, es.streamed, es.dropped);
+            ImGui::Text("Sources        %u  (%u playing, %u loading)", as.sources, as.playing, as.waiting);
+            ImGui::Text("One-shots      %u", as.oneShots);
+            ImGui::Text("Occlusion      %u rays, %u occluded", as.rays, as.occluded);
+            ImGui::Text("Reverb         %u zone(s), wet %.2f, room %.2f", as.zones, as.reverb.wet, as.reverb.roomSize);
+        }
 
         ImGui::SeparatorText("Memory");
         const VkPhysicalDeviceMemoryProperties* memory = nullptr;
@@ -1134,6 +1272,10 @@ void Editor::DrawAssets()
             DrawTextureAssets();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Sounds")) {
+            DrawSoundAssets();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::End();
@@ -1143,6 +1285,92 @@ void Editor::DrawAssets()
         m_Ctx.modelRefs.erase(std::ranges::find(m_Ctx.modelRefs, toRelease));
         m_Ctx.assets.Release(toRelease);
     }
+}
+
+void Editor::DrawSoundAssets()
+{
+    const std::vector<SoundInfo> sounds = m_Ctx.assets.Sounds();
+    if (sounds.empty()) {
+        ImGui::TextDisabled("No sounds loaded (audio sources load theirs when play starts, previews at once).");
+        return;
+    }
+    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    if (!ImGui::BeginTable("sounds", 6, flags))
+        return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Sound", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Refs", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+    ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+    ImGui::TableSetupColumn("Memory", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+    ImGui::TableHeadersRow();
+    for (const SoundInfo& info : sounds) {
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(info.handle.index));
+        ImGui::TableNextColumn();
+        const std::string name = PathToUtf8(PathFromUtf8(info.path).filename());
+        ImGui::TextUnformatted(name.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", info.path.c_str());
+        ImGui::TableNextColumn();
+        StateCell(info.state, info.reloading, info.error);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", info.refCount);
+        ImGui::TableNextColumn();
+        if (info.sampleRate)
+            ImGui::Text("%u Hz %s, %.1f s", info.sampleRate, info.channels == 1 ? "mono" : info.channels == 2 ? "stereo" : "multi",
+                        info.duration);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(info.streamed ? "streamed" : Bytes(info.memoryBytes).c_str());
+        ImGui::TableNextColumn();
+        if (m_Ctx.audio && ImGui::SmallButton("Play"))
+            m_Ctx.audio->Preview(PathFromUtf8(info.path));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(info.state == AssetState::Failed ? "Retry" : "Reload"))
+            m_Ctx.assets.Reload(info.handle);
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
+void Editor::DrawAudioSettings()
+{
+    if (!m_Ctx.audio || !ImGui::CollapsingHeader("Audio"))
+        return;
+    AudioSettings settings = m_Ctx.audio->Settings();
+    bool          changed  = false;
+    if (BeginProperties("audio")) {
+        for (std::size_t i = 0; i < kAudioBusCount; ++i) {
+            PropertyRow(ToString(static_cast<AudioBus>(i)));
+            ImGui::PushID(static_cast<int>(i));
+            changed |= ImGui::Checkbox("##mute", &settings.muted[i]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Muted");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= ImGui::SliderFloat("##v", &settings.volume[i], 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopID();
+            ImGui::PopID();
+        }
+        changed |= CheckboxRow("Occlusion", &settings.occlusion);
+        changed |= SliderFloatRow("Occlusion strength", &settings.occlusionStrength, 0.0f, 1.0f);
+        changed |= SliderUintRow("Rays per frame", &settings.occlusionRays, 1, 256);
+        ImGui::EndTable();
+    }
+    if (changed) {
+        m_Ctx.audio->Apply(settings);
+        if (m_Ctx.project) {
+            m_Ctx.project->settings.audio = settings;
+            m_ProjectDirty                = true;
+        }
+    }
+    const AudioEngine& engine = m_Ctx.audio->Engine();
+    ImGui::TextDisabled("%s, %u Hz, %u ch", engine.HasDevice() ? engine.DeviceName().c_str() : "no output device (offline)",
+                        engine.SampleRate(), engine.Channels());
+    if (m_Ctx.project)
+        ImGui::TextDisabled(m_ProjectDirty ? "Saved with the project (File > Save all)" : "Stored in the project file");
 }
 
 void Editor::DrawModelAssets(ModelHandle& toRelease)

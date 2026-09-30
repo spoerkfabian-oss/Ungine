@@ -1,4 +1,4 @@
-add_executable(EngineTests CoreTests.cpp ScriptTests.cpp ProjectTests.cpp Test.h)
+add_executable(EngineTests CoreTests.cpp ScriptTests.cpp ProjectTests.cpp AudioTests.cpp Test.h)
 target_link_libraries(EngineTests PRIVATE Engine stb nlohmann_json::nlohmann_json)
 target_compile_definitions(EngineTests PRIVATE ENGINE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 engine_set_warnings(EngineTests)
@@ -41,4 +41,11 @@ if(ENGINE_GPU_TESTS)
     add_test(NAME UngineEditorSmoke COMMAND UngineEditor ${smoke_project}/SmokeGame.ungineproj --frames 120)
     add_test(NAME UnginePlayerSmoke COMMAND UnginePlayer ${smoke_project}/SmokeGame.ungineproj --frames 200)
     set_tests_properties(UngineEditorSmoke UnginePlayerSmoke PROPERTIES FIXTURES_REQUIRED smoke_project RESOURCE_LOCK smoke_project)
+    # Basic template: streamed music + a 3D looping source (audio through the AssetManager).
+    set(smoke_basic "${CMAKE_BINARY_DIR}/smoke_basic")
+    add_test(NAME SmokeBasicProjectSetup COMMAND ${CMAKE_COMMAND} -DTEMPLATE=${CMAKE_SOURCE_DIR}/templates/Basic
+             -DDIR=${smoke_basic} -DNAME=BasicGame -P ${CMAKE_CURRENT_SOURCE_DIR}/MakeProject.cmake)
+    set_tests_properties(SmokeBasicProjectSetup PROPERTIES FIXTURES_SETUP smoke_basic)
+    add_test(NAME UnginePlayerBasicSmoke COMMAND UnginePlayer ${smoke_basic}/BasicGame.ungineproj --frames 200)
+    set_tests_properties(UnginePlayerBasicSmoke PROPERTIES FIXTURES_REQUIRED smoke_basic)
 endif()

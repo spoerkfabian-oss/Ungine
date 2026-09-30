@@ -2,6 +2,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Events/Events.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -55,13 +56,19 @@ protected:
         m_SceneRenderer->post.debugView =
             static_cast<Engine::DebugView>(std::min(m_StartDebugView, static_cast<std::uint32_t>(Engine::DebugView::Count) - 1));
         m_Physics       = std::make_unique<Engine::PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
+        m_Audio         = std::make_unique<Engine::AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
         m_CollisionSub  = GetEvents().Subscribe<Engine::CollisionEvent>([this](const Engine::CollisionEvent& e) {
             m_Collisions += e.begin ? 1u : 0u;
+            if (e.begin && !e.trigger)
+                PlayImpact(e);
         });
-        // Visual scripts run in the game view; the editor runs them only while playing.
-        m_Scripts = std::make_unique<Engine::ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets());
-        if (!m_StartWithEditor)
+        // Visual scripts and audio sources run in the game view; the editor runs them only while playing.
+        m_Scripts = std::make_unique<Engine::ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(),
+                                                           m_Audio.get());
+        if (!m_StartWithEditor) {
+            m_Audio->Begin(m_Scene);
             m_Scripts->Begin(m_Scene);
+        }
         SetEditorEnabled(m_StartWithEditor);
 
         m_LoadStart = std::chrono::steady_clock::now();
@@ -117,8 +124,13 @@ protected:
         if (!m_Editor) // Space etc. belong to the character in character mode
             m_Scripts->Update(m_Scene, static_cast<float>(dt), !m_CharacterMode);
         m_Scene.UpdateTransforms(); // only the dirty subtrees
-        if (m_Editor)
-            m_Editor->Update(static_cast<float>(dt));
+        m_ImpactsThisFrame = 0;
+        if (m_Editor) {
+            m_Editor->Update(static_cast<float>(dt)); // updates the audio too
+        } else {
+            const Engine::CameraData view = m_Camera.GetData(1.0f);
+            m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
+        }
 
         if (m_LoadDone && m_ExitAfterFrames > 0 && ++m_FramesSinceLoad >= m_ExitAfterFrames)
             GetWindow().RequestClose();
@@ -176,6 +188,8 @@ protected:
     {
         m_Editor.reset();
         m_Scripts->End(m_Scene); // releases spawned models
+        m_Audio->End(m_Scene);
+        m_Audio.reset(); // releases its sounds
         if (m_InstanceModel)
             GetAssets().Release(m_InstanceModel);
         GetAssets().Release(m_Model);
@@ -200,7 +214,8 @@ private:
         if (enabled)
             SetCharacterMode(false);
         if (enabled) {
-            m_Scripts->End(m_Scene); // edit mode: scripts run again when playing
+            m_Scripts->End(m_Scene); // edit mode: scripts and audio sources run again when playing
+            m_Audio->End(m_Scene);
             m_Editor = std::make_unique<Engine::Editor>(Engine::EditorContext{
                 .window        = GetWindow(),
                 .renderer      = GetRenderer(),
@@ -210,11 +225,25 @@ private:
                 .camera        = m_Camera,
                 .modelRefs     = m_EditorModels,
                 .physics       = m_Physics.get(),
-                .scripts       = m_Scripts.get()});
+                .scripts       = m_Scripts.get(),
+                .audio         = m_Audio.get()});
         } else {
             m_Editor.reset(); // waits for the GPU once
+            m_Audio->Begin(m_Scene);
             m_Scripts->Begin(m_Scene);
         }
+    }
+
+    // Collision begin: a thud at the body, pitch varied, a few per frame at most.
+    void PlayImpact(const Engine::CollisionEvent& e)
+    {
+        const Engine::Registry& r = m_Scene.GetRegistry();
+        if (m_ImpactsThisFrame >= 6 || !r.Valid(e.a))
+            return;
+        ++m_ImpactsThisFrame;
+        std::uniform_real_distribution<float> pitch(0.8f, 1.25f);
+        (void)m_Audio->PlayAt("assets/sounds/impact.wav", glm::vec3(r.Get<Engine::WorldTransform>(e.a).matrix[3]), 0.6f,
+                              pitch(m_Random));
     }
 
     // Stress scene: a grid of m_InstanceCount boxes on the ground, every tenth one bobbing (dirty
@@ -595,6 +624,8 @@ private:
     Engine::Entity                         m_LightRoot      = Engine::NullEntity;
     std::unique_ptr<Engine::SceneRenderer> m_SceneRenderer;
     std::unique_ptr<Engine::PhysicsWorld>  m_Physics;
+    std::unique_ptr<Engine::AudioSystem>   m_Audio; // before the scripts: they play through it
+    std::uint32_t                          m_ImpactsThisFrame = 0;
     std::unique_ptr<Engine::ScriptSystem>  m_Scripts;
     std::filesystem::path                  m_StartScript; // --script
     Engine::Subscription                   m_CollisionSub;

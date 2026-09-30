@@ -784,6 +784,178 @@ std::vector<TextureInfo> AssetManager::Textures() const
     return textures;
 }
 
+// --- Sounds --------------------------------------------------------------------------------------
+
+SoundHandle AssetManager::LoadSound(const std::filesystem::path& path, SoundLoadMode mode)
+{
+    const std::filesystem::path normalized = NormalizePath(path);
+    std::u8string key = normalized.generic_u8string() + u8"|" + ToU8(std::to_string(static_cast<int>(mode)));
+    if (const auto it = m_SoundCache.find(key); it != m_SoundCache.end()) {
+        SoundEntry& e = m_Sounds.entries[it->second];
+        ++e.refCount;
+        return {it->second, e.generation};
+    }
+    const std::uint32_t index = m_Sounds.Allocate();
+    SoundEntry&         e     = m_Sounds.entries[index];
+    e.state    = AssetState::Loading;
+    e.refCount = 1;
+    e.key      = key;
+    e.path     = normalized;
+    e.mode     = mode;
+    e.watched  = Watch({normalized});
+    m_SoundCache.emplace(std::move(key), index);
+    const SoundHandle handle{index, e.generation};
+    StartSoundJob(handle);
+    return handle;
+}
+
+void AssetManager::StartSoundJob(SoundHandle handle)
+{
+    SoundEntry& e = m_Sounds.entries[handle.index];
+    e.jobRunning  = true;
+    for (WatchedFile& f : e.watched)
+        f.loaded = f.seen = ModifiedTime(f.path);
+    EnqueueJob([this, handle, path = e.path, mode = e.mode] {
+        SoundResult result;
+        result.handle = handle;
+        if (m_ShuttingDown.load(std::memory_order_relaxed)) {
+            result.error = "cancelled";
+        } else {
+            try {
+                result.sound = std::make_shared<const SoundData>(LoadSoundFile(path, mode));
+            } catch (const std::exception& ex) {
+                result.error = ex.what();
+            }
+        }
+        std::scoped_lock lock{m_ResultMutex};
+        m_SoundResults.push_back(std::move(result));
+        FinishJob();
+    });
+}
+
+void AssetManager::OnSoundResult(SoundResult& result)
+{
+    const SoundHandle handle = result.handle;
+    SoundEntry&       e      = m_Sounds.entries[handle.index];
+    assert(e.alive && e.generation == handle.generation);
+    e.jobRunning = false;
+    if (e.orphaned) {
+        m_Sounds.Free(handle.index);
+        return;
+    }
+    if (!result.error.empty()) {
+        e.error = std::move(result.error);
+        ENGINE_ERROR("Failed to load sound '{}': {}", ToUtf8(e.path), e.error);
+        if (e.state != AssetState::Ready) {
+            e.state = AssetState::Failed;
+            ++e.revision;
+        }
+        m_Publish.push_back([this, ev = AssetFailedEvent<SoundData>{handle, ToUtf8(e.path), e.error}] { m_Events.Publish(ev); });
+    } else {
+        const bool reload = e.state == AssetState::Ready;
+        e.sound = std::move(result.sound);
+        e.state = AssetState::Ready;
+        e.error.clear();
+        ++e.revision;
+        if (reload)
+            m_Publish.push_back([this, handle] { m_Events.Publish(AssetReloadedEvent<SoundData>{handle}); });
+        else
+            m_Publish.push_back([this, handle] { m_Events.Publish(AssetLoadedEvent<SoundData>{handle}); });
+    }
+    if (e.reloadQueued) {
+        e.reloadQueued = false;
+        StartSoundJob(handle);
+    }
+}
+
+void AssetManager::Release(SoundHandle handle)
+{
+    SoundEntry* e = m_Sounds.Find(handle);
+    if (!e) {
+        ENGINE_WARN("AssetManager::Release: stale or null sound handle");
+        return;
+    }
+    assert(e->refCount > 0);
+    if (--e->refCount > 0)
+        return;
+    m_SoundCache.erase(e->key);
+    e->sound.reset(); // voices still playing it keep their own reference
+    if (e->jobRunning) {
+        e->orphaned = true;
+        return;
+    }
+    m_Sounds.Free(handle.index);
+}
+
+bool AssetManager::Reload(SoundHandle handle)
+{
+    SoundEntry* e = m_Sounds.Find(handle);
+    if (!e)
+        return false;
+    if (e->jobRunning)
+        e->reloadQueued = true;
+    else
+        StartSoundJob(handle);
+    return true;
+}
+
+std::shared_ptr<const SoundData> AssetManager::Get(SoundHandle handle) const
+{
+    const SoundEntry* e = m_Sounds.Find(handle);
+    return e && e->state == AssetState::Ready ? e->sound : nullptr;
+}
+
+AssetState AssetManager::State(SoundHandle handle) const
+{
+    const SoundEntry* e = m_Sounds.Find(handle);
+    return e ? e->state : AssetState::Invalid;
+}
+
+std::string AssetManager::Error(SoundHandle handle) const
+{
+    const SoundEntry* e = m_Sounds.Find(handle);
+    return e ? e->error : std::string{};
+}
+
+std::uint32_t AssetManager::RefCount(SoundHandle handle) const
+{
+    const SoundEntry* e = m_Sounds.Find(handle);
+    return e ? e->refCount : 0;
+}
+
+std::uint32_t AssetManager::Revision(SoundHandle handle) const
+{
+    const SoundEntry* e = m_Sounds.Find(handle);
+    return e ? e->revision : 0;
+}
+
+std::vector<SoundInfo> AssetManager::Sounds() const
+{
+    std::vector<SoundInfo> sounds;
+    for (std::uint32_t i = 0; i < m_Sounds.entries.size(); ++i) {
+        const SoundEntry& e = m_Sounds.entries[i];
+        if (!e.alive || e.orphaned)
+            continue;
+        SoundInfo info{.handle    = {i, e.generation},
+                       .state     = e.state,
+                       .refCount  = e.refCount,
+                       .path      = ToUtf8(e.path),
+                       .error     = e.error,
+                       .revision  = e.revision,
+                       .reloading = e.jobRunning,
+                       .mode      = e.mode};
+        if (const SoundData* d = e.sound.get()) {
+            info.streamed    = d->Streamed();
+            info.channels    = d->channels;
+            info.sampleRate  = d->sampleRate;
+            info.duration    = d->Duration();
+            info.memoryBytes = d->MemoryBytes();
+        }
+        sounds.push_back(std::move(info));
+    }
+    return sounds;
+}
+
 // --- Per frame -----------------------------------------------------------------------------------
 
 void AssetManager::SetHotReload(bool enabled)
@@ -825,17 +997,28 @@ void AssetManager::PollFiles()
             StartTextureJob({i, e.generation}, e.source);
         }
     }
+    for (std::uint32_t i = 0; i < m_Sounds.entries.size(); ++i) {
+        SoundEntry& e = m_Sounds.entries[i];
+        if (e.alive && !e.orphaned && !e.jobRunning && changed(e.watched)) {
+            ENGINE_INFO("Hot reload: '{}'", ToUtf8(e.path));
+            StartSoundJob({i, e.generation});
+        }
+    }
 }
 
 void AssetManager::Update()
 {
     std::vector<ModelResult>   modelResults;
     std::vector<TextureResult> textureResults;
+    std::vector<SoundResult>   soundResults;
     {
         std::scoped_lock lock{m_ResultMutex};
         modelResults.swap(m_ModelResults);
         textureResults.swap(m_TextureResults);
+        soundResults.swap(m_SoundResults);
     }
+    for (SoundResult& r : soundResults)
+        OnSoundResult(r);
     for (TextureResult& r : textureResults)
         OnTextureResult(r);
     for (ModelResult& r : modelResults) // may acquire textures (new jobs)

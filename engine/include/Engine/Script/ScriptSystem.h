@@ -13,6 +13,7 @@
 namespace Engine {
 
 class AssetManager;
+class AudioSystem;
 class EventBus;
 class Input;
 class PhysicsWorld;
@@ -52,9 +53,9 @@ struct ScriptStats {
 // than maxStepsPerEvent is aborted (infinite loop).
 class ScriptSystem {
 public:
-    // input / physics / assets are optional (their nodes report errors or do nothing without).
+    // input / physics / assets / audio are optional (their nodes report errors or do nothing without).
     ScriptSystem(EventBus& events, const Input* input = nullptr, PhysicsWorld* physics = nullptr,
-                 AssetManager* assets = nullptr);
+                 AssetManager* assets = nullptr, AudioSystem* audio = nullptr);
     ~ScriptSystem();
 
     ScriptSystem(const ScriptSystem&)            = delete;

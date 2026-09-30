@@ -7,6 +7,8 @@
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
+#include "Engine/Audio/AudioSystem.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
@@ -1748,7 +1750,7 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
             }
         };
         CHECK(editor.ContentRoot() == project->ContentDirectory());
-        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 10);
+        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 11);
         CHECK(scene.FindPrimaryCamera() != NullEntity);
         editor.OpenAsset(project->ContentDirectory() / "Scripts" / "RainOnSpace.ugraph");
         CHECK(editor.Blueprints().Count() == 1);
@@ -1756,7 +1758,7 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         editor.OpenAsset(project->ContentDirectory() / "Models" / "Box.glb");
         CHECK(F().Pump([&] {
             runFrames(1);
-            return scene.GetRegistry().AliveCount() > 10;
+            return scene.GetRegistry().AliveCount() > 11;
         }));
         CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
         CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
@@ -1768,4 +1770,129 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         F().assets->Release(h);
     CHECK(fs::exists(project->SavedDirectory() / "EditorLayout.ini"));
     fs::remove_all(root, ec);
+}
+
+TEST_CASE(Audio_SoundAssetsAndEditorPlay)
+{
+    const fs::path  dir = fs::temp_directory_path() / "ungine_gpu_audio";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path toneFile = dir / "tone.wav";
+    WriteWav(toneFile, MakeTone(440.0f, 0.5f, 48000, 0.5f));
+
+    // --- Sound assets: async load, cache, stream mode, failure, hot reload, release.
+    AssetManager&            assets = *F().assets;
+    std::vector<SoundHandle> loadedSounds, reloadedSounds, failedSounds;
+    Subscription s1 = F().events.Subscribe<AssetLoadedEvent<SoundData>>([&](const auto& e) { loadedSounds.push_back(e.handle); });
+    Subscription s2 = F().events.Subscribe<AssetReloadedEvent<SoundData>>([&](const auto& e) { reloadedSounds.push_back(e.handle); });
+    Subscription s3 = F().events.Subscribe<AssetFailedEvent<SoundData>>([&](const auto& e) { failedSounds.push_back(e.handle); });
+    const SoundHandle tone = assets.LoadSound(toneFile);
+    CHECK(assets.State(tone) == AssetState::Loading);
+    CHECK(F().Pump([&] { return assets.State(tone) == AssetState::Ready; }, 2000));
+    CHECK(loadedSounds.size() == 1 && loadedSounds[0] == tone);
+    const auto data = assets.Get(tone);
+    CHECK(data && !data->Streamed() && data->frames == 24000 && data->sampleRate == 48000);
+    CHECK(assets.LoadSound(dir / "." / "tone.wav") == tone && assets.RefCount(tone) == 2);
+    const SoundHandle streamed = assets.LoadSound(toneFile, SoundLoadMode::Stream);
+    CHECK(streamed != tone);
+    CHECK(F().Pump([&] { return assets.State(streamed) == AssetState::Ready; }, 2000) && assets.Get(streamed)->Streamed());
+    const SoundHandle missing = assets.LoadSound(dir / "missing.wav");
+    CHECK(F().Pump([&] { return assets.State(missing) == AssetState::Failed; }, 2000));
+    CHECK(failedSounds.size() == 1 && !assets.Error(missing).empty());
+    const auto infos = assets.Sounds();
+    CHECK(infos.size() == 3 && std::ranges::any_of(infos, [&](const SoundInfo& i) { return i.handle == streamed && i.streamed; }));
+
+    // Hot reload: a changed file replaces the content (voices playing the old one keep it).
+    assets.SetHotReload(true);
+    WriteWav(toneFile, MakeTone(440.0f, 0.25f, 48000, 0.5f));
+    fs::last_write_time(toneFile, fs::file_time_type::clock::now() + std::chrono::seconds(2), ec); // distinct mtime
+    CHECK(F().Pump([&] { return !reloadedSounds.empty() && assets.Get(tone) && assets.Get(tone)->frames == 12000; }));
+    CHECK(data->frames == 24000); // the old data is still intact
+    assets.SetHotReload(false);
+    assets.Release(streamed);
+    assets.Release(missing);
+    assets.Release(tone);
+    CHECK(assets.RefCount(tone) == 1);
+
+    // --- Editor: an Audio Source plays while playing, pauses with Pause, stops with Stop.
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    AudioEngine  engine(AudioEngineDesc{.device = false});
+    AudioSystem  audio(engine, F().assets.get(), &physics);
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get(), &audio);
+    const Entity speaker = scene.CreateEntity("Speaker");
+    scene.EditTransform(speaker).position = {0.0f, 1.0f, 0.0f};
+    r.Emplace<AudioSource>(speaker, AudioSource{.sound = PathToUtf8(toneFile), .loop = true});
+    const Entity zone = scene.CreateEntity("Room");
+    // Dry room: a reverb tail would keep sounding while paused.
+    r.Emplace<ReverbZone>(zone, ReverbZone{.halfExtents = glm::vec3(20.0f), .reverb = {.wet = 0.0f}});
+    r.Emplace<AudioListener>(scene.CreateEntity("Ears"));
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts,
+                   .audio         = &audio});
+    camera.position = {0.0f, 2.0f, 8.0f};
+    std::vector<float> mix(4800 * 2);
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            engine.Render(std::span<float>(mix).first(800 * 2)); // ~1/60 s
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto level = [&] {
+        engine.Render(mix);
+        double sum = 0.0;
+        for (float v : mix)
+            sum += static_cast<double>(v) * v;
+        return std::sqrt(sum / static_cast<double>(mix.size()));
+    };
+
+    editor.Select(speaker); // inspector draws the Audio Source section, the viewport its icon and range
+    runFrames(3);
+    CHECK(!audio.Running() && engine.Stats().voices == 0);
+    editor.Play();
+    for (int i = 0; i < 200 && !audio.IsPlaying(speaker); ++i)
+        runFrames(1);
+    runFrames(3);
+    CHECK(audio.Running() && audio.IsPlaying(speaker) && engine.Stats().voices == 1 && audio.Stats().zones == 1);
+    CHECK(level() > 0.05);
+    editor.Pause();
+    runFrames(1);
+    CHECK(level() < 1e-4 && audio.IsPlaying(speaker));
+    editor.Play(); // resume
+    runFrames(1);
+    CHECK(level() > 0.05);
+    editor.Stop();
+    runFrames(2);
+    CHECK(!audio.Running() && engine.Stats().voices == 0 && level() < 1e-4);
+
+    // Content browser / double-click: preview on the UI bus.
+    editor.OpenAsset(toneFile);
+    runFrames(2);
+    CHECK(audio.Previewing() && engine.Stats().voices == 1);
+    audio.StopPreview();
+    runFrames(2);
+    CHECK(!audio.Previewing());
+    fs::remove_all(dir, ec);
 }
