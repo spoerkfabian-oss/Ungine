@@ -11,6 +11,8 @@
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptNodes.h"
+#include "Engine/Script/ScriptRegistry.h"
 
 #include <imgui.h>
 #include <imgui_stdlib.h>
@@ -18,6 +20,8 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <functional>
+#include <variant>
 #include <system_error>
 
 namespace Engine {
@@ -59,11 +63,17 @@ ImVec4 KindColor(int kind)
     case 4: return {0.95f, 0.55f, 0.30f, 1.0f}; // model
     case 5: return {0.85f, 0.45f, 0.85f, 1.0f}; // texture
     case 6: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
+    case 7: return {0.55f, 0.85f, 0.55f, 1.0f}; // enum / struct / interface
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "FILE"};
+
+bool IsTypeFile(const std::string& lowerName)
+{
+    return EndsWith(lowerName, ".uenum") || EndsWith(lowerName, ".ustruct") || EndsWith(lowerName, ".uinterface");
+}
 
 } // namespace
 
@@ -159,6 +169,8 @@ void Editor::OpenAsset(const fs::path& file)
         } else {
             m_Status = "Cannot open blueprint (see log)";
         }
+    } else if (IsTypeFile(name)) {
+        OpenTypeFile(file);
     } else if (EndsWith(name, ".uprefab")) { // double-click: an instance in front of the camera
         if (m_PlayState == PlayState::Edit)
             PlacePrefab(file, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -234,6 +246,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::Texture;
         else if (IsSoundFile(path))
             item.kind = ContentItem::Kind::Sound;
+        else if (IsTypeFile(lower))
+            item.kind = ContentItem::Kind::Type;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -276,6 +290,38 @@ void Editor::DrawContentBrowser()
             }
             RefreshContent();
         }
+        // Blueprint types / libraries: shared by every blueprint of the project (name = file name).
+        const auto newType = [&](const char* stem, const char* extension, const std::function<void(const fs::path&, const std::string&)>& write) {
+            const fs::path file = UniquePath(m_ContentDir, stem, extension);
+            try {
+                write(file, PathToUtf8(file.stem()));
+            } catch (const std::exception& e) {
+                m_Status = std::string("Cannot create: ") + e.what();
+                return;
+            }
+            ReloadScriptRegistry();
+            RefreshContent();
+            OpenAsset(file);
+        };
+        if (ImGui::MenuItem("Blueprint library"))
+            newType("NewLibrary", ".ugraph", [](const fs::path& file, const std::string&) {
+                ScriptGraph library;
+                library.library = true;
+                library.AddFunction("MyFunction");
+                SaveScriptGraph(file, library);
+            });
+        if (ImGui::MenuItem("Enum"))
+            newType("NewEnum", ".uenum", [](const fs::path& file, const std::string& name) {
+                ScriptRegistry::SaveEnumFile(file, {name, {"First", "Second"}, file});
+            });
+        if (ImGui::MenuItem("Struct"))
+            newType("NewStruct", ".ustruct", [](const fs::path& file, const std::string& name) {
+                ScriptRegistry::SaveStructFile(file, {name, {{"Value", PinType::Float, 0.0f}}, file});
+            });
+        if (ImGui::MenuItem("Interface"))
+            newType("NewInterface", ".uinterface", [](const fs::path& file, const std::string& name) {
+                ScriptRegistry::SaveInterfaceFile(file, {name, {{"Interact", {}, {}}}, file});
+            });
         if (ImGui::MenuItem("Scene")) {
             std::ofstream(UniquePath(m_ContentDir, "NewScene", ".scene.json")) << "{\n  \"version\": 1,\n  \"entities\": []\n}\n";
             RefreshContent();
@@ -465,6 +511,109 @@ void Editor::DrawProjectSettings()
     ImGui::SameLine();
     ImGui::Checkbox("VSync", &s.vsync);
     ImGui::TextDisabled("Audio mixer: Renderer panel > Audio (stored here too).");
+    // Input actions / axes for blueprints (key names as in Is Key Down, plus MouseLeft / Right / Middle).
+    if (ImGui::CollapsingHeader("Input")) {
+        InputMap& input = s.input;
+        const auto keyCombo = [&](const char* id, std::string& key) {
+            bool changed = false;
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::BeginCombo(id, key.c_str())) {
+                std::vector<std::string> names(KeyNames().begin(), KeyNames().end());
+                names.insert(names.end(), {"MouseLeft", "MouseRight", "MouseMiddle"});
+                for (const std::string& k : names)
+                    if (ImGui::Selectable(k.c_str(), k == key)) {
+                        key     = k;
+                        changed = true;
+                    }
+                ImGui::EndCombo();
+            }
+            return changed;
+        };
+        bool changed = false;
+        ImGui::SeparatorText("Actions");
+        std::optional<std::size_t> removeAction;
+        for (std::size_t i = 0; i < input.actions.size(); ++i) {
+            InputActionBinding& a = input.actions[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::SetNextItemWidth(120.0f);
+            changed |= ImGui::InputText("##action", &a.name);
+            std::optional<std::size_t> removeKey;
+            for (std::size_t k = 0; k < a.keys.size(); ++k) {
+                ImGui::PushID(static_cast<int>(k));
+                ImGui::SameLine();
+                changed |= keyCombo("##key", a.keys[k]);
+                if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                    removeKey = k;
+                ImGui::PopID();
+            }
+            if (removeKey) {
+                a.keys.erase(a.keys.begin() + static_cast<std::ptrdiff_t>(*removeKey));
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+ key")) {
+                a.keys.push_back("Space");
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                removeAction = i;
+            ImGui::PopID();
+        }
+        if (removeAction) {
+            input.actions.erase(input.actions.begin() + static_cast<std::ptrdiff_t>(*removeAction));
+            changed = true;
+        }
+        if (ImGui::SmallButton("+ Action")) {
+            input.actions.push_back({"Action" + std::to_string(input.actions.size() + 1), {"Space"}});
+            changed = true;
+        }
+        ImGui::SeparatorText("Axes");
+        std::optional<std::size_t> removeAxis;
+        for (std::size_t i = 0; i < input.axes.size(); ++i) {
+            InputAxisBinding& a = input.axes[i];
+            ImGui::PushID(static_cast<int>(i) + 1000);
+            ImGui::SetNextItemWidth(120.0f);
+            changed |= ImGui::InputText("##axis", &a.name);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+ key")) {
+                a.keys.push_back({"W", 1.0f});
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                removeAxis = i;
+            std::optional<std::size_t> removeKey;
+            for (std::size_t k = 0; k < a.keys.size(); ++k) {
+                ImGui::PushID(static_cast<int>(k));
+                ImGui::Indent();
+                changed |= keyCombo("##key", a.keys[k].key);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(70.0f);
+                changed |= ImGui::DragFloat("Scale", &a.keys[k].scale, 0.05f, -10.0f, 10.0f, "%.2f");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                    removeKey = k;
+                ImGui::Unindent();
+                ImGui::PopID();
+            }
+            if (removeKey) {
+                a.keys.erase(a.keys.begin() + static_cast<std::ptrdiff_t>(*removeKey));
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        if (removeAxis) {
+            input.axes.erase(input.axes.begin() + static_cast<std::ptrdiff_t>(*removeAxis));
+            changed = true;
+        }
+        if (ImGui::SmallButton("+ Axis")) {
+            input.axes.push_back({"Axis" + std::to_string(input.axes.size() + 1), {{"W", 1.0f}, {"S", -1.0f}}});
+            changed = true;
+        }
+        ImGui::TextDisabled("Right-click a key of an action to remove it. Used from the next Play.");
+        m_ProjectDirty |= changed;
+    }
     ImGui::Separator();
     ImGui::BeginDisabled(!IsValidProjectName(s.name));
     if (ImGui::Button("Save")) {
@@ -482,6 +631,218 @@ void Editor::DrawProjectSettings()
                 m_Ctx.audio->Apply(project.settings.audio);
             m_ProjectDirty = false;
         }
+    ImGui::End();
+}
+
+
+// --- Blueprint types (enums, structs, interfaces) ------------------------------------------------
+
+struct Editor::TypeEdit {
+    fs::path                                                   file;
+    std::variant<ScriptEnum, ScriptStructDef, ScriptInterface> def;
+    bool                                                       dirty = false;
+};
+
+void Editor::OpenTypeFile(const fs::path& file)
+{
+    const std::string name = Lower(PathToUtf8(file.filename()));
+    try {
+        auto edit  = std::make_shared<TypeEdit>();
+        edit->file = file;
+        if (EndsWith(name, ".uenum"))
+            edit->def = ScriptRegistry::LoadEnumFile(file);
+        else if (EndsWith(name, ".ustruct"))
+            edit->def = ScriptRegistry::LoadStructFile(file);
+        else
+            edit->def = ScriptRegistry::LoadInterfaceFile(file);
+        m_TypeEdit  = std::move(edit);
+        m_ShowTypes = true;
+    } catch (const std::exception& e) {
+        m_Status = std::string("Cannot open: ") + e.what();
+    }
+}
+
+void Editor::DrawBlueprintTypes()
+{
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(ImVec2(center.x - 700.0f, center.y - 60.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 360.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Blueprint Types", &m_ShowTypes)) {
+        ImGui::End();
+        return;
+    }
+    // Left: everything the registry knows (from the project's files).
+    if (ImGui::BeginChild("##typelist", ImVec2(200.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX)) {
+        const auto entry = [&](const char* tag, const std::string& name, const fs::path& file) {
+            const bool selected = m_TypeEdit && m_TypeEdit->file == file;
+            if (ImGui::Selectable(std::format("{} {}##{}", tag, name, PathToUtf8(file)).c_str(), selected) && !file.empty())
+                OpenTypeFile(file);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", file.empty() ? "registered in code" : PathToUtf8(file).c_str());
+        };
+        ImGui::SeparatorText("Enums");
+        for (const std::string& n : ScriptRegistry::EnumNames())
+            entry("E", n, ScriptRegistry::FindEnum(n)->file);
+        ImGui::SeparatorText("Structs");
+        for (const std::string& n : ScriptRegistry::StructNames())
+            entry("S", n, ScriptRegistry::FindStruct(n)->file);
+        ImGui::SeparatorText("Interfaces");
+        for (const std::string& n : ScriptRegistry::InterfaceNames())
+            entry("I", n, ScriptRegistry::FindInterface(n)->file);
+        ImGui::SeparatorText("Libraries");
+        for (const std::string& n : ScriptRegistry::LibraryNames())
+            if (ImGui::Selectable(("L " + n).c_str()))
+                OpenAsset(ScriptRegistry::FindLibrary(n)->file);
+        ImGui::Spacing();
+        if (ImGui::SmallButton("Reload all"))
+            ReloadScriptRegistry();
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##typeedit");
+    if (!m_TypeEdit) {
+        ImGui::TextDisabled("Pick a type, or create one in the Content browser (+ New).");
+    } else {
+        TypeEdit& t = *m_TypeEdit;
+        ImGui::TextDisabled("%s", PathToUtf8(t.file).c_str());
+        bool changed = false;
+        // A parameter list (interface functions).
+        const auto params = [&](const char* title, std::vector<ScriptParam>& list, int base) {
+            ImGui::TextDisabled("%s", title);
+            std::optional<std::size_t> remove;
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                ImGui::PushID(base + static_cast<int>(i));
+                ImGui::SetNextItemWidth(110.0f);
+                changed |= ImGui::InputText("##p", &list[i].name);
+                ImGui::SameLine();
+                changed |= ScriptGraphEditor::EditType("##t", list[i].type, 110.0f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                    remove = i;
+                ImGui::PopID();
+            }
+            if (remove) {
+                list.erase(list.begin() + static_cast<std::ptrdiff_t>(*remove));
+                changed = true;
+            }
+            ImGui::PushID(base + 999);
+            if (ImGui::SmallButton("+")) {
+                list.push_back({"Value" + std::to_string(list.size() + 1), PinType::Float});
+                changed = true;
+            }
+            ImGui::PopID();
+        };
+        if (auto* e = std::get_if<ScriptEnum>(&t.def)) {
+            ImGui::Text("Enum %s", e->name.c_str());
+            std::optional<std::size_t> remove;
+            for (std::size_t i = 0; i < e->values.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Text("%2zu", i);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(180.0f);
+                changed |= ImGui::InputText("##v", &e->values[i]);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                    remove = i;
+                ImGui::PopID();
+            }
+            if (remove) {
+                e->values.erase(e->values.begin() + static_cast<std::ptrdiff_t>(*remove));
+                changed = true;
+            }
+            if (ImGui::SmallButton("+ Value")) {
+                e->values.push_back("Value" + std::to_string(e->values.size()));
+                changed = true;
+            }
+            ImGui::TextDisabled("Values are stored by index: removing one shifts the later ones.");
+        } else if (auto* st = std::get_if<ScriptStructDef>(&t.def)) {
+            ImGui::Text("Struct %s", st->name.c_str());
+            std::optional<std::size_t> remove;
+            for (std::size_t i = 0; i < st->fields.size(); ++i) {
+                ScriptStructField& f = st->fields[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::SetNextItemWidth(120.0f);
+                changed |= ImGui::InputText("##f", &f.name);
+                ImGui::SameLine();
+                if (ScriptGraphEditor::EditType("##t", f.type, 110.0f)) {
+                    f.value = DefaultValue(f.type);
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (f.type.kind != PinKind::Entity)
+                    changed |= ScriptGraphEditor::EditValue("##d", f.value, f.type, 140.0f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                    remove = i;
+                ImGui::PopID();
+            }
+            if (remove) {
+                st->fields.erase(st->fields.begin() + static_cast<std::ptrdiff_t>(*remove));
+                changed = true;
+            }
+            if (ImGui::SmallButton("+ Field")) {
+                st->fields.push_back({"Field" + std::to_string(st->fields.size() + 1), PinType::Float, 0.0f});
+                changed = true;
+            }
+        } else if (auto* in = std::get_if<ScriptInterface>(&t.def)) {
+            ImGui::Text("Interface %s", in->name.c_str());
+            std::optional<std::size_t> remove;
+            for (std::size_t i = 0; i < in->functions.size(); ++i) {
+                ScriptInterfaceFunction& f = in->functions[i];
+                ImGui::PushID(static_cast<int>(i) * 10000);
+                ImGui::SetNextItemWidth(160.0f);
+                changed |= ImGui::InputText("##fn", &f.name);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                    remove = i;
+                ImGui::Indent();
+                params("Inputs", f.inputs, 1000);
+                params("Outputs", f.outputs, 2000);
+                ImGui::Unindent();
+                ImGui::PopID();
+            }
+            if (remove) {
+                in->functions.erase(in->functions.begin() + static_cast<std::ptrdiff_t>(*remove));
+                changed = true;
+            }
+            if (ImGui::SmallButton("+ Function")) {
+                in->functions.push_back({"Function" + std::to_string(in->functions.size() + 1), {}, {}});
+                changed = true;
+            }
+            ImGui::TextDisabled("Blueprints implementing it need matching functions (Compile shows them).");
+        }
+        t.dirty |= changed;
+        ImGui::Separator();
+        ImGui::BeginDisabled(!t.dirty);
+        if (ImGui::Button("Save")) {
+            try {
+                std::visit(
+                    [&](const auto& def) {
+                        using T = std::decay_t<decltype(def)>;
+                        if constexpr (std::is_same_v<T, ScriptEnum>)
+                            ScriptRegistry::SaveEnumFile(t.file, def);
+                        else if constexpr (std::is_same_v<T, ScriptStructDef>)
+                            ScriptRegistry::SaveStructFile(t.file, def);
+                        else
+                            ScriptRegistry::SaveInterfaceFile(t.file, def);
+                    },
+                    t.def);
+                t.dirty = false;
+                const std::vector<std::string> problems = ReloadScriptRegistry();
+                m_Status = problems.empty() ? "Saved " + PathToUtf8(t.file.filename()) : "Saved (with problems, see Blueprint Types)";
+            } catch (const std::exception& e) {
+                m_Status = std::string("Save failed: ") + e.what();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Revert"))
+            OpenTypeFile(t.file);
+        ImGui::EndDisabled();
+        // Problems of all definitions.
+        for (const std::string& problem : ScriptRegistry::Validate())
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.35f, 1.0f), "%s", problem.c_str());
+    }
+    ImGui::EndChild();
     ImGui::End();
 }
 

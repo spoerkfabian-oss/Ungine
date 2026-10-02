@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -82,8 +83,35 @@ public:
     void                             OpenScope(const std::string& function);
     [[nodiscard]] const std::string* Scope() const;
 
+    // Moves the selected nodes into a new function / macro (named NewFunction / NewMacro, renamed in
+    // the sidebar) called in their place. Returns the error, empty on success.
+    std::string CollapseSelection(bool macro);
+
+    // Find in Blueprints (Ctrl+F): node titles / params in the open graphs and the .ugraph files
+    // below the search root (the project's content). References: nodes naming exactly `query`
+    // (param or a text input, e.g. a variable, function, macro, event or dispatcher).
+    struct SearchHit {
+        std::filesystem::path file;
+        std::string           scope; // function / macro, empty: event graph
+        std::uint32_t         node = 0;
+        std::string           label;
+    };
+    void SetSearchRoot(std::filesystem::path root) { m_SearchRoot = std::move(root); }
+    void OpenSearch(std::string query, bool references = false);
+    [[nodiscard]] std::vector<SearchHit> Search(const std::string& query, bool references) const;
+    void ShowHit(const SearchHit& hit); // opens the graph on the node
+
+    void OpenTimeline(const std::string& name); // timeline editor window (active graph)
+    // Screen rectangles (x, y, width, height; window pixels) of the last frame: the canvas and the
+    // timeline editor's curve view (zero when not shown) - for UI tests and tools.
+    [[nodiscard]] glm::vec4 CanvasRect() const { return m_CanvasRect; }
+    [[nodiscard]] glm::vec4 TimelineCurveRect() const { return m_TimelineCurveRect; }
+    // Changes with every edit of any open graph (construction scripts run again).
+    [[nodiscard]] std::uint64_t Revision() const { return m_RevisionCounter; }
+
     // The value editor of the graph editor (arrays as a popup list), for other panels.
     static bool EditValue(const char* id, ScriptValue& value, PinType type, float width);
+    static bool EditType(const char* id, PinType& type, float width); // type picker (arrays, maps, user types)
 
     // Open graphs (unsaved edits included) replace their files in play mode.
     void ProvideTo(ScriptSystem& scripts) const;
@@ -105,6 +133,10 @@ private:
     void DrawToolbar(ScriptSystem* debug, Scene* scene);
     void DrawSidebar(Document& doc);
     void DrawFunctions(Document& doc);
+    void DrawMacro(Document& doc, ScriptMacro& macro);
+    void DrawMembers(Document& doc); // events, dispatchers, interfaces, timelines
+    void DrawTimeline(Document& doc);
+    void DrawSearch();
     void DrawWatch(Document& doc, const ScriptSystem* debug);
     void SyncDebugger(ScriptSystem* debug);
     void DrawDetails(Document& doc);
@@ -130,6 +162,20 @@ private:
     std::string                                          m_FrameJson; // active graph at the start of the frame
     Scene*                                               m_Scene = nullptr; // this frame's (names in the watch)
     std::optional<ScriptWatch>                           m_Watch;          // the watched instance, this frame
+    // Find in Blueprints.
+    std::filesystem::path  m_SearchRoot;
+    std::string            m_SearchQuery;
+    bool                   m_SearchReferences = false, m_SearchOpen = false, m_SearchFocus = false;
+    std::vector<SearchHit> m_SearchHits;
+    // Search: project graphs parsed once per file change (key -> (mtime, graph)).
+    mutable std::map<std::string, std::pair<std::filesystem::file_time_type, std::shared_ptr<const ScriptGraph>>> m_SearchCache;
+    // Graphs handed to a script system by ProvideTo (by key), so closed ones can be taken back.
+    mutable std::map<std::string, std::filesystem::path> m_Provided;
+    glm::vec4 m_CanvasRect{0.0f}, m_TimelineCurveRect{0.0f};
+    // Timeline editor.
+    std::string m_Timeline;
+    int         m_TimelineTrack = 0, m_TimelineKey = -1, m_TimelineComponent = 0;
+    bool        m_TimelineDragging = false;
 };
 
 } // namespace Engine

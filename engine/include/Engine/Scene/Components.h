@@ -1,6 +1,7 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Audio/AudioTypes.h"
+#include "Engine/Core/FlatMap.h"
 #include "Engine/Script/ScriptValue.h"
 #include "Engine/ECS/Entity.h"
 
@@ -154,7 +155,8 @@ struct ScriptComponent {
 
     std::string graph;
     // Values of the graph's exposed ("instance editable") variables for this entity, by name.
-    std::map<std::string, ScriptVariableOverride> variables;
+    // (Components must move without throwing: no std::map, see FlatMap.)
+    FlatMap<std::string, ScriptVariableOverride> variables;
 
     bool operator==(const ScriptComponent&) const = default;
 };
@@ -241,6 +243,14 @@ struct PrefabLink {
     std::uint64_t source   = 0;
 
     bool operator==(const PrefabLink&) const = default;
+};
+
+// Made by the construction script of another entity (the owner's UUID): rebuilt whenever it runs,
+// not saved in scene files (kept in memory snapshots: undo, play).
+struct ConstructionOwned {
+    std::uint64_t owner = 0;
+
+    bool operator==(const ConstructionOwned&) const = default;
 };
 
 } // namespace Engine

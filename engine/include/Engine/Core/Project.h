@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Audio/AudioTypes.h"
+#include "Engine/Core/InputMap.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -21,6 +22,7 @@ struct ProjectSettings {
     bool          fullscreen   = false;
     bool          vsync        = true;
     AudioSettings audio;        // mixer (bus volumes / mutes), occlusion
+    InputMap      input;        // input actions / axes for blueprints
 };
 
 struct ProjectTemplate {

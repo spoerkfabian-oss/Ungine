@@ -1,0 +1,153 @@
+# Build and test on every push and pull request. The GPU tests (lavapipe software Vulkan with the
+# Khronos validation + synchronization validation layers, under Xvfb) run for pull requests, on
+# main and on manual runs - they take ~30 minutes.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Run the GPU tests (lavapipe)
+        type: boolean
+        default: true
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+            gpu: true
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+            gpu: false
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build glslc clang \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev \
+            mesa-vulkan-drivers vulkan-validationlayers xvfb
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-linux-${{ matrix.compiler }}-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DGLFW_BUILD_WAYLAND=OFF
+          -DENGINE_GPU_TESTS=ON -DENGINE_WARNINGS_AS_ERRORS=ON
+          -DFETCHCONTENT_BASE_DIR="$GITHUB_WORKSPACE/.deps"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: CPU tests
+        run: ctest --test-dir build -R "^EngineTests$" --output-on-failure
+
+      - name: GPU tests (lavapipe + validation)
+        if: >-
+          matrix.gpu && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' ||
+          (github.event_name == 'workflow_dispatch' && inputs.gpu))
+        env:
+          VK_LAYER_ENABLES: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" ctest --test-dir build -E "^EngineTests$" -j2 --output-on-failure --timeout 3000
+
+      - name: Trim dependency cache
+        run: rm -rf .deps/*-build
+
+  windows:
+    name: Windows MSVC
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only glslc is needed (volk loads Vulkan at run time). LunarG renamed its installers, so
+      # the current version is looked up and both file name schemes are tried.
+      - name: Resolve Vulkan SDK version
+        id: vulkan
+        shell: pwsh
+        run: |
+          $version = (Invoke-RestMethod -Uri https://vulkan.lunarg.com/sdk/latest/windows.txt).Trim()
+          if (-not $version) { throw 'Could not resolve the latest Vulkan SDK version' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Vulkan SDK $version"
+
+      - name: Cache Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK
+          key: vulkan-sdk-${{ steps.vulkan.outputs.version }}
+
+      - name: Install Vulkan SDK (glslc)
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $v = '${{ steps.vulkan.outputs.version }}'
+          $urls = @("https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe",
+                    "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe")
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try { Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe; $downloaded = $true; Write-Host "Downloaded $url"; break }
+            catch { Write-Host "Not available: $url" }
+          }
+          if (-not $downloaded) { throw "Vulkan SDK $v installer not found" }
+          $p = Start-Process -FilePath .\vulkan-sdk.exe -Wait -PassThru -NoNewWindow -ArgumentList `
+            '--root', 'C:\VulkanSDK', '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer failed ($($p.ExitCode))" }
+          if (-not (Test-Path C:\VulkanSDK\Bin\glslc.exe)) { throw 'glslc.exe missing after the install' }
+          Remove-Item vulkan-sdk.exe
+
+      - name: Vulkan SDK environment
+        shell: pwsh
+        run: |
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-windows-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Configure
+        shell: pwsh
+        run: | # forward slashes: the path ends up in generated CMake code
+          $deps = ($env:GITHUB_WORKSPACE -replace '\\', '/') + '/.deps'
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DENGINE_GPU_TESTS=OFF -DENGINE_WARNINGS_AS_ERRORS=ON "-DFETCHCONTENT_BASE_DIR=$deps"
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: CPU tests
+        run: ctest --test-dir build -C Debug -R "^EngineTests$" --output-on-failure
+
+      - name: Trim dependency cache
+        shell: pwsh
+        run: Remove-Item -Recurse -Force .deps\*-build

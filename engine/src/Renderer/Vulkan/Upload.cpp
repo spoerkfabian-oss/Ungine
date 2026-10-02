@@ -6,6 +6,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
 
 namespace Engine {
 
@@ -204,6 +205,8 @@ UploadTicket UploadQueue::Record(std::span<const std::byte> data, const PendingA
         // Budget: a full batch is closed; Submit() sends at most frameBudget bytes per frame.
         if (m_Open && m_Open->bytes > 0 && m_Open->bytes + data.size() > m_Desc.frameBudget)
             m_Closed.push_back(std::move(m_Open));
+        if (m_Open && m_Open->failed) // a failed batch can no longer accept recordings
+            m_Closed.push_back(std::move(m_Open));
         if (!m_Open)
             OpenBatchLocked();
         batch      = m_Open.get();
@@ -215,26 +218,46 @@ UploadTicket UploadQueue::Record(std::span<const std::byte> data, const PendingA
     // 2) Unlocked: copy into the ring or into an own staging buffer (large uploads, full ring),
     //    so workers do not serialize on big textures.
     Buffer staging;
-    if (ringOffset) {
-        std::memcpy(static_cast<std::byte*>(m_Ring.Mapped()) + *ringOffset, data.data(), data.size());
-        m_Ring.Flush(*ringOffset, data.size());
-    } else {
-        staging = Buffer(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                 .memory = MemoryUsage::Upload, .debugName = "staging"});
-        staging.Write(data.data(), data.size());
+    try {
+        if (ringOffset) {
+            std::memcpy(static_cast<std::byte*>(m_Ring.Mapped()) + *ringOffset, data.data(), data.size());
+            m_Ring.Flush(*ringOffset, data.size());
+        } else {
+            staging = Buffer(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                     .memory = MemoryUsage::Upload, .debugName = "staging"});
+            staging.Write(data.data(), data.size());
+        }
+    } catch (...) {
+        std::scoped_lock lock{m_Mutex};
+        batch->failed = true;
+        if (--batch->pendingWrites == 0)
+            m_WritesDone.notify_all();
+        throw;
     }
 
     // 3) Under the lock again: record the copy (the command buffer is shared by the batch).
     std::scoped_lock lock{m_Mutex};
-    record(batch->cmd, ringOffset ? m_Ring.Handle() : staging.Handle(), ringOffset.value_or(0));
-    if (!ringOffset) {
-        batch->staging.push_back(std::move(staging));
-        ++m_Stats.dedicatedStaging;
+    if (batch->failed) {
+        if (--batch->pendingWrites == 0)
+            m_WritesDone.notify_all();
+        throw std::runtime_error("UploadQueue batch was poisoned by another failed upload");
     }
-    batch->acquires.push_back(acquire);
-    m_Stats.totalBytes += data.size();
-    if (--batch->pendingWrites == 0)
-        m_WritesDone.notify_all();
+    try {
+        record(batch->cmd, ringOffset ? m_Ring.Handle() : staging.Handle(), ringOffset.value_or(0));
+        if (!ringOffset) {
+            batch->staging.push_back(std::move(staging));
+            ++m_Stats.dedicatedStaging;
+        }
+        batch->acquires.push_back(acquire);
+        m_Stats.totalBytes += data.size();
+        if (--batch->pendingWrites == 0)
+            m_WritesDone.notify_all();
+    } catch (...) {
+        batch->failed = true;
+        if (--batch->pendingWrites == 0)
+            m_WritesDone.notify_all();
+        throw;
+    }
     return batch->value;
 }
 
@@ -365,16 +388,31 @@ void UploadQueue::SubmitBatches(bool all)
         const auto fits = [&](const Batch& b) {
             return b.pendingWrites == 0 && (all || sent == 0 || sent + b.bytes <= m_Desc.frameBudget);
         };
+        // Failed batches are never submitted. They are discarded once all workers that
+        // reserved staging space in them have finished, which also releases their ring ranges.
+        std::vector<std::unique_ptr<Batch>> discarded;
+        while (!m_Closed.empty() && m_Closed.front()->failed && m_Closed.front()->pendingWrites == 0 &&
+               (m_Closed.front()->ringBytes == 0 || m_InFlight.empty())) {
+            discarded.push_back(std::move(m_Closed.front()));
+            m_Closed.pop_front();
+        }
         while (!m_Closed.empty() && fits(*m_Closed.front())) {
             sent += m_Closed.front()->bytes;
             batches.push_back(std::move(m_Closed.front()));
             m_Closed.pop_front();
+        }
+        if (m_Closed.empty() && m_Open && m_Open->failed && m_Open->pendingWrites == 0 &&
+            (m_Open->ringBytes == 0 || m_InFlight.empty())) {
+            discarded.push_back(std::move(m_Open));
         }
         if (m_Closed.empty() && m_Open && fits(*m_Open)) { // workers open a fresh batch from here on
             sent += m_Open->bytes;
             batches.push_back(std::move(m_Open));
         }
         m_Stats.submittedLastFrame = sent;
+        lock.unlock();
+        for (auto& batch : discarded)
+            RecycleBatch(std::move(batch));
     }
     for (std::unique_ptr<Batch>& batch : batches)
         SubmitBatch(std::move(batch));
@@ -413,6 +451,8 @@ void UploadQueue::RecycleBatch(std::unique_ptr<Batch> batch)
     batch->acquires.clear();
     batch->value = 0;
     batch->bytes = 0;
+    batch->pendingWrites = 0;
+    batch->failed = false;
     VK_CHECK(vkResetCommandPool(m_Ctx.Device(), batch->pool, 0));
     std::scoped_lock lock{m_Mutex};
     if (batch->ringBytes > 0) { // batches complete in ring order

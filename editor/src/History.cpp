@@ -17,6 +17,7 @@ void History::Push(EditCommand command)
         m_SavedPosition = m_SavedPosition == 0 || m_SavedPosition == kUnreachable ? kUnreachable : m_SavedPosition - 1;
     }
     m_Position = m_Commands.size();
+    ++m_Revision;
 }
 
 bool History::Undo()
@@ -24,6 +25,7 @@ bool History::Undo()
     if (!CanUndo())
         return false;
     m_Commands[--m_Position].undo();
+    ++m_Revision;
     return true;
 }
 
@@ -32,6 +34,7 @@ bool History::Redo()
     if (!CanRedo())
         return false;
     m_Commands[m_Position++].redo();
+    ++m_Revision;
     return true;
 }
 
@@ -40,6 +43,7 @@ void History::Clear()
     m_Commands.clear();
     m_Position      = 0;
     m_SavedPosition = 0;
+    ++m_Revision;
 }
 
 const std::string& History::UndoLabel() const

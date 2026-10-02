@@ -2,14 +2,23 @@
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptCondition.h"
 #include "Engine/Script/ScriptNodes.h"
+#include "Engine/Script/ScriptRegistry.h"
+#include "ScriptExpand.h"
+#include "ScriptJson.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <unordered_set>
 
@@ -18,6 +27,69 @@ namespace Engine {
 namespace {
 
 std::uint64_t EntityKey(Entity e) { return static_cast<std::uint64_t>(e); }
+
+// Save games: like ScriptValueToJson, but entities (also inside containers / structs) are stored
+// as their UUID and found again by it when loaded (in the same level).
+nlohmann::json SaveValueToJson(const ScriptValue& value, const Registry& r)
+{
+    return std::visit(
+        [&](const auto& v) -> nlohmann::json {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, Entity>) {
+                const Uuid* uuid = v != NullEntity && r.Valid(v) ? r.TryGet<Uuid>(v) : nullptr;
+                return uuid ? nlohmann::json{{"$uuid", uuid->value}} : nlohmann::json();
+            } else if constexpr (std::is_same_v<T, ScriptArrayPtr>) {
+                nlohmann::json list = nlohmann::json::array();
+                for (const ScriptValue& item : ArrayItems(value).items)
+                    list.push_back(SaveValueToJson(item, r));
+                return list;
+            } else if constexpr (std::is_same_v<T, ScriptStructPtr>) {
+                nlohmann::json object = nlohmann::json::object();
+                for (const auto& [name, field] : StructOf(value).fields)
+                    object[name] = SaveValueToJson(field, r);
+                return object;
+            } else if constexpr (std::is_same_v<T, ScriptMapPtr>) {
+                nlohmann::json pairs = nlohmann::json::array();
+                for (const auto& [key, item] : MapOf(value).items)
+                    pairs.push_back({SaveValueToJson(key, r), SaveValueToJson(item, r)});
+                return pairs;
+            } else {
+                return ScriptValueToJson(value);
+            }
+        },
+        value);
+}
+
+ScriptValue SaveValueFromJson(const nlohmann::json& j, PinType type, Scene& scene)
+{
+    if (IsArray(type)) {
+        std::vector<ScriptValue> items;
+        if (j.is_array())
+            for (const nlohmann::json& item : j)
+                items.push_back(SaveValueFromJson(item, ElementType(type), scene));
+        return MakeArray(ElementType(type), std::move(items));
+    }
+    if (IsMap(type)) {
+        ScriptValue value = MakeMap(KeyType(type), ElementType(type));
+        if (j.is_array())
+            for (const nlohmann::json& pair : j)
+                if (pair.is_array() && pair.size() == 2)
+                    MutableMap(value, KeyType(type), ElementType(type)).items[SaveValueFromJson(pair[0], KeyType(type), scene)] =
+                        SaveValueFromJson(pair[1], ElementType(type), scene);
+        return value;
+    }
+    if (type.kind == PinKind::Struct) {
+        ScriptValue value = DefaultValue(type);
+        if (const ScriptStructDef* def = ScriptRegistry::FindStruct(UserTypeName(type)); def && j.is_object())
+            for (const ScriptStructField& f : def->fields)
+                if (const auto it = j.find(f.name); it != j.end())
+                    SetStructField(value, def->name, f.name, SaveValueFromJson(*it, f.type, scene));
+        return value;
+    }
+    if (type.kind == PinKind::Entity)
+        return j.is_object() && j.contains("$uuid") ? scene.FindByUuid(j["$uuid"].get<std::uint64_t>()) : NullEntity;
+    return ScriptValueFromJson(j, type);
+}
 
 struct PinRef {
     int node = -1; // index into Program::nodes, -1: none
@@ -35,6 +107,12 @@ struct CompiledNode {
     int                      callFunction = -1; // Call / CallPure: the called function
     std::vector<int>         argPins;    // Call: input pin of each function input
     std::vector<int>         resultPins; // Call: output pin of each function output
+    // Where the node comes from (copies of macros / library functions): Program::files index, node
+    // id and function there, and the Macro node of the graph itself it was copied for.
+    int           file = 0;
+    std::uint32_t id   = 0;
+    std::string   function;
+    std::uint32_t use = 0;
 };
 
 struct CompiledFunction {
@@ -54,8 +132,19 @@ struct Program {
     std::vector<ScriptDiagnostic>           diagnostics;
     bool                                    ok = false;
     std::unordered_map<std::string, int>    variableIndex;
+    std::unordered_map<std::string, int>    functionIndex;
     std::map<std::string, std::vector<int>> events; // node type -> event nodes (event graph only)
+    // Graph files of the nodes (debugger keys): 0 = this graph, then the libraries copied in.
+    std::vector<std::string> files;
+    std::vector<std::string> fileLibraries; // library name per file ("" for this graph)
 };
+
+// Debugger key of a library: its file (ScriptSystem::Key), or a name for libraries made in code.
+std::string LibraryKey(const std::string& name)
+{
+    const ScriptLibrary* l = ScriptRegistry::FindLibrary(name);
+    return l && !l->file.empty() ? ScriptSystem::Key(l->file) : "library:" + name;
+}
 
 int PinIndex(const CompiledNode& c, const std::string& name, bool output)
 {
@@ -65,17 +154,20 @@ int PinIndex(const CompiledNode& c, const std::string& name, bool output)
     return -1;
 }
 
-std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector<ScriptDiagnostic> diagnostics)
+std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector<ScriptDiagnostic> diagnostics,
+                                 const std::unordered_map<std::uint32_t, ScriptOrigin>& origins)
 {
     auto p         = std::make_shared<Program>();
     p->key         = std::move(key);
+    p->files       = {p->key};
+    p->fileLibraries = {std::string()};
     p->graph       = std::move(graph);
     p->diagnostics = std::move(diagnostics);
     p->ok = std::ranges::none_of(p->diagnostics, [](const ScriptDiagnostic& d) { return d.error; });
     if (!p->ok)
         return p;
 
-    std::unordered_map<std::string, int> functionIndex;
+    std::unordered_map<std::string, int>& functionIndex = p->functionIndex;
     for (const ScriptFunction& f : p->graph.functions) {
         functionIndex[f.name] = static_cast<int>(p->functions.size());
         CompiledFunction cf;
@@ -96,6 +188,21 @@ std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector
         c.desc  = FindScriptNodeType(n.type);
         c.pins  = NodePins(p->graph, n);
         c.scope = n.function.empty() ? -1 : functionIndex.at(n.function);
+        c.id       = n.id;
+        c.function = n.function;
+        if (const auto o = origins.find(n.id); o != origins.end()) {
+            c.id       = o->second.node;
+            c.function = o->second.function;
+            c.use      = o->second.use;
+            if (!o->second.library.empty()) {
+                const auto f = std::ranges::find(p->fileLibraries, o->second.library);
+                c.file       = static_cast<int>(f - p->fileLibraries.begin());
+                if (f == p->fileLibraries.end()) {
+                    p->files.push_back(LibraryKey(o->second.library));
+                    p->fileLibraries.push_back(o->second.library);
+                }
+            }
+        }
         c.source.resize(c.pins.size());
         c.target.resize(c.pins.size());
         c.defaults.resize(c.pins.size(), false);
@@ -151,27 +258,52 @@ struct ScriptSystem::Impl {
         std::vector<char>                      active;  // per function: on the call stack
         std::vector<std::vector<ScriptValue>>  outputs; // per node, per pin
         std::vector<ScriptContext::NodeState>  states;
+        std::vector<std::uint32_t>             evalStamp; // per node: the execution its pure outputs were computed for
         std::vector<Timer>                     timers;
         std::unordered_set<int>                reported; // nodes whose runtime error was logged
         std::string                            graph;    // ScriptComponent::graph it was made for
+        struct Binding {
+            std::uint64_t entity = 0, serial = 0;
+            std::string   event;
+        };
+        std::unordered_map<std::string, std::vector<Binding>> bindings; // dispatcher -> bound custom events
+        std::vector<int>                                      ticking;  // nodes run with kScriptTick per update
     };
+    struct Breakpoint {
+        ScriptBreakpointOptions options;
+        std::uint32_t           hits = 0; // since play began (condition true)
+    };
+    enum class StepMode : std::uint8_t { None, Into, Over, Out };
+    static std::unordered_map<std::uint32_t, Breakpoint> BreakpointsOf(const ScriptGraph& graph)
+    {
+        std::unordered_map<std::uint32_t, Breakpoint> out;
+        for (std::uint32_t node : graph.breakpoints) {
+            const auto o = graph.breakpointOptions.find(node);
+            out[node]    = {o != graph.breakpointOptions.end() ? o->second : ScriptBreakpointOptions{}, 0};
+        }
+        return out;
+    }
     struct Continuation {
         int          node = 0;
         std::int32_t data = 0;
     };
     struct CallFrame {
-        int                       callNode = 0;
+        int                       callNode = 0; // -1: called from another script (CallFunctionOn)
         int                       function = 0;
-        std::vector<Continuation> stack; // the caller's
+        std::vector<Continuation> stack;             // the caller's
+        std::vector<ScriptValue>* results = nullptr; // callNode -1: the function's outputs
     };
     // A running chain: where it is and what comes after.
     struct ChainState {
+        std::uint64_t             id    = 0; // distinguishes chains (stepping over / out)
         int                       node  = 0;
         int                       entry = 0;
         std::int32_t              data  = 0;
         std::vector<Continuation> stack;
         std::vector<CallFrame>    calls;
         bool                      skipBreak = false; // resuming at a breakpoint
+        std::uint32_t             lastUse   = 0;     // Macro node (CompiledNode::use) of the last node run
+        bool                      atUse     = false; // paused on entering a macro copy: report its Macro node
     };
     struct SuspendedChain { // paused by the debugger, or queued while it pauses
         std::uint64_t entity = 0, serial = 0;
@@ -190,7 +322,11 @@ struct ScriptSystem::Impl {
     // The context node implementations see: one per running node / evaluation.
     class Exec final : public ScriptContext {
     public:
-        Exec(Impl& impl, Scene& scene, Instance& instance) : m_Impl(impl), m_Scene(scene), m_Instance(instance) {}
+        // Each context is one execution: pure nodes are evaluated once per context (cached by stamp).
+        Exec(Impl& impl, Scene& scene, Instance& instance)
+            : m_Impl(impl), m_Scene(scene), m_Instance(instance), stamp(++impl.evalCounter)
+        {
+        }
 
         int                       node       = 0;
         std::int32_t              resumeData = 0;
@@ -209,7 +345,7 @@ struct ScriptSystem::Impl {
             if (src.node < 0)
                 return c.defaults[static_cast<std::size_t>(pin)];
             const CompiledNode& from = m_Instance.program->nodes[static_cast<std::size_t>(src.node)];
-            if (from.desc->kind == NodeKind::Pure) {
+            if (from.desc->kind == NodeKind::Pure && m_Instance.evalStamp[static_cast<std::size_t>(src.node)] != stamp) {
                 if (depth > 256) {
                     Error("Pure evaluation too deep");
                     return DefaultValue(c.pins[static_cast<std::size_t>(pin)].type);
@@ -223,9 +359,10 @@ struct ScriptSystem::Impl {
                     from.desc->evaluate(*this);
                 --depth;
                 node = saved;
+                m_Instance.evalStamp[static_cast<std::size_t>(src.node)] = stamp;
             }
-            return Convert(m_Instance.outputs[static_cast<std::size_t>(src.node)][static_cast<std::size_t>(src.pin)],
-                           c.pins[static_cast<std::size_t>(pin)].type);
+            return ConvertFrom(m_Instance.outputs[static_cast<std::size_t>(src.node)][static_cast<std::size_t>(src.pin)],
+                               from.pins[static_cast<std::size_t>(src.pin)].type, c.pins[static_cast<std::size_t>(pin)].type);
         }
         void Out(int pin, ScriptValue value) override
         {
@@ -233,6 +370,7 @@ struct ScriptSystem::Impl {
         }
         bool Connected(int pin) const override { return Node().source[static_cast<std::size_t>(pin)].node >= 0; }
         const std::string& Param() const override { return Node().node->param; }
+        std::span<const PinInfo> Pins() const override { return Node().pins; }
         NodeState&         State() override { return m_Instance.states[static_cast<std::size_t>(node)]; }
         Entity             Self() const override { return m_Instance.entity; }
         Scene&             GetScene() override { return m_Scene; }
@@ -281,13 +419,85 @@ struct ScriptSystem::Impl {
             suspendData    = data;
         }
         std::int32_t ResumeData() const override { return resumeData; }
-        void         CallEvent(const std::string& name) override { m_Impl.CallCustomEvent(m_Scene, m_Instance, name); }
+        void CallEvent(const std::string& name, std::vector<ScriptValue> args) override
+        {
+            m_Impl.CallCustomEvent(m_Scene, m_Instance, name, args);
+        }
+        bool CallFunctionOn(Entity target, const std::string& function, std::vector<ScriptValue> args,
+                            std::vector<ScriptValue>& results) override
+        {
+            Instance* other = m_Impl.Find(target);
+            if (!other || !other->program)
+                return false;
+            const auto it = other->program->functionIndex.find(function);
+            if (it == other->program->functionIndex.end())
+                return false;
+            return m_Impl.CallFunction(m_Scene, *other, it->second, args, results);
+        }
+        bool Implements(Entity target, const std::string& interfaceName) override
+        {
+            const Instance* other = m_Impl.Find(target);
+            return other && other->program &&
+                   std::ranges::find(other->program->graph.interfaces, interfaceName) != other->program->graph.interfaces.end();
+        }
+        void CallDispatcher(const std::string& name, std::vector<ScriptValue> args) override
+        {
+            const auto it = m_Instance.bindings.find(name);
+            if (it == m_Instance.bindings.end())
+                return;
+            const std::vector<Instance::Binding> bound = it->second; // events may bind / unbind meanwhile
+            bool                                 dead  = false;
+            for (const Instance::Binding& b : bound) {
+                const auto t = m_Impl.instances.find(b.entity);
+                if (t == m_Impl.instances.end() || t->second->serial != b.serial || !t->second->program) {
+                    dead = true;
+                    continue;
+                }
+                m_Impl.CallCustomEvent(m_Scene, *t->second, b.event, args);
+            }
+            if (dead)
+                if (const auto again = m_Instance.bindings.find(name); again != m_Instance.bindings.end())
+                    std::erase_if(again->second, [&](const Instance::Binding& b) {
+                        const auto t = m_Impl.instances.find(b.entity);
+                        return t == m_Impl.instances.end() || t->second->serial != b.serial;
+                    });
+        }
+        bool BindDispatcher(Entity target, const std::string& dispatcher, const std::string& event, bool bind) override
+        {
+            Instance* other = m_Impl.Find(target);
+            if (!other || !other->program || !other->program->graph.FindDispatcher(dispatcher))
+                return false;
+            std::vector<Instance::Binding>& list = other->bindings[dispatcher];
+            const auto same = [&](const Instance::Binding& b) {
+                return b.entity == EntityKey(m_Instance.entity) && b.serial == m_Instance.serial && b.event == event;
+            };
+            if (!bind)
+                std::erase_if(list, same);
+            else if (std::ranges::none_of(list, same))
+                list.push_back({EntityKey(m_Instance.entity), m_Instance.serial, event});
+            return true;
+        }
+        bool UnbindAll(Entity target, const std::string& dispatcher) override
+        {
+            Instance* other = m_Impl.Find(target);
+            if (!other || !other->program || !other->program->graph.FindDispatcher(dispatcher))
+                return false;
+            other->bindings.erase(dispatcher);
+            return true;
+        }
         void         KeepModel(std::uint32_t index, std::uint32_t generation) override
         {
-            m_Impl.spawned.push_back(ModelHandle{index, generation});
+            if (m_Impl.constructing) // lives with the constructed entities
+                m_Impl.constructionModels[m_Impl.constructing].push_back(ModelHandle{index, generation});
+            else
+                m_Impl.spawned.push_back(ModelHandle{index, generation});
         }
         std::int32_t SetTimer(const std::string& event, float seconds, bool loop) override
         {
+            if (m_Impl.constructing) {
+                Error("Timers do not run in the construction script");
+                return 0;
+            }
             if (event.empty() || !(seconds > 0.0f)) {
                 Error("A timer needs an event name and a time > 0");
                 return 0;
@@ -300,6 +510,84 @@ struct ScriptSystem::Impl {
         {
             std::erase_if(m_Instance.timers, [&](const Timer& t) { return t.handle == handle; });
         }
+        void SetTicking(bool on) override
+        {
+            if (m_Impl.constructing) {
+                if (on)
+                    Error("Timelines and tweens do not run in the construction script");
+                return;
+            }
+            std::vector<int>& t = m_Instance.ticking;
+            const auto        it = std::ranges::find(t, node);
+            if (on && it == t.end())
+                t.push_back(node);
+            else if (!on && it != t.end())
+                t.erase(it);
+        }
+        float              DeltaTime() const override { return m_Impl.frameDt; }
+        const ScriptGraph& Graph() const override { return m_Instance.program->graph; }
+        const InputMap&    Inputs() const override { return m_Impl.inputMap; }
+        void SaveSet(const std::string& slot, const std::string& key, const ScriptValue& value, PinType type) override
+        {
+            if (nlohmann::json* j = SlotOrError(slot))
+                (*j)[key] = {{"type", ToString(type)}, {"value", SaveValueToJson(value, m_Scene.GetRegistry())}};
+        }
+        std::optional<ScriptValue> SaveGet(const std::string& slot, const std::string& key, PinType type) override
+        {
+            const nlohmann::json* j = SlotOrError(slot);
+            if (!j || !j->contains(key))
+                return std::nullopt;
+            const nlohmann::json& entry = j->at(key);
+            const auto stored = PinTypeFromString(entry.value("type", std::string()));
+            if (!stored || !CanConvert(*stored, type))
+                return std::nullopt;
+            return ConvertFrom(SaveValueFromJson(entry.value("value", nlohmann::json()), *stored, m_Scene), *stored, type);
+        }
+        bool SaveWrite(const std::string& slot) override { return SlotOrError(slot) && m_Impl.WriteSlot(slot); }
+        bool SaveRead(const std::string& slot) override { return ValidSlot(slot) && m_Impl.ReadSlot(slot); }
+        bool SaveExists(const std::string& slot) override
+        {
+            std::error_code ec;
+            return ValidSlot(slot) && !m_Impl.saveDirectory.empty() && std::filesystem::exists(m_Impl.SlotFile(slot), ec);
+        }
+        bool SaveDelete(const std::string& slot) override
+        {
+            if (!ValidSlot(slot))
+                return false;
+            m_Impl.saves.erase(slot);
+            std::error_code ec;
+            return !m_Impl.saveDirectory.empty() && std::filesystem::remove(m_Impl.SlotFile(slot), ec);
+        }
+        std::vector<std::string> SaveSlots() override
+        {
+            std::vector<std::string> names;
+            std::error_code          ec;
+            if (!m_Impl.saveDirectory.empty())
+                for (std::filesystem::directory_iterator it(m_Impl.saveDirectory, ec), end; !ec && it != end; it.increment(ec))
+                    if (it->path().extension() == ".sav")
+                        names.push_back(PathToUtf8(it->path().stem()));
+            for (const auto& [slot, values] : m_Impl.saves) // no save directory: the slots live in memory only
+                if (m_Impl.saveDirectory.empty() && std::ranges::find(names, slot) == names.end())
+                    names.push_back(slot);
+            std::ranges::sort(names);
+            return names;
+        }
+        void Construct(Entity root) override
+        {
+            Registry& r = m_Scene.GetRegistry();
+            if (!r.Valid(root) || !r.Has<Hierarchy>(root))
+                return;
+            std::vector<Entity> subtree{root};
+            for (std::size_t i = 0; i < subtree.size(); ++i)
+                for (Entity child : r.Get<Hierarchy>(subtree[i]).children)
+                    subtree.push_back(child);
+            for (Entity e : subtree)
+                if (r.Valid(e) && r.Has<ScriptComponent>(e))
+                    (void)m_Impl.Construct(m_Scene, e);
+        }
+        void RequestLevel(std::string scene, bool quit) override { m_Impl.levelRequest = ScriptLevelRequest{std::move(scene), quit}; }
+        const std::string& CurrentLevel() const override { return m_Impl.currentLevel; }
+
         float TimerRemaining(std::int32_t handle) const override
         {
             for (const Timer& t : m_Instance.timers)
@@ -309,9 +597,21 @@ struct ScriptSystem::Impl {
         }
 
     private:
+        bool ValidSlot(const std::string& slot)
+        {
+            if (IsValidScriptName(slot))
+                return true;
+            Error("Invalid save slot name '" + slot + "' (letters, digits, '_', ' ')");
+            return false;
+        }
+        nlohmann::json* SlotOrError(const std::string& slot) { return ValidSlot(slot) ? &m_Impl.Slot(slot) : nullptr; }
+
         Impl&     m_Impl;
         Scene&    m_Scene;
         Instance& m_Instance;
+
+    public:
+        const std::uint32_t stamp;
     };
 
     Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am, AudioSystem* au)
@@ -328,6 +628,54 @@ struct ScriptSystem::Impl {
     {
         const auto it = instances.find(EntityKey(e));
         return it != instances.end() ? it->second.get() : nullptr;
+    }
+
+    // --- Save games ---
+
+    std::filesystem::path SlotFile(const std::string& slot) const { return saveDirectory / PathFromUtf8(slot + ".sav"); }
+
+    // The cached values of a slot (read from its file the first time).
+    nlohmann::json& Slot(const std::string& slot)
+    {
+        if (const auto it = saves.find(slot); it != saves.end())
+            return it->second;
+        if (!ReadSlot(slot))
+            saves[slot] = nlohmann::json::object();
+        return saves[slot];
+    }
+
+    bool ReadSlot(const std::string& slot)
+    {
+        if (saveDirectory.empty())
+            return saves.contains(slot); // memory only
+        std::ifstream in(SlotFile(slot), std::ios::binary);
+        if (!in)
+            return false;
+        try {
+            const nlohmann::json root = nlohmann::json::parse(in);
+            saves[slot]               = root.value("values", nlohmann::json::object());
+            return true;
+        } catch (const std::exception& e) {
+            PrintMessage("Save slot '" + slot + "' is damaged: " + e.what(), 4.0f, true);
+            return false;
+        }
+    }
+
+    bool WriteSlot(const std::string& slot)
+    {
+        if (saveDirectory.empty())
+            return true; // memory only
+        std::error_code ec;
+        std::filesystem::create_directories(saveDirectory, ec);
+        const std::filesystem::path file = SlotFile(slot), temp = file.string() + ".tmp";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            out << nlohmann::json{{"version", 1}, {"values", Slot(slot)}}.dump(2);
+            if (!out)
+                return false;
+        }
+        std::filesystem::rename(temp, file, ec);
+        return !ec;
     }
 
     // --- Programs ---
@@ -351,8 +699,34 @@ struct ScriptSystem::Impl {
         if (diagnostics.empty())
             diagnostics = ValidateScriptGraph(graph);
         if (!breakpoints.contains(key))
-            breakpoints[key] = {graph.breakpoints.begin(), graph.breakpoints.end()};
-        auto program = Compile(key, std::move(graph), diagnostics);
+            breakpoints[key] = BreakpointsOf(graph);
+        // Macros and library functions: copied in. Problems the copies cause (e.g. recursion through
+        // a macro) are reported at their origin.
+        std::unordered_map<std::uint32_t, ScriptOrigin> origins;
+        if (std::ranges::none_of(diagnostics, &ScriptDiagnostic::error)) {
+            ScriptGraph expanded = graph;
+            if (std::string problem = ExpandScriptGraph(expanded, origins); !problem.empty()) {
+                diagnostics.push_back({0, std::move(problem), true});
+            } else {
+                for (const ScriptDiagnostic& d : ValidateExpandedScriptGraph(expanded)) {
+                    const auto       o = origins.find(d.node);
+                    ScriptDiagnostic mapped =
+                        o == origins.end()             ? d
+                        : o->second.library.empty() ? ScriptDiagnostic{o->second.node, d.message, d.error}
+                                                     : ScriptDiagnostic{o->second.use, "Library '" + o->second.library + "': " + d.message, d.error};
+                    if (std::ranges::none_of(diagnostics, [&](const ScriptDiagnostic& x) {
+                            return x.node == mapped.node && x.message == mapped.message;
+                        }))
+                        diagnostics.push_back(std::move(mapped));
+                }
+                graph = std::move(expanded);
+            }
+        }
+        auto program = Compile(key, std::move(graph), diagnostics, origins);
+        for (std::size_t i = 1; i < program->files.size(); ++i) // breakpoints saved in libraries
+            if (const ScriptLibrary* lib = ScriptRegistry::FindLibrary(program->fileLibraries[i]);
+                lib && !breakpoints.contains(program->files[i]))
+                breakpoints[program->files[i]] = BreakpointsOf(lib->graph);
         ScriptDebugInfo& info = debug[key];
         info.diagnostics      = program->diagnostics;
         if (!program->ok) {
@@ -370,6 +744,14 @@ struct ScriptSystem::Impl {
     // --- Instances ---
 
     Instance* CreateInstance(Scene& scene, Entity e, const std::string& graph)
+    {
+        auto      inst = MakeInstance(scene, e, graph);
+        Instance* raw  = inst.get();
+        instances[EntityKey(e)] = std::move(inst);
+        return raw;
+    }
+
+    std::unique_ptr<Instance> MakeInstance(Scene& scene, Entity e, const std::string& graph)
     {
         auto program  = ProgramFor(graph);
         auto inst     = std::make_unique<Instance>();
@@ -411,10 +793,118 @@ struct ScriptSystem::Impl {
                         inst->outputs[i][p] = DefaultValue(c.pins[p].type);
             }
             inst->states.resize(program->nodes.size());
+            inst->evalStamp.assign(program->nodes.size(), 0);
+            for (std::size_t i = 0; i < program->nodes.size(); ++i) // auto-play timelines
+                if (program->nodes[i].node->type == "Timeline.Play")
+                    if (const ScriptTimeline* t = program->graph.FindTimeline(program->nodes[i].node->param); t && t->autoPlay) {
+                        inst->states[i].flag = true;
+                        inst->ticking.push_back(static_cast<int>(i));
+                    }
         }
-        Instance* raw = inst.get();
-        instances[EntityKey(e)] = std::move(inst);
-        return raw;
+        return inst;
+    }
+
+    // --- Construction scripts ---
+
+    // Destroys what the owner's construction script made and releases its models.
+    void DestroyConstructed(Scene& scene, std::uint64_t owner)
+    {
+        std::vector<Entity> owned;
+        scene.GetRegistry().ViewOf<ConstructionOwned>().Each([&](Entity e, ConstructionOwned& o) {
+            if (o.owner == owner)
+                owned.push_back(e);
+        });
+        for (Entity e : owned)
+            if (scene.GetRegistry().Valid(e))
+                scene.DestroyEntity(e);
+        if (const auto it = constructionModels.find(owner); it != constructionModels.end()) {
+            if (assets)
+                for (ModelHandle h : it->second)
+                    assets->Release(h);
+            constructionModels.erase(it);
+        }
+    }
+
+    // Runs Event.Construction of the entity's script on a temporary instance; the entities it
+    // creates are marked as owned (rebuilt next time, not saved). False: no construction script.
+    bool Construct(Scene& scene, Entity e)
+    {
+        Registry& r = scene.GetRegistry();
+        if (!r.Valid(e) || !r.Has<Uuid>(e) || r.Has<ConstructionOwned>(e))
+            return false;
+        const std::uint64_t owner = r.Get<Uuid>(e).value;
+        DestroyConstructed(scene, owner);
+        RestoreOwner(scene, e, owner); // like UE: every run starts from the owner without the script's changes
+        const ScriptComponent* sc = r.TryGet<ScriptComponent>(e);
+        if (!sc || sc->graph.empty())
+            return false;
+        const std::shared_ptr<const Program> program = ProgramFor(sc->graph);
+        if (!program->ok || !program->events.contains("Event.Construction"))
+            return false;
+        const std::string                 ownerBefore = SnapshotEntityState(scene, e);
+        std::unordered_set<std::uint64_t> before;
+        r.ViewOf<Uuid>().Each([&](Entity, Uuid& u) { before.insert(u.value); });
+        const std::unique_ptr<Instance> inst  = MakeInstance(scene, e, sc->graph);
+        const std::uint64_t             outer = std::exchange(constructing, owner); // spawned prefabs construct nested
+        FireSimple(scene, *inst, "Event.Construction");
+        constructing = outer;
+        std::vector<Entity> created;
+        r.ViewOf<Uuid>().Each([&](Entity x, Uuid& u) {
+            if (!before.contains(u.value))
+                created.push_back(x);
+        });
+        for (Entity x : created) // entities of nested constructions keep their own owner
+            if (r.Valid(x) && !r.Has<ConstructionOwned>(x))
+                r.Emplace<ConstructionOwned>(x, ConstructionOwned{owner});
+        scene.UpdateTransforms();
+        if (r.Valid(e))
+            constructionStates[owner] = {ownerBefore, SnapshotEntityState(scene, e)};
+        return true;
+    }
+
+    // The owner as it was before its construction script last ran, with the edits made since
+    // (the difference to the script's result) on top.
+    void RestoreOwner(Scene& scene, Entity e, std::uint64_t owner)
+    {
+        const auto it = constructionStates.find(owner);
+        if (it == constructionStates.end())
+            return;
+        const auto [before, after] = it->second;
+        constructionStates.erase(it);
+        const std::string current = SnapshotEntityState(scene, e);
+        ApplyEntityState(scene, e, before);
+        if (current != after)
+            (void)ApplyEntityStateDiff(scene, e, after, current);
+    }
+
+    std::size_t ConstructAll(Scene& scene)
+    {
+        Registry&                         r = scene.GetRegistry();
+        std::vector<Entity>               owners;
+        std::unordered_set<std::uint64_t> alive;
+        r.ViewOf<ScriptComponent>().Each([&](Entity e, ScriptComponent&) {
+            if (!r.Has<ConstructionOwned>(e)) {
+                owners.push_back(e);
+                alive.insert(r.Get<Uuid>(e).value);
+            }
+        });
+        // Leftovers of owners that are gone (or lost their script).
+        std::unordered_set<std::uint64_t> orphaned;
+        r.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned& o) {
+            if (!alive.contains(o.owner))
+                orphaned.insert(o.owner);
+        });
+        for (const auto& [owner, models] : constructionModels)
+            if (!alive.contains(owner))
+                orphaned.insert(owner);
+        for (std::uint64_t owner : orphaned) {
+            DestroyConstructed(scene, owner);
+            constructionStates.erase(owner);
+        }
+        std::size_t count = 0;
+        for (Entity e : owners)
+            count += Construct(scene, e) ? 1 : 0;
+        return count;
     }
 
     // Adds / removes instances to match the scene's ScriptComponents. Decides first, then fires
@@ -457,7 +947,11 @@ struct ScriptSystem::Impl {
 
     void MarkNode(const Instance& inst, int node)
     {
-        debug[inst.program->key].nodeTimes[inst.program->nodes[static_cast<std::size_t>(node)].node->id] = time;
+        const Program&      p = *inst.program;
+        const CompiledNode& c = p.nodes[static_cast<std::size_t>(node)];
+        debug[p.files[static_cast<std::size_t>(c.file)]].nodeTimes[c.id] = time;
+        if (c.use) // a copy of a macro: its Macro node runs too
+            debug[p.key].nodeTimes[c.use] = time;
     }
 
     // Exec output (node, pin) -> next (node, input pin); records the link for the debugger.
@@ -469,7 +963,7 @@ struct ScriptSystem::Impl {
         const PinRef t = c.target[static_cast<std::size_t>(pin)];
         if (t.node < 0)
             return false;
-        debug[inst.program->key].linkTimes[{c.node->id, c.pins[static_cast<std::size_t>(pin)].name}] = time;
+        debug[inst.program->files[static_cast<std::size_t>(c.file)]].linkTimes[{c.id, c.pins[static_cast<std::size_t>(pin)].name}] = time;
         nextNode  = t.node;
         nextEntry = t.pin;
         return true;
@@ -521,15 +1015,62 @@ struct ScriptSystem::Impl {
         return frame.callNode;
     }
 
-    bool ShouldBreak(const Instance& inst, const ChainState& st) const
+    bool ShouldBreak(Instance& inst, ChainState& st)
     {
-        if (st.skipBreak)
+        if (st.skipBreak || constructing)
             return false;
-        if (stepping)
+        switch (stepMode) {
+        case StepMode::Into: return true;
+        case StepMode::Over:
+            if (st.id != stepChain || st.calls.size() <= stepDepth)
+                return true;
+            break;
+        case StepMode::Out:
+            if (st.id != stepChain || st.calls.size() < stepDepth)
+                return true;
+            break;
+        case StepMode::None: break;
+        }
+        const CompiledNode& c = inst.program->nodes[static_cast<std::size_t>(st.node)];
+        // Entering a copy of a macro whose Macro node has a breakpoint, else the node's own.
+        Breakpoint* use = nullptr;
+        if (c.use && c.use != st.lastUse)
+            if (const auto own = breakpoints.find(inst.program->key); own != breakpoints.end())
+                if (const auto b = own->second.find(c.use); b != own->second.end())
+                    use = &b->second;
+        Breakpoint* node = nullptr;
+        if (const auto it = breakpoints.find(inst.program->files[static_cast<std::size_t>(c.file)]); it != breakpoints.end())
+            if (const auto b = it->second.find(c.id); b != it->second.end())
+                node = &b->second;
+        if (use && Hit(inst, c, *use)) {
+            st.atUse = true;
             return true;
-        const auto it = breakpoints.find(inst.program->key);
-        return it != breakpoints.end() &&
-               it->second.contains(inst.program->nodes[static_cast<std::size_t>(st.node)].node->id);
+        }
+        return node && Hit(inst, c, *node);
+    }
+
+    // A breakpoint reached: its condition and hit count decide.
+    bool Hit(Instance& inst, const CompiledNode& c, Breakpoint& b)
+    {
+        if (!b.options.condition.empty()) {
+            // Variables as the node sees them: the running function's locals first.
+            const auto lookup = [&](std::string_view name) -> const ScriptValue* {
+                if (c.scope >= 0) {
+                    const CompiledFunction& f = inst.program->functions[static_cast<std::size_t>(c.scope)];
+                    if (const auto l = f.localIndex.find(std::string(name)); l != f.localIndex.end())
+                        return &inst.locals[static_cast<std::size_t>(c.scope)][static_cast<std::size_t>(l->second)];
+                }
+                const auto v = inst.program->variableIndex.find(std::string(name));
+                return v != inst.program->variableIndex.end() ? &inst.variables[static_cast<std::size_t>(v->second)] : nullptr;
+            };
+            std::string error;
+            const auto  result = EvaluateScriptCondition(b.options.condition, lookup, &error);
+            if (!result)
+                RuntimeError(inst, static_cast<int>(&c - inst.program->nodes.data()), "Breakpoint condition: " + error); // stops: fix it
+            else if (!*result)
+                return false;
+        }
+        return ++b.hits >= b.options.hitCount;
     }
 
     // Runs a chain until it ends (true) or stops at a breakpoint (false, state kept in `paused`).
@@ -549,13 +1090,15 @@ struct ScriptSystem::Impl {
                 return true;
             }
             if (!nested && ShouldBreak(inst, st)) {
-                stepping = false;
+                stepMode = StepMode::None;
                 paused   = SuspendedChain{key, serial, std::move(st)};
                 return false;
             }
             st.skipBreak = false;
+            st.atUse     = false;
             ++stats.nodesExecuted;
             MarkNode(inst, st.node);
+            st.lastUse = p.nodes[static_cast<std::size_t>(st.node)].use;
             const CompiledNode& c    = p.nodes[static_cast<std::size_t>(st.node)];
             int                 from = st.node;
             int                 out  = kScriptStop;
@@ -572,16 +1115,23 @@ struct ScriptSystem::Impl {
                 // Continuations pushed now run after the chain that starts here: LIFO, pushed last = next.
                 for (auto it = ctx.pushed.rbegin(); it != ctx.pushed.rend(); ++it)
                     st.stack.push_back(*it);
-                if (ctx.suspended)
+                if (ctx.suspended && constructing)
+                    RuntimeError(inst, st.node, "Latent nodes do not run in the construction script");
+                else if (ctx.suspended)
                     waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds});
                 if (out == kScriptReturn) {
                     out = kScriptStop;
                     if (!st.calls.empty()) { // hand the outputs to the caller, back after the call
-                        const CompiledNode& callNode =
-                            p.nodes[static_cast<std::size_t>(st.calls.back().callNode)];
-                        for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
-                            inst.outputs[static_cast<std::size_t>(st.calls.back().callNode)]
-                                        [static_cast<std::size_t>(callNode.resultPins[i])] = ctx.In(static_cast<int>(i) + 1);
+                        const CallFrame& frame = st.calls.back();
+                        if (frame.callNode < 0) {
+                            for (std::size_t i = 0; i < frame.results->size(); ++i)
+                                (*frame.results)[i] = ctx.In(static_cast<int>(i) + 1);
+                        } else {
+                            const CompiledNode& callNode = p.nodes[static_cast<std::size_t>(frame.callNode)];
+                            for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
+                                inst.outputs[static_cast<std::size_t>(frame.callNode)]
+                                            [static_cast<std::size_t>(callNode.resultPins[i])] = ctx.In(static_cast<int>(i) + 1);
+                        }
                         st.stack.clear();
                         from = PopFrame(inst, st);
                         if (nested && st.calls.size() == base)
@@ -631,13 +1181,54 @@ struct ScriptSystem::Impl {
         RunState(scene, inst, st, true);
     }
 
+    // Called from another script (interfaces): runs the function to its end now, like a pure one.
+    bool CallFunction(Scene& scene, Instance& inst, int function, const std::vector<ScriptValue>& args,
+                      std::vector<ScriptValue>& results)
+    {
+        const Program&          p  = *inst.program;
+        const auto              f  = static_cast<std::size_t>(function);
+        const CompiledFunction& fn = p.functions[f];
+        const ScriptFunction&   sf = p.graph.functions[f];
+        if (inst.active[f]) {
+            PrintMessage("Recursive call of '" + fn.name + "' (not supported)", 3.0f, true);
+            return false;
+        }
+        const auto fit = [](const ScriptValue& v, PinType t) {
+            return ValueFits(v, t) ? v : CanConvert(TypeOf(v), t) ? Convert(v, t) : DefaultValue(t);
+        };
+        for (std::size_t i = 0; i < sf.inputs.size(); ++i)
+            inst.outputs[static_cast<std::size_t>(fn.entry)][i + 1] =
+                i < args.size() ? fit(args[i], sf.inputs[i].type) : DefaultValue(sf.inputs[i].type);
+        results.clear();
+        for (const ScriptParam& out : sf.outputs)
+            results.push_back(DefaultValue(out.type));
+        for (std::size_t i = 0; i < fn.locals.size(); ++i)
+            inst.locals[f][i] = fn.locals[i].value;
+        inst.active[f] = 1;
+        ChainState st;
+        st.calls.push_back({-1, function, {}, &results});
+        MarkNode(inst, fn.entry);
+        int next = 0, entry = 0;
+        if (!Follow(inst, fn.entry, 0, next, entry)) {
+            PopFrame(inst, st);
+            return true;
+        }
+        st.node  = next;
+        st.entry = entry;
+        RunState(scene, inst, st, true);
+        return true;
+    }
+
     // A new chain: queued while the debugger pauses.
     void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
     {
         ChainState st;
-        st.node  = node;
-        st.entry = entry;
-        st.data  = data;
+        st.id        = ++nextChain;
+        st.lastUse   = entry < 0 ? inst.program->nodes[static_cast<std::size_t>(node)].use : 0; // resumed inside a macro copy
+        st.node      = node;
+        st.entry     = entry;
+        st.data      = data;
+        st.skipBreak = entry == kScriptTick; // a breakpoint on a timeline stops when it is triggered, not every frame
         if (paused) {
             queued.push_back({EntityKey(inst.entity), inst.serial, std::move(st)});
             return;
@@ -652,8 +1243,13 @@ struct ScriptSystem::Impl {
             const auto it = instances.find(chain.entity);
             if (it == instances.end() || it->second->serial != chain.serial || !it->second->program)
                 return;
+            const std::uint64_t chainId = chain.state.id;
             chain.state.skipBreak = skip;
-            RunState(scene, *it->second, chain.state, false);
+            const bool finished = RunState(scene, *it->second, chain.state, false);
+            // A step request belongs to the chain that was paused. If that chain ends without
+            // reaching another node, do not carry the step mode into a later event/tick.
+            if (finished && stepMode != StepMode::None && stepChain == chainId)
+                stepMode = StepMode::None;
         };
         if (paused) {
             SuspendedChain chain = std::move(*paused);
@@ -669,7 +1265,7 @@ struct ScriptSystem::Impl {
 
     // Fires all event nodes of `type` (matching param if given); `outputs` fills their output pins.
     void Fire(Scene& scene, Instance& inst, const std::string& type, const std::string* param,
-              const std::function<void(std::vector<ScriptValue>&)>& outputs)
+              const std::function<void(const CompiledNode&, std::vector<ScriptValue>&)>& outputs)
     {
         if (!inst.program)
             return;
@@ -683,7 +1279,7 @@ struct ScriptSystem::Impl {
             ++stats.eventsFired;
             MarkNode(inst, node);
             if (outputs)
-                outputs(inst.outputs[static_cast<std::size_t>(node)]);
+                outputs(inst.program->nodes[static_cast<std::size_t>(node)], inst.outputs[static_cast<std::size_t>(node)]);
             int next = 0, entry = 0;
             if (Follow(inst, node, 0, next, entry))
                 RunChain(scene, inst, next, entry, 0);
@@ -692,14 +1288,25 @@ struct ScriptSystem::Impl {
 
     void FireSimple(Scene& scene, Instance& inst, const std::string& type) { Fire(scene, inst, type, nullptr, {}); }
 
-    void CallCustomEvent(Scene& scene, Instance& inst, const std::string& name)
+    // Arguments fill the event's parameter outputs in order (converted where possible).
+    void CallCustomEvent(Scene& scene, Instance& inst, const std::string& name, const std::vector<ScriptValue>& args = {})
     {
         if (callDepth >= 32) {
             PrintMessage("Custom event recursion too deep: " + name, 3.0f, true);
             return;
         }
         ++callDepth;
-        Fire(scene, inst, "Event.Custom", &name, {});
+        Fire(scene, inst, "Event.Custom", &name, [&](const CompiledNode& c, std::vector<ScriptValue>& out) {
+            for (std::size_t i = 1; i < c.pins.size(); ++i) {
+                const PinType t = c.pins[i].type;
+                if (i - 1 >= args.size())
+                    out[i] = DefaultValue(t);
+                else if (ValueFits(args[i - 1], t))
+                    out[i] = args[i - 1];
+                else
+                    out[i] = CanConvert(TypeOf(args[i - 1]), t) ? Convert(args[i - 1], t) : DefaultValue(t);
+            }
+        });
         --callDepth;
     }
 
@@ -719,9 +1326,10 @@ struct ScriptSystem::Impl {
         ++stats.errors;
         if (!inst.reported.insert(node).second)
             return;
-        const std::uint32_t id = inst.program->nodes[static_cast<std::size_t>(node)].node->id;
-        debug[inst.program->key].diagnostics.push_back({id, message, true});
-        PrintMessage(std::filesystem::path(inst.program->key).filename().string() + ": " +
+        const CompiledNode& c    = inst.program->nodes[static_cast<std::size_t>(node)];
+        const std::string&  file = inst.program->files[static_cast<std::size_t>(c.file)];
+        debug[file].diagnostics.push_back({c.id, message, true});
+        PrintMessage(std::filesystem::path(file).filename().string() + ": " +
                          inst.program->nodes[static_cast<std::size_t>(node)].desc->title + ": " + message,
                      4.0f, true);
     }
@@ -733,7 +1341,7 @@ struct ScriptSystem::Impl {
         collisions.clear();
         paused.reset();
         queued.clear();
-        stepping = false;
+        stepMode = StepMode::None;
         if (assets)
             for (ModelHandle h : spawned)
                 assets->Release(h);
@@ -750,8 +1358,10 @@ struct ScriptSystem::Impl {
     bool           running     = false;
     bool           acceptInput = true;
     double         time        = 0.0;
+    float          frameDt     = 0.0f;
     std::uint32_t  maxSteps    = 100000;
     int            callDepth   = 0;
+    std::uint32_t  evalCounter = 0; // Exec stamps (pure evaluation cache)
     std::uint64_t  nextSerial  = 0;
     std::int32_t   nextTimer   = 0;
     ScriptViewport viewport;
@@ -765,12 +1375,24 @@ struct ScriptSystem::Impl {
     std::vector<ModelHandle>                                        spawned;
     std::vector<ScriptMessage>                                      messages;
     ScriptStats                                                     stats;
+    InputMap                                                        inputMap;
+    std::filesystem::path                                           saveDirectory;
+    std::map<std::string, nlohmann::json>                           saves; // slot -> values (cache)
+    std::optional<ScriptLevelRequest>                               levelRequest;
+    std::uint64_t                                                   constructing = 0; // owner UUID while a construction script runs
+    std::unordered_map<std::uint64_t, std::vector<ModelHandle>>     constructionModels; // by owner UUID
+    // Owner state before / after its construction script last ran (by owner UUID).
+    std::unordered_map<std::uint64_t, std::pair<std::string, std::string>> constructionStates;
+    std::string                                                     currentLevel;
 
     // Debugger.
-    std::unordered_map<std::string, std::unordered_set<std::uint32_t>> breakpoints; // by program key
-    std::optional<SuspendedChain>                                      paused;
-    std::deque<SuspendedChain>                                         queued;
-    bool                                                               stepping = false;
+    std::unordered_map<std::string, std::unordered_map<std::uint32_t, Breakpoint>> breakpoints; // by program key
+    std::optional<SuspendedChain>                                                   paused;
+    std::deque<SuspendedChain>                                                      queued;
+    StepMode                                                                        stepMode  = StepMode::None;
+    std::size_t                                                                     stepDepth = 0;
+    std::uint64_t                                                                   stepChain = 0;
+    std::uint64_t                                                                   nextChain = 0;
 };
 
 ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* physics, AssetManager* assets,
@@ -779,10 +1401,19 @@ ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* p
 {
 }
 
-ScriptSystem::~ScriptSystem() { m_Impl->Clear(); }
+ScriptSystem::~ScriptSystem()
+{
+    m_Impl->Clear();
+    if (m_Impl->assets)
+        for (const auto& [owner, models] : m_Impl->constructionModels)
+            for (ModelHandle h : models)
+                m_Impl->assets->Release(h);
+}
 
 std::string ScriptSystem::Key(const std::filesystem::path& file)
 {
+    if (const std::u8string name = file.generic_u8string(); name.starts_with(u8"library:"))
+        return {name.begin(), name.end()}; // libraries registered in code (no file)
     std::error_code ec;
     const std::u8string s = std::filesystem::absolute(file, ec).lexically_normal().generic_u8string();
     return {s.begin(), s.end()};
@@ -801,8 +1432,11 @@ void ScriptSystem::Begin(Scene& scene)
     w.running  = true;
     w.maxSteps = maxStepsPerEvent;
     scene.UpdateTransforms();
+    w.ConstructAll(scene); // fresh constructed entities before BeginPlay
     w.SyncInstances(scene);
     w.stats.instances = static_cast<std::uint32_t>(w.instances.size());
+    for (const auto& [key, inst] : w.instances)
+        w.stats.ticking += static_cast<std::uint32_t>(inst->ticking.size());
     scene.UpdateTransforms();
 }
 
@@ -816,6 +1450,7 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     w.stats.nodesExecuted = 0;
     w.stats.eventsFired   = 0;
     w.time += std::max(dt, 0.0f);
+    w.frameDt = std::max(dt, 0.0f);
     scene.UpdateTransforms();
 
     w.SyncInstances(scene);
@@ -863,6 +1498,14 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
             w.CallCustomEvent(scene, inst, event);
     });
 
+    // Timelines and tweens.
+    forEach([&](Impl::Instance& inst) {
+        const std::vector<int> ticking = inst.ticking; // nodes stop / start ticking meanwhile
+        for (int node : ticking)
+            if (std::ranges::find(inst.ticking, node) != inst.ticking.end())
+                w.RunChain(scene, inst, node, kScriptTick, 0);
+    });
+
     // Collisions since the last update (physics steps publish them).
     const std::vector<Impl::QueuedCollision> collisions = std::exchange(w.collisions, {});
     for (const Impl::QueuedCollision& q : collisions) {
@@ -874,7 +1517,7 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
                 continue;
             const Entity otherEntity = other;
             const bool   trigger     = e.trigger;
-            w.Fire(scene, *it->second, type, nullptr, [&](std::vector<ScriptValue>& out) {
+            w.Fire(scene, *it->second, type, nullptr, [&](const CompiledNode&, std::vector<ScriptValue>& out) {
                 out[1] = otherEntity;
                 out[2] = trigger;
             });
@@ -912,13 +1555,40 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
                     if (!edge)
                         continue;
                     const std::string name = button;
-                    w.Fire(scene, inst, type, &name, [&](std::vector<ScriptValue>& out) { out[1] = glm::vec3(mouse, 0.0f); });
+                    w.Fire(scene, inst, type, &name, [&](const CompiledNode&, std::vector<ScriptValue>& out) {
+                        out[1] = glm::vec3(mouse, 0.0f);
+                    });
                 }
+            }
+            // Input actions: pressed when the first bound key goes down (none was held), released
+            // when the last one goes up.
+            for (const bool pressed : {true, false}) {
+                const std::string type   = pressed ? "Event.InputActionPressed" : "Event.InputActionReleased";
+                const auto        events = inst.program->events.find(type);
+                if (events == inst.program->events.end())
+                    continue;
+                std::vector<std::string> fired;
+                for (int node : events->second) {
+                    const std::string&        name   = inst.program->nodes[static_cast<std::size_t>(node)].node->param;
+                    const InputActionBinding* action = w.inputMap.FindAction(name);
+                    if (!action || std::ranges::find(fired, name) != fired.end())
+                        continue;
+                    const auto any = [&](KeyQuery q) {
+                        return std::ranges::any_of(action->keys, [&](const std::string& k) { return QueryKey(*w.input, k, q); });
+                    };
+                    const bool heldBefore = std::ranges::any_of(action->keys, [&](const std::string& k) {
+                        return QueryKey(*w.input, k, KeyQuery::Down) && !QueryKey(*w.input, k, KeyQuery::Pressed);
+                    });
+                    if (pressed ? any(KeyQuery::Pressed) && !heldBefore : any(KeyQuery::Released) && !any(KeyQuery::Down))
+                        fired.push_back(name);
+                }
+                for (const std::string& name : fired)
+                    w.Fire(scene, inst, type, &name, {});
             }
         });
     }
     forEach([&](Impl::Instance& inst) {
-        w.Fire(scene, inst, "Event.Tick", nullptr, [&](std::vector<ScriptValue>& out) { out[1] = dt; });
+        w.Fire(scene, inst, "Event.Tick", nullptr, [&](const CompiledNode&, std::vector<ScriptValue>& out) { out[1] = dt; });
     });
 
     std::erase_if(w.messages, [&](const ScriptMessage& m) { return m.time + m.duration < w.time; });
@@ -927,7 +1597,10 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     w.stats.timers    = 0;
     for (const auto& [key, inst] : w.instances)
         w.stats.timers += static_cast<std::uint32_t>(inst->timers.size());
-    w.stats.queued = static_cast<std::uint32_t>(w.queued.size());
+    w.stats.queued  = static_cast<std::uint32_t>(w.queued.size());
+    w.stats.ticking = 0;
+    for (const auto& [key, inst] : w.instances)
+        w.stats.ticking += static_cast<std::uint32_t>(inst->ticking.size());
     scene.UpdateTransforms();
 }
 
@@ -938,7 +1611,7 @@ void ScriptSystem::End(Scene& scene)
         return;
     w.paused.reset(); // the debugger lets go: EndPlay runs to completion
     w.queued.clear();
-    w.stepping = false;
+    w.stepMode = Impl::StepMode::None;
     w.breakpoints.clear();
     std::vector<std::uint64_t> keys;
     for (const auto& [key, inst] : w.instances)
@@ -982,9 +1655,78 @@ double                         ScriptSystem::Time() const { return m_Impl->time;
 
 void ScriptSystem::SetViewport(const ScriptViewport& viewport) { m_Impl->viewport = viewport; }
 
+// Outside play the compiled programs and breakpoints are not kept: graphs change while editing
+// and Begin must start from their saved breakpoints.
+bool ScriptSystem::RunConstruction(Scene& scene, Entity entity)
+{
+    Impl& w = *m_Impl;
+    if (!w.running)
+        w.programs.clear();
+    auto breakpoints = w.breakpoints;
+    w.maxSteps       = maxStepsPerEvent;
+    const bool ran   = w.Construct(scene, entity);
+    if (!w.running) {
+        w.programs.clear();
+        w.breakpoints = std::move(breakpoints);
+    }
+    return ran;
+}
+
+void ScriptSystem::ResetConstructed(Scene& scene)
+{
+    Impl&                                     w = *m_Impl;
+    std::vector<std::pair<Entity, std::uint64_t>> owners;
+    for (const auto& [owner, state] : w.constructionStates)
+        if (const Entity e = scene.FindByUuid(owner); e != NullEntity)
+            owners.emplace_back(e, owner);
+    for (const auto& [e, owner] : owners) {
+        w.DestroyConstructed(scene, owner);
+        w.RestoreOwner(scene, e, owner);
+    }
+    w.constructionStates.clear();
+    scene.UpdateTransforms();
+}
+
+std::size_t ScriptSystem::RunAllConstruction(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.running)
+        w.programs.clear();
+    auto breakpoints = w.breakpoints;
+    w.maxSteps       = maxStepsPerEvent;
+    const std::size_t count = w.ConstructAll(scene);
+    if (!w.running) {
+        w.programs.clear();
+        w.breakpoints = std::move(breakpoints);
+    }
+    return count;
+}
+void ScriptSystem::SetInputMap(InputMap map) { m_Impl->inputMap = std::move(map); }
+void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)
+{
+    m_Impl->saveDirectory = std::move(directory);
+    m_Impl->saves.clear();
+}
+std::optional<ScriptLevelRequest> ScriptSystem::TakeLevelRequest() { return std::exchange(m_Impl->levelRequest, std::nullopt); }
+void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = std::move(scene); }
+
 void ScriptSystem::SetBreakpoints(const std::filesystem::path& file, std::vector<std::uint32_t> nodes)
 {
-    m_Impl->breakpoints[Key(file)] = {nodes.begin(), nodes.end()};
+    std::vector<ScriptBreakpoint> list;
+    for (std::uint32_t n : nodes)
+        list.push_back({n, {}});
+    SetBreakpointList(file, list);
+}
+
+void ScriptSystem::SetBreakpointList(const std::filesystem::path& file, const std::vector<ScriptBreakpoint>& list)
+{
+    auto& map = m_Impl->breakpoints[Key(file)];
+    std::unordered_map<std::uint32_t, Impl::Breakpoint> next;
+    for (const ScriptBreakpoint& b : list) { // hits count on while the options stay
+        const auto old = map.find(b.node);
+        next[b.node]   = {b.options, old != map.end() && old->second.options == b.options ? old->second.hits : 0};
+    }
+    map = std::move(next);
 }
 
 bool ScriptSystem::DebugPaused() const { return m_Impl->paused.has_value(); }
@@ -997,9 +1739,22 @@ std::optional<ScriptDebugFrame> ScriptSystem::PausedAt() const
     const auto it = w.instances.find(w.paused->entity);
     if (it == w.instances.end() || !it->second->program)
         return std::nullopt;
-    const Program&      p = *it->second->program;
-    const CompiledNode& c = p.nodes[static_cast<std::size_t>(w.paused->state.node)];
-    return ScriptDebugFrame{p.key, c.node->id, c.node->function, it->second->entity};
+    const Program&      p     = *it->second->program;
+    const auto          frame = [&](int node) {
+        const CompiledNode& c = p.nodes[static_cast<std::size_t>(node)];
+        return ScriptDebugFrame{p.files[static_cast<std::size_t>(c.file)], c.id, c.function, it->second->entity, {}};
+    };
+    ScriptDebugFrame result = frame(w.paused->state.node);
+    if (w.paused->state.atUse) { // stopped on a Macro node: it is what the graph shows
+        const CompiledNode& c = p.nodes[static_cast<std::size_t>(w.paused->state.node)];
+        result.file           = p.key;
+        result.node           = c.use;
+        result.function       = c.node->function;
+    }
+    for (const Impl::CallFrame& call : w.paused->state.calls)
+        if (call.callNode >= 0)
+            result.callers.push_back(frame(call.callNode));
+    return result;
 }
 
 void ScriptSystem::DebugContinue(Scene& scene)
@@ -1007,7 +1762,7 @@ void ScriptSystem::DebugContinue(Scene& scene)
     Impl& w = *m_Impl;
     if (!w.paused)
         return;
-    w.stepping = false;
+    w.stepMode = Impl::StepMode::None;
     w.ResumeChains(scene);
     scene.UpdateTransforms();
 }
@@ -1017,7 +1772,31 @@ void ScriptSystem::DebugStep(Scene& scene)
     Impl& w = *m_Impl;
     if (!w.paused)
         return;
-    w.stepping = true; // the next node that runs stops again (also in a later frame)
+    w.stepMode = Impl::StepMode::Into; // the next node that runs stops again (also in a later frame)
+    w.ResumeChains(scene);
+    scene.UpdateTransforms();
+}
+
+void ScriptSystem::DebugStepOver(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.paused)
+        return;
+    w.stepMode  = Impl::StepMode::Over;
+    w.stepDepth = w.paused->state.calls.size();
+    w.stepChain = w.paused->state.id;
+    w.ResumeChains(scene);
+    scene.UpdateTransforms();
+}
+
+void ScriptSystem::DebugStepOut(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.paused)
+        return;
+    w.stepMode  = Impl::StepMode::Out;
+    w.stepDepth = w.paused->state.calls.size();
+    w.stepChain = w.paused->state.id;
     w.ResumeChains(scene);
     scene.UpdateTransforms();
 }
@@ -1056,9 +1835,11 @@ std::optional<ScriptWatch> ScriptSystem::Watch(const std::filesystem::path& file
     }
     for (std::size_t n = 0; n < p.nodes.size(); ++n) {
         const CompiledNode& c = p.nodes[n];
+        if (c.file != 0) // copied from a library
+            continue;
         for (std::size_t pin = 0; pin < c.pins.size(); ++pin)
             if (c.pins[pin].output && c.pins[pin].type != PinType::Exec)
-                watch.pins[{c.node->id, c.pins[pin].name}] = inst.outputs[n][pin];
+                watch.pins[{c.id, c.pins[pin].name}] = inst.outputs[n][pin];
     }
     return watch;
 }

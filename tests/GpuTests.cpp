@@ -21,6 +21,7 @@
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -664,7 +666,8 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
                                      .assets        = *F().assets,
                                      .sceneRenderer = sceneRenderer,
                                      .camera        = camera,
-                                     .modelRefs     = modelRefs};
+                                     .modelRefs     = modelRefs,
+                                     .layoutFile    = {}}; // the default layout, nothing saved
     const auto runFrames = [&](Editor& editor, int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -738,7 +741,8 @@ TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
                    .assets        = *F().assets,
                    .sceneRenderer = sceneRenderer,
                    .camera        = camera,
-                   .modelRefs     = modelRefs});
+                   .modelRefs     = modelRefs,
+                   .layoutFile    = {}});
     const auto runFrames = [&](int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -874,7 +878,8 @@ TEST_CASE(Physics_MeshColliderAndEditorPlayStop)
                    .sceneRenderer = sceneRenderer,
                    .camera        = camera,
                    .modelRefs     = modelRefs,
-                   .physics       = &physics});
+                   .physics       = &physics,
+                   .layoutFile    = {}});
     camera.position = {0.0f, world.max.y + 2.0f, 6.0f};
     camera.LookAt({0.0f, world.max.y, 0.0f});
     const auto runFrames = [&](int count, int stepsPerFrame) {
@@ -1601,7 +1606,8 @@ TEST_CASE(Editor_BlueprintPlayAndGraphEditing)
                    .camera        = camera,
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
-                   .scripts       = &scripts});
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 2.0f, 8.0f};
     const auto runFrames = [&](int count) {
         for (int i = 0; i < count; ++i) {
@@ -1845,7 +1851,8 @@ TEST_CASE(Audio_SoundAssetsAndEditorPlay)
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
                    .scripts       = &scripts,
-                   .audio         = &audio});
+                   .audio         = &audio,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 2.0f, 8.0f};
     std::vector<float> mix(4800 * 2);
     const auto runFrames = [&](int count) {
@@ -1921,7 +1928,8 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
                    .camera        = camera,
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
-                   .scripts       = &scripts});
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 3.0f, 10.0f};
     TextOverlay text(*F().renderer);
     const auto runFrames = [&](int count) {
@@ -2064,6 +2072,7 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
     CHECK(editor.SaveScene(sceneFile));
     editor.NewScene();
     CHECK(editor.OpenScene(sceneFile));
+    editor.FocusViewport(); // the blueprint tab came to front at the breakpoint
     runFrames(6);
     int instances = 0, meshes = 0;
     r.ViewOf<PrefabInstance>().Each([&](Entity, PrefabInstance&) { ++instances; });
@@ -2081,6 +2090,314 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
 
     editor.NewScene();
     bp.Close(0);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+// Phase 20 editor tools: macro / timeline / types / search windows, collapse, construction
+// scripts following edits, debugger stepping with a conditional breakpoint.
+TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_p20_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    ScriptRegistry::SaveEnumFile(dir / "Mood.uenum", {"Mood", {"Calm", "Angry"}, {}});
+    ScriptRegistry::SaveInterfaceFile(dir / "Usable.uinterface", {"Usable", {{"Use", {{"Power", PinType::Float}}, {}}}, {}});
+    CHECK(ScriptRegistry::LoadDirectory(dir).empty() && ScriptRegistry::FindEnum("Mood") && ScriptRegistry::FindInterface("Usable"));
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot) { // windows placed for a full-size editor
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(10);
+    }
+
+    // A blueprint with a construction script (Count posts), a macro, a timeline, events.
+    const fs::path     file = dir / "Fence.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Graph());
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, begin = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes) {
+        if (n.type == "Debug.Print")
+            print = n.id;
+        if (n.type == "Event.BeginPlay")
+            begin = n.id;
+    }
+    std::uint32_t spawn = 0, use = 0, add = 0, get = 0;
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        g.variables.push_back({"Count", PinType::Int, std::int32_t{2}, true});
+        g.variables.push_back({"Mood", PinType::Enum("Mood"), std::int32_t{1}, false});
+        const std::uint32_t cons = g.AddNode("Event.Construction", {0.0f, 400.0f});
+        const std::uint32_t loop = g.AddNode("Flow.ForLoop", {200.0f, 400.0f});
+        const std::uint32_t last = g.AddNode("Math.SubtractInt", {0.0f, 520.0f});
+        g.FindNode(last)->defaults["B"] = std::int32_t{1};
+        get                             = g.AddNode("Variable.Get", {-150.0f, 520.0f}, "Count");
+        spawn                           = g.AddNode("Entity.SpawnEmpty", {450.0f, 400.0f});
+        const std::uint32_t self        = g.AddNode("Entity.Self", {300.0f, 520.0f});
+        CHECK(g.Connect(cons, "Out", loop, "In").empty() && g.Connect(get, "Value", last, "A").empty() &&
+              g.Connect(last, "Result", loop, "Last Index").empty() && g.Connect(loop, "Loop Body", spawn, "In").empty() &&
+              g.Connect(self, "Self", spawn, "Parent").empty());
+        // Macro AddOne(In, X) -> (Out, Y = X + 1), used between BeginPlay and Print.
+        CHECK(g.AddMacro("AddOne", {0.0f, 0.0f}));
+        g.FindMacro("AddOne")->inputs.push_back({"X", PinType::Int});
+        g.FindMacro("AddOne")->outputs.push_back({"Y", PinType::Int});
+        std::uint32_t in = 0, out = 0;
+        for (const ScriptNode& n : g.nodes) {
+            if (n.type == "Macro.Inputs")
+                in = n.id;
+            if (n.type == "Macro.Outputs")
+                out = n.id;
+        }
+        add = g.AddNode("Math.AddInt", {200.0f, 100.0f}, {}, "AddOne");
+        g.FindNode(add)->defaults["B"] = std::int32_t{1};
+        CHECK(g.Connect(in, "X", add, "A").empty() && g.Connect(add, "Result", out, "Y").empty());
+        use = g.AddNode("Macro.Use", {150.0f, 0.0f}, "AddOne");
+        std::erase_if(g.links, [&](const ScriptLink& l) { return l.fromNode == begin; });
+        CHECK(g.Connect(begin, "Out", use, "In").empty() && g.Connect(use, "Out", print, "In").empty() &&
+              g.Connect(use, "Y", print, "Text").empty());
+        g.FindNode(use)->defaults["X"] = std::int32_t{41};
+        // Timeline + custom event with a parameter + dispatcher + interface.
+        ScriptTimeline t{"Fade", 1.0f, false, false, {}};
+        t.tracks.push_back({"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {1.0f, glm::vec3(1.0f)}}});
+        t.tracks.push_back({"Ping", ScriptTrackKind::Event, {{0.5f, glm::vec3(0.0f)}}});
+        g.timelines.push_back(t);
+        g.AddNode("Timeline.Play", {0.0f, 700.0f}, "Fade");
+        g.events.push_back({"Hit", {{"Damage", PinType::Float}}});
+        g.dispatchers.push_back({"OnHit", {{"Damage", PinType::Float}}});
+        g.AddNode("Event.Custom", {0.0f, 900.0f}, "Hit");
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    // Implementing the interface needs its function: Compile reports it.
+    bp.Edit("Interface", [&](ScriptGraph& g) { g.interfaces.push_back("Usable"); });
+    CHECK(std::ranges::any_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    bp.Edit("Implement", [&](ScriptGraph& g) {
+        g.AddFunction("Use", {0.0f, 1200.0f});
+        g.FindFunction("Use")->inputs = {{"Power", PinType::Float}};
+        g.FunctionSignatureChanged("Use");
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    CHECK(bp.Save());
+
+    // The windows: macro scope, timeline editor, search, types.
+    bp.OpenScope("AddOne");
+    bp.OpenTimeline("Fade");
+    bp.OpenSearch("Print");
+    editor.OpenAsset(dir / "Mood.uenum");
+    runFrames(4);
+    if (const char* shot = std::getenv("UNGINE_TEST_SCREENSHOT")) { // documentation: the windows as they look
+        bp.Focus();
+        runFrames(40);
+        (void)std::system((std::string("import -window root ") + shot).c_str());
+    }
+    CHECK(!bp.Search("Print", false).empty() && bp.Search("Count", true).size() >= 1 && bp.Search("AddOne", true).size() == 3); // Macro node + its Inputs / Outputs
+    bp.OpenScope({});
+
+    // Construction script: follows edits of the graph and of the exposed variable.
+    const Entity fence = scene.CreateEntity("Fence");
+    r.Emplace<ScriptComponent>(fence, ScriptComponent{PathToUtf8(file)});
+    editor.RunConstructionScripts();
+    runFrames(2);
+    const auto posts = [&] {
+        int n = 0;
+        r.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned&) { ++n; });
+        return n;
+    };
+    CHECK(posts() == 2);
+    r.Get<ScriptComponent>(fence).variables["Count"] = {std::int32_t{4}, 0};
+    bp.Edit("Default", [](ScriptGraph& g) { g.variables[0].value = std::int32_t{3}; }); // any graph edit runs them again
+    runFrames(2);
+    CHECK(posts() == 4);
+    const fs::path sceneFile = dir / "Fence.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    {
+        Scene loaded;
+        (void)LoadSceneFile(sceneFile, loaded, nullptr);
+        int count = 0;
+        loaded.GetRegistry().ViewOf<Uuid>().Each([&](Entity, Uuid&) { ++count; });
+        CHECK(count == 1); // posts are not saved
+    }
+
+    // Collapse: the Print node into a function (undoable).
+    bp.Select({print});
+    CHECK(bp.CollapseSelection(false).empty() && bp.Graph()->FindFunction("NewFunction"));
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    CHECK(bp.Undo() && !bp.Graph()->FindFunction("NewFunction"));
+
+    // Debugger: conditional breakpoint inside the macro's copy, step over, call stack drawn.
+    bp.Edit("Breakpoint", [&](ScriptGraph& g) {
+        g.SetBreakpoint(print, true);
+        g.breakpointOptions[print] = {"Count == 4", 0};
+    });
+    editor.Play();
+    runFrames(2);
+    CHECK(scripts.DebugPaused() && scripts.PausedAt() && scripts.PausedAt()->node == print);
+    CHECK(posts() == 4); // rebuilt before BeginPlay
+    scripts.DebugStepOver(scene);
+    runFrames(2);
+    CHECK(!scripts.DebugPaused());
+    CHECK(std::ranges::any_of(scripts.Messages(), [](const ScriptMessage& m) { return m.text == "42"; }));
+    editor.Stop();
+    runFrames(2);
+    CHECK(posts() == 4);
+
+    editor.NewScene();
+    runFrames(1);
+    bp.Close(0);
+    ScriptRegistry::Clear();
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(3);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+// The new panels driven like a user: right click on the canvas -> search -> Enter adds a node;
+// double click in the timeline curve adds a key, dragging moves it.
+TEST_CASE(Editor_Blueprint3MouseInput)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_mouse_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    glfwSetWindowSize(F().window->Native(), 1280, 800);
+
+    Scene        scene;
+    ScriptSystem scripts(F().events, nullptr, nullptr, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto click = [&](glm::vec2 at, int button) {
+        editor.SimulateMouse(at);
+        runFrames(1);
+        editor.SimulateMouse(at, button, true);
+        runFrames(1);
+        editor.SimulateMouse(at, button, false);
+        runFrames(1);
+    };
+
+    runFrames(4); // the default layout brings the viewport to front after its first frames
+    ScriptGraphEditor& bp = editor.Blueprints();
+    CHECK(bp.New(dir / "Mouse.ugraph") && bp.Graph());
+    if (!bp.Graph())
+        return;
+    bp.Edit("Timeline", [](ScriptGraph& g) {
+        ScriptTimeline t{"Fade", 2.0f, false, false, {}};
+        t.tracks.push_back({"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {2.0f, glm::vec3(1.0f)}}});
+        g.timelines.push_back(t);
+    });
+    bp.Focus();
+    runFrames(6);
+
+    // Palette: right click on an empty spot of the canvas, type, Enter.
+    const glm::vec4 canvas = bp.CanvasRect();
+    CHECK(canvas.z > 100.0f && canvas.w > 100.0f);
+    const auto prints = [&] {
+        return std::ranges::count_if(bp.Graph()->nodes, [](const ScriptNode& n) { return n.type == "Debug.Print"; });
+    };
+    const auto before = prints();
+    click({canvas.x + canvas.z * 0.92f, canvas.y + canvas.w * 0.08f}, 1); // top right: no nodes, not the minimap
+    runFrames(1);
+    editor.SimulateText("Print String");
+    runFrames(2);
+    editor.SimulateKey("Enter", true);
+    runFrames(1);
+    editor.SimulateKey("Enter", false);
+    runFrames(2);
+    CHECK(prints() == before + 1);
+
+    // Timeline: double click adds a key at the cursor, dragging it moves it in time.
+    bp.OpenTimeline("Fade");
+    runFrames(4);
+    const glm::vec4 curve = bp.TimelineCurveRect();
+    CHECK(curve.z > 100.0f && curve.w > 50.0f);
+    const auto keys = [&] { return bp.Graph()->FindTimeline("Fade")->tracks[0].keys; };
+    const glm::vec2 at{curve.x + curve.z * 0.25f, curve.y + curve.w * 0.5f};
+    click(at, 0);
+    click(at, 0); // second click: a double click
+    runFrames(2);
+    CHECK(keys().size() == 3);
+    if (keys().size() == 3) {
+        CHECK(std::abs(keys()[1].time - 0.5f) < 0.05f); // 25 % of 2 s
+        editor.SimulateMouse(at);
+        runFrames(1);
+        editor.SimulateMouse(at, 0, true);
+        runFrames(1);
+        for (int i = 1; i <= 5; ++i) {
+            editor.SimulateMouse({at.x + curve.z * 0.07f * static_cast<float>(i), at.y});
+            runFrames(1);
+        }
+        for (int i = 0; i < 2; ++i) { // hold still: under Xvfb the warped pointer reaches ImGui a frame later
+            editor.SimulateMouse({at.x + curve.z * 0.35f, at.y});
+            runFrames(1);
+        }
+        editor.SimulateMouse({at.x + curve.z * 0.35f, at.y}, 0, false);
+        runFrames(2);
+        CHECK(keys().size() == 3 && std::abs(keys()[1].time - 1.2f) < 0.08f); // 60 % of 2 s
+    }
+    CHECK(bp.CanUndo()); // the clicks and drags were edits
+
+    bp.Close(0);
+    glfwSetWindowSize(F().window->Native(), 320, 240);
+    runFrames(2);
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);

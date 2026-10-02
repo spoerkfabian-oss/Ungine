@@ -16,11 +16,14 @@
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 
 #include <ImGuizmo.h>
 #include <imgui.h>
 #include <imgui_internal.h> // DockBuilder
+
+#include <GLFW/glfw3.h>
 
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -62,6 +65,58 @@ Editor::Editor(const EditorContext& context)
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
+    ReloadScriptRegistry();
+    if (m_Ctx.project)
+        m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
+}
+
+void Editor::SimulateMouse(glm::vec2 position, int button, bool down)
+{
+    ImGuiIO& io             = ImGui::GetIO();
+    if (io.MouseDoubleClickTime < 2.0f) { // simulated clicks are frames apart
+        io.MouseDoubleClickTime  = 2.0f;
+        io.MouseSingleClickDelay = std::max(io.MouseSingleClickDelay, 2.5f); // must stay longer (ImGui check)
+    }
+    glfwSetCursorPos(m_Ctx.window.Native(), position.x, position.y);   // the backend may poll the cursor
+    io.AddMousePosEvent(position.x, position.y);
+    if (button >= 0)
+        io.AddMouseButtonEvent(button, down);
+}
+
+void Editor::SimulateKey(std::string_view key, bool down)
+{
+    const ImGuiKey k = key == "Enter" ? ImGuiKey_Enter : key == "Escape" ? ImGuiKey_Escape : key == "Delete" ? ImGuiKey_Delete
+                     : key == "Tab"   ? ImGuiKey_Tab
+                                      : ImGuiKey_None;
+    if (k != ImGuiKey_None)
+        ImGui::GetIO().AddKeyEvent(k, down);
+}
+
+void Editor::SimulateText(std::string_view utf8) { ImGui::GetIO().AddInputCharactersUTF8(std::string(utf8).c_str()); }
+
+void Editor::RunConstructionScripts()
+{
+    m_ConstructedRevision = m_History->Revision();
+    m_ConstructedGraphs   = m_Graphs->Revision();
+    m_LastConstruction    = ImGui::GetTime();
+    if (!m_Ctx.scripts || m_PlayState != PlayState::Edit)
+        return;
+    m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits count
+    (void)m_Ctx.scripts->RunAllConstruction(m_Ctx.scene);
+    ValidateSelection();
+}
+
+std::vector<std::string> Editor::ReloadScriptRegistry()
+{
+    if (!m_Ctx.project)
+        return {};
+    ScriptRegistry::Clear();
+    std::vector<std::string> problems = ScriptRegistry::LoadDirectory(m_Ctx.project->ContentDirectory());
+    for (std::string& p : ScriptRegistry::Validate())
+        problems.push_back(std::move(p));
+    for (const std::string& p : problems)
+        ENGINE_WARN("[Blueprint types] {}", p);
+    return problems;
 }
 
 Editor::~Editor()
@@ -133,6 +188,8 @@ void Editor::Update(float dt)
         DrawAssets();
     if (m_ShowProjectSettings)
         DrawProjectSettings();
+    if (m_ShowTypes)
+        DrawBlueprintTypes();
     if (m_ShowStats)
         DrawStats();
     if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
@@ -160,8 +217,15 @@ void Editor::Update(float dt)
     }
 
     // Scripts tick with the frame while playing; they see the keyboard when the viewport has it.
-    if (m_Ctx.scripts && m_PlayState == PlayState::Playing)
+    if (m_Ctx.scripts && m_PlayState == PlayState::Playing) {
         m_Ctx.scripts->Update(m_Ctx.scene, dt, (m_ViewportHovered || m_ViewportFocused) && !WantsKeyboard());
+        if (const auto request = m_Ctx.scripts->TakeLevelRequest()) { // Open Level / Quit Game
+            if (request->quit)
+                Stop();
+            else
+                (void)PlayLevel(PathFromUtf8(request->scene));
+        }
+    }
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
@@ -170,6 +234,12 @@ void Editor::Update(float dt)
         const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
     }
+    // Edit mode: construction scripts follow every edit (History change, New / Open, Stop).
+    // While a widget is dragged at most 4 times a second, then once more when it is let go.
+    if (m_PlayState == PlayState::Edit && m_Ctx.scripts &&
+        (m_History->Revision() != m_ConstructedRevision || m_Graphs->Revision() != m_ConstructedGraphs) &&
+        (!ImGui::IsAnyItemActive() || ImGui::GetTime() - m_LastConstruction >= 0.25))
+        RunConstructionScripts();
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)
         m_Ctx.physics->Sync(m_Ctx.scene);
@@ -337,6 +407,11 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("Content browser", nullptr, &m_ShowContent);
         if (ImGui::MenuItem("Blueprint", nullptr, &m_ShowBlueprint) && m_ShowBlueprint)
             m_Graphs->Focus();
+        ImGui::MenuItem("Blueprint types", nullptr, &m_ShowTypes);
+        if (ImGui::MenuItem("Find in Blueprints", "Ctrl+F (Blueprint)")) {
+            m_ShowBlueprint = true;
+            m_Graphs->OpenSearch({});
+        }
         ImGui::Separator();
         ImGui::MenuItem("ImGui demo", nullptr, &m_ShowDemo);
         ImGui::EndMenu();

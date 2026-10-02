@@ -297,6 +297,14 @@ Pose Decompose(const glm::mat4& m)
     return p;
 }
 
+bool Finite(const glm::vec3& v) { return glm::all(glm::isfinite(v)); }
+bool Finite(const glm::quat& q) { return glm::all(glm::isfinite(glm::vec4(q.x, q.y, q.z, q.w))); }
+bool ValidPhysicsScale(const glm::vec3& scale)
+{
+    constexpr float kMinPhysicsScale = 1e-5f;
+    return Finite(scale) && glm::all(glm::greaterThan(glm::abs(scale), glm::vec3(kMinPhysicsScale)));
+}
+
 bool Moved(const glm::vec3& a, const glm::vec3& b) { return glm::any(glm::greaterThan(glm::abs(a - b), glm::vec3(1e-5f))); }
 bool Rotated(const glm::quat& a, const glm::quat& b) { return std::abs(glm::dot(a, b)) < 1.0f - 1e-6f; }
 bool Rescaled(const glm::vec3& a, const glm::vec3& b)
@@ -316,11 +324,12 @@ struct ScaledCollider {
 
 ScaledCollider Scaled(const Collider& c, const glm::vec3& scale)
 {
-    const float uniform = std::max({scale.x, scale.y, scale.z});
-    return {.halfExtents = glm::max(c.halfExtents * scale, glm::vec3(kMinExtent)),
-            .radius      = std::max(c.radius * (c.shape == ColliderShape::Capsule ? std::max(scale.x, scale.z) : uniform), kMinExtent),
-            .halfHeight  = std::max(c.halfHeight * scale.y, 0.0f),
-            .center      = c.center * scale};
+    const glm::vec3 safeScale = glm::abs(scale);
+    const float uniform = std::max({safeScale.x, safeScale.y, safeScale.z});
+    return {.halfExtents = glm::max(c.halfExtents * safeScale, glm::vec3(kMinExtent)),
+            .radius      = std::max(c.radius * (c.shape == ColliderShape::Capsule ? std::max(safeScale.x, safeScale.z) : uniform), kMinExtent),
+            .halfHeight  = std::max(c.halfHeight * safeScale.y, 0.0f),
+            .center      = c.center * safeScale};
 }
 
 } // namespace
@@ -429,8 +438,8 @@ struct PhysicsWorld::Impl {
                 triangles.push_back(JPH::IndexedTriangle(index(0), index(1), index(2)));
             }
         }
-        JPH::MeshShapeSettings settings(std::move(vertices), std::move(triangles));
-        const JPH::ShapeSettings::ShapeResult result = settings.Create();
+        JPH::MeshShapeSettings meshSettings(std::move(vertices), std::move(triangles));
+        const JPH::ShapeSettings::ShapeResult result = meshSettings.Create();
         if (result.HasError()) {
             ENGINE_WARN("Physics: mesh collider for '{}' mesh {} failed: {}", model.name, meshIndex, result.GetError().c_str());
             return nullptr;
@@ -484,23 +493,23 @@ struct PhysicsWorld::Impl {
         const JPH::EMotionType motion = r.type == BodyType::Static      ? JPH::EMotionType::Static
                                         : r.type == BodyType::Kinematic ? JPH::EMotionType::Kinematic
                                                                         : JPH::EMotionType::Dynamic;
-        JPH::BodyCreationSettings settings(shape, JPH::RVec3(ToJolt(pose.position)), ToJolt(pose.rotation), motion,
+        JPH::BodyCreationSettings bodySettings(shape, JPH::RVec3(ToJolt(pose.position)), ToJolt(pose.rotation), motion,
                                            Layers::Make(r.collider.layer, r.type != BodyType::Static));
-        settings.mMotionQuality = r.type == BodyType::Dynamic && r.body.continuous ? JPH::EMotionQuality::LinearCast
+        bodySettings.mMotionQuality = r.type == BodyType::Dynamic && r.body.continuous ? JPH::EMotionQuality::LinearCast
                                                                                    : JPH::EMotionQuality::Discrete;
-        settings.mUserData       = Key(r.entity);
-        settings.mFriction       = r.collider.friction;
-        settings.mRestitution    = r.collider.restitution;
-        settings.mIsSensor       = r.collider.trigger;
-        settings.mLinearDamping  = r.body.linearDamping;
-        settings.mAngularDamping = r.body.angularDamping;
-        settings.mGravityFactor  = r.body.gravityFactor;
-        settings.mAllowSleeping  = r.body.allowSleeping;
+        bodySettings.mUserData       = Key(r.entity);
+        bodySettings.mFriction       = r.collider.friction;
+        bodySettings.mRestitution    = r.collider.restitution;
+        bodySettings.mIsSensor       = r.collider.trigger;
+        bodySettings.mLinearDamping  = r.body.linearDamping;
+        bodySettings.mAngularDamping = r.body.angularDamping;
+        bodySettings.mGravityFactor  = r.body.gravityFactor;
+        bodySettings.mAllowSleeping  = r.body.allowSleeping;
         if (r.type == BodyType::Dynamic) {
-            settings.mOverrideMassProperties       = JPH::EOverrideMassProperties::CalculateInertia;
-            settings.mMassPropertiesOverride.mMass = std::max(r.body.mass, 1e-3f);
+            bodySettings.mOverrideMassProperties       = JPH::EOverrideMassProperties::CalculateInertia;
+            bodySettings.mMassPropertiesOverride.mMass = std::max(r.body.mass, 1e-3f);
         }
-        r.id = Bodies().CreateAndAddBody(settings, r.type == BodyType::Static ? JPH::EActivation::DontActivate
+        r.id = Bodies().CreateAndAddBody(bodySettings, r.type == BodyType::Static ? JPH::EActivation::DontActivate
                                                                                : JPH::EActivation::Activate);
         if (r.id.IsInvalid()) {
             ENGINE_WARN("Physics: body limit reached");
@@ -653,13 +662,13 @@ struct PhysicsWorld::Impl {
         const float halfHeight = std::max(cc.height * 0.5f - radius, 0.01f); // cylinder part
         const JPH::RefConst<JPH::Shape> capsule = new JPH::CapsuleShape(halfHeight, radius);
 
-        JPH::CharacterVirtualSettings settings;
-        settings.mShape             = capsule;
-        settings.mShapeOffset       = JPH::Vec3(0.0f, halfHeight + radius, 0.0f); // feet at the entity position
-        settings.mMaxSlopeAngle     = cc.maxSlope;
-        settings.mSupportingVolume  = JPH::Plane(JPH::Vec3::sAxisY(), -radius); // contacts below the lower hemisphere center
-        settings.mInnerBodyShape    = capsule; // lets rigid bodies and queries see the character
-        settings.mInnerBodyLayer    = Layers::kMoving; // user layer 0
+        JPH::CharacterVirtualSettings characterSettings;
+        characterSettings.mShape             = capsule;
+        characterSettings.mShapeOffset       = JPH::Vec3(0.0f, halfHeight + radius, 0.0f); // feet at the entity position
+        characterSettings.mMaxSlopeAngle     = cc.maxSlope;
+        characterSettings.mSupportingVolume  = JPH::Plane(JPH::Vec3::sAxisY(), -radius); // contacts below the lower hemisphere center
+        characterSettings.mInnerBodyShape    = capsule; // lets rigid bodies and queries see the character
+        characterSettings.mInnerBodyLayer    = Layers::kMoving; // user layer 0
 
         CharacterRecord r;
         r.entity       = e;
@@ -668,7 +677,7 @@ struct PhysicsWorld::Impl {
         r.between = false;
         r.input        = input;
         r.visit        = visit;
-        r.character = new JPH::CharacterVirtual(&settings, JPH::RVec3(ToJolt(position)), JPH::Quat::sIdentity(), Key(e),
+        r.character = new JPH::CharacterVirtual(&characterSettings, JPH::RVec3(ToJolt(position)), JPH::Quat::sIdentity(), Key(e),
                                                 system.get());
         innerBodies.insert(r.character->GetInnerBodyID().GetIndexAndSequenceNumber());
         characters.emplace(Key(e), std::move(r));
@@ -852,12 +861,28 @@ struct PhysicsWorld::Impl {
         for (const auto& [depth, i] : order) {
             const PoseWrite& w      = writes[i];
             const Entity     parent = parentOf(w.entity);
-            const glm::mat4  parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
-            Transform&       t           = scene.EditTransform(w.entity);
+            const glm::mat4 parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
+            if (!Finite(w.position) || (w.rotation && !Finite(*w.rotation)) ||
+                !glm::all(glm::isfinite(parentWorld[0])) || !glm::all(glm::isfinite(parentWorld[1])) ||
+                !glm::all(glm::isfinite(parentWorld[2])) || !glm::all(glm::isfinite(parentWorld[3]))) {
+                ENGINE_WARN("Physics: refusing invalid pose write for entity {}", static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
+            const float determinant = glm::determinant(parentWorld);
+            if (parent != NullEntity && std::abs(determinant) < 1e-8f) {
+                ENGINE_WARN("Physics: refusing pose write through singular parent for entity {}",
+                            static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
+            Transform& t = scene.EditTransform(w.entity);
             t.position = glm::vec3(glm::inverse(parentWorld) * glm::vec4(w.position, 1.0f));
             if (w.rotation)
                 t.rotation = parent != NullEntity ? glm::normalize(glm::conjugate(Decompose(parentWorld).rotation) * *w.rotation)
                                                   : *w.rotation;
+            if (!Finite(t.position) || !Finite(t.rotation)) {
+                ENGINE_WARN("Physics: refusing non-finite local pose for entity {}", static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
             fresh[Key(w.entity)] = parentWorld * t.LocalMatrix();
         }
 

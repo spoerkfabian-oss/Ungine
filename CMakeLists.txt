@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Engine VERSION 0.19.0 LANGUAGES C CXX)
+project(Engine VERSION 0.20.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,12 +11,19 @@ if(NOT MSVC)
 endif()
 
 # Warnings only for our own targets, never for third-party code
+option(ENGINE_WARNINGS_AS_ERRORS "Treat warnings in the engine's own code as errors (CI)" OFF)
 function(engine_set_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /utf-8 /MP)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS) # getenv / fopen are fine here
+        if(ENGINE_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(ENGINE_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
     endif()
 endfunction()
 

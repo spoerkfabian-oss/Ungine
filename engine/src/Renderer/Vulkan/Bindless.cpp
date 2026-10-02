@@ -87,16 +87,21 @@ BindlessRegistry::BindlessRegistry(const VulkanContext& ctx)
     vkGetPhysicalDeviceProperties2(ctx.PhysicalDevice(), &props);
 
     // Limits count every binding of a descriptor type together: the cube/array bindings come off the top.
+    // Saturate before subtraction; Vulkan implementations are not required to expose enough
+    // descriptors for our desired reserved cube/array ranges.
+    const auto remaining = [](std::uint32_t limit, std::uint32_t reserved) {
+        return limit > reserved ? limit - reserved : 0u;
+    };
     m_CubeTextures.capacity  = kMaxCubeTextures;
     m_StorageArrays.capacity = kMaxStorageArrays;
     m_SampledImages.capacity = std::min({kMaxSampledImages,
-                                         p12.maxDescriptorSetUpdateAfterBindSampledImages - kMaxCubeTextures,
-                                         p12.maxPerStageDescriptorUpdateAfterBindSampledImages - kMaxCubeTextures});
+                                         remaining(p12.maxDescriptorSetUpdateAfterBindSampledImages, kMaxCubeTextures),
+                                         remaining(p12.maxPerStageDescriptorUpdateAfterBindSampledImages, kMaxCubeTextures)});
     m_Samplers.capacity      = std::min({kMaxSamplers, p12.maxDescriptorSetUpdateAfterBindSamplers,
                                          p12.maxPerStageDescriptorUpdateAfterBindSamplers});
     m_StorageImages.capacity = std::min({kMaxStorageImages,
-                                         p12.maxDescriptorSetUpdateAfterBindStorageImages - kMaxStorageArrays,
-                                         p12.maxPerStageDescriptorUpdateAfterBindStorageImages - kMaxStorageArrays});
+                                         remaining(p12.maxDescriptorSetUpdateAfterBindStorageImages, kMaxStorageArrays),
+                                         remaining(p12.maxPerStageDescriptorUpdateAfterBindStorageImages, kMaxStorageArrays)});
 
     // --- Layout ---
     const std::array<VkDescriptorSetLayoutBinding, 5> bindings{{

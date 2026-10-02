@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -116,6 +117,21 @@ public:
     void                    Play();     // from Edit: snapshot + simulate; from Paused: resume
     void                    Pause();
     void                    Stop();     // back to the snapshot
+    // UI automation (tests): input for the next frame, in window pixels. Keys: "Enter", "Escape",
+    // "Delete", "Tab". Double clicks may be slow (several frames apart).
+    void SimulateMouse(glm::vec2 position, int button = -1, bool down = false);
+    void SimulateKey(std::string_view key, bool down);
+    void SimulateText(std::string_view utf8);
+    void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
+
+    // Project: (re)loads the blueprint types / interfaces / libraries of the content directory
+    // (ScriptRegistry); done at start and before play. Returns the problems found.
+    std::vector<std::string> ReloadScriptRegistry();
+    // Edit mode: runs the construction scripts again (after edits / Undo / Open automatically).
+    void RunConstructionScripts();
+    // While playing: replaces the play scene by a scene file (scripts' Open Level); Stop returns
+    // to the edited scene. False if the file does not load (the current level stays).
+    bool PlayLevel(const std::filesystem::path& scene);
     void                    StepOnce(); // paused: one fixed step
 
     // Blueprint (visual script) editor window.
@@ -193,6 +209,8 @@ private:
     [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
     void DrawContentBrowser();
     void DrawProjectSettings();
+    void DrawBlueprintTypes();
+    void OpenTypeFile(const std::filesystem::path& file);
     void RefreshContent();
     void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
     void HandleHotkeys();
@@ -278,6 +296,10 @@ private:
     // Play mode
     PlayState   m_PlayState = PlayState::Edit;
     std::string m_PlaySnapshot; // whole scene before Play
+    std::vector<ModelHandle> m_PlayModels; // of levels opened by scripts while playing (released at Stop)
+    std::uint64_t            m_ConstructedRevision = ~std::uint64_t{0}; // History revision construction scripts ran for
+    std::uint64_t            m_ConstructedGraphs   = 0; // graph editor revision they ran for
+    double                   m_LastConstruction    = -1.0; // ImGui time of the last run (throttle while dragging)
     bool        m_StepRequested = false;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
@@ -295,6 +317,9 @@ private:
     bool m_ShowHierarchy = true, m_ShowInspector = true, m_ShowRenderer = true, m_ShowStats = true;
     bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
     bool m_ShowProjectSettings = false;
+    bool m_ShowTypes           = false; // Blueprint Types window
+    struct TypeEdit;                    // the enum / struct / interface edited there
+    std::shared_ptr<TypeEdit> m_TypeEdit;
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
     bool m_AskQuit = false, m_QuitConfirmed = false;
 
@@ -302,7 +327,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;

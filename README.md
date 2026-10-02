@@ -55,9 +55,10 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    Variablen, *Pure*); Aufruf über die Knotensuche (*Call …*). Variablen können Arrays sein
    (*For Each Loop*, *Add*, *Find*, …); das Häkchen neben einer Variable macht sie
    *instance editable* (Wert pro Entity im Inspector, auch Verweise auf andere Entities).
-   **Debugger**: F9 setzt einen Breakpoint (roter Punkt); im Play-Modus hält das Spiel dort an,
-   F5 läuft weiter, F10 geht einen Knoten weiter, Werte stehen im *Debug*-Bereich und im
-   Pin-Tooltip. Komfort: Doppelklick auf eine Verbindung = Reroute-Knoten, Shift+W/A/S/D richtet
+   **Debugger**: F9 setzt einen Breakpoint (roter Punkt, im Details-Panel optional mit Bedingung
+   wie `health < 10` und Hit-Count); im Play-Modus hält das Spiel dort an, F5 läuft weiter, F10
+   springt über Funktionsaufrufe, F11 hinein, Shift+F11 heraus; Werte und Call Stack stehen im
+   *Debug*-Bereich und im Pin-Tooltip. Komfort: Doppelklick auf eine Verbindung = Reroute-Knoten, Shift+W/A/S/D richtet
    aus, M blendet die Minimap um, C setzt einen Kommentar um die Auswahl (Farben im Details-Panel).
 10. **Prefabs** (Blueprint-Klassen): Hierarchy → Rechtsklick → *Create prefab…* speichert den
    Teilbaum als `.uprefab` (z. B. `Content/Prefabs/`). Prefabs per Doppelklick oder Ziehen aus dem
@@ -65,6 +66,17 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    zurücksetzen), *Apply to prefab* überträgt sie auf alle Instanzen, *Unlink* löst die Verbindung.
    Blueprints erzeugen Prefabs zur Laufzeit mit *Spawn Prefab*. *Print String* erscheint im Player
    oben links auf dem Bildschirm.
+11. **Blueprints 3**: Content → *+ New* → *Enum*, *Struct*, *Interface* (bearbeitet im Fenster
+   *Blueprint types*) und *Blueprint library* (Funktionen/Makros für alle Blueprints, Aufruf als
+   `Bibliothek.Funktion`). Variablen-Typen: Arrays, Maps (`Map<string, int>`), Enums, Structs. In der
+   Blueprint-Seitenleiste: *+ Macro* (mehrere Exec-Pins, Delays erlaubt), *Custom Events* mit
+   Parametern, *Event Dispatchers* (Call/Bind), *Interfaces* (fügt die Funktionen an),
+   *Timelines* (Kurven-Editor: Doppelklick = Key, Ziehen verschiebt). Knoten: *Switch*, *Select*,
+   *Tween* (Move/Rotate/Scale To), *Save Game*, *Open Level*, *Input Actions* (Project Settings →
+   *Input*). **Construction Script** (*Construction Script*-Event): läuft im Editor nach jeder
+   Änderung und vor BeginPlay; was es erzeugt, wird nicht gespeichert (grau in der Hierarchy).
+   Strg+F sucht in allen Blueprints, Rechtsklick → *Collapse to function / macro* fasst Knoten
+   zusammen.
 
 ## Entwicklung
 

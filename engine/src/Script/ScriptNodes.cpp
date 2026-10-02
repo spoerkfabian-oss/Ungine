@@ -6,6 +6,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Prefab.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Scene/Scene.h"
 
 #include <glm/gtc/quaternion.hpp>
@@ -183,26 +184,18 @@ PinType VariableElement(const ScriptGraph& graph, const ScriptNode& node)
     return IsArray(t) ? ElementType(t) : PinType::Float;
 }
 
-// Scalar type named by a param ("int", "vec3:3" -> Vec3); float if it names none.
+// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3); float if it names none.
 PinType ElementParam(const std::string& param)
 {
-    const auto t = PinTypeFromString(std::string_view(param).substr(0, param.find(':')));
-    return t && *t != PinType::Exec && !IsArray(*t) && *t != PinType::Count ? *t : PinType::Float;
+    const auto t = PinTypeFromString(SplitTypeAndCount(param, 0).first);
+    return t && t->kind != PinKind::Exec && !IsContainer(*t) ? *t : PinType::Float;
 }
 
-// Any value type named by a param (scalars and arrays).
+// Any value type named by a param (scalars and containers).
 PinType ValueParam(const std::string& param)
 {
     const auto t = PinTypeFromString(param);
-    return t && *t != PinType::Exec && *t != PinType::Count ? *t : PinType::Float;
-}
-
-std::vector<std::string> ValueTypeNames()
-{
-    std::vector<std::string> names;
-    for (int i = 1; i < static_cast<int>(PinType::Count); ++i)
-        names.emplace_back(ToString(static_cast<PinType>(i)));
-    return names;
+    return t && t->kind != PinKind::Exec ? *t : PinType::Float;
 }
 
 std::vector<ScriptParam> FunctionParams(const ScriptGraph& graph, const std::string& name, bool inputs)
@@ -219,11 +212,190 @@ Entity CameraOf(ScriptContext& c, int pin)
     return c.Connected(pin) ? c.InEntity(pin) : c.GetScene().FindPrimaryCamera();
 }
 
+// "Item.count" -> {"Item", "count"} (the part after the first dot may be empty).
+std::pair<std::string, std::string> SplitDotted(const std::string& param)
+{
+    const std::size_t dot = param.find('.');
+    return dot == std::string::npos ? std::pair{param, std::string()} : std::pair{param.substr(0, dot), param.substr(dot + 1)};
+}
+
+// Comma separated case values, trimmed.
+std::vector<std::string> SplitCases(const std::string& param)
+{
+    std::vector<std::string> cases;
+    std::size_t              start = 0;
+    while (start <= param.size()) {
+        const std::size_t comma = std::min(param.find(',', start), param.size());
+        std::string       c     = param.substr(start, comma - start);
+        c.erase(0, c.find_first_not_of(' '));
+        c.erase(c.find_last_not_of(' ') + 1);
+        if (!c.empty())
+            cases.push_back(std::move(c));
+        start = comma + 1;
+    }
+    return cases;
+}
+
+// Map type of a param / map variable (a string -> int map if it names none).
+PinType MapParam(const std::string& param)
+{
+    const PinType t = ValueParam(param);
+    return IsMap(t) ? t : PinType::Map(PinType::String, PinType::Int);
+}
+
 std::uint32_t CountParam(const std::string& param, std::uint32_t min, std::uint32_t max)
 {
     std::uint32_t n = min;
     std::from_chars(param.data(), param.data() + param.size(), n);
     return std::clamp(n, min, max);
+}
+
+// Values of the data inputs from pin `first` on (calls forwarding their arguments).
+std::vector<ScriptValue> DataInputs(ScriptContext& c, int first)
+{
+    std::vector<ScriptValue>  args;
+    std::span<const PinInfo>  pins = c.Pins();
+    for (int i = first; i < static_cast<int>(pins.size()); ++i)
+        if (!pins[static_cast<std::size_t>(i)].output && pins[static_cast<std::size_t>(i)].type != PinType::Exec)
+            args.push_back(c.In(i));
+    return args;
+}
+
+// Pins of a call: (exec) inputs then outputs of a signature.
+std::vector<PinInfo> SignaturePins(std::vector<PinInfo> pins, const std::vector<ScriptParam>& inputs,
+                                   const std::vector<ScriptParam>& outputs)
+{
+    for (const ScriptParam& p : inputs)
+        pins.push_back(In(p.name, p.type));
+    for (const ScriptParam& p : outputs)
+        pins.push_back(Out(p.name, p.type));
+    return pins;
+}
+
+// A macro of the graph, or "<Library>.<Macro>".
+const ScriptMacro* FindMacroRef(const ScriptGraph& graph, const std::string& name)
+{
+    if (const ScriptMacro* m = graph.FindMacro(name))
+        return m;
+    return name.find('.') != std::string::npos ? ScriptRegistry::FindLibraryMacro(name) : nullptr;
+}
+
+// --- Timelines and tweens ------------------------------------------------------------------------
+
+// Timeline node pins: 0..5 exec inputs, 6 New Time, 7 Update, 8 Finished, 9 Reversed, 10 Time,
+// then one per track. State: flag = playing, flag2 = reversed, time = position.
+constexpr int kTimelineUpdate = 7, kTimelineFinished = 8, kTimelineReversed = 9, kTimelineTime = 10, kTimelineTracks = 11;
+
+int RunTimeline(ScriptContext& c, int entry)
+{
+    if (entry == kScriptResume) // further outputs of a tick (event tracks, Finished)
+        return c.ResumeData();
+    const ScriptTimeline* t = c.Graph().FindTimeline(c.Param());
+    if (!t) {
+        c.Error("Unknown timeline '" + c.Param() + "'");
+        return kScriptStop;
+    }
+    ScriptContext::NodeState& s = c.State();
+    const double length         = std::max(t->length, 1e-4f);
+    const auto   outputs        = [&] {
+        c.Out(kTimelineReversed, s.flag2);
+        c.Out(kTimelineTime, static_cast<float>(s.time));
+        for (std::size_t i = 0; i < t->tracks.size(); ++i) {
+            const ScriptTimelineTrack& track = t->tracks[i];
+            if (track.kind == ScriptTrackKind::Event)
+                continue;
+            const glm::vec3 v = EvaluateTrack(track, static_cast<float>(s.time));
+            c.Out(kTimelineTracks + static_cast<int>(i), track.kind == ScriptTrackKind::Vector ? ScriptValue(v) : ScriptValue(v.x));
+        }
+    };
+    if (entry >= 0) {
+        switch (entry) {
+        case 0: s.flag = true, s.flag2 = false; break;                // Play
+        case 1: s.flag = true, s.flag2 = false, s.time = 0.0; break;   // Play from Start
+        case 2: s.flag = false; break;                                // Stop
+        case 3: s.flag = true, s.flag2 = true; break;                 // Reverse
+        case 4: s.flag = true, s.flag2 = true, s.time = length; break; // Reverse from End
+        case 5: s.time = std::clamp(static_cast<double>(c.InFloat(6)), 0.0, length); break;
+        default: break;
+        }
+        c.SetTicking(s.flag);
+        outputs();
+        return kScriptStop; // Update fires with the next tick
+    }
+    if (entry != kScriptTick || !s.flag) {
+        c.SetTicking(false);
+        return kScriptStop;
+    }
+    const double before = s.time;
+    double       after  = before + (s.flag2 ? -1.0 : 1.0) * c.DeltaTime();
+    bool         wrapped = false, finished = false;
+    if (!s.flag2 && after >= length) {
+        wrapped  = t->loop;
+        finished = !t->loop;
+        after    = t->loop ? std::fmod(after, length) : length;
+    } else if (s.flag2 && after <= 0.0) {
+        wrapped  = t->loop;
+        finished = !t->loop;
+        after    = t->loop ? length + std::fmod(after, length) : 0.0;
+    }
+    s.time = after;
+    outputs();
+    // Event keys passed: (before, after] forward, [after, before) backwards (both ends at the start).
+    const auto passed = [&](double k) {
+        const bool atStart = s.flag2 ? before >= length && k >= length : before <= 0.0 && k <= 0.0;
+        if (atStart)
+            return true;
+        if (!s.flag2)
+            return wrapped ? k > before || k <= after : k > before && k <= after;
+        return wrapped ? k < before || k >= after : k < before && k >= after;
+    };
+    std::vector<int> fire{kTimelineUpdate};
+    for (std::size_t i = 0; i < t->tracks.size(); ++i)
+        if (t->tracks[i].kind == ScriptTrackKind::Event)
+            for (const ScriptTimelineKey& k : t->tracks[i].keys)
+                if (passed(k.time))
+                    fire.push_back(kTimelineTracks + static_cast<int>(i));
+    if (finished) {
+        s.flag = false;
+        c.SetTicking(false);
+        fire.push_back(kTimelineFinished);
+    }
+    for (std::size_t i = 1; i < fire.size(); ++i)
+        c.PushContinuation(fire[i]);
+    return fire.front();
+}
+
+// Tweens: 0 In, 1 Target, 2 value, 3 Duration, 4 Completed. State: value = target, values = {from,
+// to, duration}, time = elapsed. A new trigger restarts from the current value.
+int RunTween(ScriptContext& c, int entry, const std::function<ScriptValue(ScriptContext&, Entity)>& current,
+             const std::function<void(ScriptContext&, Entity, const ScriptValue&, const ScriptValue&, float)>& apply)
+{
+    ScriptContext::NodeState& s = c.State();
+    if (entry == 0) {
+        const auto e = Target(c, 1);
+        if (!e)
+            return kScriptStop;
+        s.value  = *e;
+        s.values = {current(c, *e), c.In(2), c.InFloat(3)};
+        s.time   = 0.0;
+        c.SetTicking(true);
+        return kScriptStop;
+    }
+    if (entry != kScriptTick || s.values.size() != 3)
+        return kScriptStop;
+    const Entity e = std::get<Entity>(s.value);
+    if (!Alive(c, e)) {
+        c.SetTicking(false);
+        return kScriptStop;
+    }
+    s.time += c.DeltaTime();
+    const float duration = std::get<float>(s.values[2]);
+    const float alpha    = duration > 0.0f ? std::min(static_cast<float>(s.time) / duration, 1.0f) : 1.0f;
+    apply(c, e, s.values[0], s.values[1], ScriptEase(c.Param(), alpha));
+    if (alpha < 1.0f)
+        return kScriptStop;
+    c.SetTicking(false);
+    return 4; // Completed
 }
 
 // --- Keys ---------------------------------------------------------------------------------------
@@ -265,6 +437,9 @@ std::vector<NodeDesc> BuildRegistry()
     add(Event("Event.BeginPlay", "Event BeginPlay", {}, "When play starts (or the script is added while playing)"));
     add(Event("Event.Tick", "Event Tick", {Out("Delta Seconds", P::Float)}, "Every frame while playing"));
     add(Event("Event.EndPlay", "Event EndPlay", {}, "When play stops or the script / entity is removed"));
+    add(Event("Event.Construction", "Construction Script",  {},
+              "Runs in the editor after changes and when play starts (before BeginPlay); entities it creates are rebuilt "
+              "each time and not saved. No latent nodes, timers or timelines"));
     add(Event("Event.CollisionBegin", "On Collision Begin", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
               "This entity starts touching another body (physics)"));
     add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
@@ -273,8 +448,19 @@ std::vector<NodeDesc> BuildRegistry()
                   "Key", "Space"));
     add(WithParam(Event("Event.KeyReleased", "On Key Released", {}, "The key went up this frame"), ParamKind::Key,
                   "Key", "Space"));
-    add(WithParam(Event("Event.Custom", "Custom Event", {}, "Runs when a Call Custom Event node with this name runs"),
-                  ParamKind::Text, "Name", "MyEvent"));
+    {
+        // Declared events (ScriptGraph::events) have parameters: outputs here, inputs on the calls.
+        NodeDesc d = Event("Event.Custom", "Custom Event", {},
+                           "Runs when a Call Custom Event node with this name runs (or a bound dispatcher, a timer)");
+        d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecOut("Out")};
+            if (const ScriptEventDecl* e = g.FindEvent(n.param))
+                for (const ScriptParam& p : e->params)
+                    pins.push_back(Out(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Text, "Name", "MyEvent"));
+    }
 
     // Flow control.
     add(Flow("Flow.Branch", "Branch", {ExecIn(), In("Condition", P::Bool), ExecOut("True"), ExecOut("False")},
@@ -372,13 +558,22 @@ std::vector<NodeDesc> BuildRegistry()
              "Continues after Duration seconds (latent)"),
                      {{"Duration", 1.0f}}));
     r.back().latent = true;
-    add(WithParam(Flow("Flow.CallEvent", "Call Custom Event", {ExecIn(), ExecOut()},
-                       [](ScriptContext& c, int) {
-                           c.CallEvent(c.Param());
-                           return 1;
-                       },
-                       "Runs the Custom Event nodes with this name"),
-                  ParamKind::Text, "Event", "MyEvent"));
+    {
+        NodeDesc d = Flow("Flow.CallEvent", "Call Custom Event", {ExecIn(), ExecOut()},
+                          [](ScriptContext& c, int) {
+                              c.CallEvent(c.Param(), DataInputs(c, 2));
+                              return 1;
+                          },
+                          "Runs the Custom Event nodes with this name");
+        d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            if (const ScriptEventDecl* e = g.FindEvent(n.param))
+                for (const ScriptParam& p : e->params)
+                    pins.push_back(In(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Text, "Event", "MyEvent"));
+    }
 
     // Variables (pins typed like the variable).
     {
@@ -632,6 +827,20 @@ std::vector<NodeDesc> BuildRegistry()
         if (const auto e = Target(c, 2))
             c.GetScene().DestroyEntity(*e);
     }, "Destroys the entity and its children"));
+    add(Action("Entity.SpawnEmpty", "Spawn Entity", "Entity",
+               {In("Location", P::Vec3), In("Name", P::String), In("Parent", P::Entity), Out("Spawned", P::Entity)},
+               [](ScriptContext& c) {
+                   Scene&       scene  = c.GetScene();
+                   const Entity parent = c.Connected(4) ? c.InEntity(4) : NullEntity; // unconnected: a root
+                   if (parent != NullEntity && !Alive(c, parent)) {
+                       c.Error("Parent is not a valid entity");
+                       return;
+                   }
+                   const std::string name = c.InString(3);
+                   const Entity      e    = scene.CreateEntity(name.empty() ? std::string("Entity") : name, parent);
+                   SetWorldPosition(c, e, c.InVec3(2));
+                   c.Out(5, e);
+               }, "Creates an empty entity at a world location (optionally under a parent); add components with other nodes"));
     add(WithParam(WithDefaults(Action("Entity.SpawnPrimitive", "Spawn Primitive", "Entity",
                          {In("Location", P::Vec3), In("Size", P::Float), In("Simulate Physics", P::Bool), In("Name", P::String),
                           Out("Spawned", P::Entity)},
@@ -692,13 +901,14 @@ std::vector<NodeDesc> BuildRegistry()
                    try {
                        const Entity e = InstantiatePrefab(c.GetScene(), c.Assets(), file, NullEntity, t, models);
                        c.Out(5, e);
+                       c.Construct(e); // like placed ones: before their BeginPlay
                    } catch (const std::exception& ex) {
                        c.Error(ex.what());
                    }
                    for (ModelHandle h : models)
                        c.KeepModel(h.index, h.generation);
                }, "Instantiates a .uprefab (path relative to the project) at a world location (Euler degrees); "
-                  "its scripts start on the next frame"));
+                  "construction scripts run now, BeginPlay on the next frame"));
 
     // Physics.
     add(Action("Physics.AddImpulse", "Add Impulse", "Physics", {In("Target", P::Entity), In("Impulse", P::Vec3)},
@@ -936,8 +1146,7 @@ std::vector<NodeDesc> BuildRegistry()
               }, "First index of Item, -1 if missing");
     {
         const auto count = [](const std::string& param) {
-            const std::size_t colon = param.find(':');
-            return colon == std::string::npos ? 2u : CountParam(param.substr(colon + 1), 1, 16);
+            return static_cast<std::uint32_t>(std::clamp(SplitTypeAndCount(param, 2).second, 1, 16));
         };
         NodeDesc d = Pure("Array.Make", "Make Array", "Array", {}, [count](ScriptContext& c) {
             const PinType            e = ElementParam(c.Param());
@@ -1301,7 +1510,7 @@ std::vector<NodeDesc> BuildRegistry()
             return std::vector<PinInfo>{In("Target", P::Entity), In("Name", P::String), Out("Value", ValueParam(n.param)),
                                         Out("Found", P::Bool)};
         };
-        add(WithParam(std::move(get), ParamKind::Choice, "Type", "float", ValueTypeNames()));
+        add(WithParam(std::move(get), ParamKind::PinType, "Type", "float"));
         NodeDesc set = Flow("Script.SetVariable", "Set Script Variable", {}, [](ScriptContext& c, int) {
             ScriptValue* v = c.InstanceVariable(c.InEntity(2), c.InString(3));
             const bool   ok = v && CanConvert(ValueParam(c.Param()), TypeOf(*v));
@@ -1315,13 +1524,626 @@ std::vector<NodeDesc> BuildRegistry()
             return std::vector<PinInfo>{ExecIn(), ExecOut(), In("Target", P::Entity), In("Name", P::String),
                                         In("Value", ValueParam(n.param)), Out("Success", P::Bool)};
         };
-        add(WithParam(std::move(set), ParamKind::Choice, "Type", "float", ValueTypeNames()));
+        add(WithParam(std::move(set), ParamKind::PinType, "Type", "float"));
     }
     add(WithDefaults(Action("Script.CallEvent", "Call Event on Entity", "Script",
                             {In("Target", P::Entity), In("Event", P::String), Out("Called", P::Bool)},
                             [](ScriptContext& c) { c.Out(4, c.CallEventOn(c.InEntity(2), c.InString(3))); },
                             "Runs the Custom Event of another entity's script now"),
                      {{"Event", std::string("MyEvent")}}));
+
+    // Structs (ScriptRegistry definitions).
+    {
+        NodeDesc d = Pure("Struct.Make", "Make Struct", "Struct", {}, [](ScriptContext& c) {
+            const std::string&     name  = c.Param();
+            ScriptValue            value = MakeStruct(name);
+            const ScriptStructDef* def   = ScriptRegistry::FindStruct(name);
+            const std::size_t      count = def ? def->fields.size() : 0;
+            for (std::size_t i = 0; i < count; ++i)
+                SetStructField(value, name, def->fields[i].name, c.In(static_cast<int>(i)));
+            c.Out(static_cast<int>(count), std::move(value));
+        }, "A struct from its field values");
+        d.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins;
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    pins.push_back(In(f.name, f.type));
+            pins.push_back(Out("Struct", PinType::Struct(n.param)));
+            return pins;
+        };
+        d.pinDefault = [](const ScriptNode& n, const PinInfo& pin) -> std::optional<ScriptValue> {
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    if (f.name == pin.name)
+                        return f.value;
+            return std::nullopt;
+        };
+        d.inference = ParamInference::UserType;
+        add(WithParam(std::move(d), ParamKind::StructType, "Struct", ""));
+
+        NodeDesc b = Pure("Struct.Break", "Break Struct", "Struct", {}, [](ScriptContext& c) {
+            const ScriptValue      value = c.In(0);
+            const ScriptStructDef* def   = ScriptRegistry::FindStruct(c.Param());
+            for (std::size_t i = 0; def && i < def->fields.size(); ++i) {
+                const ScriptValue* field = StructField(value, def->fields[i].name);
+                c.Out(static_cast<int>(i) + 1, field ? Convert(*field, def->fields[i].type) : def->fields[i].value);
+            }
+        }, "The field values of a struct");
+        b.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{In("Struct", PinType::Struct(n.param))};
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    pins.push_back(Out(f.name, f.type));
+            return pins;
+        };
+        b.inference = ParamInference::UserType;
+        add(WithParam(std::move(b), ParamKind::StructType, "Struct", ""));
+
+        NodeDesc f = Pure("Struct.SetField", "Set Struct Field", "Struct", {}, [](ScriptContext& c) {
+            const auto [name, field] = SplitDotted(c.Param());
+            ScriptValue value        = c.In(0);
+            SetStructField(value, name, field, c.In(1));
+            c.Out(2, std::move(value));
+        }, "A copy of the struct with one field changed");
+        f.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const auto [name, field] = SplitDotted(n.param);
+            PinType type             = PinType::Float;
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(name))
+                for (const ScriptStructField& x : def->fields)
+                    if (x.name == field)
+                        type = x.type;
+            return std::vector<PinInfo>{In("Struct", PinType::Struct(name)), In("Value", type), Out("Struct", PinType::Struct(name))};
+        };
+        add(WithParam(std::move(f), ParamKind::StructField, "Field", ""));
+    }
+
+    // Enums.
+    {
+        NodeDesc lit = Pure("Enum.Literal", "Enum Value", "Enum", {}, [](ScriptContext& c) {
+            const auto [name, value] = SplitDotted(c.Param());
+            c.Out(0, std::max(ScriptRegistry::EnumValueIndex(name, value), 0));
+        }, "A constant enum value");
+        lit.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{Out("Value", PinType::Enum(SplitDotted(n.param).first))};
+        };
+        add(WithParam(std::move(lit), ParamKind::EnumValue, "Value", ""));
+
+        NodeDesc sw = Flow("Enum.Switch", "Switch on Enum", {}, [](ScriptContext& c, int) {
+            const ScriptEnum*  e     = ScriptRegistry::FindEnum(c.Param());
+            const std::int32_t value = c.InInt(1);
+            const std::int32_t count = e ? static_cast<std::int32_t>(e->values.size()) : 0;
+            return 2 + (value >= 0 && value < count ? value : count);
+        }, "Continues at the output of the value (Default for unknown values)");
+        sw.category    = "Enum";
+        sw.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), In("Selection", PinType::Enum(n.param))};
+            if (const ScriptEnum* e = ScriptRegistry::FindEnum(n.param))
+                for (const std::string& v : e->values)
+                    pins.push_back(ExecOut(v));
+            pins.push_back(ExecOut("Default"));
+            return pins;
+        };
+        sw.inference = ParamInference::UserType;
+        add(WithParam(std::move(sw), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc name = Pure("Enum.ToName", "Enum to Name", "Enum", {}, [](ScriptContext& c) {
+            c.Out(1, ScriptRegistry::EnumValueName(c.Param(), c.InInt(0)));
+        });
+        name.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{In("Value", PinType::Enum(n.param)), Out("Name", P::String)};
+        };
+        name.inference = ParamInference::UserType;
+        add(WithParam(std::move(name), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc from = Pure("Enum.FromName", "Name to Enum", "Enum", {}, [](ScriptContext& c) {
+            const std::int32_t index = ScriptRegistry::EnumValueIndex(c.Param(), c.InString(0));
+            c.Out(1, std::max(index, 0));
+            c.Out(2, index >= 0);
+        });
+        from.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{In("Name", P::String), Out("Value", PinType::Enum(n.param)), Out("Found", P::Bool)};
+        };
+        add(WithParam(std::move(from), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc count = Pure("Enum.Count", "Enum Value Count", "Enum", {Out("Count", P::Int)}, [](ScriptContext& c) {
+            const ScriptEnum* e = ScriptRegistry::FindEnum(c.Param());
+            c.Out(0, e ? static_cast<std::int32_t>(e->values.size()) : 0);
+        });
+        add(WithParam(std::move(count), ParamKind::EnumType, "Enum", ""));
+    }
+
+    // Maps.
+    const auto mapRead = [&](const char* type, const char* title, auto pins, auto eval, const char* tooltip = "") {
+        NodeDesc d = Pure(type, title, "Map", {}, [eval](ScriptContext& c) {
+            const PinType     t     = MapParam(c.Param());
+            const ScriptValue value = c.In(0);
+            eval(c, MapOf(value), t);
+        }, tooltip);
+        d.resolvePins = [pins](const ScriptGraph&, const ScriptNode& n) { return pins(MapParam(n.param)); };
+        d.inference   = ParamInference::MapType;
+        add(WithParam(std::move(d), ParamKind::PinType, "Map type", "map:string:int"));
+    };
+    mapRead("Map.Find", "Find",
+            [](PinType t) {
+                return std::vector<PinInfo>{In("Map", t), In("Key", KeyType(t)), Out("Value", ElementType(t)), Out("Found", P::Bool)};
+            },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                const auto it = m.items.find(c.In(1));
+                c.Out(2, it != m.items.end() ? it->second : DefaultValue(ElementType(t)));
+                c.Out(3, it != m.items.end());
+            }, "The value stored for Key");
+    mapRead("Map.Contains", "Contains Key",
+            [](PinType t) { return std::vector<PinInfo>{In("Map", t), In("Key", KeyType(t)), Out("Result", P::Bool)}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType) { c.Out(2, m.items.contains(c.In(1))); });
+    mapRead("Map.Length", "Length (map)", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Length", P::Int)}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType) { c.Out(1, static_cast<std::int32_t>(m.items.size())); });
+    mapRead("Map.Keys", "Keys", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Keys", ArrayOf(KeyType(t)))}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                std::vector<ScriptValue> keys;
+                for (const auto& [k, v] : m.items)
+                    keys.push_back(k);
+                c.Out(1, MakeArray(KeyType(t), std::move(keys)));
+            }, "All keys (sorted)");
+    mapRead("Map.Values", "Values", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Values", ArrayOf(ElementType(t)))}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                std::vector<ScriptValue> values;
+                for (const auto& [k, v] : m.items)
+                    values.push_back(v);
+                c.Out(1, MakeArray(ElementType(t), std::move(values)));
+            }, "All values (in key order)");
+    const auto mapWrite = [&](const char* type, const char* title, auto data, auto run, const char* tooltip = "") {
+        NodeDesc d = Flow(type, title, {}, [run](ScriptContext& c, int) {
+            ScriptValue* v = c.Variable(c.Param());
+            if (!v || !IsMap(TypeOf(*v))) {
+                c.Error("'" + c.Param() + "' is not a map variable");
+                return 1;
+            }
+            run(c, *v, TypeOf(*v)); // reads its inputs before changing the map
+            return 1;
+        }, tooltip);
+        d.category    = "Map";
+        d.mapVariable = true;
+        d.resolvePins = [data](const ScriptGraph& g, const ScriptNode& n) {
+            const PinType        t = VariableType(g, n);
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            const std::vector<PinInfo> extra = data(IsMap(t) ? t : PinType::Map(PinType::String, PinType::Int));
+            pins.insert(pins.end(), extra.begin(), extra.end());
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Variable, "Map", ""));
+    };
+    mapWrite("Map.Add", "Add (map)", [](PinType t) { return std::vector<PinInfo>{In("Key", KeyType(t)), In("Value", ElementType(t))}; },
+             [](ScriptContext& c, ScriptValue& v, PinType t) {
+                 ScriptValue key = c.In(2), value = c.In(3);
+                 MutableMap(v, KeyType(t), ElementType(t)).items[std::move(key)] = std::move(value);
+             }, "Stores Value for Key (replaces an existing one)");
+    mapWrite("Map.Remove", "Remove (map)", [](PinType t) { return std::vector<PinInfo>{In("Key", KeyType(t)), Out("Removed", P::Bool)}; },
+             [](ScriptContext& c, ScriptValue& v, PinType t) {
+                 const ScriptValue key = c.In(2);
+                 c.Out(3, MutableMap(v, KeyType(t), ElementType(t)).items.erase(key) > 0);
+             });
+    mapWrite("Map.Clear", "Clear (map)", [](PinType) { return std::vector<PinInfo>{}; },
+             [](ScriptContext&, ScriptValue& v, PinType t) { MutableMap(v, KeyType(t), ElementType(t)).items.clear(); });
+
+    // Switches, select, multi gate, retriggerable delay.
+    for (const bool strings : {false, true}) {
+        NodeDesc d = Flow(strings ? "Flow.SwitchString" : "Flow.SwitchInt", strings ? "Switch on String" : "Switch on Int", {},
+                          [strings](ScriptContext& c, int) {
+                              const std::vector<std::string> cases = SplitCases(c.Param());
+                              for (std::size_t i = 0; i < cases.size(); ++i)
+                                  if (strings ? c.InString(1) == cases[i] : c.InInt(1) == std::atoi(cases[i].c_str()))
+                                      return 2 + static_cast<int>(i);
+                              return 2 + static_cast<int>(cases.size()); // Default
+                          },
+                          "Continues at the matching case, else at Default");
+        d.resolvePins = [strings](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), In("Selection", strings ? P::String : P::Int)};
+            for (const std::string& c : SplitCases(n.param))
+                pins.push_back(ExecOut(c));
+            pins.push_back(ExecOut("Default"));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Cases, "Cases", strings ? "A, B, C" : "0, 1, 2"));
+    }
+    {
+        const auto count = [](const std::string& param) { return std::clamp(SplitTypeAndCount(param, 2).second, 2, 16); };
+        NodeDesc   d     = Pure("Utility.Select", "Select", "Utility", {}, [count](ScriptContext& c) {
+            const int n     = count(c.Param());
+            const int index = c.InInt(0);
+            c.Out(n + 1, index >= 0 && index < n ? c.In(1 + index) : DefaultValue(ElementParam(c.Param())));
+        }, "The option at Index (only that one is evaluated; bools pick 0 / 1)");
+        d.resolvePins = [count](const ScriptGraph&, const ScriptNode& n) {
+            const PinType        t = ElementParam(n.param);
+            std::vector<PinInfo> pins{In("Index", P::Int)};
+            for (int i = 0, c = count(n.param); i < c; ++i)
+                pins.push_back(In("Option " + std::to_string(i), t));
+            pins.push_back(Out("Result", t));
+            return pins;
+        };
+        d.inference = ParamInference::PinType;
+        d.infers    = [](std::string_view pin) { return pin != "Index"; };
+        add(WithParam(std::move(d), ParamKind::TypeAndCount, "Type : options", "float:2"));
+    }
+    {
+        NodeDesc d = Flow("Flow.MultiGate", "Multi Gate", {}, [](ScriptContext& c, int entry) {
+            ScriptContext::NodeState& s = c.State();
+            const int                 n = static_cast<int>(CountParam(c.Param(), 2, 16));
+            if (entry == 1) { // Reset
+                s.counter = 0;
+                s.flag2   = false;
+                return kScriptStop;
+            }
+            const std::int32_t all = (1 << n) - 1;
+            if ((s.counter & all) == all) {
+                if (!c.InBool(3)) // done until Reset
+                    return kScriptStop;
+                s.counter = 0;
+            }
+            if (!s.flag2) { // first run: the start index
+                s.flag2 = true;
+                s.value = std::clamp(c.InInt(4), 0, n - 1);
+            }
+            int pick = -1;
+            if (c.InBool(2)) { // random among the unused outputs
+                std::vector<int> unused;
+                for (int i = 0; i < n; ++i)
+                    if (!(s.counter & (1 << i)))
+                        unused.push_back(i);
+                pick = unused[std::uniform_int_distribution<std::size_t>(0, unused.size() - 1)(Rng())];
+            } else {
+                const int start = std::get<std::int32_t>(Convert(s.value, P::Int));
+                for (int k = 0; k < n && pick < 0; ++k)
+                    if (!(s.counter & (1 << ((start + k) % n))))
+                        pick = (start + k) % n;
+                s.value = (pick + 1) % n;
+            }
+            s.counter |= 1 << pick;
+            return 5 + pick;
+        }, "Each run fires the next unused output (or a random one); Loop starts over when all were used");
+        d.resolvePins = [](const ScriptGraph&, const ScriptNode& node) {
+            std::vector<PinInfo> pins{ExecIn(), ExecIn("Reset"), In("Is Random", P::Bool), In("Loop", P::Bool), In("Start Index", P::Int)};
+            for (std::uint32_t i = 0, n = CountParam(node.param, 2, 16); i < n; ++i)
+                pins.push_back(ExecOut("Out " + std::to_string(i)));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Count, "Outputs", "3"));
+    }
+    add(WithDefaults(Flow("Flow.RetriggerableDelay", "Retriggerable Delay",
+                          {ExecIn(), In("Duration", P::Float), ExecOut("Completed")},
+                          [](ScriptContext& c, int entry) {
+                              ScriptContext::NodeState& s = c.State();
+                              if (entry == kScriptResume) // only the latest trigger completes
+                                  return c.ResumeData() == s.counter ? 2 : kScriptStop;
+                              ++s.counter;
+                              c.Suspend(std::max(c.InFloat(1), 0.0f), s.counter);
+                              return kScriptStop;
+                          },
+                          "Continues Duration seconds after the last trigger (each trigger restarts the countdown)"),
+                     {{"Duration", 1.0f}}));
+    r.back().latent = true;
+
+    // Libraries: functions of library graphs (copied into the program when compiled).
+    {
+        NodeDesc call = Flow("Library.Call", "Call Library Function", {}, [](ScriptContext&, int) { return 1; });
+        call.category    = "Libraries";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptFunction* f = ScriptRegistry::FindLibraryFunction(n.param);
+            return f ? SignaturePins({ExecIn(), ExecOut()}, f->inputs, f->outputs) : std::vector<PinInfo>{ExecIn(), ExecOut()};
+        };
+        add(WithParam(std::move(call), ParamKind::LibraryFunction, "Function", ""));
+        NodeDesc pure    = Pure("Library.CallPure", "Call Pure Library Function", "Libraries", {}, [](ScriptContext&) {});
+        pure.hidden      = true;
+        pure.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptFunction* f = ScriptRegistry::FindLibraryFunction(n.param);
+            return f ? SignaturePins({}, f->inputs, f->outputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(pure), ParamKind::LibraryFunction, "Function", ""));
+    }
+
+    // Macros: Use nodes are replaced by a copy of the macro's nodes when the graph is compiled; the
+    // Inputs / Outputs nodes are the tunnels inside the macro.
+    {
+        NodeDesc inputs;
+        inputs.type        = "Macro.Inputs";
+        inputs.title       = "Inputs";
+        inputs.category    = "Macros";
+        inputs.kind        = NodeKind::Event;
+        inputs.hidden      = true;
+        inputs.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = g.FindMacro(n.param);
+            return m ? SignaturePins({}, {}, m->inputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(inputs), ParamKind::Macro, "Macro", ""));
+        NodeDesc outputs    = Flow("Macro.Outputs", "Outputs", {}, [](ScriptContext&, int) { return kScriptStop; });
+        outputs.category    = "Macros";
+        outputs.hidden      = true;
+        outputs.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = g.FindMacro(n.param);
+            return m ? SignaturePins({}, m->outputs, {}) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(outputs), ParamKind::Macro, "Macro", ""));
+        NodeDesc use    = Flow("Macro.Use", "Macro", {}, [](ScriptContext&, int) { return kScriptStop; });
+        use.category    = "Macros";
+        use.hidden      = true;
+        use.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = FindMacroRef(g, n.param);
+            return m ? SignaturePins({}, m->inputs, m->outputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(use), ParamKind::Macro, "Macro", ""));
+    }
+
+    // Interfaces: functions any script can implement; calls go to the target's implementation.
+    {
+        NodeDesc call = Flow("Interface.Call", "Call Interface Function", {}, [](ScriptContext& c, int) {
+            const ScriptInterfaceFunction* f = ScriptRegistry::FindInterfaceFunction(c.Param());
+            if (!f) {
+                c.Error("Unknown interface function '" + c.Param() + "'");
+                return 1;
+            }
+            const int                firstOut = 3 + static_cast<int>(f->inputs.size());
+            std::vector<ScriptValue> results;
+            const Entity             target = c.InEntity(2);
+            const bool called = c.Implements(target, SplitDotted(c.Param()).first) &&
+                                c.CallFunctionOn(target, f->name, DataInputs(c, 3), results);
+            for (std::size_t i = 0; i < f->outputs.size(); ++i)
+                c.Out(firstOut + static_cast<int>(i), called && i < results.size() ? results[i] : DefaultValue(f->outputs[i].type));
+            c.Out(firstOut + static_cast<int>(f->outputs.size()), called);
+            return 1;
+        }, "Runs the function on the target's script if it implements the interface; Implemented tells whether it "
+           "did (else the outputs are defaults)");
+        call.category    = "Interfaces";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptInterfaceFunction* f = ScriptRegistry::FindInterfaceFunction(n.param);
+            std::vector<PinInfo>           pins{ExecIn(), ExecOut(), In("Target", P::Entity)};
+            if (!f)
+                return pins;
+            pins = SignaturePins(std::move(pins), f->inputs, f->outputs);
+            pins.push_back(Out("Implemented", P::Bool));
+            return pins;
+        };
+        add(WithParam(std::move(call), ParamKind::InterfaceFunction, "Function", ""));
+        add(WithParam(Pure("Interface.Implements", "Implements Interface", "Interfaces",
+                           {In("Target", P::Entity), Out("Result", P::Bool)},
+                           [](ScriptContext& c) { c.Out(1, c.Implements(c.InEntity(0), c.Param())); },
+                           "Does the target's script implement the interface?"),
+                      ParamKind::Interface, "Interface", ""));
+    }
+
+    // Event dispatchers: other scripts bind their custom events, Call runs all of them.
+    {
+        NodeDesc call = Flow("Dispatcher.Call", "Call Dispatcher", {ExecIn(), ExecOut()}, [](ScriptContext& c, int) {
+            c.CallDispatcher(c.Param(), DataInputs(c, 2));
+            return 1;
+        }, "Runs every custom event bound to this dispatcher, with these arguments");
+        call.category    = "Dispatchers";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptEventDecl* d = g.FindDispatcher(n.param);
+            return SignaturePins({ExecIn(), ExecOut()}, d ? d->params : std::vector<ScriptParam>{}, {});
+        };
+        add(WithParam(std::move(call), ParamKind::Dispatcher, "Dispatcher", ""));
+        const auto bind = [&](const char* type, const char* title, bool binding, const char* tooltip) {
+            add(WithParam(Action(type, title, "Dispatchers", {In("Target", P::Entity), In("Event", P::String)},
+                                 [binding](ScriptContext& c) {
+                                     if (!c.BindDispatcher(c.InEntity(2), c.Param(), c.InString(3), binding))
+                                         c.Error("Target has no script with the dispatcher '" + c.Param() + "'");
+                                 }, tooltip),
+                          ParamKind::Text, "Dispatcher", "OnChanged"));
+        };
+        bind("Dispatcher.Bind", "Bind Event to Dispatcher", true,
+             "The custom event Event of this script runs whenever the target's dispatcher is called");
+        bind("Dispatcher.Unbind", "Unbind Event from Dispatcher", false, "Removes a binding made by Bind");
+        add(WithParam(Action("Dispatcher.UnbindAll", "Unbind All from Dispatcher", "Dispatchers", {In("Target", P::Entity)},
+                             [](ScriptContext& c) {
+                                 if (!c.UnbindAll(c.InEntity(2), c.Param()))
+                                     c.Error("Target has no script with the dispatcher '" + c.Param() + "'");
+                             }, "Removes every binding of the target's dispatcher"),
+                      ParamKind::Text, "Dispatcher", "OnChanged"));
+    }
+
+    // Timelines (ScriptGraph::timelines; their nodes come from the editor's timeline list).
+    {
+        NodeDesc d    = Flow("Timeline.Play", "Timeline", {}, RunTimeline,
+                             "Plays a timeline: Update fires every frame with the track values (latent)");
+        d.category    = "Timeline";
+        d.hidden      = true;
+        d.latent      = true;
+        d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn("Play"),         ExecIn("Play from Start"), ExecIn("Stop"),
+                                      ExecIn("Reverse"),      ExecIn("Reverse from End"), ExecIn("Set New Time"),
+                                      In("New Time", P::Float), ExecOut("Update"),        ExecOut("Finished"),
+                                      Out("Reversed", P::Bool), Out("Time", P::Float)};
+            if (const ScriptTimeline* t = g.FindTimeline(n.param))
+                for (const ScriptTimelineTrack& track : t->tracks)
+                    pins.push_back(track.kind == ScriptTrackKind::Event ? ExecOut(track.name)
+                                                                        : Out(track.name, track.kind == ScriptTrackKind::Vector ? P::Vec3 : P::Float));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Timeline, "Timeline", ""));
+    }
+
+    // Tweens: latent changes over Duration seconds along an easing curve.
+    {
+        std::vector<std::string> eases(ScriptEaseNames().begin(), ScriptEaseNames().end());
+        const auto tween = [&](const char* type, const char* title, PinInfo value, ScriptValue def,
+                               std::function<ScriptValue(ScriptContext&, Entity)> current,
+                               std::function<void(ScriptContext&, Entity, const ScriptValue&, const ScriptValue&, float)> apply,
+                               const char* tooltip) {
+            NodeDesc d = Flow(type, title, {ExecIn(), In("Target", P::Entity), value, In("Duration", P::Float), ExecOut("Completed")},
+                              [current, apply](ScriptContext& c, int entry) { return RunTween(c, entry, current, apply); }, tooltip);
+            d.category = "Tween";
+            d.latent   = true;
+            add(WithParam(WithDefaults(std::move(d), {{value.name, std::move(def)}, {"Duration", 1.0f}}), ParamKind::Choice,
+                          "Ease", "Sine In Out", eases));
+        };
+        tween("Tween.MoveTo", "Move To", In("Location", P::Vec3), glm::vec3(0.0f),
+              [](ScriptContext& c, Entity e) { return ScriptValue(glm::vec3(World(c, e)[3])); },
+              [](ScriptContext& c, Entity e, const ScriptValue& a, const ScriptValue& b, float t) {
+                  SetWorldPosition(c, e, glm::mix(std::get<glm::vec3>(a), std::get<glm::vec3>(Convert(b, P::Vec3)), t));
+              },
+              "Moves the target to a world location over Duration seconds; Completed fires at the end");
+        tween("Tween.RotateTo", "Rotate To", In("Rotation", P::Vec3), glm::vec3(0.0f),
+              [](ScriptContext& c, Entity e) { return ScriptValue(ToEulerDegrees(RotationOf(World(c, e)))); },
+              [](ScriptContext& c, Entity e, const ScriptValue& a, const ScriptValue& b, float t) {
+                  SetWorldRotation(c, e, glm::slerp(FromEulerDegrees(std::get<glm::vec3>(a)),
+                                                    FromEulerDegrees(std::get<glm::vec3>(Convert(b, P::Vec3))), t));
+              },
+              "Turns the target to a world rotation (degrees) over Duration seconds");
+        tween("Tween.ScaleTo", "Scale To", In("Scale", P::Vec3), glm::vec3(1.0f),
+              [](ScriptContext& c, Entity e) { return ScriptValue(c.GetScene().GetRegistry().Get<Transform>(e).scale); },
+              [](ScriptContext& c, Entity e, const ScriptValue& a, const ScriptValue& b, float t) {
+                  c.GetScene().EditTransform(e).scale = glm::mix(std::get<glm::vec3>(a), std::get<glm::vec3>(Convert(b, P::Vec3)), t);
+              },
+              "Scales the target (local scale) over Duration seconds");
+        NodeDesc f = Flow("Tween.Float", "Tween Float",
+                          {ExecIn(), In("From", P::Float), In("To", P::Float), In("Duration", P::Float), ExecOut("Update"),
+                           Out("Value", P::Float), ExecOut("Completed")},
+                          [](ScriptContext& c, int entry) {
+                              ScriptContext::NodeState& s = c.State();
+                              if (entry == kScriptResume)
+                                  return c.ResumeData();
+                              if (entry == 0) {
+                                  s.values = {c.InFloat(1), c.InFloat(2), c.InFloat(3)};
+                                  s.time   = 0.0;
+                                  c.Out(5, s.values[0]);
+                                  c.SetTicking(true);
+                                  return kScriptStop;
+                              }
+                              if (entry != kScriptTick || s.values.size() != 3)
+                                  return kScriptStop;
+                              s.time += c.DeltaTime();
+                              const float duration = std::get<float>(s.values[2]);
+                              const float alpha = duration > 0.0f ? std::min(static_cast<float>(s.time) / duration, 1.0f) : 1.0f;
+                              const float from = std::get<float>(s.values[0]), to = std::get<float>(s.values[1]);
+                              c.Out(5, from + (to - from) * ScriptEase(c.Param(), alpha));
+                              if (alpha >= 1.0f) {
+                                  c.SetTicking(false);
+                                  c.PushContinuation(6);
+                              }
+                              return 4; // Update (then Completed)
+                          },
+                          "Animates Value from From to To over Duration seconds: Update every frame, then Completed");
+        f.category = "Tween";
+        f.latent   = true;
+        add(WithParam(WithDefaults(std::move(f), {{"To", 1.0f}, {"Duration", 1.0f}}), ParamKind::Choice, "Ease", "Linear", eases));
+        add(WithParam(Pure("Math.Ease", "Ease", "Math|Float", {In("Alpha", P::Float), Out("Result", P::Float)},
+                           [](ScriptContext& c) { c.Out(1, ScriptEase(c.Param(), c.InFloat(0))); },
+                           "Easing curve: 0..1 -> 0..1 (overshoots for Back / Elastic)"),
+                      ParamKind::Choice, "Ease", "Sine In Out", eases));
+    }
+
+    // Input actions / axes of the project (Project Settings -> Input).
+    add(WithParam(Event("Event.InputActionPressed", "On Input Action Pressed", {}, "A key bound to the action went down"),
+                  ParamKind::InputAction, "Action", "Jump"));
+    add(WithParam(Event("Event.InputActionReleased", "On Input Action Released", {},
+                        "The last held key bound to the action went up"),
+                  ParamKind::InputAction, "Action", "Jump"));
+    add(WithParam(Pure("Input.IsActionDown", "Is Action Down", "Input", {Out("Down", P::Bool)},
+                       [](ScriptContext& c) {
+                           const InputActionBinding* a = c.Inputs().FindAction(c.Param());
+                           if (!a)
+                               c.Error("Unknown input action '" + c.Param() + "'");
+                           const Input* in = c.GetInput();
+                           c.Out(0, in && a && std::ranges::any_of(a->keys, [&](const std::string& k) { return QueryKey(*in, k, KeyQuery::Down); }));
+                       }, "Is a key bound to the action held?"),
+                  ParamKind::InputAction, "Action", "Jump"));
+    add(WithParam(Pure("Input.GetAxis", "Get Axis Value", "Input", {Out("Value", P::Float)},
+                       [](ScriptContext& c) {
+                           const InputAxisBinding* a = c.Inputs().FindAxis(c.Param());
+                           if (!a)
+                               c.Error("Unknown input axis '" + c.Param() + "'");
+                           float value = 0.0f;
+                           if (const Input* in = c.GetInput(); in && a)
+                               for (const InputAxisKey& k : a->keys)
+                                   if (QueryKey(*in, k.key, KeyQuery::Down))
+                                       value += k.scale;
+                           c.Out(0, std::clamp(value, -1.0f, 1.0f));
+                       }, "Sum of the scales of the held keys of the axis, -1..1"),
+                  ParamKind::InputAxis, "Axis", "MoveForward"));
+
+    // Save games: slots (files) of key -> value pairs.
+    {
+        NodeDesc set = Action("SaveGame.SetValue", "Set Save Value", "Save Game",
+                              {In("Slot", P::String), In("Key", P::String), In("Value", P::Float)}, [](ScriptContext& c) {
+                                  c.SaveSet(c.InString(2), c.InString(3), c.In(4), ValueParam(c.Param()));
+                              }, "Stores a value in the slot (in memory until Save Game)");
+        set.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{ExecIn(), ExecOut(), In("Slot", P::String), In("Key", P::String), In("Value", ValueParam(n.param))};
+        };
+        set.inference = ParamInference::PinType;
+        set.infers    = [](std::string_view pin) { return pin == "Value"; };
+        add(WithParam(WithDefaults(std::move(set), {{"Slot", std::string("Save1")}}), ParamKind::PinType, "Type", "float"));
+        NodeDesc get = Pure("SaveGame.GetValue", "Get Save Value", "Save Game", {}, [](ScriptContext& c) {
+            const PinType type  = ValueParam(c.Param());
+            const auto    value = c.SaveGet(c.InString(0), c.InString(1), type);
+            c.Out(2, value ? *value : DefaultValue(type));
+            c.Out(3, value.has_value());
+        }, "A value of the slot (loads the slot file the first time)");
+        get.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{In("Slot", P::String), In("Key", P::String), Out("Value", ValueParam(n.param)), Out("Found", P::Bool)};
+        };
+        get.inference = ParamInference::PinType;
+        get.infers    = [](std::string_view pin) { return pin == "Value"; };
+        add(WithParam(WithDefaults(std::move(get), {{"Slot", std::string("Save1")}}), ParamKind::PinType, "Type", "float"));
+        const auto slotAction = [&](const char* type, const char* title, std::function<bool(ScriptContext&, const std::string&)> run,
+                                    const char* tooltip) {
+            add(WithDefaults(Action(type, title, "Save Game", {In("Slot", P::String), Out("Success", P::Bool)},
+                                    [run](ScriptContext& c) { c.Out(3, run(c, c.InString(2))); }, tooltip),
+                             {{"Slot", std::string("Save1")}}));
+        };
+        slotAction("SaveGame.Save", "Save Game to Slot", [](ScriptContext& c, const std::string& slot) { return c.SaveWrite(slot); },
+                   "Writes the slot's values to its file");
+        slotAction("SaveGame.Load", "Load Game from Slot", [](ScriptContext& c, const std::string& slot) { return c.SaveRead(slot); },
+                   "Reads the slot's file (replacing values set since)");
+        slotAction("SaveGame.Delete", "Delete Save Slot", [](ScriptContext& c, const std::string& slot) { return c.SaveDelete(slot); },
+                   "Removes the slot's file and values");
+        add(Pure("SaveGame.ListSlots", "Get Save Slots", "Save Game", {Out("Slots", P::StringArray)},
+                 [](ScriptContext& c) {
+                     std::vector<ScriptValue> names;
+                     for (std::string& n : c.SaveSlots())
+                         names.emplace_back(std::move(n));
+                     c.Out(0, MakeArray(P::String, std::move(names)));
+                 }, "The slots that have a save file (load menus)"));
+        add(WithDefaults(Pure("SaveGame.Exists", "Does Save Slot Exist", "Save Game", {In("Slot", P::String), Out("Exists", P::Bool)},
+                              [](ScriptContext& c) { c.Out(1, c.SaveExists(c.InString(0))); }, "Is there a file for the slot?"),
+                         {{"Slot", std::string("Save1")}}));
+        const auto variables = [&](const char* type, const char* title, bool save, const char* tooltip) {
+            add(WithDefaults(Action(type, title, "Save Game", {In("Slot", P::String), In("Prefix", P::String), Out("Success", P::Bool)},
+                                    [save](ScriptContext& c) {
+                                        const std::string slot = c.InString(2), prefix = c.InString(3);
+                                        bool ok = save || c.SaveRead(slot);
+                                        for (const ScriptVariable& v : c.Graph().variables) {
+                                            ScriptValue* value = c.Variable(v.name); // entities: by UUID
+                                            if (!value)
+                                                continue;
+                                            if (save)
+                                                c.SaveSet(slot, prefix + v.name, *value, v.type);
+                                            else if (const auto stored = c.SaveGet(slot, prefix + v.name, v.type))
+                                                *value = *stored;
+                                        }
+                                        if (save)
+                                            ok = c.SaveWrite(slot);
+                                        c.Out(4, ok);
+                                    }, tooltip),
+                             {{"Slot", std::string("Save1")}}));
+        };
+        variables("SaveGame.SaveVariables", "Save Variables", true,
+                  "Stores all variables of this script (keys Prefix + name; entities by UUID) and writes the slot");
+        variables("SaveGame.LoadVariables", "Load Variables", false,
+                  "Reads the slot and sets this script's variables stored by Save Variables");
+    }
+
+    // Levels.
+    add(WithDefaults(Action("Game.OpenLevel", "Open Level", "Game", {In("Scene", P::String)},
+                            [](ScriptContext& c) { c.RequestLevel(c.InString(2), false); },
+                            "Loads a scene file (relative to the project) after this frame; scripts restart"),
+                     {{"Scene", std::string("Content/Scenes/Main.uscene")}}));
+    add(Action("Game.Quit", "Quit Game", "Game", {}, [](ScriptContext& c) { c.RequestLevel({}, true); },
+               "Ends the game after this frame (in the editor: stops playing)"));
+    add(Pure("Game.CurrentLevel", "Get Current Level", "Game", {Out("Scene", P::String)},
+             [](ScriptContext& c) { c.Out(0, c.CurrentLevel()); }, "The scene file being played"));
     return r;
 }
 
@@ -1337,10 +2159,14 @@ ScriptValue PinDefault(const ScriptNode& node, const NodeDesc* desc, const PinIn
 {
     if (const auto it = node.defaults.find(pin.name); it != node.defaults.end())
         return Convert(it->second, pin.type);
-    if (desc)
+    if (desc) {
         for (const auto& [name, value] : desc->defaults)
             if (name == pin.name)
                 return Convert(value, pin.type);
+        if (desc->pinDefault)
+            if (auto value = desc->pinDefault(node, pin))
+                return Convert(*value, pin.type);
+    }
     return DefaultValue(pin.type);
 }
 
@@ -1356,9 +2182,95 @@ const NodeDesc* FindScriptNodeType(std::string_view type)
     return it != index.end() ? it->second : nullptr;
 }
 
-std::span<const std::string> ElementTypeNames()
+std::vector<std::string> ElementTypeNames()
 {
-    static const std::vector<std::string> names{"bool", "int", "float", "vec3", "string", "entity"};
+    std::vector<std::string> names{"bool", "int", "float", "vec3", "string", "entity"};
+    for (const std::string& e : ScriptRegistry::EnumNames())
+        names.push_back("enum:" + e);
+    for (const std::string& s : ScriptRegistry::StructNames())
+        names.push_back("struct:" + s);
+    return names;
+}
+
+std::pair<std::string, int> SplitTypeAndCount(std::string_view param, int fallback)
+{
+    const std::size_t colon = param.rfind(':');
+    if (colon != std::string_view::npos && colon + 1 < param.size() &&
+        std::all_of(param.begin() + static_cast<std::ptrdiff_t>(colon + 1), param.end(),
+                    [](char ch) { return ch >= '0' && ch <= '9'; }))
+        return {std::string(param.substr(0, colon)), std::atoi(std::string(param.substr(colon + 1)).c_str())};
+    return {std::string(param), fallback};
+}
+
+bool QueryKey(const Input& input, std::string_view key, KeyQuery query)
+{
+    int mouse = -1;
+    if (key == "MouseLeft")
+        mouse = 0;
+    else if (key == "MouseRight")
+        mouse = 1;
+    else if (key == "MouseMiddle")
+        mouse = 2;
+    if (mouse >= 0)
+        return query == KeyQuery::Down ? input.IsMouseDown(mouse)
+               : query == KeyQuery::Pressed ? input.WasMousePressed(mouse) : input.WasMouseReleased(mouse);
+    const int code = KeyFromName(key);
+    if (code < 0)
+        return false;
+    return query == KeyQuery::Down ? input.IsKeyDown(code) : query == KeyQuery::Pressed ? input.WasKeyPressed(code) : input.WasKeyReleased(code);
+}
+
+float ScriptEase(std::string_view name, float t)
+{
+    t                  = std::clamp(t, 0.0f, 1.0f);
+    constexpr float pi = 3.14159265f;
+    const auto bounce  = [](float x) {
+        constexpr float n = 7.5625f, d = 2.75f;
+        const auto      arc = [&](float center, float base) { return n * (x - center / d) * (x - center / d) + base; };
+        if (x < 1.0f / d)
+            return n * x * x;
+        if (x < 2.0f / d)
+            return arc(1.5f, 0.75f);
+        if (x < 2.5f / d)
+            return arc(2.25f, 0.9375f);
+        return arc(2.625f, 0.984375f);
+    };
+    if (name == "Sine In")
+        return 1.0f - std::cos(t * pi / 2.0f);
+    if (name == "Sine Out")
+        return std::sin(t * pi / 2.0f);
+    if (name == "Sine In Out")
+        return -(std::cos(pi * t) - 1.0f) / 2.0f;
+    if (name == "Quad In")
+        return t * t;
+    if (name == "Quad Out")
+        return 1.0f - (1.0f - t) * (1.0f - t);
+    if (name == "Quad In Out")
+        return t < 0.5f ? 2.0f * t * t : 1.0f - std::pow(-2.0f * t + 2.0f, 2.0f) / 2.0f;
+    if (name == "Cubic In")
+        return t * t * t;
+    if (name == "Cubic Out")
+        return 1.0f - std::pow(1.0f - t, 3.0f);
+    if (name == "Cubic In Out")
+        return t < 0.5f ? 4.0f * t * t * t : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+    if (name == "Back Out") {
+        constexpr float c1 = 1.70158f, c3 = c1 + 1.0f;
+        return 1.0f + c3 * std::pow(t - 1.0f, 3.0f) + c1 * std::pow(t - 1.0f, 2.0f);
+    }
+    if (name == "Elastic Out")
+        return t <= 0.0f || t >= 1.0f ? t : std::pow(2.0f, -10.0f * t) * std::sin((t * 10.0f - 0.75f) * (2.0f * pi / 3.0f)) + 1.0f;
+    if (name == "Bounce Out")
+        return bounce(t);
+    if (name == "Smooth Step")
+        return t * t * (3.0f - 2.0f * t);
+    return t; // Linear
+}
+
+std::span<const std::string> ScriptEaseNames()
+{
+    static const std::vector<std::string> names{"Linear",   "Sine In",      "Sine Out",  "Sine In Out", "Quad In",
+                                                "Quad Out", "Quad In Out",  "Cubic In",  "Cubic Out",   "Cubic In Out",
+                                                "Back Out", "Elastic Out",  "Bounce Out", "Smooth Step"};
     return names;
 }
 

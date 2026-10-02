@@ -120,6 +120,16 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
             s.audio.occlusionStrength = std::clamp(a->value("occlusionStrength", s.audio.occlusionStrength), 0.0f, 1.0f);
             s.audio.occlusionRays     = std::min(a->value("occlusionRays", s.audio.occlusionRays), 4096u);
         }
+        if (const auto in = root->find("input"); in != root->end() && in->is_object()) {
+            for (const json& a : in->value("actions", json::array()))
+                s.input.actions.push_back({a.at("name").get<std::string>(), a.value("keys", std::vector<std::string>{})});
+            for (const json& a : in->value("axes", json::array())) {
+                InputAxisBinding axis{a.at("name").get<std::string>(), {}};
+                for (const json& k : a.value("keys", json::array()))
+                    axis.keys.push_back({k.at("key").get<std::string>(), k.value("scale", 1.0f)});
+                s.input.axes.push_back(std::move(axis));
+            }
+        }
         return project;
     } catch (const json::exception& e) {
         SetError(error, "'" + PathToUtf8(file) + "': " + e.what());
@@ -132,6 +142,15 @@ bool Project::Save(std::string* error) const
     json buses = json::object();
     for (std::size_t i = 0; i < kAudioBusCount; ++i)
         buses[ToString(static_cast<AudioBus>(i))] = {{"volume", settings.audio.volume[i]}, {"muted", settings.audio.muted[i]}};
+    json actions = json::array(), axes = json::array();
+    for (const InputActionBinding& a : settings.input.actions)
+        actions.push_back({{"name", a.name}, {"keys", a.keys}});
+    for (const InputAxisBinding& a : settings.input.axes) {
+        json keys = json::array();
+        for (const InputAxisKey& k : a.keys)
+            keys.push_back({{"key", k.key}, {"scale", k.scale}});
+        axes.push_back({{"name", a.name}, {"keys", std::move(keys)}});
+    }
     const json root{{"version", kProjectVersion},
                     {"engine", "Ungine"},
                     {"name", settings.name},
@@ -145,7 +164,8 @@ bool Project::Save(std::string* error) const
                      {{"buses", std::move(buses)},
                       {"occlusion", settings.audio.occlusion},
                       {"occlusionStrength", settings.audio.occlusionStrength},
-                      {"occlusionRays", settings.audio.occlusionRays}}}};
+                      {"occlusionRays", settings.audio.occlusionRays}}},
+                    {"input", {{"actions", std::move(actions)}, {"axes", std::move(axes)}}}};
     return WriteText(m_File, root.dump(2), error);
 }
 
