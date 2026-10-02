@@ -51,6 +51,20 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    (Master/World/Music/UI/Ambient) und Occlusion: Renderer-Panel → *Audio* (im Projekt gespeichert).
    Blueprints: Kategorie *Audio* (Play Sound 2D, Play Sound at Location, Play/Stop Audio Source, …;
    Pfade relativ zum Projektordner, z. B. `Content/Sounds/impact.wav`).
+9. **Blueprints für Fortgeschrittene**: links *Graphs* → *+ Function* (Ein-/Ausgänge, lokale
+   Variablen, *Pure*); Aufruf über die Knotensuche (*Call …*). Variablen können Arrays sein
+   (*For Each Loop*, *Add*, *Find*, …); das Häkchen neben einer Variable macht sie
+   *instance editable* (Wert pro Entity im Inspector, auch Verweise auf andere Entities).
+   **Debugger**: F9 setzt einen Breakpoint (roter Punkt); im Play-Modus hält das Spiel dort an,
+   F5 läuft weiter, F10 geht einen Knoten weiter, Werte stehen im *Debug*-Bereich und im
+   Pin-Tooltip. Komfort: Doppelklick auf eine Verbindung = Reroute-Knoten, Shift+W/A/S/D richtet
+   aus, M blendet die Minimap um, C setzt einen Kommentar um die Auswahl (Farben im Details-Panel).
+10. **Prefabs** (Blueprint-Klassen): Hierarchy → Rechtsklick → *Create prefab…* speichert den
+   Teilbaum als `.uprefab` (z. B. `Content/Prefabs/`). Prefabs per Doppelklick oder Ziehen aus dem
+   Content-Browser platzieren; Änderungen an einer Instanz sind *Overrides* (Inspector: einzeln
+   zurücksetzen), *Apply to prefab* überträgt sie auf alle Instanzen, *Unlink* löst die Verbindung.
+   Blueprints erzeugen Prefabs zur Laufzeit mit *Spawn Prefab*. *Print String* erscheint im Player
+   oben links auf dem Bildschirm.
 
 ## Entwicklung
 

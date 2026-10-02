@@ -11,6 +11,7 @@
 #include "Engine/Events/Events.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -51,6 +52,7 @@ protected:
     void OnInit() override
     {
         m_SceneRenderer = std::make_unique<SceneRenderer>(GetRenderer(), GetContext(), GetAssets());
+        m_Text          = std::make_unique<TextOverlay>(GetRenderer());
         m_Physics       = std::make_unique<PhysicsWorld>(GetJobs(), GetEvents(), &GetAssets());
         m_Audio         = std::make_unique<AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
         m_Audio->Apply(m_Project.settings.audio);
@@ -83,6 +85,8 @@ protected:
     {
         if (m_Failed)
             return;
+        // Mouse / camera nodes work in window coordinates of the whole window.
+        m_Scripts->SetViewport({.origin = glm::vec2(0.0f), .size = GetWindow().WindowSize()});
         m_Scripts->Update(m_Scene, static_cast<float>(dt));
         m_Scene.UpdateTransforms();
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
@@ -104,6 +108,23 @@ protected:
             camera = CameraFromWorld(m_Scene.GetRegistry().Get<WorldTransform>(e).matrix, cam.fovY, cam.nearPlane, aspect);
         }
         m_SceneRenderer->Render(frame, m_Scene, camera);
+        DrawPrints(frame);
+    }
+
+    // Print String output, newest first, top left (scaled with the display's pixel density).
+    void DrawPrints(const FrameContext& frame)
+    {
+        const glm::vec2 window = GetWindow().WindowSize();
+        const float     dpi    = window.x > 0.0f ? static_cast<float>(frame.extent.width) / window.x : 1.0f;
+        const float     scale  = 2.0f * dpi;
+        float           y      = 8.0f * dpi;
+        const auto      prints = m_Scripts->Messages();
+        for (auto it = prints.rbegin(); it != prints.rend() && y < static_cast<float>(frame.extent.height); ++it) {
+            m_Text->Add(it->text, {8.0f * dpi, y}, it->error ? glm::vec4(1.0f, 0.45f, 0.4f, 1.0f) : glm::vec4(0.35f, 0.8f, 1.0f, 1.0f),
+                        scale);
+            y += TextOverlay::Measure(it->text, scale).y + 4.0f * dpi;
+        }
+        m_Text->Render(frame);
     }
 
     void OnShutdown() override
@@ -130,6 +151,7 @@ private:
     FlyCamera                      m_FallbackCamera;
     std::vector<ModelHandle>       m_Models;
     std::unique_ptr<SceneRenderer> m_SceneRenderer;
+    std::unique_ptr<TextOverlay>   m_Text;
     std::unique_ptr<PhysicsWorld>  m_Physics;
     std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;

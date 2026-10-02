@@ -23,6 +23,7 @@ add_library(Engine STATIC
     src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
+    src/Renderer/TextOverlay.cpp
     src/Renderer/ShaderReload.cpp
     src/Renderer/ShadowAtlas.cpp
     src/Renderer/ShadowCascades.cpp
@@ -40,10 +41,12 @@ add_library(Engine STATIC
     src/Scene/AabbTree.cpp
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/Prefab.cpp
     src/Scene/SpatialIndex.cpp
     src/Physics/PhysicsWorld.cpp
     src/Script/ScriptGraph.cpp
     src/Script/ScriptNodes.cpp
+    src/Script/ScriptValue.cpp
     src/Script/ScriptSystem.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 
@@ -120,4 +123,6 @@ engine_add_shaders(Engine SOURCES
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag
+    shaders/text.frag
+    shaders/text.vert
     shaders/tonemap.frag)

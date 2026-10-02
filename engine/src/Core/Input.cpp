@@ -27,6 +27,7 @@ Input::Input(EventBus& events)
             m_ButtonsPressed.set(static_cast<std::size_t>(e.button));
         } else if (e.action == InputAction::Release) {
             m_Buttons.reset(static_cast<std::size_t>(e.button));
+            m_ButtonsReleased.set(static_cast<std::size_t>(e.button));
         }
     });
     m_MoveSub = events.Subscribe<MouseMoveEvent>([this](const MouseMoveEvent& e) {
@@ -52,6 +53,7 @@ void Input::NewFrame()
     m_KeysPressed.reset();
     m_KeysReleased.reset();
     m_ButtonsPressed.reset();
+    m_ButtonsReleased.reset();
     m_MouseDelta = glm::vec2{0.0f};
     m_Scroll     = 0.0f;
 }
@@ -72,6 +74,10 @@ bool Input::IsMouseDown(int b) const
 bool Input::WasMousePressed(int b) const
 {
     return InRange(b, MouseButton::Last) && m_ButtonsPressed.test(static_cast<std::size_t>(b));
+}
+bool Input::WasMouseReleased(int b) const
+{
+    return InRange(b, MouseButton::Last) && m_ButtonsReleased.test(static_cast<std::size_t>(b));
 }
 
 } // namespace Engine

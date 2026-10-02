@@ -1,6 +1,7 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Audio/AudioTypes.h"
+#include "Engine/Script/ScriptValue.h"
 #include "Engine/ECS/Entity.h"
 
 #include <glm/glm.hpp>
@@ -10,7 +11,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Engine {
@@ -137,10 +141,30 @@ struct CameraComponent {
 // Visual script (.ugraph, see Script/ScriptGraph.h) run by ScriptSystem while playing. graph: file
 // path (absolute or relative to the working directory at runtime; scene files store it relative
 // to the scene file).
+struct ScriptVariableOverride {
+    ScriptValue   value = 0.0f;
+    std::uint64_t entityUuid = 0; // entity variables: the referenced entity (0: none)
+
+    bool operator==(const ScriptVariableOverride& o) const { return entityUuid == o.entityUuid && ValuesEqual(value, o.value); }
+};
+
 struct ScriptComponent {
+    ScriptComponent() = default;
+    ScriptComponent(std::string graphFile) : graph(std::move(graphFile)) {} // NOLINT(google-explicit-constructor)
+
     std::string graph;
+    // Values of the graph's exposed ("instance editable") variables for this entity, by name.
+    std::map<std::string, ScriptVariableOverride> variables;
 
     bool operator==(const ScriptComponent&) const = default;
+};
+
+// Free-form labels (Blueprint nodes find entities by tag).
+struct Tags {
+    std::vector<std::string> values;
+
+    [[nodiscard]] bool Has(std::string_view tag) const { return std::ranges::find(values, tag) != values.end(); }
+    bool operator==(const Tags&) const = default;
 };
 
 // Sound emitter played by AudioSystem while playing (play mode, player). sound: file path like
@@ -192,5 +216,31 @@ inline constexpr float kLightCutoffIlluminance = 0.005f;
     const float peak = light.intensity * std::max({light.color.r, light.color.g, light.color.b});
     return std::sqrt(std::max(peak, 0.0f) / kLightCutoffIlluminance);
 }
+
+struct PrefabAsset; // parsed prefab file (Prefab.cpp)
+
+// Root of a prefab instance (see Prefab.h). prefab: the .uprefab file (absolute; scene files
+// store it relative like ScriptComponent::graph).
+struct PrefabInstance {
+    PrefabInstance() = default;
+    explicit PrefabInstance(std::string file) : prefab(std::move(file)) {}
+
+    std::string prefab;
+    // Runtime only: the prefab content the instance was built from (overrides are computed
+    // against it), and the scene-file data of an instance whose prefab could not be read
+    // (written back unchanged when the scene is saved).
+    std::shared_ptr<const PrefabAsset> built;
+    std::shared_ptr<const std::string> unresolved;
+
+    bool operator==(const PrefabInstance& o) const { return prefab == o.prefab; }
+};
+
+// Member of a prefab instance: the instance root's UUID and the entity's UUID in the prefab file.
+struct PrefabLink {
+    std::uint64_t instance = 0;
+    std::uint64_t source   = 0;
+
+    bool operator==(const PrefabLink&) const = default;
+};
 
 } // namespace Engine

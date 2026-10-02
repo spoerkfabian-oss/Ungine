@@ -15,7 +15,9 @@
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
@@ -1895,4 +1897,191 @@ TEST_CASE(Audio_SoundAssetsAndEditorPlay)
     runFrames(2);
     CHECK(!audio.Previewing());
     fs::remove_all(dir, ec);
+}
+
+TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_p19_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts});
+    camera.position = {0.0f, 3.0f, 10.0f};
+    TextOverlay text(*F().renderer);
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                text.Add("Overlay text\nsecond line", {4.0f, 4.0f}, glm::vec4(1.0f, 0.8f, 0.2f, 1.0f), 1.0f);
+                text.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+
+    // --- Blueprint: a function, an exposed variable, a breakpoint --------------------------------
+    const fs::path     file = dir / "Counter.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Graph());
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, begin = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes) {
+        if (n.type == "Debug.Print")
+            print = n.id;
+        if (n.type == "Event.BeginPlay")
+            begin = n.id;
+    }
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        g.variables.push_back({"Count", PinType::Int, std::int32_t{0}});
+        g.variables.push_back({"Speed", PinType::Float, 1.0f, true});
+        CHECK(g.AddFunction("Bump", {0.0f, 0.0f}));
+        std::uint32_t entry = 0, ret = 0;
+        for (const ScriptNode& n : g.nodes) {
+            if (n.type == "Function.Entry" && n.function == "Bump")
+                entry = n.id;
+            if (n.type == "Function.Return" && n.function == "Bump")
+                ret = n.id;
+        }
+        g.FindFunction("Bump")->inputs.push_back({"Amount", PinType::Int});
+        g.FunctionSignatureChanged("Bump");
+        const std::uint32_t get = g.AddNode("Variable.Get", {100.0f, 150.0f}, "Count", "Bump");
+        const std::uint32_t add = g.AddNode("Math.AddInt", {250.0f, 150.0f}, {}, "Bump");
+        const std::uint32_t set = g.AddNode("Variable.Set", {400.0f, 0.0f}, "Count", "Bump");
+        CHECK(g.Connect(entry, "Then", set, "In").empty());
+        CHECK(g.Connect(set, "Then", ret, "In").empty());
+        CHECK(g.Connect(get, "Value", add, "A").empty());
+        CHECK(g.Connect(entry, "Amount", add, "B").empty());
+        CHECK(g.Connect(add, "Result", set, "Value").empty());
+        const std::uint32_t call  = g.AddNode("Function.Call", {200.0f, 0.0f}, "Bump");
+        const std::uint32_t count = g.AddNode("Variable.Get", {200.0f, 120.0f}, "Count");
+        g.FindNode(call)->defaults["Amount"] = std::int32_t{5};
+        CHECK(g.Connect(begin, "Out", call, "In").empty());
+        CHECK(g.Connect(call, "Then", print, "In").empty());
+        CHECK(g.Connect(count, "Value", print, "Text").empty());
+        g.FindNode(print)->defaults["Duration"] = 100.0f;
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    bp.OpenScope("Bump");
+    CHECK(bp.Scope() && *bp.Scope() == "Bump");
+    bp.Focus();
+    runFrames(3); // function scope on the canvas, signature + locals in the sidebar, minimap
+    bp.OpenScope({});
+    bp.Select({print});
+    bp.ToggleBreakpoints();
+    CHECK(bp.Graph()->HasBreakpoint(print));
+    std::uint32_t a = 0, b = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes)
+        if (n.function.empty() && n.type == "Variable.Get")
+            a = n.id;
+    b = begin;
+    bp.Select({a, b});
+    bp.AlignSelection(ScriptGraphEditor::Align::Left);
+    CHECK(bp.Graph()->FindNode(a)->position.x == bp.Graph()->FindNode(b)->position.x);
+    CHECK(bp.Save());
+
+    const Entity actor = scene.CreateEntity("Counter");
+    ScriptComponent component{file.string()};
+    component.variables["Speed"] = {2.5f, 0};
+    r.Emplace<ScriptComponent>(actor, component);
+    editor.Select(actor); // inspector: exposed variables
+    runFrames(2);
+
+    // Play: the breakpoint stops before Print with Count = 5; the graph opens there.
+    editor.Play();
+    runFrames(4);
+    CHECK(scripts.DebugPaused() && scripts.PausedAt() && scripts.PausedAt()->node == print);
+    const Entity running = actor;
+    const auto   watch   = scripts.Watch(file, running);
+    CHECK(watch && std::ranges::any_of(watch->variables, [](const auto& v) {
+              return v.first == "Count" && ValuesEqual(v.second, std::int32_t{5});
+          }));
+    CHECK(watch && std::ranges::any_of(watch->variables, [](const auto& v) {
+              return v.first == "Speed" && ValuesEqual(v.second, 2.5f);
+          }));
+    CHECK(bp.Scope() && bp.Scope()->empty() && bp.SelectedNodes().size() == 1 && bp.SelectedNodes()[0] == print);
+    scripts.DebugContinue(scene);
+    runFrames(2);
+    CHECK(!scripts.DebugPaused() && std::ranges::any_of(scripts.Messages(), [](const ScriptMessage& m) { return m.text == "5"; }));
+    editor.Stop();
+    runFrames(1);
+
+    // --- Prefabs with meshes: create, place, override, revert, apply (+ undo), scene file ---------
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    modelRefs.push_back(box);
+    const Entity crate = scene.CreateEntity("Crate");
+    r.Emplace<MeshRenderer>(crate, MeshRenderer{.model = box, .meshIndex = 0});
+    const Entity lamp = scene.CreateEntity("Lamp", crate);
+    scene.EditTransform(lamp).position = {0.0f, 1.0f, 0.0f};
+    r.Emplace<Light>(lamp, Light{.intensity = 3.0f, .range = 4.0f});
+    const fs::path prefabFile = dir / "Prefabs" / "Crate.uprefab";
+    const std::uint64_t crateUuid = r.Get<Uuid>(crate).value, lampUuid = r.Get<Uuid>(lamp).value;
+    CHECK(editor.CreatePrefabFrom(crate, prefabFile) && r.Has<PrefabInstance>(crate) && r.Has<PrefabLink>(lamp));
+    const Entity crate2 = editor.PlacePrefab(prefabFile, {3.0f, 0.0f, 0.0f});
+    CHECK(crate2 != NullEntity && r.Has<MeshRenderer>(crate2) && r.Get<MeshRenderer>(crate2).model == box);
+    const Entity        lamp2     = r.Get<Hierarchy>(crate2).children.at(0);
+    const std::uint64_t lamp2Uuid = r.Get<Uuid>(lamp2).value; // handles change when undo restores subtrees
+    editor.Select(crate2);
+    runFrames(2); // inspector prefab header, hierarchy tint
+
+    r.Get<Light>(lamp2).intensity = 9.0f;
+    CHECK(PrefabOverriddenKeys(scene, F().assets.get(), lamp2) == std::vector<std::string>{"light"});
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Revert, lamp2, "light"));
+    const Entity lamp2b = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2b != NullEntity && r.Get<Light>(lamp2b).intensity == 3.0f);
+    CHECK(editor.Undo()); // back to the override (subtree restored)
+    const Entity lamp2c = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2c != NullEntity && r.Get<Light>(lamp2c).intensity == 9.0f);
+
+    r.Get<Light>(scene.FindByUuid(lampUuid)).color = {0.0f, 1.0f, 0.0f};
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Apply, scene.FindByUuid(crateUuid)));
+    const Entity lamp2d = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2d != NullEntity && r.Get<Light>(lamp2d).color == glm::vec3(0.0f, 1.0f, 0.0f) && r.Get<Light>(lamp2d).intensity == 9.0f);
+    runFrames(3);
+
+    const fs::path sceneFile = dir / "Prefabs.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    editor.NewScene();
+    CHECK(editor.OpenScene(sceneFile));
+    runFrames(6);
+    int instances = 0, meshes = 0;
+    r.ViewOf<PrefabInstance>().Each([&](Entity, PrefabInstance&) { ++instances; });
+    r.ViewOf<MeshRenderer>().Each([&](Entity, MeshRenderer& m) { meshes += F().assets->State(m.model) == AssetState::Ready ? 1 : 0; });
+    CHECK(instances == 2 && meshes == 2);
+    CHECK(sceneRenderer.Stats().gpuDriven ? sceneRenderer.Stats().instances >= 2 : true);
+    Entity loadedLamp = NullEntity;
+    r.ViewOf<Light>().Each([&](Entity e, Light& l) {
+        if (l.intensity == 9.0f)
+            loadedLamp = e;
+    });
+    CHECK(loadedLamp != NullEntity && r.Get<Light>(loadedLamp).color == glm::vec3(0.0f, 1.0f, 0.0f));
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Unlink, loadedLamp) && PrefabInstanceRoot(scene, loadedLamp) == NullEntity);
+    runFrames(2);
+
+    editor.NewScene();
+    bp.Close(0);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

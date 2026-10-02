@@ -556,8 +556,8 @@ private:
             std::error_code             ec;
             const std::filesystem::path graph = std::filesystem::absolute(m_StartScript, ec);
             registry.Emplace<Engine::ScriptComponent>(root, Engine::ScriptComponent{graph.string()});
-            if (m_Editor) // ready to edit in the Blueprint tab
-                (void)m_Editor->Blueprints().Open(graph);
+            if (m_Editor && m_Editor->Blueprints().Open(graph)) // ready to edit in the Blueprint tab
+                m_Editor->Blueprints().Focus();
         }
         if (m_Editor)
             m_Editor->Select(root);

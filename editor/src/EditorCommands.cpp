@@ -14,6 +14,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 
@@ -221,8 +222,114 @@ void Editor::Reparent(Entity child, Entity parent)
     PushCommand({"Reparent", [apply, before] { apply(before); }, [apply, after] { apply(after); }});
 }
 
+// --- Prefabs ------------------------------------------------------------------------------------
+
+std::vector<Entity> Editor::OutermostRoots(const std::vector<std::uint64_t>& uuids) const
+{
+    std::vector<Entity> entities;
+    for (std::uint64_t uuid : uuids)
+        if (const Entity e = m_Ctx.scene.FindByUuid(uuid); e != NullEntity && std::ranges::find(entities, e) == entities.end())
+            entities.push_back(e);
+    std::vector<Entity> roots; // SnapshotEntities: none may lie below another
+    for (Entity e : entities)
+        if (std::ranges::none_of(entities, [&](Entity other) { return other != e && m_Ctx.scene.IsAncestor(other, e); }))
+            roots.push_back(e);
+    return roots;
+}
+
+void Editor::PushSubtreesChange(std::string label, const std::vector<std::uint64_t>& uuids, std::string before)
+{
+    std::vector<std::uint64_t> rootUuids;
+    for (Entity e : OutermostRoots(uuids))
+        rootUuids.push_back(UuidOf(e));
+    std::string after = SnapshotEntities(m_Ctx.scene, OutermostRoots(uuids));
+    const auto  swap  = [this, rootUuids](const std::string& snapshot) {
+        DestroyByUuids(rootUuids);
+        (void)RestoreEntities(m_Ctx.scene, snapshot, RestoreMode::Original);
+        ValidateSelection();
+    };
+    PushCommand({std::move(label), [swap, before = std::move(before)] { swap(before); },
+                 [swap, after = std::move(after)] { swap(after); }});
+}
+
+bool Editor::CreatePrefabFrom(Entity root, const std::filesystem::path& file)
+{
+    if (!m_Ctx.scene.GetRegistry().Valid(root))
+        return false;
+    const std::vector<std::uint64_t> uuids{UuidOf(root)};
+    std::string                      before = SnapshotEntities(m_Ctx.scene, OutermostRoots(uuids));
+    try {
+        CreatePrefab(file, m_Ctx.scene, &m_Ctx.assets, root);
+    } catch (const std::exception& e) {
+        m_Status = e.what();
+        ENGINE_ERROR("{}", m_Status);
+        return false;
+    }
+    PushSubtreesChange("Create prefab", uuids, std::move(before));
+    m_Status = "Prefab " + PathToUtf8(file.filename());
+    RefreshContent();
+    return true;
+}
+
+Entity Editor::PlacePrefab(const std::filesystem::path& file, const glm::vec3& position)
+{
+    Transform t;
+    t.position = position;
+    Entity e   = NullEntity;
+    try {
+        e = InstantiatePrefab(m_Ctx.scene, &m_Ctx.assets, file, NullEntity, t, m_Ctx.modelRefs);
+    } catch (const std::exception& ex) {
+        m_Status = ex.what();
+        ENGINE_ERROR("{}", m_Status);
+        return NullEntity;
+    }
+    const Entity roots[] = {e};
+    PushCreated("Place " + PathToUtf8(file.stem()), roots);
+    Select(e);
+    m_Ctx.scene.UpdateTransforms();
+    m_Status = "Placed " + PathToUtf8(file.filename());
+    return e;
+}
+
+bool Editor::RunPrefabOp(PrefabOp op, Entity entity, const std::string& key)
+{
+    const Entity root = PrefabInstanceRoot(m_Ctx.scene, entity);
+    if (root == NullEntity)
+        return false;
+    Registry&                  registry = m_Ctx.scene.GetRegistry();
+    std::vector<std::uint64_t> affected{UuidOf(root)};
+    if (op == PrefabOp::Apply) { // every instance of the prefab is rebuilt
+        const std::string file = registry.Get<PrefabInstance>(root).prefab;
+        registry.ViewOf<PrefabInstance>().Each([&](Entity e, PrefabInstance& instance) {
+            if (e != root && instance.prefab == file)
+                affected.push_back(UuidOf(e));
+        });
+    }
+    std::string before = SnapshotEntities(m_Ctx.scene, OutermostRoots(affected));
+    const char* label  = op == PrefabOp::Apply ? "Apply to prefab" : op == PrefabOp::Revert ? "Revert to prefab" : "Unlink prefab";
+    try {
+        switch (op) {
+        case PrefabOp::Apply: ApplyPrefabInstance(m_Ctx.scene, &m_Ctx.assets, root, m_Ctx.modelRefs); break;
+        case PrefabOp::Revert: RevertPrefabOverrides(m_Ctx.scene, &m_Ctx.assets, entity, key, m_Ctx.modelRefs); break;
+        case PrefabOp::Unlink: UnlinkPrefabInstance(m_Ctx.scene, root); break;
+        }
+    } catch (const std::exception& e) {
+        m_Status = e.what();
+        ENGINE_ERROR("{}", m_Status);
+        return false;
+    }
+    PushSubtreesChange(label, affected, std::move(before));
+    ValidateSelection();
+    m_Ctx.scene.UpdateTransforms();
+    m_Status = label;
+    return true;
+}
+
 void Editor::ApplyPendingEdits()
 {
+    if (const auto op = std::exchange(m_PendingPrefabOp, std::nullopt))
+        if (const Entity e = m_Ctx.scene.FindByUuid(op->uuid); e != NullEntity)
+            RunPrefabOp(op->op, e, op->key);
     if (!m_PendingDelete.empty()) {
         m_Selection = std::exchange(m_PendingDelete, {});
         ValidateSelection();
@@ -344,6 +451,13 @@ void Editor::DrawDialogs()
             if (m_Ctx.project)
                 PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
             break;
+        case DialogPurpose::CreatePrefab: {
+            std::filesystem::path file = *path;
+            if (file.extension() != kPrefabExtension)
+                file += kPrefabExtension;
+            CreatePrefabFrom(m_PrefabTarget, file);
+            break;
+        }
         case DialogPurpose::OpenScene: OpenScene(*path); break;
         case DialogPurpose::SaveScene: SaveScene(*path); break;
         case DialogPurpose::LoadModel: {
@@ -538,6 +652,8 @@ void Editor::FixedUpdate(float dt)
 {
     if (!m_Ctx.physics)
         return; // scripts tick per frame (Update)
+    if (m_Ctx.scripts && m_Ctx.scripts->DebugPaused())
+        return; // stopped at a breakpoint: the world waits too
     if (m_PlayState == PlayState::Playing || (m_PlayState == PlayState::Paused && m_StepRequested)) {
         m_Ctx.physics->Step(m_Ctx.scene, dt);
         m_StepRequested = false;

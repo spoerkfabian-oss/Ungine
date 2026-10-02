@@ -4,6 +4,7 @@
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
 #include "Engine/Scene/Frustum.h"
+#include "Engine/Script/ScriptGraph.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -35,6 +37,7 @@ class SceneRenderer;
 class ScriptGraphEditor;
 class ScriptSystem;
 class Window;
+struct ScriptComponent;
 enum class LightType : std::uint8_t;
 enum class PrimitiveShape : std::uint8_t;
 struct EditCommand;
@@ -136,6 +139,14 @@ public:
     bool SaveScene(const std::filesystem::path& file);
     [[nodiscard]] const std::filesystem::path& ScenePath() const { return m_ScenePath; }
 
+    // Prefabs (undoable; writing a prefab file is not undone). Errors go to the status line.
+    bool   CreatePrefabFrom(Entity root, const std::filesystem::path& file); // the subtree becomes an instance
+    Entity PlacePrefab(const std::filesystem::path& file, const glm::vec3& position);
+    enum class PrefabOp { Apply, Revert, Unlink };
+    // Apply / Unlink: the instance of `entity`; Revert: `key` of `entity` (empty: all of it, or the
+    // whole instance for its root).
+    bool RunPrefabOp(PrefabOp op, Entity entity, const std::string& key = {});
+
 private:
     enum class GizmoOperation { Translate, Rotate, Scale };
     struct StateEdit {
@@ -173,6 +184,13 @@ private:
     [[nodiscard]] std::uint64_t TexturePreview(TextureHandle handle); // ImTextureID, 0: none
     void ReleaseTexturePreviews(bool all); // all: shutdown; else those not shown this frame / outdated
     void DrawDialogs();
+    void DrawPrefabHeader(Entity entity);         // inspector: prefab of the entity, overrides, actions
+    void DrawScriptVariables(ScriptComponent& script); // inspector: exposed variables of the graph
+    // The graph of a script file: the open editor document (unsaved edits) or the file (cached by mtime).
+    [[nodiscard]] const ScriptGraph* GraphFor(const std::string& file);
+    // Instance roots `uuids` (whole subtrees) were rebuilt: undo restores `before`.
+    void PushSubtreesChange(std::string label, const std::vector<std::uint64_t>& uuids, std::string before);
+    [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
     void DrawContentBrowser();
     void DrawProjectSettings();
     void RefreshContent();
@@ -234,6 +252,16 @@ private:
 
     std::vector<Entity> m_Selection;
     std::vector<Entity> m_PendingDelete;              // hierarchy context menu
+    struct PendingPrefabOp {
+        PrefabOp      op;
+        std::uint64_t uuid = 0;
+        std::string   key;
+    };
+    std::optional<PendingPrefabOp> m_PendingPrefabOp; // after the panels (they read the entities)
+    double                         m_PrefabPollTime = 0.0; // last RefreshPrefabInstances (ImGui time)
+    std::string                    m_NewTag;               // inspector: tag being typed
+    std::map<std::string, std::pair<std::filesystem::file_time_type, ScriptGraph>> m_GraphCache;
+    bool m_DebugPauseAudio = false; // audio paused because the script debugger stopped
     bool                m_PendingDuplicate = false;   // hierarchy context menu
     Entity              m_ReparentChild = NullEntity; // drag & drop in the hierarchy
     Entity              m_ReparentTo    = NullEntity; // NullEntity: make it a root
@@ -274,7 +302,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Model, Texture, Sound, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -295,7 +323,8 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab } m_DialogPurpose = DialogPurpose::None;
+    Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";

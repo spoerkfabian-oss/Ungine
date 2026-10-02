@@ -13,6 +13,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptSystem.h"
@@ -25,6 +26,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include <algorithm>
+#include <format>
 #include <utility>
 
 namespace Engine {
@@ -116,8 +118,10 @@ void Editor::Update(float dt)
         BuildDefaultLayout(dockspace); // first run (no editor.ini yet)
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport());
 
+    if (m_Ctx.scripts && m_Ctx.scripts->DebugPaused())
+        m_ShowBlueprint = true; // a breakpoint hit: the graph editor shows where (and syncs breakpoints)
     if (m_ShowBlueprint) // before the viewport: new dock tabs are selected in submission order
-        m_Graphs->Draw(&m_ShowBlueprint, m_Ctx.scripts);
+        m_Graphs->Draw(&m_ShowBlueprint, m_Ctx.scripts, &m_Ctx.scene);
     DrawViewport();
     if (m_ShowHierarchy)
         DrawHierarchy();
@@ -140,7 +144,20 @@ void Editor::Update(float dt)
     HandleHotkeys();
     ApplyPendingEdits();
     UpdatePendingInstances();
+    // Prefab files changed on disk (another editor, version control): instances follow.
+    if (m_PlayState == PlayState::Edit && ImGui::GetTime() - m_PrefabPollTime > 1.0) {
+        m_PrefabPollTime = ImGui::GetTime();
+        if (const std::size_t updated = RefreshPrefabInstances(m_Ctx.scene, &m_Ctx.assets, m_Ctx.modelRefs))
+            m_Status = std::format("Updated {} prefab instance(s)", updated);
+    }
     ValidateSelection();
+
+    // Script debugger stopped: sound waits with the world (physics skips its steps).
+    const bool debugPaused = m_Ctx.scripts && m_PlayState == PlayState::Playing && m_Ctx.scripts->DebugPaused();
+    if (m_Ctx.audio && debugPaused != m_DebugPauseAudio) {
+        m_Ctx.audio->SetPaused(debugPaused);
+        m_DebugPauseAudio = debugPaused;
+    }
 
     // Scripts tick with the frame while playing; they see the keyboard when the viewport has it.
     if (m_Ctx.scripts && m_PlayState == PlayState::Playing)
@@ -162,8 +179,9 @@ void Editor::Update(float dt)
 void Editor::Render(const FrameContext& frame, float physicsAlpha)
 {
     // Paused: the fixed tick keeps running without steps, so show the last step as it is.
+    const bool running = m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused());
     if (m_Ctx.physics && m_PlayState != PlayState::Edit)
-        m_Ctx.physics->Interpolate(m_Ctx.scene, m_PlayState == PlayState::Playing ? physicsAlpha : 1.0f);
+        m_Ctx.physics->Interpolate(m_Ctx.scene, running ? physicsAlpha : 1.0f);
 
     const VkCommandBuffer cmd = frame.cmd;
     if (m_ViewportImage && m_ViewportVisible) {
@@ -368,6 +386,11 @@ void Editor::DrawViewport()
     EnsureViewportTarget(width, height);
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
+    if (m_Ctx.scripts) { // mouse / camera nodes: the viewport in window coordinates
+        const ImVec2 window = ImGui::GetMainViewport()->Pos;
+        m_Ctx.scripts->SetViewport({.origin = glm::vec2(origin.x - window.x, origin.y - window.y),
+                                    .size   = glm::vec2(static_cast<float>(width), static_cast<float>(height))});
+    }
     ImGui::Image(ImTextureRef(m_ViewportTexture), ImVec2(static_cast<float>(width), static_cast<float>(height)));
     // Content browser drops: models are placed where the cursor points, blueprints go to the selection.
     if (ImGui::BeginDragDropTarget()) {
@@ -379,6 +402,22 @@ void Editor::DrawViewport()
                     AssignScript(Selected(), file);
                 else
                     m_Status = "Select an entity to give it the script";
+            } else if (ext == kPrefabExtension) { // an instance on the surface under the cursor
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                    target = cam.position + dir * hit->distance;
+                else if (dir.y < -1e-3f)
+                    target = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
+                if (m_PlayState == PlayState::Edit)
+                    PlacePrefab(file, target);
+                else
+                    m_Status = "Stop playing to place prefabs";
             } else if (IsSoundFile(file)) { // a new audio source where the cursor points
                 const ImVec2     mouse = ImGui::GetIO().MousePos;
                 const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
@@ -434,11 +473,17 @@ void Editor::DrawViewport()
             y += ImGui::GetTextLineHeightWithSpacing();
         }
     }
-    if (m_PlayState != PlayState::Edit) // frame: this is the simulated scene, changes are temporary
+    if (m_PlayState != PlayState::Edit) { // frame: this is the simulated scene, changes are temporary
+        const bool breakpoint = m_Ctx.scripts && m_Ctx.scripts->DebugPaused();
         ImGui::GetWindowDrawList()->AddRect(origin, ImVec2(origin.x + static_cast<float>(width), origin.y + static_cast<float>(height)),
-                                            m_PlayState == PlayState::Playing ? IM_COL32(60, 200, 90, 255)
-                                                                              : IM_COL32(230, 170, 40, 255),
+                                            breakpoint                           ? IM_COL32(230, 60, 60, 255)
+                                            : m_PlayState == PlayState::Playing ? IM_COL32(60, 200, 90, 255)
+                                                                                : IM_COL32(230, 170, 40, 255),
                                             0.0f, 3.0f);
+        if (breakpoint)
+            ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 10.0f, origin.y + static_cast<float>(height) - 24.0f),
+                                                IM_COL32(255, 120, 120, 255), "Breakpoint - see the Blueprint window (F5 continue, F10 step)");
+    }
     // Left button: a click picks (on release), a drag selects everything in the box.
     const ImGuiIO&  io    = ImGui::GetIO();
     const glm::vec2 mouse = glm::vec2(io.MousePos.x - origin.x, io.MousePos.y - origin.y);

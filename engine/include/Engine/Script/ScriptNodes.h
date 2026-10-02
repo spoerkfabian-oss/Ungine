@@ -19,12 +19,27 @@ class Scene;
 enum class NodeKind : std::uint8_t { Event, Impure, Pure };
 
 // What the node's param means (the editor shows a matching widget).
-enum class ParamKind : std::uint8_t { None, Text, Variable, Key, Count, Choice };
+//   Function     name of a function of the graph (Entry / Return / Call nodes)
+//   ElementType  element type of the array pins ("bool".."entity"; set on connect)
+//   TypeAndCount "<element type>:<n>" (Make Array)
+//   PinType      type of a reroute node (set on connect / by the editor; not shown)
+enum class ParamKind : std::uint8_t { None, Text, Variable, Key, Count, Choice, Function, ElementType, TypeAndCount, PinType };
+
+// How the param adapts when a link is made to the node (ScriptGraph::Connect).
+enum class ParamInference : std::uint8_t { None, PinType, ElementType };
 
 // NodeDesc::execute results besides an exec output pin index.
 inline constexpr int kScriptStop = -1; // the chain ends here (a pushed continuation resumes)
 // NodeDesc::execute entry for a continuation pushed by the node (PushContinuation / Suspend).
 inline constexpr int kScriptResume = -2;
+// NodeDesc::execute result of a Return node: back to the caller of the function.
+inline constexpr int kScriptReturn = -3;
+
+// Where the game view is in the window (pixels) - mouse and camera nodes work relative to it.
+struct ScriptViewport {
+    glm::vec2 origin{0.0f};
+    glm::vec2 size{1280.0f, 720.0f};
+};
 
 // Runtime services for node implementations (implemented by ScriptSystem). Pins are indices into
 // the node's resolved pin list (NodePins order).
@@ -48,11 +63,12 @@ public:
         return Connected(pin) ? std::get<Entity>(Convert(In(pin), PinType::Entity)) : Self();
     }
 
-    // Per script instance and node (DoOnce, FlipFlop, Gate, Delay).
+    // Per script instance and node (DoOnce, FlipFlop, Gate, Delay, ForEach).
     struct NodeState {
         std::int32_t counter = 0;
         bool         flag    = false;
         bool         flag2   = false;
+        ScriptValue  value   = false; // e.g. the array a ForEach iterates
     };
     [[nodiscard]] virtual NodeState& State() = 0;
 
@@ -63,7 +79,13 @@ public:
     [[nodiscard]] virtual AssetManager* Assets() = 0;     // may be null
     [[nodiscard]] virtual AudioSystem*  Audio() = 0;      // may be null
     [[nodiscard]] virtual const Input*  GetInput() = 0;   // null while the game does not have the input
-    [[nodiscard]] virtual ScriptValue*  Variable(const std::string& name) = 0; // null: no such variable
+    // A variable of this instance: the running function's locals first, then the graph's. Null:
+    // no such variable.
+    [[nodiscard]] virtual ScriptValue*  Variable(const std::string& name) = 0;
+    // Variables / custom events of another entity's script (null / false without one).
+    [[nodiscard]] virtual ScriptValue*  InstanceVariable(Entity entity, const std::string& name) = 0;
+    virtual bool                        CallEventOn(Entity entity, const std::string& name) = 0;
+    [[nodiscard]] virtual ScriptViewport Viewport() const = 0;
 
     virtual void Print(std::string text, float seconds) = 0;
     virtual void Error(std::string message) = 0; // logged once per node, shown in the editor
@@ -75,6 +97,10 @@ public:
     [[nodiscard]] virtual std::int32_t ResumeData() const = 0;
     virtual void CallEvent(const std::string& name) = 0; // runs the Custom Event nodes named `name` now
     virtual void KeepModel(std::uint32_t index, std::uint32_t generation) = 0; // spawned: released when play ends
+    // Timers fire a Custom Event of this instance; handles are > 0.
+    virtual std::int32_t SetTimer(const std::string& event, float seconds, bool loop) = 0;
+    virtual void         ClearTimer(std::int32_t handle) = 0;
+    [[nodiscard]] virtual float TimerRemaining(std::int32_t handle) const = 0; // < 0: not active
 };
 
 struct NodeDesc {
@@ -91,6 +117,10 @@ struct NodeDesc {
     std::string              paramLabel;
     std::string              paramDefault;
     std::vector<std::string> paramChoices; // ParamKind::Choice
+    ParamInference           inference     = ParamInference::None;
+    bool                     latent        = false; // suspends (not allowed in functions)
+    bool                     arrayVariable = false; // ParamKind::Variable: needs an array variable
+    bool                     hidden        = false; // not offered in the node palette (function nodes)
 
     // Pins that depend on the param or the graph (variables, output counts); null: `pins`.
     std::function<std::vector<PinInfo>(const ScriptGraph&, const ScriptNode&)> resolvePins;
@@ -100,6 +130,8 @@ struct NodeDesc {
 
 [[nodiscard]] std::span<const NodeDesc> ScriptNodeTypes();
 [[nodiscard]] const NodeDesc*           FindScriptNodeType(std::string_view type);
+// Element type names for ParamKind::ElementType / TypeAndCount ("bool", "int", ...).
+[[nodiscard]] std::span<const std::string> ElementTypeNames();
 // Value of an unconnected input: the node's own default, else the type's, else DefaultValue.
 [[nodiscard]] ScriptValue PinDefault(const ScriptNode& node, const NodeDesc* desc, const PinInfo& pin);
 

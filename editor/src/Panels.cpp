@@ -12,6 +12,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptSystem.h"
@@ -296,8 +297,11 @@ void Editor::DrawHierarchyNode(Entity entity)
         flags |= ImGuiTreeNodeFlags_Leaf;
     if (IsSelected(entity))
         flags |= ImGuiTreeNodeFlags_Selected;
-    const bool tinted = registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
-    if (tinted)
+    const Entity prefabRoot = PrefabInstanceRoot(m_Ctx.scene, entity);
+    const bool   tinted     = prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
+    if (prefabRoot != NullEntity) // prefab instances: root bright blue, members lighter
+        ImGui::PushStyleColor(ImGuiCol_Text, prefabRoot == entity ? ImVec4(0.35f, 0.65f, 1.0f, 1.0f) : ImVec4(0.6f, 0.78f, 1.0f, 1.0f));
+    else if (tinted)
         ImGui::PushStyleColor(ImGuiCol_Text, registry.Has<Light>(entity) ? ImVec4(1.0f, 0.85f, 0.4f, 1.0f)
                                                                         : ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
     const bool open = ImGui::TreeNodeEx(EntityId(entity), flags, "%s", name.empty() ? "(unnamed)" : name.c_str());
@@ -337,6 +341,27 @@ void Editor::DrawHierarchyNode(Entity entity)
             m_PendingDuplicate = true;
         if (ImGui::MenuItem("Delete", "Del"))
             m_PendingDelete = m_Selection; // after the tree was drawn
+        ImGui::Separator();
+        if (ImGui::MenuItem("Create prefab...", nullptr, false, m_PlayState == PlayState::Edit)) {
+            m_PrefabTarget  = entity;
+            m_DialogPurpose = DialogPurpose::CreatePrefab;
+            std::error_code ec;
+            const std::filesystem::path dir = ContentRoot() / "Prefabs";
+            std::filesystem::create_directories(dir, ec);
+            m_FileDialog->Open("Create prefab", FileDialog::Mode::Save, dir, {std::string(kPrefabExtension)},
+                               name + std::string(kPrefabExtension));
+        }
+        if (prefabRoot != NullEntity) {
+            const bool edit = m_PlayState == PlayState::Edit;
+            if (prefabRoot != entity && ImGui::MenuItem("Select prefab root"))
+                Select(prefabRoot);
+            if (ImGui::MenuItem("Apply to prefab", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+            if (ImGui::MenuItem(prefabRoot == entity ? "Revert instance" : "Revert entity", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), {}};
+            if (ImGui::MenuItem("Unlink prefab", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Unlink, UuidOf(entity), {}};
+        }
         ImGui::EndPopup();
     }
 
@@ -376,6 +401,8 @@ void Editor::DrawInspector()
         ImGui::TextDisabled("%zu selected - edits apply to all (values of the last one shown)", m_Selection.size());
     ImGui::TextDisabled("Entity %u (gen %u), uuid %016llx", EntityIndex(e), EntityGeneration(e),
                         static_cast<unsigned long long>(registry.Get<Uuid>(e).value));
+    if (PrefabInstanceRoot(m_Ctx.scene, e) != NullEntity)
+        DrawPrefabHeader(e);
 
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("transform")) {
         // Edited as a copy: writing back only on change keeps the entity (and its shadow caches) clean.
@@ -614,8 +641,34 @@ void Editor::DrawInspector()
                 else
                     ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Running");
             }
+        DrawScriptVariables(*script);
         if (ImGui::Button("Remove script"))
             registry.Remove<ScriptComponent>(e);
+    }
+
+    if (Tags* tags = registry.TryGet<Tags>(e); tags && ImGui::CollapsingHeader("Tags", ImGuiTreeNodeFlags_DefaultOpen)) {
+        std::optional<std::size_t> remove;
+        for (std::size_t i = 0; i < tags->values.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            if (i && ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize(tags->values[i].c_str()).x + 40.0f)
+                ImGui::SameLine();
+            if (ImGui::SmallButton((tags->values[i] + "  x").c_str()))
+                remove = i;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Remove tag");
+            ImGui::PopID();
+        }
+        if (remove)
+            tags->values.erase(tags->values.begin() + static_cast<std::ptrdiff_t>(*remove));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputTextWithHint("##newtag", "add a tag (Enter)", &m_NewTag, ImGuiInputTextFlags_EnterReturnsTrue)) {
+            if (!m_NewTag.empty() && !tags->Has(m_NewTag))
+                tags->values.push_back(m_NewTag);
+            m_NewTag.clear();
+            ImGui::SetKeyboardFocusHere(-1);
+        }
+        if (ImGui::Button("Remove tags"))
+            registry.Remove<Tags>(e);
     }
 
     if (AudioSource* audio = registry.TryGet<AudioSource>(e);
@@ -733,6 +786,8 @@ void Editor::DrawInspector()
             registry.Emplace<ScriptComponent>(e);
         if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
             registry.Emplace<CameraComponent>(e);
+        if (ImGui::MenuItem("Tags", nullptr, false, !registry.Has<Tags>(e)))
+            registry.Emplace<Tags>(e);
         ImGui::Separator();
         if (ImGui::MenuItem("Audio Source", nullptr, false, !registry.Has<AudioSource>(e)))
             registry.Emplace<AudioSource>(e);
@@ -796,6 +851,152 @@ std::optional<std::pair<glm::vec3, glm::vec3>> Editor::MeshBounds(Entity entity)
         hi = glm::max(hi, sm.boundsMax);
     }
     return std::pair{lo, hi};
+}
+
+void Editor::DrawPrefabHeader(Entity entity)
+{
+    const Registry& registry = m_Ctx.scene.GetRegistry();
+    const Entity    root     = PrefabInstanceRoot(m_Ctx.scene, entity);
+    const auto&     instance = registry.Get<PrefabInstance>(root);
+    const bool      edit     = m_PlayState == PlayState::Edit;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.2f, 0.32f, 1.0f));
+    ImGui::BeginChild("prefab", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    ImGui::TextColored(ImVec4(0.45f, 0.72f, 1.0f, 1.0f), "Prefab %s", PathToUtf8(PathFromUtf8(instance.prefab).filename()).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", instance.prefab.c_str());
+    if (!instance.built && instance.unresolved)
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "The prefab file is missing: the instance keeps its saved data");
+    if (root != entity) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("member of '%s'", registry.Get<Name>(root).value.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Select root"))
+            Select(root);
+    }
+    // Overridden values of this entity (each can go back to the prefab's).
+    const std::vector<std::string> keys = PrefabOverriddenKeys(m_Ctx.scene, &m_Ctx.assets, entity);
+    if (!keys.empty()) {
+        ImGui::TextDisabled("Overrides:");
+        for (const std::string& key : keys) {
+            ImGui::SameLine();
+            ImGui::PushID(key.c_str());
+            ImGui::BeginDisabled(!edit);
+            if (ImGui::SmallButton((key + "  x").c_str()))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), key};
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Revert '%s' to the prefab", key.c_str());
+            ImGui::PopID();
+        }
+    }
+    if (root == entity) {
+        const std::size_t changes = PrefabOverrides(m_Ctx.scene, &m_Ctx.assets, root).size();
+        ImGui::BeginDisabled(!edit);
+        if (ImGui::Button("Apply to prefab"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Writes this instance into the prefab file; the other instances update (their overrides stay)");
+        ImGui::SameLine();
+        if (ImGui::Button("Revert all"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), {}};
+        ImGui::SameLine();
+        if (ImGui::Button("Unlink"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Unlink, UuidOf(entity), {}};
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled(changes ? "%zu changed entit%s" : "matches the prefab", changes, changes == 1 ? "y" : "ies");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+const ScriptGraph* Editor::GraphFor(const std::string& file)
+{
+    if (file.empty())
+        return nullptr;
+    if (const ScriptGraph* open = m_Graphs->Find(PathFromUtf8(file)))
+        return open; // unsaved edits count
+    std::error_code ec;
+    const auto      mtime = std::filesystem::last_write_time(PathFromUtf8(file), ec);
+    if (ec)
+        return nullptr;
+    auto it = m_GraphCache.find(file);
+    if (it == m_GraphCache.end() || it->second.first != mtime) {
+        try {
+            m_GraphCache[file] = {mtime, LoadScriptGraph(PathFromUtf8(file))};
+        } catch (const std::exception&) {
+            m_GraphCache.erase(file);
+            return nullptr;
+        }
+        it = m_GraphCache.find(file);
+    }
+    return &it->second.second;
+}
+
+void Editor::DrawScriptVariables(ScriptComponent& script)
+{
+    const ScriptGraph* graph = GraphFor(script.graph);
+    if (!graph)
+        return;
+    bool any = false;
+    for (const ScriptVariable& v : graph->variables)
+        any |= v.exposed;
+    if (!any) {
+        ImGui::TextDisabled("No instance editable variables (tick the box next to a variable in the Blueprint)");
+        return;
+    }
+    if (!BeginProperties("scriptvars"))
+        return;
+    std::optional<std::string> reset;
+    for (const ScriptVariable& v : graph->variables) {
+        if (!v.exposed)
+            continue;
+        const auto overridden = script.variables.find(v.name);
+        PropertyRow(v.name.c_str());
+        if (overridden == script.variables.end())
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.6f); // the graph's default
+        const float width = overridden != script.variables.end() ? -28.0f : -FLT_MIN;
+        if (v.type == PinType::Entity) { // pick an entity of the scene (stored by UUID)
+            const std::uint64_t current = overridden != script.variables.end() ? overridden->second.entityUuid : 0;
+            const Entity        target  = current ? m_Ctx.scene.FindByUuid(current) : NullEntity;
+            const std::string   preview = !current ? "(self / none)"
+                                          : target != NullEntity ? m_Ctx.scene.GetRegistry().Get<Name>(target).value
+                                                                 : "(missing)";
+            ImGui::SetNextItemWidth(width);
+            if (ImGui::BeginCombo("##entity", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+                if (ImGui::Selectable("(self / none)", current == 0))
+                    reset = v.name;
+                int shown = 0;
+                m_Ctx.scene.GetRegistry().ViewOf<Name>().Each([&](Entity other, Name& name) {
+                    if (++shown > 2000)
+                        return;
+                    const std::uint64_t uuid = UuidOf(other);
+                    ImGui::PushID(static_cast<int>(EntityIndex(other)));
+                    if (ImGui::Selectable(name.value.c_str(), uuid == current))
+                        script.variables[v.name] = ScriptVariableOverride{.value = NullEntity, .entityUuid = uuid};
+                    ImGui::PopID();
+                });
+                ImGui::EndCombo();
+            }
+        } else {
+            ScriptValue value = overridden != script.variables.end() ? Convert(overridden->second.value, v.type) : v.value;
+            if (ScriptGraphEditor::EditValue("##value", value, v.type, width))
+                script.variables[v.name] = ScriptVariableOverride{.value = std::move(value), .entityUuid = 0};
+        }
+        if (overridden == script.variables.end()) {
+            ImGui::PopStyleVar();
+        } else {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                reset = v.name;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Back to the graph's value");
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+    if (reset)
+        script.variables.erase(*reset);
 }
 
 // ---------------------------------------------------------------------------------------------

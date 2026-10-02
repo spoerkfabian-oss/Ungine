@@ -21,6 +21,7 @@ public:
     [[nodiscard]] bool WasKeyReleased(int key) const;     // released this frame
     [[nodiscard]] bool IsMouseDown(int button) const;
     [[nodiscard]] bool WasMousePressed(int button) const;
+    [[nodiscard]] bool WasMouseReleased(int button) const;
 
     [[nodiscard]] glm::vec2 MousePosition() const { return m_MousePos; }
     [[nodiscard]] glm::vec2 MouseDelta()    const { return m_MouseDelta; }
@@ -28,7 +29,7 @@ public:
 
 private:
     std::bitset<Key::Last + 1>         m_Keys, m_KeysPressed, m_KeysReleased;
-    std::bitset<MouseButton::Last + 1> m_Buttons, m_ButtonsPressed;
+    std::bitset<MouseButton::Last + 1> m_Buttons, m_ButtonsPressed, m_ButtonsReleased;
     glm::vec2 m_MousePos{0.0f}, m_MouseDelta{0.0f};
     float     m_Scroll    = 0.0f;
     bool      m_FirstMove = true;

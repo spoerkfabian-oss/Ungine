@@ -55,14 +55,15 @@ ImVec4 KindColor(int kind)
     case 0: return {0.95f, 0.80f, 0.35f, 1.0f}; // folder
     case 1: return {0.45f, 0.85f, 0.45f, 1.0f}; // scene
     case 2: return {0.40f, 0.65f, 1.00f, 1.0f}; // blueprint
-    case 3: return {0.95f, 0.55f, 0.30f, 1.0f}; // model
-    case 4: return {0.85f, 0.45f, 0.85f, 1.0f}; // texture
-    case 5: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
+    case 3: return {0.35f, 0.75f, 1.00f, 1.0f}; // prefab
+    case 4: return {0.95f, 0.55f, 0.30f, 1.0f}; // model
+    case 5: return {0.85f, 0.45f, 0.85f, 1.0f}; // texture
+    case 6: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "MODEL", "TEX", "SND", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "FILE"};
 
 } // namespace
 
@@ -158,6 +159,11 @@ void Editor::OpenAsset(const fs::path& file)
         } else {
             m_Status = "Cannot open blueprint (see log)";
         }
+    } else if (EndsWith(name, ".uprefab")) { // double-click: an instance in front of the camera
+        if (m_PlayState == PlayState::Edit)
+            PlacePrefab(file, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+        else
+            m_Status = "Stop playing to place prefabs";
     } else if (EndsWith(name, ".glb") || EndsWith(name, ".gltf")) {
         const ModelHandle handle = m_Ctx.assets.LoadModel(file);
         m_Ctx.modelRefs.push_back(handle);
@@ -220,6 +226,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::Scene;
         else if (EndsWith(lower, ".ugraph"))
             item.kind = ContentItem::Kind::Blueprint;
+        else if (EndsWith(lower, ".uprefab"))
+            item.kind = ContentItem::Kind::Prefab;
         else if (EndsWith(lower, ".glb") || EndsWith(lower, ".gltf"))
             item.kind = ContentItem::Kind::Model;
         else if (EndsWith(lower, ".png") || EndsWith(lower, ".jpg") || EndsWith(lower, ".jpeg") || EndsWith(lower, ".ktx2"))
