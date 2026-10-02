@@ -116,7 +116,8 @@ public:
     [[nodiscard]] std::vector<Entity>        InstancesOf(const std::filesystem::path& file) const;
     [[nodiscard]] std::optional<ScriptWatch> Watch(const std::filesystem::path& file, Entity entity) const;
 
-    // Canonical key of a graph file (absolute, normalized).
+    // Canonical key of a graph file (absolute, normalized). Libraries registered without a file are
+    // "library:<name>" (debug info, breakpoints of their nodes).
     [[nodiscard]] static std::string Key(const std::filesystem::path& file);
 
 private:

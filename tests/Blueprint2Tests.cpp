@@ -288,3 +288,278 @@ TEST_CASE(Blueprint2_SwitchSelectMultiGateDelayAndPureCache)
     CHECK(ValuesEqual(r.Var("flow.ugraph", e, "Done"), std::int32_t{1}) && r.scripts.Stats().errors == 0);
     r.scripts.End(r.scene);
 }
+
+namespace {
+
+// Sets variable `name` from (node, pin) after `after` fired; returns the Set node.
+std::uint32_t SetVar(Graph& g, std::uint32_t after, const char* afterPin, const char* name, std::uint32_t from,
+                     const char* fromPin, std::string function = {})
+{
+    const std::uint32_t set = g.Node("Variable.Set", name, std::move(function));
+    g.Link(after, afterPin, set, "In");
+    g.Link(from, fromPin, set, "Value");
+    return set;
+}
+
+float FloatOf(const ScriptValue& v) { return std::get<float>(Convert(v, PinType::Float)); }
+std::int32_t IntOf(const ScriptValue& v) { return std::get<std::int32_t>(Convert(v, PinType::Int)); }
+
+// Library "MathLib": Triple(X) -> Y = 3 X (pure), Report(Msg) prints it, macro TwiceLib(In, V) ->
+// (Out, R = Triple(V)) calling the library's own function.
+void RegisterMathLib(bool broken = false)
+{
+    Graph l;
+    l.g.library = true;
+    CHECK(l.g.AddFunction("Triple"));
+    ScriptFunction* t = l.g.FindFunction("Triple");
+    t->inputs  = {{"X", PinType::Float}};
+    t->outputs = {{"Y", PinType::Float}};
+    l.g.SetFunctionPure("Triple", true);
+    const std::uint32_t mul = l.Node("Math.MultiplyFloat", {}, "Triple");
+    l.Set(mul, "B", 3.0f);
+    l.Link(l.Find("Function.Entry", "Triple"), "X", mul, "A");
+    l.Link(mul, "Result", l.Find("Function.Return", "Triple"), "Y");
+    CHECK(l.g.AddFunction("Report"));
+    l.g.FindFunction("Report")->inputs = {{"Msg", PinType::String}};
+    l.g.FunctionSignatureChanged("Report");
+    const std::uint32_t print = Print(l, "", "Report");
+    l.Link(l.Find("Function.Entry", "Report"), "Then", print, "In");
+    l.Link(l.Find("Function.Entry", "Report"), "Msg", print, "Text");
+    l.Link(print, "Then", l.Find("Function.Return", "Report"), "In");
+    CHECK(l.g.AddMacro("TwiceLib"));
+    ScriptMacro* m = l.g.FindMacro("TwiceLib");
+    m->inputs.push_back({"V", PinType::Float});
+    m->outputs.push_back({"R", PinType::Float});
+    const std::uint32_t triple = l.Node("Function.CallPure", "Triple", "TwiceLib");
+    l.Link(l.Find("Macro.Inputs", "TwiceLib"), "V", triple, "X");
+    l.Link(triple, "Y", l.Find("Macro.Outputs", "TwiceLib"), "R");
+    if (broken)
+        l.Node("Variable.Get", "Missing", "Report");
+    CHECK(broken || l.Valid());
+    ScriptRegistry::AddLibrary({"MathLib", l.g, {}});
+}
+
+} // namespace
+
+TEST_CASE(Blueprint2_MacrosAndLibraries)
+{
+    ScriptRegistry::Clear();
+    RegisterMathLib();
+    Graph g;
+    for (const char* v : {"r1", "r2", "r3", "r4", "r5"})
+        g.g.variables.push_back({v, PinType::Float, 0.0f, false});
+    g.g.variables.push_back({"counter", PinType::Int, std::int32_t{0}, false});
+    g.g.variables.push_back({"n", PinType::Int, std::int32_t{5}, false});
+    // Twice(In, Value) -> (Out, Result = Value + Value); counts its runs in a graph variable.
+    CHECK(g.g.AddMacro("Twice") && !g.g.AddMacro("Twice") && !g.g.AddMacro("bad.name"));
+    CHECK(!g.g.AddFunction("Twice"));
+    ScriptMacro* m = g.g.FindMacro("Twice");
+    m->inputs.push_back({"Value", PinType::Float});
+    m->outputs.push_back({"Result", PinType::Float});
+    const std::uint32_t in = g.Find("Macro.Inputs", "Twice"), out = g.Find("Macro.Outputs", "Twice");
+    const std::uint32_t sum = g.Node("Math.AddFloat", {}, "Twice");
+    g.Link(in, "Value", sum, "A");
+    g.Link(in, "Value", sum, "B");
+    g.Link(sum, "Result", out, "Result");
+    g.g.Disconnect(in, "In", true);
+    const std::uint32_t count = g.Node("Variable.Get", "counter", "Twice"), inc = g.Node("Math.AddInt", {}, "Twice");
+    g.Set(inc, "B", std::int32_t{1});
+    g.Link(count, "Value", inc, "A");
+    const std::uint32_t bump = SetVar(g, in, "In", "counter", inc, "Result", "Twice");
+    g.Link(bump, "Then", out, "Out");
+
+    // BeginPlay -> Twice(1.5) -> r1 -> Twice(r1) -> r2 -> Twice(n: int, through a float pin) -> r3
+    //   -> MathLib.Report("lib hello") -> MathLib.TwiceLib(2) -> r4 -> r5 = MathLib.Triple(5).
+    const std::uint32_t begin = g.Node("Event.BeginPlay");
+    const std::uint32_t u1 = g.Node("Macro.Use", "Twice"), u2 = g.Node("Macro.Use", "Twice"), u3 = g.Node("Macro.Use", "Twice");
+    g.Set(u1, "Value", 1.5f);
+    g.Link(begin, "Out", u1, "In");
+    const std::uint32_t s1 = SetVar(g, u1, "Out", "r1", u1, "Result");
+    g.Link(s1, "Then", u2, "In");
+    g.Link(g.Node("Variable.Get", "r1"), "Value", u2, "Value");
+    const std::uint32_t s2 = SetVar(g, u2, "Out", "r2", u2, "Result");
+    g.Link(s2, "Then", u3, "In");
+    g.Link(g.Node("Variable.Get", "n"), "Value", u3, "Value");
+    const std::uint32_t s3     = SetVar(g, u3, "Out", "r3", u3, "Result");
+    const std::uint32_t report = g.Node("Library.Call", "MathLib.Report");
+    g.Set(report, "Msg", std::string("lib hello"));
+    g.Link(s3, "Then", report, "In");
+    const std::uint32_t lib = g.Node("Macro.Use", "MathLib.TwiceLib");
+    g.Set(lib, "V", 2.0f);
+    g.Link(report, "Then", lib, "In");
+    const std::uint32_t s4     = SetVar(g, lib, "Out", "r4", lib, "R");
+    const std::uint32_t triple = g.Node("Library.CallPure", "MathLib.Triple");
+    g.Set(triple, "X", 5.0f);
+    SetVar(g, s4, "Then", "r5", triple, "Y");
+    CHECK(g.Valid());
+    CHECK(ScriptGraphFromJson(ScriptGraphToJson(g.g)).macros.size() == 1);
+
+    {
+        Runner r;
+        const Entity e = r.Add("M", "macros.ugraph", g.g);
+        r.scripts.Begin(r.scene);
+        CHECK(FloatOf(r.Var("macros.ugraph", e, "r1")) == 3.0f && FloatOf(r.Var("macros.ugraph", e, "r2")) == 6.0f &&
+              FloatOf(r.Var("macros.ugraph", e, "r3")) == 10.0f && IntOf(r.Var("macros.ugraph", e, "counter")) == 3);
+        CHECK(FloatOf(r.Var("macros.ugraph", e, "r4")) == 6.0f && FloatOf(r.Var("macros.ugraph", e, "r5")) == 15.0f);
+        CHECK(r.Printed("lib hello"));
+        // The debugger sees the Macro nodes and the macro's own nodes run (a macro without impure
+        // nodes, like TwiceLib, has nothing that runs); library nodes under the library.
+        const ScriptDebugInfo* info = r.scripts.Debug("macros.ugraph");
+        CHECK(info && info->nodeTimes.contains(u1) && info->nodeTimes.contains(u3) && info->nodeTimes.contains(bump) &&
+              info->nodeTimes.contains(report) && !info->nodeTimes.contains(count));
+        const ScriptDebugInfo* libInfo = r.scripts.Debug("library:MathLib");
+        CHECK(libInfo && !libInfo->nodeTimes.empty());
+        r.scripts.End(r.scene);
+    }
+
+    // Validation.
+    {
+        Graph bad = g;
+        bad.Node("Macro.Use", "Nope");
+        CHECK(HasError(bad.g, "Unknown macro"));
+    }
+    {
+        Graph bad = g; // a macro using itself
+        bad.Node("Macro.Use", "Twice", "Twice");
+        CHECK(HasError(bad.g, "uses itself"));
+    }
+    {
+        Graph bad = g; // latent macro inside a function
+        CHECK(bad.g.AddMacro("Wait"));
+        const std::uint32_t delay = bad.Node("Flow.Delay", {}, "Wait");
+        bad.Link(bad.Find("Macro.Inputs", "Wait"), "In", delay, "In");
+        CHECK(bad.g.AddFunction("F"));
+        const std::uint32_t use = bad.Node("Macro.Use", "Wait", "F");
+        bad.Link(bad.Find("Function.Entry", "F"), "Then", use, "In");
+        CHECK(HasError(bad.g, "contains latent nodes"));
+        CHECK(!HasError(g.g, "contains latent nodes"));
+    }
+    {
+        Graph bad = g;
+        bad.g.FindNode(triple)->type = "Library.Call"; // pure function with exec pins
+        CHECK(HasError(bad.g, "is pure"));
+        bad.g.FindNode(triple)->param = "MathLib.Nope";
+        CHECK(HasError(bad.g, "Unknown library function"));
+    }
+    {
+        Graph bad = g; // a second Inputs node
+        bad.Node("Macro.Inputs", "Twice", "Twice");
+        CHECK(HasError(bad.g, "exactly one"));
+    }
+    {
+        ScriptGraph library;
+        library.library = true;
+        library.variables.push_back({"x", PinType::Int, std::int32_t{0}, false});
+        library.AddNode("Event.BeginPlay", {});
+        CHECK(HasError(library, "only functions and macros") && HasError(library, "no event graph"));
+    }
+    // A broken library: its users do not run.
+    RegisterMathLib(true);
+    CHECK(HasError(g.g, "Library 'MathLib' has errors"));
+    CHECK(!ScriptRegistry::Validate().empty());
+    ScriptRegistry::Clear();
+    CHECK(HasError(g.g, "Unknown library function") && HasError(g.g, "Unknown macro"));
+}
+
+TEST_CASE(Blueprint2_InterfacesAndDispatchers)
+{
+    ScriptRegistry::Clear();
+    ScriptRegistry::AddInterface({"Damageable", {{"TakeDamage", {{"Amount", PinType::Float}}, {{"Remaining", PinType::Float}}}}, {}});
+    CHECK(ScriptRegistry::Validate().empty());
+
+    // Target: hp, implements TakeDamage (hp -= Amount, calls OnDamaged(Amount)).
+    Graph t;
+    t.g.variables.push_back({"hp", PinType::Float, 100.0f, false});
+    t.g.interfaces.push_back("Damageable");
+    t.g.dispatchers.push_back({"OnDamaged", {{"Amount", PinType::Float}}});
+    CHECK(HasError(t.g, "is not implemented"));
+    CHECK(t.g.AddFunction("TakeDamage"));
+    ScriptFunction* f = t.g.FindFunction("TakeDamage");
+    f->inputs  = {{"Amount", PinType::Float}};
+    f->outputs = {{"Remaining", PinType::Int}};
+    t.g.FunctionSignatureChanged("TakeDamage");
+    CHECK(HasError(t.g, "differ from the interface"));
+    f->outputs = {{"Remaining", PinType::Float}};
+    t.g.FunctionSignatureChanged("TakeDamage");
+    const std::uint32_t entry = t.Find("Function.Entry", "TakeDamage"), ret = t.Find("Function.Return", "TakeDamage");
+    const std::uint32_t sub = t.Node("Math.SubtractFloat", {}, "TakeDamage");
+    t.Link(t.Node("Variable.Get", "hp", "TakeDamage"), "Value", sub, "A");
+    t.Link(entry, "Amount", sub, "B");
+    const std::uint32_t setHp = SetVar(t, entry, "Then", "hp", sub, "Result", "TakeDamage");
+    const std::uint32_t call  = t.Node("Dispatcher.Call", "OnDamaged", "TakeDamage");
+    t.Link(setHp, "Then", call, "In");
+    t.Link(entry, "Amount", call, "Amount");
+    t.Link(call, "Then", ret, "In");
+    t.Link(setHp, "Value", ret, "Remaining");
+    CHECK(t.Valid());
+
+    // Attacker: binds Hurt(Amount) to the target's OnDamaged, damages it twice (unbinding in
+    // between), asks whether target / itself implement Damageable, calls Hurt(5) itself.
+    Graph a;
+    a.g.variables.push_back({"Target", PinType::Entity, NullEntity, true});
+    for (const char* v : {"remaining", "lastHurt"})
+        a.g.variables.push_back({v, PinType::Float, 0.0f, false});
+    a.g.variables.push_back({"hurtCount", PinType::Int, std::int32_t{0}, false});
+    a.g.variables.push_back({"targetImplements", PinType::Bool, false, false});
+    a.g.variables.push_back({"selfImplements", PinType::Bool, true, false});
+    a.g.events.push_back({"Hurt", {{"Amount", PinType::Float}}});
+    const std::uint32_t hurt = a.Node("Event.Custom", "Hurt");
+    const std::uint32_t last = SetVar(a, hurt, "Out", "lastHurt", hurt, "Amount");
+    const std::uint32_t inc  = a.Node("Math.AddInt");
+    a.Set(inc, "B", std::int32_t{1});
+    a.Link(a.Node("Variable.Get", "hurtCount"), "Value", inc, "A");
+    SetVar(a, last, "Then", "hurtCount", inc, "Result");
+
+    const std::uint32_t begin = a.Node("Event.BeginPlay"), target = a.Node("Variable.Get", "Target");
+    const std::uint32_t bind = a.Node("Dispatcher.Bind", "OnDamaged");
+    a.Set(bind, "Event", std::string("Hurt"));
+    a.Link(begin, "Out", bind, "In");
+    a.Link(target, "Value", bind, "Target");
+    const std::uint32_t hit1 = a.Node("Interface.Call", "Damageable.TakeDamage");
+    a.Set(hit1, "Amount", 30.0f);
+    a.Link(bind, "Then", hit1, "In");
+    a.Link(target, "Value", hit1, "Target");
+    const std::uint32_t unbind = a.Node("Dispatcher.Unbind", "OnDamaged");
+    a.Set(unbind, "Event", std::string("Hurt"));
+    a.Link(hit1, "Then", unbind, "In");
+    a.Link(target, "Value", unbind, "Target");
+    const std::uint32_t hit2 = a.Node("Interface.Call", "Damageable.TakeDamage");
+    a.Set(hit2, "Amount", 20.0f);
+    a.Link(unbind, "Then", hit2, "In");
+    a.Link(target, "Value", hit2, "Target");
+    const std::uint32_t s1 = SetVar(a, hit2, "Then", "remaining", hit2, "Remaining");
+    const std::uint32_t impl = a.Node("Interface.Implements", "Damageable"), self = a.Node("Interface.Implements", "Damageable");
+    a.Link(target, "Value", impl, "Target");
+    const std::uint32_t s2 = SetVar(a, s1, "Then", "targetImplements", impl, "Result");
+    const std::uint32_t s3 = SetVar(a, s2, "Then", "selfImplements", self, "Result");
+    const std::uint32_t own = a.Node("Interface.Call", "Damageable.TakeDamage"); // not implemented here: nothing
+    a.Link(s3, "Then", own, "In");
+    const std::uint32_t callHurt = a.Node("Flow.CallEvent", "Hurt");
+    a.Set(callHurt, "Amount", 5.0f);
+    a.Link(own, "Then", callHurt, "In");
+    CHECK(a.Valid());
+    {
+        Graph bad = a;
+        bad.Node("Dispatcher.Call", "Nope");
+        CHECK(HasError(bad.g, "Unknown dispatcher"));
+        bad.g.interfaces.push_back("Unknown");
+        CHECK(HasError(bad.g, "Unknown interface 'Unknown'"));
+    }
+    const ScriptGraph back = ScriptGraphFromJson(ScriptGraphToJson(t.g));
+    CHECK(back.interfaces == t.g.interfaces && back.dispatchers.size() == 1 && back.dispatchers[0].params.size() == 1);
+
+    Runner       r;
+    const Entity victim = r.Add("Victim", "target.ugraph", t.g);
+    const Entity hero   = r.Add("Hero", "attacker.ugraph", a.g);
+    r.scene.GetRegistry().Get<ScriptComponent>(hero).variables["Target"] = {NullEntity, r.scene.GetRegistry().Get<Uuid>(victim).value};
+    r.scripts.Begin(r.scene);
+    r.Run(0.2f);
+    CHECK(FloatOf(r.Var("target.ugraph", victim, "hp")) == 50.0f);
+    CHECK(FloatOf(r.Var("attacker.ugraph", hero, "remaining")) == 50.0f);
+    CHECK(IntOf(r.Var("attacker.ugraph", hero, "hurtCount")) == 2); // bound once (30), then called directly (5)
+    CHECK(FloatOf(r.Var("attacker.ugraph", hero, "lastHurt")) == 5.0f);
+    CHECK(std::get<bool>(r.Var("attacker.ugraph", hero, "targetImplements")) &&
+          !std::get<bool>(r.Var("attacker.ugraph", hero, "selfImplements")));
+    CHECK(r.scripts.Stats().errors == 0);
+    r.scripts.End(r.scene);
+}

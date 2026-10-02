@@ -153,6 +153,12 @@ std::string NodeTitle(const NodeDesc* desc, const ScriptNode& node)
     case ParamKind::StructType:
     case ParamKind::EnumType: return desc->title + " (" + node.param + ")";
     case ParamKind::EnumValue: return node.param.empty() ? desc->title : node.param;
+    case ParamKind::Macro:
+        return node.type == "Macro.Use" ? (node.param.empty() ? desc->title : node.param) : desc->title;
+    case ParamKind::LibraryFunction: return node.param.empty() ? desc->title : node.param;
+    case ParamKind::InterfaceFunction: return node.param.empty() ? desc->title : node.param + " (Message)";
+    case ParamKind::Interface:
+    case ParamKind::Dispatcher: return desc->title + " " + node.param;
     default: return desc->title;
     }
 }
@@ -1640,6 +1646,52 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
             ImGui::EndCombo();
         }
         break;
+    case ParamKind::Macro:
+    case ParamKind::LibraryFunction:
+    case ParamKind::Interface:
+    case ParamKind::InterfaceFunction:
+    case ParamKind::Dispatcher: {
+        if (node->type == "Macro.Inputs" || node->type == "Macro.Outputs") {
+            ImGui::TextDisabled("Macro %s: edit its pins in the sidebar", node->function.c_str());
+            break;
+        }
+        std::vector<std::string> names;
+        switch (desc->paramKind) {
+        case ParamKind::Macro:
+            for (const ScriptMacro& m : g.macros)
+                if (m.name != node->function)
+                    names.push_back(m.name);
+            for (const std::string& lib : ScriptRegistry::LibraryNames())
+                for (const ScriptMacro& m : ScriptRegistry::FindLibrary(lib)->graph.macros)
+                    names.push_back(lib + "." + m.name);
+            break;
+        case ParamKind::LibraryFunction:
+            for (const std::string& lib : ScriptRegistry::LibraryNames())
+                for (const ScriptFunction& f : ScriptRegistry::FindLibrary(lib)->graph.functions)
+                    if (f.pure == (desc->kind == NodeKind::Pure))
+                        names.push_back(lib + "." + f.name);
+            break;
+        case ParamKind::Interface: names = ScriptRegistry::InterfaceNames(); break;
+        case ParamKind::InterfaceFunction:
+            for (const std::string& i : ScriptRegistry::InterfaceNames())
+                for (const ScriptInterfaceFunction& f : ScriptRegistry::FindInterface(i)->functions)
+                    names.push_back(i + "." + f.name);
+            break;
+        default:
+            for (const ScriptEventDecl& d : g.dispatchers)
+                names.push_back(d.name);
+            break;
+        }
+        if (ImGui::BeginCombo(desc->paramLabel.c_str(), param.c_str())) {
+            for (const std::string& name : names)
+                if (ImGui::Selectable(name.c_str(), name == param)) {
+                    param  = name;
+                    commit = true;
+                }
+            ImGui::EndCombo();
+        }
+        break;
+    }
     case ParamKind::ElementType:
         if (ImGui::BeginCombo(desc->paramLabel.c_str(), param.c_str())) {
             for (const std::string& t : ElementTypeNames())

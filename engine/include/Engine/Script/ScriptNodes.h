@@ -28,9 +28,13 @@ enum class NodeKind : std::uint8_t { Event, Impure, Pure };
 //   StructType   struct name (Make / Break Struct)        EnumType   enum name (Switch on Enum)
 //   EnumValue    "<enum>.<value>" (enum literal)          StructField "<struct>.<field>" (Set Field)
 //   Cases        comma separated case values (Switch on Int / String)
+//   Macro        a macro of the graph or "<Library>.<Macro>"   LibraryFunction "<Library>.<Function>"
+//   Interface    interface name             InterfaceFunction "<Interface>.<Function>"
+//   Dispatcher   an event dispatcher of the graph
 enum class ParamKind : std::uint8_t {
     None, Text, Variable, Key, Count, Choice, Function, ElementType, TypeAndCount, PinType,
-    StructType, EnumType, EnumValue, StructField, Cases
+    StructType, EnumType, EnumValue, StructField, Cases, Macro, LibraryFunction, Interface, InterfaceFunction,
+    Dispatcher
 };
 
 // How the param adapts when a link is made to the node (ScriptGraph::Connect):
@@ -63,6 +67,7 @@ public:
     virtual void Out(int pin, ScriptValue value) = 0;
     [[nodiscard]] virtual bool Connected(int pin) const = 0;
     [[nodiscard]] virtual const std::string& Param() const = 0;
+    [[nodiscard]] virtual std::span<const PinInfo> Pins() const = 0; // the node's resolved pins
 
     [[nodiscard]] bool          InBool(int pin) { return std::get<bool>(Convert(In(pin), PinType::Bool)); }
     [[nodiscard]] std::int32_t  InInt(int pin) { return std::get<std::int32_t>(Convert(In(pin), PinType::Int)); }
@@ -107,7 +112,20 @@ public:
     // ... or after `seconds` (latent nodes; the node returns kScriptStop now).
     virtual void Suspend(float seconds, std::int32_t data) = 0;
     [[nodiscard]] virtual std::int32_t ResumeData() const = 0;
-    virtual void CallEvent(const std::string& name) = 0; // runs the Custom Event nodes named `name` now
+    // Runs the Custom Event nodes named `name` now; `args` fill their parameter outputs in order
+    // (converted where possible).
+    virtual void CallEvent(const std::string& name, std::vector<ScriptValue> args) = 0;
+    // Interfaces: runs the function `function` of the target's script now (to its end, like a pure
+    // function). False: no script or no such function (`results` then stays empty).
+    virtual bool CallFunctionOn(Entity target, const std::string& function, std::vector<ScriptValue> args,
+                                std::vector<ScriptValue>& results) = 0;
+    [[nodiscard]] virtual bool Implements(Entity target, const std::string& interfaceName) = 0;
+    // Event dispatchers. CallDispatcher runs every custom event bound to this script's dispatcher;
+    // Bind adds (removes) this script's custom event `event` to (from) the target script's
+    // dispatcher; UnbindAll clears it. False: the target has no script with that dispatcher.
+    virtual void CallDispatcher(const std::string& name, std::vector<ScriptValue> args) = 0;
+    virtual bool BindDispatcher(Entity target, const std::string& dispatcher, const std::string& event, bool bind) = 0;
+    virtual bool UnbindAll(Entity target, const std::string& dispatcher) = 0;
     virtual void KeepModel(std::uint32_t index, std::uint32_t generation) = 0; // spawned: released when play ends
     // Timers fire a Custom Event of this instance; handles are > 0.
     virtual std::int32_t SetTimer(const std::string& event, float seconds, bool loop) = 0;

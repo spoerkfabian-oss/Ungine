@@ -567,6 +567,7 @@ void Editor::Play()
     }
     if (m_PlayState != PlayState::Edit)
         return;
+    ReloadScriptRegistry(); // type / library files may have changed
     // Finish edits in progress so they land in the history before it is frozen.
     if (m_InspectorEdit)
         PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());

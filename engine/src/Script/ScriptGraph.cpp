@@ -2,6 +2,7 @@
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptRegistry.h"
 
+#include "ScriptExpand.h"
 #include "ScriptJson.h"
 
 #include <nlohmann/json.hpp>
@@ -648,7 +649,42 @@ ScriptGraph LoadScriptGraph(const std::filesystem::path& file)
 
 // --- Validation --------------------------------------------------------------------------------
 
-std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
+namespace {
+
+bool SameParams(const std::vector<ScriptParam>& a, const std::vector<ScriptParam>& b)
+{
+    return std::ranges::equal(a, b, [](const ScriptParam& x, const ScriptParam& y) { return x.name == y.name && x.type == y.type; });
+}
+
+// The graph and local name of a macro reference: a macro of `graph`, or "<Library>.<Macro>".
+std::pair<const ScriptGraph*, std::string> ResolveMacro(const ScriptGraph& graph, const std::string& name)
+{
+    if (graph.FindMacro(name))
+        return {&graph, name};
+    const std::size_t dot = name.find('.');
+    const ScriptLibrary* lib = dot == std::string::npos ? nullptr : ScriptRegistry::FindLibrary(name.substr(0, dot));
+    if (lib && lib->graph.FindMacro(name.substr(dot + 1)))
+        return {&lib->graph, name.substr(dot + 1)};
+    return {nullptr, {}};
+}
+
+// Does the macro contain latent nodes (directly or through the macros it uses)?
+bool MacroIsLatent(const ScriptGraph& graph, const std::string& name, int depth = 0)
+{
+    const auto [g, local] = ResolveMacro(graph, name);
+    if (!g || depth > 32)
+        return false;
+    for (const ScriptNode& n : g->nodes) {
+        if (n.function != local)
+            continue;
+        const NodeDesc* d = FindScriptNodeType(n.type);
+        if ((d && d->latent) || (n.type == "Macro.Use" && MacroIsLatent(*g, n.param, depth + 1)))
+            return true;
+    }
+    return false;
+}
+
+std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
 {
     std::vector<ScriptDiagnostic> out;
     const auto error = [&](std::uint32_t node, std::string message) { out.push_back({node, std::move(message), true}); };
@@ -667,9 +703,68 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
         }
     };
     checkVariables(graph.variables, "");
+    if (graph.library) {
+        if (!graph.variables.empty() || !graph.events.empty() || !graph.dispatchers.empty() || !graph.interfaces.empty())
+            error(0, "A library has only functions and macros (no variables, events, dispatchers or interfaces)");
+        for (const ScriptNode& n : graph.nodes)
+            if (n.function.empty())
+                error(n.id, "A library has no event graph: nodes belong into functions or macros");
+    }
+    const auto checkParams = [&](const std::vector<ScriptParam>& params, const std::string& where, bool allowExec) {
+        std::unordered_set<std::string> names;
+        for (const ScriptParam& p : params) {
+            if (!IsValidScriptName(p.name) || !names.insert(p.name).second)
+                error(0, where + ": parameter names must be unique names ('" + p.name + "')");
+            if (p.type.kind == PinKind::Exec ? !allowExec || IsContainer(p.type) : !KnownType(p.type))
+                error(0, where + ", parameter '" + p.name + "': invalid type " + DisplayName(p.type));
+        }
+    };
+    for (const auto* list : {&graph.events, &graph.dispatchers}) {
+        const char*                     what = list == &graph.events ? "Event" : "Dispatcher";
+        std::unordered_set<std::string> names;
+        for (const ScriptEventDecl& e : *list) {
+            if (!IsValidScriptName(e.name) || !names.insert(e.name).second)
+                error(0, std::string(what) + " names must be unique names ('" + e.name + "')");
+            checkParams(e.params, std::string(what) + " '" + e.name + "'", false);
+        }
+    }
+    {
+        std::unordered_set<std::string> seen;
+        for (const std::string& name : graph.interfaces) {
+            const ScriptInterface* iface = ScriptRegistry::FindInterface(name);
+            if (!seen.insert(name).second)
+                error(0, "Interface '" + name + "' is listed twice");
+            if (!iface) {
+                error(0, "Unknown interface '" + name + "'");
+                continue;
+            }
+            for (const ScriptInterfaceFunction& f : iface->functions) {
+                const ScriptFunction* impl = graph.FindFunction(f.name);
+                if (!impl)
+                    error(0, "Interface '" + name + "': function '" + f.name + "' is not implemented");
+                else if (!SameParams(impl->inputs, f.inputs) || !SameParams(impl->outputs, f.outputs))
+                    error(0, "Interface '" + name + "': the inputs / outputs of '" + f.name + "' differ from the interface");
+            }
+        }
+    }
+    for (const ScriptMacro& m : graph.macros) {
+        if (!IsValidScriptName(m.name) || graph.FindFunction(m.name) ||
+            std::ranges::count(graph.macros, m.name, &ScriptMacro::name) > 1)
+            error(0, "Macro '" + m.name + "': the name must be a unique name (functions and macros)");
+        checkParams(m.inputs, "Macro '" + m.name + "'", true);
+        checkParams(m.outputs, "Macro '" + m.name + "'", true);
+        for (const char* type : {"Macro.Inputs", "Macro.Outputs"}) {
+            const auto count = std::ranges::count_if(graph.nodes, [&](const ScriptNode& n) {
+                return n.type == type && n.function == m.name;
+            });
+            if (count > 1 || (count == 0 && std::string_view(type) == "Macro.Inputs"))
+                error(0, std::format("Macro '{}' needs {} {} node ({} found)", m.name,
+                                     std::string_view(type) == "Macro.Inputs" ? "exactly one" : "at most one", type + 6, count));
+        }
+    }
     std::unordered_set<std::string> functionNames;
     for (const ScriptFunction& f : graph.functions) {
-        if (!IsValidScriptName(f.name))
+        if (!expanded && !IsValidScriptName(f.name)) // expanded: library functions are "<Library>.<Function>"
             error(0, "Invalid function name '" + f.name + "'");
         else if (!functionNames.insert(f.name).second)
             error(0, "Function '" + f.name + "' is defined twice");
@@ -698,8 +793,9 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
             continue;
         }
         const ScriptFunction* scope = n.function.empty() ? nullptr : graph.FindFunction(n.function);
-        if (!n.function.empty() && !scope)
-            error(n.id, "Unknown function '" + n.function + "'");
+        const ScriptMacro*    macro = n.function.empty() || scope ? nullptr : graph.FindMacro(n.function);
+        if (!n.function.empty() && !scope && !macro)
+            error(n.id, "Unknown function / macro '" + n.function + "'");
         if (desc->paramKind == ParamKind::Variable) {
             const ScriptVariable* v = graph.FindVariableInScope(n.function, n.param);
             if (!v)
@@ -775,8 +871,47 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
         }
         if (scope && desc->kind == NodeKind::Event && n.type != "Function.Entry")
             error(n.id, desc->title + " cannot be used inside a function");
+        if (macro && desc->kind == NodeKind::Event && n.type != "Macro.Inputs")
+            error(n.id, desc->title + " cannot be used inside a macro");
         if (scope && desc->latent)
             error(n.id, desc->title + " is latent: not allowed inside a function");
+        switch (desc->paramKind) {
+        case ParamKind::Macro:
+            if (n.type != "Macro.Use") {
+                if (n.param != n.function || !macro)
+                    error(n.id, "Macro Inputs / Outputs nodes belong into their own macro");
+            } else if (!ResolveMacro(graph, n.param).first) {
+                error(n.id, "Unknown macro '" + n.param + "'");
+            } else if (scope && MacroIsLatent(graph, n.param)) {
+                error(n.id, "Macro '" + n.param + "' contains latent nodes: not allowed inside a function");
+            }
+            break;
+        case ParamKind::LibraryFunction: {
+            const ScriptFunction* f = ScriptRegistry::FindLibraryFunction(n.param);
+            const std::vector<ScriptDiagnostic>* libErrors =
+                f ? ScriptRegistry::LibraryDiagnostics(n.param.substr(0, n.param.find('.'))) : nullptr;
+            if (!f)
+                error(n.id, "Unknown library function '" + n.param + "'");
+            else if ((n.type == "Library.CallPure") != f->pure)
+                error(n.id, "'" + n.param + (f->pure ? "' is pure: use a pure call" : "' is not pure: use a call with exec pins"));
+            else if (libErrors && std::ranges::any_of(*libErrors, &ScriptDiagnostic::error))
+                error(n.id, "Library '" + n.param.substr(0, n.param.find('.')) + "' has errors");
+            break;
+        }
+        case ParamKind::Interface:
+            if (!ScriptRegistry::FindInterface(n.param))
+                error(n.id, "Unknown interface '" + n.param + "'");
+            break;
+        case ParamKind::InterfaceFunction:
+            if (!ScriptRegistry::FindInterfaceFunction(n.param))
+                error(n.id, "Unknown interface function '" + n.param + "'");
+            break;
+        case ParamKind::Dispatcher:
+            if (!graph.FindDispatcher(n.param))
+                error(n.id, "Unknown dispatcher '" + n.param + "'");
+            break;
+        default: break;
+        }
         if (desc->paramKind == ParamKind::Key && KeyFromName(n.param) < 0)
             error(n.id, "Unknown key '" + n.param + "'");
         if ((desc->paramKind == ParamKind::Text) && n.param.empty())
@@ -865,13 +1000,41 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
         if (visit[f.name] == 0)
             recursive(f.name);
 
+    // Macros using themselves (their copies would never end).
+    std::unordered_map<std::string, int> macroVisit;
+    std::function<bool(const std::string&)> macroCycle = [&](const std::string& name) {
+        int& v = macroVisit[name];
+        if (v == 1)
+            return true;
+        if (v == 2)
+            return false;
+        v = 1;
+        for (const ScriptNode& n : graph.nodes)
+            if (n.function == name && n.type == "Macro.Use" && graph.FindMacro(n.param) && macroCycle(n.param)) {
+                error(n.id, "Macro '" + n.param + "' uses itself");
+                return true;
+            }
+        macroVisit[name] = 2;
+        return false;
+    };
+    for (const ScriptMacro& m : graph.macros)
+        if (macroVisit[m.name] == 0)
+            macroCycle(m.name);
+
+    if (expanded)
+        return out;
     for (const ScriptNode& n : graph.nodes) {
         const NodeDesc* desc = FindScriptNodeType(n.type);
-        if (desc && desc->kind == NodeKind::Event &&
+        if (desc && desc->kind == NodeKind::Event && n.type != "Macro.Inputs" &&
             std::ranges::none_of(graph.links, [&](const ScriptLink& l) { return l.fromNode == n.id; }))
             out.push_back({n.id, desc->title + ": nothing connected", false});
     }
     return out;
 }
+
+} // namespace
+
+std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph) { return Validate(graph, false); }
+std::vector<ScriptDiagnostic> ValidateExpandedScriptGraph(const ScriptGraph& graph) { return Validate(graph, true); }
 
 } // namespace Engine

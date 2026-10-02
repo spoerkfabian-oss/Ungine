@@ -116,6 +116,9 @@ public:
     void                    Play();     // from Edit: snapshot + simulate; from Paused: resume
     void                    Pause();
     void                    Stop();     // back to the snapshot
+    // Project: (re)loads the blueprint types / interfaces / libraries of the content directory
+    // (ScriptRegistry); done at start and before play. Returns the problems found.
+    std::vector<std::string> ReloadScriptRegistry();
     void                    StepOnce(); // paused: one fixed step
 
     // Blueprint (visual script) editor window.

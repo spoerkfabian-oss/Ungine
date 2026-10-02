@@ -78,6 +78,9 @@ void RemoveLibrary(std::string_view name);
 [[nodiscard]] const ScriptFunction*          FindLibraryFunction(std::string_view qualified);
 [[nodiscard]] const ScriptMacro*             FindLibraryMacro(std::string_view qualified);
 [[nodiscard]] const ScriptInterfaceFunction* FindInterfaceFunction(std::string_view qualified);
+// Validation of a library graph (ValidateScriptGraph, computed when first asked after a change);
+// null for unknown libraries.
+[[nodiscard]] const std::vector<ScriptDiagnostic>* LibraryDiagnostics(std::string_view name);
 [[nodiscard]] const ScriptEnum*      FindEnum(std::string_view name);
 [[nodiscard]] const ScriptStructDef* FindStruct(std::string_view name);
 [[nodiscard]] std::vector<std::string> EnumNames();   // sorted
@@ -99,8 +102,8 @@ void SaveEnumFile(const std::filesystem::path& file, const ScriptEnum& def);
 void SaveStructFile(const std::filesystem::path& file, const ScriptStructDef& def);
 std::vector<std::string> LoadDirectory(const std::filesystem::path& root);
 
-// Problems of the definitions: unknown types in struct fields, structs containing themselves,
-// duplicate / invalid names.
+// Problems of the definitions: unknown types in struct fields / interface parameters, structs
+// containing themselves, duplicate / invalid names, errors in libraries.
 [[nodiscard]] std::vector<std::string> Validate();
 
 } // namespace ScriptRegistry

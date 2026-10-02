@@ -16,6 +16,7 @@
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 
 #include <cstdlib>
@@ -58,6 +59,10 @@ protected:
         m_Audio->Apply(m_Project.settings.audio);
         m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
 
+        // Blueprint types, interfaces and libraries of the project (before the scene: values of them).
+        ScriptRegistry::Clear();
+        for (const std::string& problem : ScriptRegistry::LoadDirectory(m_Project.ContentDirectory()))
+            ENGINE_WARN("[Blueprint types] {}", problem);
         const fs::path scene = m_Project.StartScene();
         try {
             m_Models = LoadSceneFile(scene, m_Scene, GetAssets(),

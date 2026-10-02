@@ -16,6 +16,7 @@
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 
 #include <ImGuizmo.h>
@@ -62,6 +63,20 @@ Editor::Editor(const EditorContext& context)
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
+    ReloadScriptRegistry();
+}
+
+std::vector<std::string> Editor::ReloadScriptRegistry()
+{
+    if (!m_Ctx.project)
+        return {};
+    ScriptRegistry::Clear();
+    std::vector<std::string> problems = ScriptRegistry::LoadDirectory(m_Ctx.project->ContentDirectory());
+    for (std::string& p : ScriptRegistry::Validate())
+        problems.push_back(std::move(p));
+    for (const std::string& p : problems)
+        ENGINE_WARN("[Blueprint types] {}", p);
+    return problems;
 }
 
 Editor::~Editor()

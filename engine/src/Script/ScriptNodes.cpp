@@ -250,6 +250,36 @@ std::uint32_t CountParam(const std::string& param, std::uint32_t min, std::uint3
     return std::clamp(n, min, max);
 }
 
+// Values of the data inputs from pin `first` on (calls forwarding their arguments).
+std::vector<ScriptValue> DataInputs(ScriptContext& c, int first)
+{
+    std::vector<ScriptValue>  args;
+    std::span<const PinInfo>  pins = c.Pins();
+    for (int i = first; i < static_cast<int>(pins.size()); ++i)
+        if (!pins[static_cast<std::size_t>(i)].output && pins[static_cast<std::size_t>(i)].type != PinType::Exec)
+            args.push_back(c.In(i));
+    return args;
+}
+
+// Pins of a call: (exec) inputs then outputs of a signature.
+std::vector<PinInfo> SignaturePins(std::vector<PinInfo> pins, const std::vector<ScriptParam>& inputs,
+                                   const std::vector<ScriptParam>& outputs)
+{
+    for (const ScriptParam& p : inputs)
+        pins.push_back(In(p.name, p.type));
+    for (const ScriptParam& p : outputs)
+        pins.push_back(Out(p.name, p.type));
+    return pins;
+}
+
+// A macro of the graph, or "<Library>.<Macro>".
+const ScriptMacro* FindMacroRef(const ScriptGraph& graph, const std::string& name)
+{
+    if (const ScriptMacro* m = graph.FindMacro(name))
+        return m;
+    return name.find('.') != std::string::npos ? ScriptRegistry::FindLibraryMacro(name) : nullptr;
+}
+
 // --- Keys ---------------------------------------------------------------------------------------
 
 struct KeyEntry {
@@ -297,8 +327,19 @@ std::vector<NodeDesc> BuildRegistry()
                   "Key", "Space"));
     add(WithParam(Event("Event.KeyReleased", "On Key Released", {}, "The key went up this frame"), ParamKind::Key,
                   "Key", "Space"));
-    add(WithParam(Event("Event.Custom", "Custom Event", {}, "Runs when a Call Custom Event node with this name runs"),
-                  ParamKind::Text, "Name", "MyEvent"));
+    {
+        // Declared events (ScriptGraph::events) have parameters: outputs here, inputs on the calls.
+        NodeDesc d = Event("Event.Custom", "Custom Event", {},
+                           "Runs when a Call Custom Event node with this name runs (or a bound dispatcher, a timer)");
+        d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecOut("Out")};
+            if (const ScriptEventDecl* e = g.FindEvent(n.param))
+                for (const ScriptParam& p : e->params)
+                    pins.push_back(Out(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Text, "Name", "MyEvent"));
+    }
 
     // Flow control.
     add(Flow("Flow.Branch", "Branch", {ExecIn(), In("Condition", P::Bool), ExecOut("True"), ExecOut("False")},
@@ -396,13 +437,22 @@ std::vector<NodeDesc> BuildRegistry()
              "Continues after Duration seconds (latent)"),
                      {{"Duration", 1.0f}}));
     r.back().latent = true;
-    add(WithParam(Flow("Flow.CallEvent", "Call Custom Event", {ExecIn(), ExecOut()},
-                       [](ScriptContext& c, int) {
-                           c.CallEvent(c.Param());
-                           return 1;
-                       },
-                       "Runs the Custom Event nodes with this name"),
-                  ParamKind::Text, "Event", "MyEvent"));
+    {
+        NodeDesc d = Flow("Flow.CallEvent", "Call Custom Event", {ExecIn(), ExecOut()},
+                          [](ScriptContext& c, int) {
+                              c.CallEvent(c.Param(), DataInputs(c, 2));
+                              return 1;
+                          },
+                          "Runs the Custom Event nodes with this name");
+        d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            if (const ScriptEventDecl* e = g.FindEvent(n.param))
+                for (const ScriptParam& p : e->params)
+                    pins.push_back(In(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Text, "Event", "MyEvent"));
+    }
 
     // Variables (pins typed like the variable).
     {
@@ -1635,6 +1685,121 @@ std::vector<NodeDesc> BuildRegistry()
                           "Continues Duration seconds after the last trigger (each trigger restarts the countdown)"),
                      {{"Duration", 1.0f}}));
     r.back().latent = true;
+
+    // Libraries: functions of library graphs (copied into the program when compiled).
+    {
+        NodeDesc call = Flow("Library.Call", "Call Library Function", {}, [](ScriptContext&, int) { return 1; });
+        call.category    = "Libraries";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptFunction* f = ScriptRegistry::FindLibraryFunction(n.param);
+            return f ? SignaturePins({ExecIn(), ExecOut()}, f->inputs, f->outputs) : std::vector<PinInfo>{ExecIn(), ExecOut()};
+        };
+        add(WithParam(std::move(call), ParamKind::LibraryFunction, "Function", ""));
+        NodeDesc pure    = Pure("Library.CallPure", "Call Pure Library Function", "Libraries", {}, [](ScriptContext&) {});
+        pure.hidden      = true;
+        pure.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptFunction* f = ScriptRegistry::FindLibraryFunction(n.param);
+            return f ? SignaturePins({}, f->inputs, f->outputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(pure), ParamKind::LibraryFunction, "Function", ""));
+    }
+
+    // Macros: Use nodes are replaced by a copy of the macro's nodes when the graph is compiled; the
+    // Inputs / Outputs nodes are the tunnels inside the macro.
+    {
+        NodeDesc inputs;
+        inputs.type        = "Macro.Inputs";
+        inputs.title       = "Inputs";
+        inputs.category    = "Macros";
+        inputs.kind        = NodeKind::Event;
+        inputs.hidden      = true;
+        inputs.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = g.FindMacro(n.param);
+            return m ? SignaturePins({}, {}, m->inputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(inputs), ParamKind::Macro, "Macro", ""));
+        NodeDesc outputs    = Flow("Macro.Outputs", "Outputs", {}, [](ScriptContext&, int) { return kScriptStop; });
+        outputs.category    = "Macros";
+        outputs.hidden      = true;
+        outputs.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = g.FindMacro(n.param);
+            return m ? SignaturePins({}, m->outputs, {}) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(outputs), ParamKind::Macro, "Macro", ""));
+        NodeDesc use    = Flow("Macro.Use", "Macro", {}, [](ScriptContext&, int) { return kScriptStop; });
+        use.category    = "Macros";
+        use.hidden      = true;
+        use.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptMacro* m = FindMacroRef(g, n.param);
+            return m ? SignaturePins({}, m->inputs, m->outputs) : std::vector<PinInfo>{};
+        };
+        add(WithParam(std::move(use), ParamKind::Macro, "Macro", ""));
+    }
+
+    // Interfaces: functions any script can implement; calls go to the target's implementation.
+    {
+        NodeDesc call = Flow("Interface.Call", "Call Interface Function", {}, [](ScriptContext& c, int) {
+            const ScriptInterfaceFunction* f = ScriptRegistry::FindInterfaceFunction(c.Param());
+            if (!f) {
+                c.Error("Unknown interface function '" + c.Param() + "'");
+                return 1;
+            }
+            const int                firstOut = 3 + static_cast<int>(f->inputs.size());
+            std::vector<ScriptValue> results;
+            const Entity             target = c.InEntity(2);
+            const bool called = c.Implements(target, SplitDotted(c.Param()).first) &&
+                                c.CallFunctionOn(target, f->name, DataInputs(c, 3), results);
+            for (std::size_t i = 0; i < f->outputs.size(); ++i)
+                c.Out(firstOut + static_cast<int>(i), called && i < results.size() ? results[i] : DefaultValue(f->outputs[i].type));
+            return 1;
+        }, "Runs the function on the target's script if it implements the interface (else nothing; outputs default)");
+        call.category    = "Interfaces";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const ScriptInterfaceFunction* f = ScriptRegistry::FindInterfaceFunction(n.param);
+            std::vector<PinInfo>           pins{ExecIn(), ExecOut(), In("Target", P::Entity)};
+            return f ? SignaturePins(std::move(pins), f->inputs, f->outputs) : pins;
+        };
+        add(WithParam(std::move(call), ParamKind::InterfaceFunction, "Function", ""));
+        add(WithParam(Pure("Interface.Implements", "Implements Interface", "Interfaces",
+                           {In("Target", P::Entity), Out("Result", P::Bool)},
+                           [](ScriptContext& c) { c.Out(1, c.Implements(c.InEntity(0), c.Param())); },
+                           "Does the target's script implement the interface?"),
+                      ParamKind::Interface, "Interface", ""));
+    }
+
+    // Event dispatchers: other scripts bind their custom events, Call runs all of them.
+    {
+        NodeDesc call = Flow("Dispatcher.Call", "Call Dispatcher", {ExecIn(), ExecOut()}, [](ScriptContext& c, int) {
+            c.CallDispatcher(c.Param(), DataInputs(c, 2));
+            return 1;
+        }, "Runs every custom event bound to this dispatcher, with these arguments");
+        call.category    = "Dispatchers";
+        call.hidden      = true;
+        call.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            const ScriptEventDecl* d = g.FindDispatcher(n.param);
+            return SignaturePins({ExecIn(), ExecOut()}, d ? d->params : std::vector<ScriptParam>{}, {});
+        };
+        add(WithParam(std::move(call), ParamKind::Dispatcher, "Dispatcher", ""));
+        const auto bind = [&](const char* type, const char* title, bool binding, const char* tooltip) {
+            add(WithParam(Action(type, title, "Dispatchers", {In("Target", P::Entity), In("Event", P::String)},
+                                 [binding](ScriptContext& c) {
+                                     if (!c.BindDispatcher(c.InEntity(2), c.Param(), c.InString(3), binding))
+                                         c.Error("Target has no script with the dispatcher '" + c.Param() + "'");
+                                 }, tooltip),
+                          ParamKind::Text, "Dispatcher", "OnChanged"));
+        };
+        bind("Dispatcher.Bind", "Bind Event to Dispatcher", true,
+             "The custom event Event of this script runs whenever the target's dispatcher is called");
+        bind("Dispatcher.Unbind", "Unbind Event from Dispatcher", false, "Removes a binding made by Bind");
+        add(WithParam(Action("Dispatcher.UnbindAll", "Unbind All from Dispatcher", "Dispatchers", {In("Target", P::Entity)},
+                             [](ScriptContext& c) {
+                                 if (!c.UnbindAll(c.InEntity(2), c.Param()))
+                                     c.Error("Target has no script with the dispatcher '" + c.Param() + "'");
+                             }, "Removes every binding of the target's dispatcher"),
+                      ParamKind::Text, "Dispatcher", "OnChanged"));
+    }
     return r;
 }
 

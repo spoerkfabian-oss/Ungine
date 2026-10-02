@@ -23,6 +23,11 @@ struct State {
     std::map<std::string, ScriptInterface, std::less<>> interfaces;
     std::map<std::string, ScriptLibrary, std::less<>>   libraries;
     std::uint64_t                                       revision = 1;
+    // Library validation cache (cleared on any change) and the libraries being validated now
+    // (libraries using each other).
+    std::map<std::string, std::vector<ScriptDiagnostic>, std::less<>> libraryDiagnostics;
+    std::uint64_t                                                     diagnosticsRevision = 0;
+    std::unordered_set<std::string>                                   validating;
 };
 
 std::pair<std::string_view, std::string_view> SplitQualified(std::string_view q)
@@ -183,6 +188,26 @@ const ScriptInterfaceFunction* FindInterfaceFunction(std::string_view qualified)
             if (f.name == fn)
                 return &f;
     return nullptr;
+}
+
+const std::vector<ScriptDiagnostic>* LibraryDiagnostics(std::string_view name)
+{
+    State&               s   = S();
+    const ScriptLibrary* lib = FindLibrary(name);
+    if (!lib)
+        return nullptr;
+    if (s.diagnosticsRevision != s.revision) {
+        s.libraryDiagnostics.clear();
+        s.diagnosticsRevision = s.revision;
+    }
+    if (const auto it = s.libraryDiagnostics.find(name); it != s.libraryDiagnostics.end())
+        return &it->second;
+    static const std::vector<ScriptDiagnostic> none;
+    if (!s.validating.insert(std::string(name)).second)
+        return &none; // reached again through another library: reported by the outer check
+    std::vector<ScriptDiagnostic> diagnostics = ValidateScriptGraph(lib->graph);
+    s.validating.erase(std::string(name));
+    return &(s.libraryDiagnostics[std::string(name)] = std::move(diagnostics));
 }
 
 ScriptInterface LoadInterfaceFile(const std::filesystem::path& file)
@@ -452,6 +477,32 @@ std::vector<std::string> Validate()
     for (const auto& [name, s] : S().structs)
         if (state[name] == 0 && cyclic(name))
             problems.push_back("Struct '" + name + "' contains itself");
+    for (const auto& [name, i] : S().interfaces) {
+        if (!IsValidScriptName(name))
+            problems.push_back("Invalid interface name '" + name + "'");
+        std::unordered_set<std::string> functions;
+        for (const ScriptInterfaceFunction& f : i.functions) {
+            if (!IsValidScriptName(f.name) || !functions.insert(f.name).second)
+                problems.push_back("Interface '" + name + "': function names must be unique names ('" + f.name + "')");
+            for (const auto* params : {&f.inputs, &f.outputs}) {
+                std::unordered_set<std::string> names;
+                for (const ScriptParam& p : *params) {
+                    if (!IsValidScriptName(p.name) || !names.insert(p.name).second)
+                        problems.push_back("Interface '" + name + "', function '" + f.name +
+                                           "': parameter names must be unique names ('" + p.name + "')");
+                    if (!known(p.type))
+                        problems.push_back("Interface '" + name + "', function '" + f.name + "', parameter '" + p.name +
+                                           "': unknown type " + DisplayName(p.type));
+                }
+            }
+        }
+    }
+    for (const auto& [name, l] : S().libraries)
+        if (const std::vector<ScriptDiagnostic>* d = LibraryDiagnostics(name))
+            for (const ScriptDiagnostic& diag : *d)
+                if (diag.error)
+                    problems.push_back("Library '" + name + "'" + (diag.node ? ", node " + std::to_string(diag.node) : "") +
+                                       ": " + diag.message);
     return problems;
 }
 
