@@ -346,20 +346,34 @@ struct ScriptSystem::Impl {
                 return c.defaults[static_cast<std::size_t>(pin)];
             const CompiledNode& from = m_Instance.program->nodes[static_cast<std::size_t>(src.node)];
             if (from.desc->kind == NodeKind::Pure && m_Instance.evalStamp[static_cast<std::size_t>(src.node)] != stamp) {
+                const int pureNode = src.node;
+                if (!m_activePure.insert(pureNode).second) {
+                    Error("Pure evaluation cycle");
+                    return DefaultValue(c.pins[static_cast<std::size_t>(pin)].type);
+                }
                 if (depth > 256) {
+                    m_activePure.erase(pureNode);
                     Error("Pure evaluation too deep");
                     return DefaultValue(c.pins[static_cast<std::size_t>(pin)].type);
                 }
                 const int saved = node;
-                node            = src.node;
+                node            = pureNode;
                 ++depth;
-                if (from.callFunction >= 0)
-                    m_Impl.RunPureFunction(m_Scene, m_Instance, *this);
-                else
-                    from.desc->evaluate(*this);
+                try {
+                    if (from.callFunction >= 0)
+                        m_Impl.RunPureFunction(m_Scene, m_Instance, *this);
+                    else
+                        from.desc->evaluate(*this);
+                } catch (...) {
+                    --depth;
+                    node = saved;
+                    m_activePure.erase(pureNode);
+                    throw;
+                }
                 --depth;
                 node = saved;
-                m_Instance.evalStamp[static_cast<std::size_t>(src.node)] = stamp;
+                m_activePure.erase(pureNode);
+                m_Instance.evalStamp[static_cast<std::size_t>(pureNode)] = stamp;
             }
             return ConvertFrom(m_Instance.outputs[static_cast<std::size_t>(src.node)][static_cast<std::size_t>(src.pin)],
                                from.pins[static_cast<std::size_t>(src.pin)].type, c.pins[static_cast<std::size_t>(pin)].type);
@@ -612,6 +626,11 @@ struct ScriptSystem::Impl {
 
     public:
         const std::uint64_t stamp;
+
+    private:
+        std::unordered_set<int> m_activePure;
+
+    public:
     };
 
     Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am, AudioSystem* au)
