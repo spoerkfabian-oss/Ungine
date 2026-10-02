@@ -1,4 +1,4 @@
-# UngineEditor (editor + project browser) and UnginePlayer (runs a project), installed with CPack.
+# UngineEditor and the developer sandbox (editor + project browser) and UnginePlayer (runs a project), installed with CPack.
 # Both land in the same output directory: Build & Run finds the player next to the editor.
 add_executable(UngineEditor editor/main.cpp)
 target_link_libraries(UngineEditor PRIVATE Engine Editor)
