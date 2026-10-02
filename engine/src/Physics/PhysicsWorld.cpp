@@ -861,12 +861,28 @@ struct PhysicsWorld::Impl {
         for (const auto& [depth, i] : order) {
             const PoseWrite& w      = writes[i];
             const Entity     parent = parentOf(w.entity);
-            const glm::mat4  parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
-            Transform&       t           = scene.EditTransform(w.entity);
+            const glm::mat4 parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
+            if (!Finite(w.position) || (w.rotation && !Finite(*w.rotation)) ||
+                !glm::all(glm::isfinite(parentWorld[0])) || !glm::all(glm::isfinite(parentWorld[1])) ||
+                !glm::all(glm::isfinite(parentWorld[2])) || !glm::all(glm::isfinite(parentWorld[3]))) {
+                ENGINE_WARN("Physics: refusing invalid pose write for entity {}", static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
+            const float determinant = glm::determinant(parentWorld);
+            if (parent != NullEntity && std::abs(determinant) < 1e-8f) {
+                ENGINE_WARN("Physics: refusing pose write through singular parent for entity {}",
+                            static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
+            Transform& t = scene.EditTransform(w.entity);
             t.position = glm::vec3(glm::inverse(parentWorld) * glm::vec4(w.position, 1.0f));
             if (w.rotation)
                 t.rotation = parent != NullEntity ? glm::normalize(glm::conjugate(Decompose(parentWorld).rotation) * *w.rotation)
                                                   : *w.rotation;
+            if (!Finite(t.position) || !Finite(t.rotation)) {
+                ENGINE_WARN("Physics: refusing non-finite local pose for entity {}", static_cast<std::uint64_t>(w.entity));
+                continue;
+            }
             fresh[Key(w.entity)] = parentWorld * t.LocalMatrix();
         }
 
