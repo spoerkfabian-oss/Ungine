@@ -970,6 +970,28 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
         r.scripts.End(r.scene);
     }
 
+    // A step request must expire when the paused chain ends; otherwise the next event would
+    // be mistaken for the next step and pause at its first node.
+    {
+        Graph terminal;
+        const std::uint32_t beginTerminal = terminal.Node("Event.BeginPlay");
+        const std::uint32_t done = Print(terminal, "done");
+        terminal.Link(beginTerminal, "Out", done, "In");
+        const std::uint32_t tick = terminal.Node("Event.Tick"), tickPrint = Print(terminal, "tick");
+        terminal.Link(tick, "Out", tickPrint, "In");
+        terminal.g.SetBreakpoint(done, true);
+        CHECK(terminal.Valid());
+        Runner r;
+        r.Add("Terminal", "terminal.ugraph", terminal.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.scripts.DebugPaused() && r.scripts.PausedAt() && r.scripts.PausedAt()->node == done);
+        r.scripts.DebugStepOver(r.scene);
+        CHECK(!r.scripts.DebugPaused() && r.Printed("done"));
+        r.Run(1.0f / 60.0f);
+        CHECK(!r.scripts.DebugPaused() && r.Printed("tick"));
+        r.scripts.End(r.scene);
+    }
+
     // Construction script: Count posts (exposed) as children, rebuilt on every run, not saved.
     Graph c;
     c.g.variables.push_back({"Count", PinType::Int, std::int32_t{3}, true});
