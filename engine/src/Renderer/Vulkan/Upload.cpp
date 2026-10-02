@@ -391,7 +391,8 @@ void UploadQueue::SubmitBatches(bool all)
         // Failed batches are never submitted. They are discarded once all workers that
         // reserved staging space in them have finished, which also releases their ring ranges.
         std::vector<std::unique_ptr<Batch>> discarded;
-        while (!m_Closed.empty() && m_Closed.front()->failed && m_Closed.front()->pendingWrites == 0) {
+        while (!m_Closed.empty() && m_Closed.front()->failed && m_Closed.front()->pendingWrites == 0 &&
+               (m_Closed.front()->ringBytes == 0 || m_InFlight.empty())) {
             discarded.push_back(std::move(m_Closed.front()));
             m_Closed.pop_front();
         }
@@ -400,7 +401,8 @@ void UploadQueue::SubmitBatches(bool all)
             batches.push_back(std::move(m_Closed.front()));
             m_Closed.pop_front();
         }
-        if (m_Closed.empty() && m_Open && m_Open->failed && m_Open->pendingWrites == 0) {
+        if (m_Closed.empty() && m_Open && m_Open->failed && m_Open->pendingWrites == 0 &&
+            (m_Open->ringBytes == 0 || m_InFlight.empty())) {
             discarded.push_back(std::move(m_Open));
         }
         if (m_Closed.empty() && m_Open && fits(*m_Open)) { // workers open a fresh batch from here on
