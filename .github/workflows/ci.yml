@@ -83,26 +83,46 @@ jobs:
     name: Windows MSVC
     runs-on: windows-2022
     timeout-minutes: 90
-    env:
-      VULKAN_SDK_VERSION: 1.3.290.0
     steps:
       - uses: actions/checkout@v4
+
+      # Only glslc is needed (volk loads Vulkan at run time). LunarG renamed its installers, so
+      # the current version is looked up and both file name schemes are tried.
+      - name: Resolve Vulkan SDK version
+        id: vulkan
+        shell: pwsh
+        run: |
+          $version = (Invoke-RestMethod -Uri https://vulkan.lunarg.com/sdk/latest/windows.txt).Trim()
+          if (-not $version) { throw 'Could not resolve the latest Vulkan SDK version' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Vulkan SDK $version"
 
       - name: Cache Vulkan SDK
         id: vulkan-cache
         uses: actions/cache@v4
         with:
           path: C:\VulkanSDK
-          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ steps.vulkan.outputs.version }}
 
       - name: Install Vulkan SDK (glslc)
         if: steps.vulkan-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/VulkanSDK-$env:VULKAN_SDK_VERSION-Installer.exe"
-          Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe
-          Start-Process -FilePath .\vulkan-sdk.exe -Wait -NoNewWindow -ArgumentList `
+          $ProgressPreference = 'SilentlyContinue'
+          $v = '${{ steps.vulkan.outputs.version }}'
+          $urls = @("https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe",
+                    "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe")
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try { Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe; $downloaded = $true; Write-Host "Downloaded $url"; break }
+            catch { Write-Host "Not available: $url" }
+          }
+          if (-not $downloaded) { throw "Vulkan SDK $v installer not found" }
+          $p = Start-Process -FilePath .\vulkan-sdk.exe -Wait -PassThru -NoNewWindow -ArgumentList `
             '--root', 'C:\VulkanSDK', '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer failed ($($p.ExitCode))" }
+          if (-not (Test-Path C:\VulkanSDK\Bin\glslc.exe)) { throw 'glslc.exe missing after the install' }
+          Remove-Item vulkan-sdk.exe
 
       - name: Vulkan SDK environment
         shell: pwsh
