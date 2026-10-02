@@ -451,6 +451,8 @@ void UploadQueue::RecycleBatch(std::unique_ptr<Batch> batch)
     batch->acquires.clear();
     batch->value = 0;
     batch->bytes = 0;
+    batch->pendingWrites = 0;
+    batch->failed = false;
     VK_CHECK(vkResetCommandPool(m_Ctx.Device(), batch->pool, 0));
     std::scoped_lock lock{m_Mutex};
     if (batch->ringBytes > 0) { // batches complete in ring order
