@@ -1,9 +1,9 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
 #include "Editor/ScriptGraphEditor.h"
-#include "FileDialog.h"
-#include "History.h"
-#include "ImGuiLayer.h"
+#include "Editor/FileDialog.h"
+#include "Editor/History.h"
+#include "Editor/ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Platform.h"
