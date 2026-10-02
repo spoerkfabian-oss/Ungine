@@ -1243,8 +1243,13 @@ struct ScriptSystem::Impl {
             const auto it = instances.find(chain.entity);
             if (it == instances.end() || it->second->serial != chain.serial || !it->second->program)
                 return;
+            const std::uint64_t chainId = chain.state.id;
             chain.state.skipBreak = skip;
-            RunState(scene, *it->second, chain.state, false);
+            const bool finished = RunState(scene, *it->second, chain.state, false);
+            // A step request belongs to the chain that was paused. If that chain ends without
+            // reaching another node, do not carry the step mode into a later event/tick.
+            if (finished && stepMode != StepMode::None && stepChain == chainId)
+                stepMode = StepMode::None;
         };
         if (paused) {
             SuspendedChain chain = std::move(*paused);
