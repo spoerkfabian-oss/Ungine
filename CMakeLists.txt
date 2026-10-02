@@ -32,7 +32,6 @@ include(cmake/Shaders.cmake)
 
 add_subdirectory(engine)
 add_subdirectory(editor)
-add_subdirectory(sandbox)
 add_subdirectory(apps)
 
 # Sample sound generator (not built by default): MakeSounds <dir> writes the synthesized WAVs in
