@@ -1394,7 +1394,6 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
         Edit("Remove macro", [&](ScriptGraph& graph) { graph.RemoveMacro(name); });
         std::erase_if(doc.selected, [&](std::uint32_t id) { return !doc.graph.FindNode(id); });
     }
-    ImGui::SameLine();
     if (ImGui::SmallButton("+ Macro")) {
         const std::string name = UniqueName(g, {}, "NewMacro", true);
         Edit("Add macro", [&](ScriptGraph& graph) { graph.AddMacro(name, {0.0f, 0.0f}); });
@@ -3184,7 +3183,9 @@ void ScriptGraphEditor::DrawTimeline(Document& doc)
         m_Timeline.clear();
         return;
     }
-    bool open = true;
+    bool          open   = true;
+    const ImVec2  center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(ImVec2(center.x - 40.0f, center.y - 60.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(640.0f, 460.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(("Timeline: " + t->name + "###TimelineEditor").c_str(), &open)) {
         ImGui::End();
@@ -3530,7 +3531,9 @@ void ScriptGraphEditor::DrawSearch()
 {
     if (!m_SearchOpen)
         return;
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 360.0f), ImGuiCond_FirstUseEver);
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(ImVec2(center.x + 140.0f, center.y - 320.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 300.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Find in Blueprints", &m_SearchOpen)) {
         ImGui::End();
         return;

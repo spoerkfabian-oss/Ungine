@@ -2131,6 +2131,12 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
         }
     };
 
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot) { // windows placed for a full-size editor
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(10);
+    }
+
     // A blueprint with a construction script (Count posts), a macro, a timeline, events.
     const fs::path     file = dir / "Fence.ugraph";
     ScriptGraphEditor& bp   = editor.Blueprints();
@@ -2206,11 +2212,9 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
     editor.OpenAsset(dir / "Mood.uenum");
     runFrames(4);
     if (const char* shot = std::getenv("UNGINE_TEST_SCREENSHOT")) { // documentation: the windows as they look
-        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        bp.Focus();
         runFrames(40);
         (void)std::system((std::string("import -window root ") + shot).c_str());
-        glfwSetWindowSize(F().window->Native(), 320, 240);
-        runFrames(5);
     }
     CHECK(!bp.Search("Print", false).empty() && bp.Search("Count", true).size() >= 1 && bp.Search("AddOne", true).size() == 3); // Macro node + its Inputs / Outputs
     bp.OpenScope({});
@@ -2267,6 +2271,10 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
     runFrames(1);
     bp.Close(0);
     ScriptRegistry::Clear();
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(3);
+    }
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);

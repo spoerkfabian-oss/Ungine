@@ -664,7 +664,9 @@ void Editor::OpenTypeFile(const fs::path& file)
 
 void Editor::DrawBlueprintTypes()
 {
-    ImGui::SetNextWindowSize(ImVec2(620.0f, 420.0f), ImGuiCond_FirstUseEver);
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(ImVec2(center.x - 700.0f, center.y - 60.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 360.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Blueprint Types", &m_ShowTypes)) {
         ImGui::End();
         return;
