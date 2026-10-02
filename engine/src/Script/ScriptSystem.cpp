@@ -258,7 +258,7 @@ struct ScriptSystem::Impl {
         std::vector<char>                      active;  // per function: on the call stack
         std::vector<std::vector<ScriptValue>>  outputs; // per node, per pin
         std::vector<ScriptContext::NodeState>  states;
-        std::vector<std::uint32_t>             evalStamp; // per node: the execution its pure outputs were computed for
+        std::vector<std::uint64_t>             evalStamp; // per node: the execution its pure outputs were computed for
         std::vector<Timer>                     timers;
         std::unordered_set<int>                reported; // nodes whose runtime error was logged
         std::string                            graph;    // ScriptComponent::graph it was made for
@@ -611,7 +611,7 @@ struct ScriptSystem::Impl {
         Instance& m_Instance;
 
     public:
-        const std::uint32_t stamp;
+        const std::uint64_t stamp;
     };
 
     Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am, AudioSystem* au)
