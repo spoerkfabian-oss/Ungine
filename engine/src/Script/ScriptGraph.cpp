@@ -1175,6 +1175,23 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
         }
         if (desc->paramKind == ParamKind::Key && KeyFromName(n.param) < 0)
             error(n.id, "Unknown key '" + n.param + "'");
+        if (n.type == "Dispatcher.Bind" || n.type == "Dispatcher.Unbind" || n.type == "Dispatcher.UnbindAll") {
+            const auto linked = [&](const char* pin) {
+                return std::ranges::any_of(graph.links, [&](const ScriptLink& l) { return l.toNode == n.id && l.toPin == pin; });
+            };
+            if (!linked("Target") && !graph.FindDispatcher(n.param)) // self: this graph's dispatchers are known
+                error(n.id, "This graph has no dispatcher '" + n.param + "' (the target is this script)");
+            if (n.type != "Dispatcher.UnbindAll" && !linked("Event")) {
+                const auto        it    = n.defaults.find("Event");
+                const std::string event = it != n.defaults.end() && std::holds_alternative<std::string>(it->second)
+                                              ? std::get<std::string>(it->second)
+                                              : std::string();
+                if (event.empty())
+                    error(n.id, "No custom event to bind (Event)");
+                else if (std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) { return e.type == "Event.Custom" && e.param == event; }))
+                    out.push_back({n.id, "This graph has no Custom Event '" + event + "' to bind", false});
+            }
+        }
         if (desc->paramKind == ParamKind::Timeline && !graph.FindTimeline(n.param))
             error(n.id, "Unknown timeline '" + n.param + "'");
         if ((desc->paramKind == ParamKind::Text || desc->paramKind == ParamKind::InputAction ||

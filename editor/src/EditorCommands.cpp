@@ -417,6 +417,9 @@ bool Editor::SaveScene(const std::filesystem::path& file)
         m_Status = "Stop playing to save";
         return false;
     }
+    // Saved without what construction scripts did (they run again when the scene loads).
+    if (m_Ctx.scripts)
+        m_Ctx.scripts->ResetConstructed(m_Ctx.scene);
     try {
         SaveSceneFile(file, m_Ctx.scene, m_Ctx.assets,
                       {.renderer = &m_Ctx.sceneRenderer,
@@ -425,8 +428,10 @@ bool Editor::SaveScene(const std::filesystem::path& file)
     } catch (const std::exception& e) {
         ENGINE_ERROR("Save scene failed: {}", e.what());
         m_Status = "Save failed (see log)";
+        RunConstructionScripts();
         return false;
     }
+    RunConstructionScripts();
     m_ScenePath = file;
     m_History->MarkSaved();
     m_Status = "Saved " + file.filename().string();

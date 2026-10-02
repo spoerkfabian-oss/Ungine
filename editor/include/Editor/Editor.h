@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -116,6 +117,13 @@ public:
     void                    Play();     // from Edit: snapshot + simulate; from Paused: resume
     void                    Pause();
     void                    Stop();     // back to the snapshot
+    // UI automation (tests): input for the next frame, in window pixels. Keys: "Enter", "Escape",
+    // "Delete", "Tab". Double clicks may be slow (several frames apart).
+    void SimulateMouse(glm::vec2 position, int button = -1, bool down = false);
+    void SimulateKey(std::string_view key, bool down);
+    void SimulateText(std::string_view utf8);
+    void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
+
     // Project: (re)loads the blueprint types / interfaces / libraries of the content directory
     // (ScriptRegistry); done at start and before play. Returns the problems found.
     std::vector<std::string> ReloadScriptRegistry();
@@ -291,6 +299,7 @@ private:
     std::vector<ModelHandle> m_PlayModels; // of levels opened by scripts while playing (released at Stop)
     std::uint64_t            m_ConstructedRevision = ~std::uint64_t{0}; // History revision construction scripts ran for
     std::uint64_t            m_ConstructedGraphs   = 0; // graph editor revision they ran for
+    double                   m_LastConstruction    = -1.0; // ImGui time of the last run (throttle while dragging)
     bool        m_StepRequested = false;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).

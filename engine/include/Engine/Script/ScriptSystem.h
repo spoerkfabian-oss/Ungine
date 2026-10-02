@@ -122,8 +122,13 @@ public:
     // ConstructionOwned and are destroyed when the owner's script runs again (or the owner is
     // gone); latent nodes, timers and timelines do not run there. RunConstruction: one entity
     // (false: no construction script); RunAllConstruction: every scripted entity, returns how many ran.
+    // Each run starts from the owner as it was before the last run (the script's own changes to it
+    // are undone, edits made since are kept), like UE.
     bool        RunConstruction(Scene& scene, Entity entity);
     std::size_t RunAllConstruction(Scene& scene);
+    // Back to the state without construction scripts (owners restored, constructed entities
+    // destroyed), e.g. to save the scene; run them again afterwards.
+    void ResetConstructed(Scene& scene);
 
     // Game view rectangle in window pixels (mouse / camera nodes).
     void SetViewport(const ScriptViewport& viewport);

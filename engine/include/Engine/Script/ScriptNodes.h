@@ -154,6 +154,10 @@ public:
     [[nodiscard]] virtual bool SaveExists(const std::string& slot) = 0;
     virtual bool               SaveDelete(const std::string& slot) = 0;
 
+    [[nodiscard]] virtual std::vector<std::string> SaveSlots() = 0; // slots with a file (names, sorted)
+    // Runs the construction scripts of the entity and its children now (spawned prefabs).
+    virtual void Construct(Entity root) = 0;
+
     // Levels: the application handles the request after the update (ScriptSystem::TakeLevelRequest).
     virtual void RequestLevel(std::string scene, bool quit) = 0;
     [[nodiscard]] virtual const std::string& CurrentLevel() const = 0;

@@ -901,13 +901,14 @@ std::vector<NodeDesc> BuildRegistry()
                    try {
                        const Entity e = InstantiatePrefab(c.GetScene(), c.Assets(), file, NullEntity, t, models);
                        c.Out(5, e);
+                       c.Construct(e); // like placed ones: before their BeginPlay
                    } catch (const std::exception& ex) {
                        c.Error(ex.what());
                    }
                    for (ModelHandle h : models)
                        c.KeepModel(h.index, h.generation);
                }, "Instantiates a .uprefab (path relative to the project) at a world location (Euler degrees); "
-                  "its scripts start on the next frame"));
+                  "construction scripts run now, BeginPlay on the next frame"));
 
     // Physics.
     add(Action("Physics.AddImpulse", "Add Impulse", "Physics", {In("Target", P::Entity), In("Impulse", P::Vec3)},
@@ -1887,14 +1888,20 @@ std::vector<NodeDesc> BuildRegistry()
                                 c.CallFunctionOn(target, f->name, DataInputs(c, 3), results);
             for (std::size_t i = 0; i < f->outputs.size(); ++i)
                 c.Out(firstOut + static_cast<int>(i), called && i < results.size() ? results[i] : DefaultValue(f->outputs[i].type));
+            c.Out(firstOut + static_cast<int>(f->outputs.size()), called);
             return 1;
-        }, "Runs the function on the target's script if it implements the interface (else nothing; outputs default)");
+        }, "Runs the function on the target's script if it implements the interface; Implemented tells whether it "
+           "did (else the outputs are defaults)");
         call.category    = "Interfaces";
         call.hidden      = true;
         call.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
             const ScriptInterfaceFunction* f = ScriptRegistry::FindInterfaceFunction(n.param);
             std::vector<PinInfo>           pins{ExecIn(), ExecOut(), In("Target", P::Entity)};
-            return f ? SignaturePins(std::move(pins), f->inputs, f->outputs) : pins;
+            if (!f)
+                return pins;
+            pins = SignaturePins(std::move(pins), f->inputs, f->outputs);
+            pins.push_back(Out("Implemented", P::Bool));
+            return pins;
         };
         add(WithParam(std::move(call), ParamKind::InterfaceFunction, "Function", ""));
         add(WithParam(Pure("Interface.Implements", "Implements Interface", "Interfaces",
@@ -2092,6 +2099,13 @@ std::vector<NodeDesc> BuildRegistry()
                    "Reads the slot's file (replacing values set since)");
         slotAction("SaveGame.Delete", "Delete Save Slot", [](ScriptContext& c, const std::string& slot) { return c.SaveDelete(slot); },
                    "Removes the slot's file and values");
+        add(Pure("SaveGame.ListSlots", "Get Save Slots", "Save Game", {Out("Slots", P::StringArray)},
+                 [](ScriptContext& c) {
+                     std::vector<ScriptValue> names;
+                     for (std::string& n : c.SaveSlots())
+                         names.emplace_back(std::move(n));
+                     c.Out(0, MakeArray(P::String, std::move(names)));
+                 }, "The slots that have a save file (load menus)"));
         add(WithDefaults(Pure("SaveGame.Exists", "Does Save Slot Exist", "Save Game", {In("Slot", P::String), Out("Exists", P::Bool)},
                               [](ScriptContext& c) { c.Out(1, c.SaveExists(c.InString(0))); }, "Is there a file for the slot?"),
                          {{"Slot", std::string("Save1")}}));
@@ -2101,9 +2115,7 @@ std::vector<NodeDesc> BuildRegistry()
                                         const std::string slot = c.InString(2), prefix = c.InString(3);
                                         bool ok = save || c.SaveRead(slot);
                                         for (const ScriptVariable& v : c.Graph().variables) {
-                                            if (v.type.kind == PinKind::Entity) // runtime references
-                                                continue;
-                                            ScriptValue* value = c.Variable(v.name);
+                                            ScriptValue* value = c.Variable(v.name); // entities: by UUID
                                             if (!value)
                                                 continue;
                                             if (save)
@@ -2118,7 +2130,7 @@ std::vector<NodeDesc> BuildRegistry()
                              {{"Slot", std::string("Save1")}}));
         };
         variables("SaveGame.SaveVariables", "Save Variables", true,
-                  "Stores all variables of this script (keys Prefix + name; no entities) and writes the slot");
+                  "Stores all variables of this script (keys Prefix + name; entities by UUID) and writes the slot");
         variables("SaveGame.LoadVariables", "Load Variables", false,
                   "Reads the slot and sets this script's variables stored by Save Variables");
     }

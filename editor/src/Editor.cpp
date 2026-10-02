@@ -23,6 +23,8 @@
 #include <imgui.h>
 #include <imgui_internal.h> // DockBuilder
 
+#include <GLFW/glfw3.h>
+
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 
@@ -68,10 +70,35 @@ Editor::Editor(const EditorContext& context)
         m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
 }
 
+void Editor::SimulateMouse(glm::vec2 position, int button, bool down)
+{
+    ImGuiIO& io             = ImGui::GetIO();
+    if (io.MouseDoubleClickTime < 2.0f) { // simulated clicks are frames apart
+        io.MouseDoubleClickTime  = 2.0f;
+        io.MouseSingleClickDelay = std::max(io.MouseSingleClickDelay, 2.5f); // must stay longer (ImGui check)
+    }
+    glfwSetCursorPos(m_Ctx.window.Native(), position.x, position.y);   // the backend may poll the cursor
+    io.AddMousePosEvent(position.x, position.y);
+    if (button >= 0)
+        io.AddMouseButtonEvent(button, down);
+}
+
+void Editor::SimulateKey(std::string_view key, bool down)
+{
+    const ImGuiKey k = key == "Enter" ? ImGuiKey_Enter : key == "Escape" ? ImGuiKey_Escape : key == "Delete" ? ImGuiKey_Delete
+                     : key == "Tab"   ? ImGuiKey_Tab
+                                      : ImGuiKey_None;
+    if (k != ImGuiKey_None)
+        ImGui::GetIO().AddKeyEvent(k, down);
+}
+
+void Editor::SimulateText(std::string_view utf8) { ImGui::GetIO().AddInputCharactersUTF8(std::string(utf8).c_str()); }
+
 void Editor::RunConstructionScripts()
 {
     m_ConstructedRevision = m_History->Revision();
     m_ConstructedGraphs   = m_Graphs->Revision();
+    m_LastConstruction    = ImGui::GetTime();
     if (!m_Ctx.scripts || m_PlayState != PlayState::Edit)
         return;
     m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits count
@@ -208,8 +235,10 @@ void Editor::Update(float dt)
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
     }
     // Edit mode: construction scripts follow every edit (History change, New / Open, Stop).
+    // While a widget is dragged at most 4 times a second, then once more when it is let go.
     if (m_PlayState == PlayState::Edit && m_Ctx.scripts &&
-        (m_History->Revision() != m_ConstructedRevision || m_Graphs->Revision() != m_ConstructedGraphs))
+        (m_History->Revision() != m_ConstructedRevision || m_Graphs->Revision() != m_ConstructedGraphs) &&
+        (!ImGui::IsAnyItemActive() || ImGui::GetTime() - m_LastConstruction >= 0.25))
         RunConstructionScripts();
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)

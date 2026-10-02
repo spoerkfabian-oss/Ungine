@@ -666,7 +666,8 @@ TEST_CASE(Editor_FramesSelectionAndToggle)
                                      .assets        = *F().assets,
                                      .sceneRenderer = sceneRenderer,
                                      .camera        = camera,
-                                     .modelRefs     = modelRefs};
+                                     .modelRefs     = modelRefs,
+                                     .layoutFile    = {}}; // the default layout, nothing saved
     const auto runFrames = [&](Editor& editor, int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -740,7 +741,8 @@ TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
                    .assets        = *F().assets,
                    .sceneRenderer = sceneRenderer,
                    .camera        = camera,
-                   .modelRefs     = modelRefs});
+                   .modelRefs     = modelRefs,
+                   .layoutFile    = {}});
     const auto runFrames = [&](int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -876,7 +878,8 @@ TEST_CASE(Physics_MeshColliderAndEditorPlayStop)
                    .sceneRenderer = sceneRenderer,
                    .camera        = camera,
                    .modelRefs     = modelRefs,
-                   .physics       = &physics});
+                   .physics       = &physics,
+                   .layoutFile    = {}});
     camera.position = {0.0f, world.max.y + 2.0f, 6.0f};
     camera.LookAt({0.0f, world.max.y, 0.0f});
     const auto runFrames = [&](int count, int stepsPerFrame) {
@@ -1603,7 +1606,8 @@ TEST_CASE(Editor_BlueprintPlayAndGraphEditing)
                    .camera        = camera,
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
-                   .scripts       = &scripts});
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 2.0f, 8.0f};
     const auto runFrames = [&](int count) {
         for (int i = 0; i < count; ++i) {
@@ -1847,7 +1851,8 @@ TEST_CASE(Audio_SoundAssetsAndEditorPlay)
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
                    .scripts       = &scripts,
-                   .audio         = &audio});
+                   .audio         = &audio,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 2.0f, 8.0f};
     std::vector<float> mix(4800 * 2);
     const auto runFrames = [&](int count) {
@@ -1923,7 +1928,8 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
                    .camera        = camera,
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
-                   .scripts       = &scripts});
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
     camera.position = {0.0f, 3.0f, 10.0f};
     TextOverlay text(*F().renderer);
     const auto runFrames = [&](int count) {
@@ -2066,6 +2072,7 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
     CHECK(editor.SaveScene(sceneFile));
     editor.NewScene();
     CHECK(editor.OpenScene(sceneFile));
+    editor.FocusViewport(); // the blueprint tab came to front at the breakpoint
     runFrames(6);
     int instances = 0, meshes = 0;
     r.ViewOf<PrefabInstance>().Each([&](Entity, PrefabInstance&) { ++instances; });
@@ -2116,7 +2123,8 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
                    .camera        = camera,
                    .modelRefs     = modelRefs,
                    .physics       = &physics,
-                   .scripts       = &scripts});
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
     const auto runFrames = [&](int count) {
         for (int i = 0; i < count; ++i) {
             F().window->PollEvents();
@@ -2275,6 +2283,121 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
         glfwSetWindowSize(F().window->Native(), 320, 240);
         runFrames(3);
     }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+// The new panels driven like a user: right click on the canvas -> search -> Enter adds a node;
+// double click in the timeline curve adds a key, dragging moves it.
+TEST_CASE(Editor_Blueprint3MouseInput)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_mouse_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    glfwSetWindowSize(F().window->Native(), 1280, 800);
+
+    Scene        scene;
+    ScriptSystem scripts(F().events, nullptr, nullptr, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto click = [&](glm::vec2 at, int button) {
+        editor.SimulateMouse(at);
+        runFrames(1);
+        editor.SimulateMouse(at, button, true);
+        runFrames(1);
+        editor.SimulateMouse(at, button, false);
+        runFrames(1);
+    };
+
+    runFrames(4); // the default layout brings the viewport to front after its first frames
+    ScriptGraphEditor& bp = editor.Blueprints();
+    CHECK(bp.New(dir / "Mouse.ugraph") && bp.Graph());
+    if (!bp.Graph())
+        return;
+    bp.Edit("Timeline", [](ScriptGraph& g) {
+        ScriptTimeline t{"Fade", 2.0f, false, false, {}};
+        t.tracks.push_back({"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {2.0f, glm::vec3(1.0f)}}});
+        g.timelines.push_back(t);
+    });
+    bp.Focus();
+    runFrames(6);
+
+    // Palette: right click on an empty spot of the canvas, type, Enter.
+    const glm::vec4 canvas = bp.CanvasRect();
+    CHECK(canvas.z > 100.0f && canvas.w > 100.0f);
+    const auto prints = [&] {
+        return std::ranges::count_if(bp.Graph()->nodes, [](const ScriptNode& n) { return n.type == "Debug.Print"; });
+    };
+    const auto before = prints();
+    click({canvas.x + canvas.z * 0.92f, canvas.y + canvas.w * 0.08f}, 1); // top right: no nodes, not the minimap
+    runFrames(1);
+    editor.SimulateText("Print String");
+    runFrames(2);
+    editor.SimulateKey("Enter", true);
+    runFrames(1);
+    editor.SimulateKey("Enter", false);
+    runFrames(2);
+    CHECK(prints() == before + 1);
+
+    // Timeline: double click adds a key at the cursor, dragging it moves it in time.
+    bp.OpenTimeline("Fade");
+    runFrames(4);
+    const glm::vec4 curve = bp.TimelineCurveRect();
+    CHECK(curve.z > 100.0f && curve.w > 50.0f);
+    const auto keys = [&] { return bp.Graph()->FindTimeline("Fade")->tracks[0].keys; };
+    const glm::vec2 at{curve.x + curve.z * 0.25f, curve.y + curve.w * 0.5f};
+    click(at, 0);
+    click(at, 0); // second click: a double click
+    runFrames(2);
+    CHECK(keys().size() == 3);
+    if (keys().size() == 3) {
+        CHECK(std::abs(keys()[1].time - 0.5f) < 0.05f); // 25 % of 2 s
+        editor.SimulateMouse(at);
+        runFrames(1);
+        editor.SimulateMouse(at, 0, true);
+        runFrames(1);
+        for (int i = 1; i <= 5; ++i) {
+            editor.SimulateMouse({at.x + curve.z * 0.07f * static_cast<float>(i), at.y});
+            runFrames(1);
+        }
+        for (int i = 0; i < 2; ++i) { // hold still: under Xvfb the warped pointer reaches ImGui a frame later
+            editor.SimulateMouse({at.x + curve.z * 0.35f, at.y});
+            runFrames(1);
+        }
+        editor.SimulateMouse({at.x + curve.z * 0.35f, at.y}, 0, false);
+        runFrames(2);
+        CHECK(keys().size() == 3 && std::abs(keys()[1].time - 1.2f) < 0.08f); // 60 % of 2 s
+    }
+    CHECK(bp.CanUndo()); // the clicks and drags were edits
+
+    bp.Close(0);
+    glfwSetWindowSize(F().window->Native(), 320, 240);
+    runFrames(2);
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);

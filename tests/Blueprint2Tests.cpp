@@ -3,6 +3,8 @@
 
 #include "Engine/Core/Input.h"
 #include "Engine/Core/Project.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptCondition.h"
 #include "Engine/Script/ScriptRegistry.h"
@@ -416,6 +418,21 @@ TEST_CASE(Blueprint2_MacrosAndLibraries)
         r.scripts.End(r.scene);
     }
 
+    // A breakpoint on a Macro node stops when its copy is entered (reported as the Macro node).
+    {
+        Graph bp = g;
+        bp.g.SetBreakpoint(u2, true);
+        Runner r;
+        const Entity e = r.Add("M", "macros.ugraph", bp.g);
+        r.scripts.Begin(r.scene);
+        const auto at = r.scripts.PausedAt();
+        CHECK(at && at->node == u2 && at->file == ScriptSystem::Key("macros.ugraph") &&
+              IntOf(r.Var("macros.ugraph", e, "counter")) == 1);
+        r.scripts.DebugContinue(r.scene);
+        CHECK(!r.scripts.DebugPaused() && IntOf(r.Var("macros.ugraph", e, "counter")) == 3);
+        r.scripts.End(r.scene);
+    }
+
     // Validation.
     {
         Graph bad = g;
@@ -506,6 +523,8 @@ TEST_CASE(Blueprint2_InterfacesAndDispatchers)
     a.g.variables.push_back({"hurtCount", PinType::Int, std::int32_t{0}, false});
     a.g.variables.push_back({"targetImplements", PinType::Bool, false, false});
     a.g.variables.push_back({"selfImplements", PinType::Bool, true, false});
+    a.g.variables.push_back({"called", PinType::Bool, false, false});
+    a.g.variables.push_back({"ownCalled", PinType::Bool, true, false});
     a.g.events.push_back({"Hurt", {{"Amount", PinType::Float}}});
     const std::uint32_t hurt = a.Node("Event.Custom", "Hurt");
     const std::uint32_t last = SetVar(a, hurt, "Out", "lastHurt", hurt, "Amount");
@@ -538,12 +557,26 @@ TEST_CASE(Blueprint2_InterfacesAndDispatchers)
     const std::uint32_t s3 = SetVar(a, s2, "Then", "selfImplements", self, "Result");
     const std::uint32_t own = a.Node("Interface.Call", "Damageable.TakeDamage"); // not implemented here: nothing
     a.Link(s3, "Then", own, "In");
+    const std::uint32_t s4 = SetVar(a, own, "Then", "called", hit2, "Implemented");
+    const std::uint32_t s5 = SetVar(a, s4, "Then", "ownCalled", own, "Implemented");
     const std::uint32_t callHurt = a.Node("Flow.CallEvent", "Hurt");
     a.Set(callHurt, "Amount", 5.0f);
-    a.Link(own, "Then", callHurt, "In");
+    a.Link(s5, "Then", callHurt, "In");
     CHECK(a.Valid());
     {
         Graph bad = a;
+        const std::uint32_t selfBind = bad.Node("Dispatcher.Bind", "Nope"); // target unconnected: this graph
+        bad.Set(selfBind, "Event", std::string("Hurt"));
+        CHECK(HasError(bad.g, "no dispatcher 'Nope'"));
+        bad.g.RemoveNode(selfBind);
+        const std::uint32_t noEvent = bad.Node("Dispatcher.Bind", "OnDamaged");
+        bad.Link(target, "Value", noEvent, "Target");
+        CHECK(HasError(bad.g, "No custom event to bind"));
+        bad.Set(noEvent, "Event", std::string("Missing"));
+        CHECK(!HasError(bad.g, "No custom event") &&
+              std::ranges::any_of(ValidateScriptGraph(bad.g), [](const ScriptDiagnostic& d) {
+                  return !d.error && d.message.find("no Custom Event 'Missing'") != std::string::npos;
+              }));
         bad.Node("Dispatcher.Call", "Nope");
         CHECK(HasError(bad.g, "Unknown dispatcher"));
         bad.g.interfaces.push_back("Unknown");
@@ -564,6 +597,7 @@ TEST_CASE(Blueprint2_InterfacesAndDispatchers)
     CHECK(FloatOf(r.Var("attacker.ugraph", hero, "lastHurt")) == 5.0f);
     CHECK(std::get<bool>(r.Var("attacker.ugraph", hero, "targetImplements")) &&
           !std::get<bool>(r.Var("attacker.ugraph", hero, "selfImplements")));
+    CHECK(std::get<bool>(r.Var("attacker.ugraph", hero, "called")) && !std::get<bool>(r.Var("attacker.ugraph", hero, "ownCalled")));
     CHECK(r.scripts.Stats().errors == 0);
     r.scripts.End(r.scene);
 }
@@ -728,8 +762,8 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
     CHECK(IntOf(var("jumps")) == 1 && FloatOf(var("axis")) == 1.0f && std::get<bool>(var("down")));
     frame({{kS, InputAction::Press}});
     CHECK(FloatOf(var("axis")) == 0.0f && IntOf(var("jumps")) == 1);
-    frame({{-1, InputAction::Press}}); // a second bound key: pressed again
-    CHECK(IntOf(var("jumps")) == 2);
+    frame({{-1, InputAction::Press}}); // a second bound key while one is held: no new press
+    CHECK(IntOf(var("jumps")) == 1);
     frame({{kSpace, InputAction::Release}});
     CHECK(IntOf(var("releases")) == 0 && std::get<bool>(var("down"))); // the mouse button still holds it
     frame({{-1, InputAction::Release}, {kW, InputAction::Release}});
@@ -745,6 +779,8 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
     s.g.variables.push_back({"found", PinType::Bool, false, false});
     s.g.variables.push_back({"exists", PinType::Bool, false, false});
     s.g.variables.push_back({"level", PinType::String, std::string(), false});
+    s.g.variables.push_back({"friend", PinType::Entity, NullEntity, true});
+    s.g.variables.push_back({"slots", PinType::StringArray, MakeArray(PinType::String), false});
     s.g.events.push_back({"Load", {}});
     s.g.events.push_back({"Bad", {}});
     {
@@ -767,7 +803,8 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
         s.Set(get, "Key", std::string("best"));
         const std::uint32_t a = SetVar(s, lv, "Then", "loaded", get, "Value");
         const std::uint32_t b = SetVar(s, a, "Then", "found", get, "Found");
-        const std::uint32_t c = SetVar(s, b, "Then", "exists", s.Node("SaveGame.Exists"), "Exists");
+        const std::uint32_t c0 = SetVar(s, b, "Then", "exists", s.Node("SaveGame.Exists"), "Exists");
+        const std::uint32_t c  = SetVar(s, c0, "Then", "slots", s.Node("SaveGame.ListSlots"), "Slots");
         const std::uint32_t quit = s.Node("Game.Quit");
         s.Link(c, "Then", quit, "In");
         const std::uint32_t bad = s.Node("SaveGame.Save");
@@ -779,7 +816,10 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
         Runner r;
         r.scripts.SetSaveDirectory(dir);
         r.scripts.SetCurrentLevel("Content/Main.uscene");
-        r.Add("Saver", "save.ugraph", s.g);
+        const Entity buddy = r.scene.CreateEntity("Buddy", NullEntity, 4242); // same UUID in the next "level load"
+        const Entity saver = r.Add("Saver", "save.ugraph", s.g);
+        r.scene.GetRegistry().Get<ScriptComponent>(saver).variables["friend"] = {NullEntity, 4242};
+        CHECK(buddy != NullEntity);
         r.scripts.Begin(r.scene);
         const auto request = r.scripts.TakeLevelRequest();
         CHECK(request && !request->quit && request->scene == "Content/Next.uscene" && !r.scripts.TakeLevelRequest());
@@ -792,6 +832,7 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
         Graph changed = s; // different start values: Load Variables restores the saved ones
         changed.g.variables[0].value = std::int32_t{0};
         changed.g.variables[1].value = std::string("Bob");
+        const Entity buddy = r.scene.CreateEntity("Buddy again", NullEntity, 4242);
         changed.g.nodes.erase(std::ranges::find(changed.g.nodes, std::string("Event.BeginPlay"), &ScriptNode::type));
         std::erase_if(changed.g.links, [&](const ScriptLink& l) { return !changed.g.FindNode(l.fromNode); });
         CHECK(changed.Valid());
@@ -813,6 +854,10 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
               std::get<std::string>(r.Var("load.ugraph", loader, "name")) == "Ada");
         CHECK(IntOf(r.Var("load.ugraph", loader, "loaded")) == 42 && std::get<bool>(r.Var("load.ugraph", loader, "found")) &&
               std::get<bool>(r.Var("load.ugraph", loader, "exists")));
+        CHECK(std::get<Entity>(r.Var("load.ugraph", loader, "friend")) == buddy); // by UUID
+        const ScriptValue  slotsValue = r.Var("load.ugraph", loader, "slots");
+        const ScriptArray& slots      = ArrayItems(slotsValue);
+        CHECK(slots.items.size() == 1 && std::get<std::string>(slots.items[0]) == "Save1");
         const auto request = r.scripts.TakeLevelRequest();
         CHECK(request && request->quit);
         CHECK(r.scripts.Stats().errors == 1 && !fs::exists(dir.parent_path() / "escape.sav")); // invalid slot name
@@ -941,8 +986,11 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
     c.Link(toFloat, "Result", vec, "X");
     c.Link(vec, "Vector", spawn, "Location");
     c.Link(c.Node("Entity.Self"), "Self", spawn, "Parent");
+    const std::uint32_t tag = c.Node("Entity.AddTag"); // a change of the owner itself: undone before every run
+    c.Set(tag, "Tag", std::string("built"));
+    c.Link(floop, "Completed", tag, "In");
     const std::uint32_t delay = c.Node("Flow.Delay"); // reported, does not run
-    c.Link(floop, "Completed", delay, "In");
+    c.Link(tag, "Then", delay, "In");
     CHECK(c.Valid());
     {
         Runner           r;
@@ -958,6 +1006,15 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
         CHECK(reg.Get<Hierarchy>(fence).children.size() == 3 && r.scripts.Stats().errors == 1); // the Delay
         r.scene.GetRegistry().Get<ScriptComponent>(fence).variables["Count"] = {std::int32_t{5}, 0};
         CHECK(r.scripts.RunAllConstruction(r.scene) == 1 && posts() == 5);
+        // The owner: the script's tag is back each run; a user edit since the last run stays.
+        CHECK(reg.Has<Tags>(fence) && reg.Get<Tags>(fence).Has("built"));
+        r.scene.EditTransform(fence).position = {7.0f, 0.0f, 0.0f};
+        CHECK(r.scripts.RunConstruction(r.scene, fence) && reg.Get<Transform>(fence).position.x == 7.0f &&
+              reg.Get<Tags>(fence).values.size() == 1);
+        r.scripts.ResetConstructed(r.scene); // as saved: no posts, no tag
+        CHECK(posts() == 0 && (!reg.Has<Tags>(fence) || !reg.Get<Tags>(fence).Has("built")) &&
+              reg.Get<Transform>(fence).position.x == 7.0f);
+        CHECK(r.scripts.RunAllConstruction(r.scene) == 1 && posts() == 5 && reg.Get<Tags>(fence).Has("built"));
         // Saved without the posts; a snapshot (undo / play) keeps them marked.
         const fs::path dir = TempDir("ungine_construct");
         SaveSceneFile(dir / "s.uscene", r.scene, nullptr);
@@ -975,6 +1032,26 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
         r.scripts.Begin(r.scene);
         CHECK(posts() == 5);
         r.scripts.End(r.scene);
+        // A prefab spawned while playing runs its construction script before its BeginPlay.
+        {
+            Scene     templ;
+            const Entity root = templ.CreateEntity("FencePrefab");
+            templ.GetRegistry().Emplace<ScriptComponent>(root, ScriptComponent{"fence.ugraph"});
+            CreatePrefab(dir / "Fence.uprefab", templ, nullptr, root);
+            Graph spawner;
+            const std::uint32_t b = spawner.Node("Event.BeginPlay"), sp = spawner.Node("Entity.SpawnPrefab");
+            spawner.Set(sp, "Prefab", PathToUtf8(dir / "Fence.uprefab"));
+            spawner.Link(b, "Out", sp, "In");
+            CHECK(spawner.Valid());
+            Runner rs;
+            rs.scripts.Provide("fence.ugraph", c.g);
+            rs.Add("Spawner", "spawner.ugraph", spawner.g);
+            rs.scripts.Begin(rs.scene);
+            int spawnedPosts = 0;
+            rs.scene.GetRegistry().ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned&) { ++spawnedPosts; });
+            CHECK(spawnedPosts == 3);
+            rs.scripts.End(rs.scene);
+        }
         // The owner gone: its posts go with the next run.
         const Entity owner = r.scene.FindByUuid(fenceUuid);
         r.scene.GetRegistry().Remove<ScriptComponent>(owner);

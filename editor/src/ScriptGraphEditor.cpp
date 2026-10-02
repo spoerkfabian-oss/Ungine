@@ -2053,6 +2053,7 @@ void ScriptGraphEditor::DrawCanvas(Document& doc, const ScriptSystem* debug)
     const ImVec2  avail  = ImGui::GetContentRegionAvail();
     const glm::vec2 size(std::max(avail.x, 50.0f), std::max(avail.y, 50.0f));
     doc.viewSize = size;
+    m_CanvasRect = {origin.x, origin.y, size.x, size.y};
     if (!doc.framed) {
         doc.framed = true;
         doc.scroll = glm::vec2(60.0f, 60.0f);
@@ -3176,6 +3177,7 @@ void ScriptGraphEditor::OpenTimeline(const std::string& name)
 
 void ScriptGraphEditor::DrawTimeline(Document& doc)
 {
+    m_TimelineCurveRect = glm::vec4(0.0f);
     if (m_Timeline.empty())
         return;
     ScriptTimeline* t = doc.graph.FindTimeline(m_Timeline);
@@ -3303,6 +3305,7 @@ void ScriptGraphEditor::DrawTimeline(Document& doc)
     // Curve view: time to the right, value up. Double-click adds a key, drag moves one.
     const ImVec2 size(ImGui::GetContentRegionAvail().x, std::max(ImGui::GetContentRegionAvail().y * 0.55f, 120.0f));
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    m_TimelineCurveRect = {p0.x, p0.y, size.x, size.y};
     ImGui::InvisibleButton("##curve", size);
     const bool  hovered = ImGui::IsItemHovered();
     ImDrawList* dl      = ImGui::GetWindowDrawList();
@@ -3464,7 +3467,6 @@ std::vector<ScriptGraphEditor::SearchHit> ScriptGraphEditor::Search(const std::s
     if (query.empty())
         return hits;
     std::vector<std::pair<std::filesystem::path, const ScriptGraph*>> graphs;
-    std::deque<ScriptGraph>                                            loaded; // stable addresses
     std::unordered_set<std::string>                                    seen;
     for (const auto& d : m_Docs) {
         graphs.emplace_back(d->path, &d->graph);
@@ -3474,13 +3476,21 @@ std::vector<ScriptGraphEditor::SearchHit> ScriptGraphEditor::Search(const std::s
     if (!m_SearchRoot.empty())
         for (std::filesystem::recursive_directory_iterator it(m_SearchRoot, std::filesystem::directory_options::skip_permission_denied, ec), end;
              !ec && it != end; it.increment(ec)) {
-            if (it->path().extension() != ".ugraph" || seen.contains(ScriptSystem::Key(it->path())))
+            const std::string key = ScriptSystem::Key(it->path());
+            if (it->path().extension() != ".ugraph" || seen.contains(key))
                 continue;
-            try {
-                loaded.push_back(LoadScriptGraph(it->path()));
-                graphs.emplace_back(it->path(), &loaded.back());
-            } catch (const std::exception&) { // broken files are not searched
+            std::error_code timeError;
+            const auto      time   = std::filesystem::last_write_time(it->path(), timeError);
+            auto&           cached = m_SearchCache[key];
+            if (!cached.second || cached.first != time) { // parsed again only when the file changed
+                try {
+                    cached = {time, std::make_shared<const ScriptGraph>(LoadScriptGraph(it->path()))};
+                } catch (const std::exception&) { // broken files are not searched
+                    m_SearchCache.erase(key);
+                    continue;
+                }
             }
+            graphs.emplace_back(it->path(), cached.second.get());
         }
     const std::string lower = Lower(query);
     for (const auto& [path, graph] : graphs)

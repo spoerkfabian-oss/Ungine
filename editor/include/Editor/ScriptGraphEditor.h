@@ -102,6 +102,10 @@ public:
     void ShowHit(const SearchHit& hit); // opens the graph on the node
 
     void OpenTimeline(const std::string& name); // timeline editor window (active graph)
+    // Screen rectangles (x, y, width, height; window pixels) of the last frame: the canvas and the
+    // timeline editor's curve view (zero when not shown) - for UI tests and tools.
+    [[nodiscard]] glm::vec4 CanvasRect() const { return m_CanvasRect; }
+    [[nodiscard]] glm::vec4 TimelineCurveRect() const { return m_TimelineCurveRect; }
     // Changes with every edit of any open graph (construction scripts run again).
     [[nodiscard]] std::uint64_t Revision() const { return m_RevisionCounter; }
 
@@ -163,8 +167,11 @@ private:
     std::string            m_SearchQuery;
     bool                   m_SearchReferences = false, m_SearchOpen = false, m_SearchFocus = false;
     std::vector<SearchHit> m_SearchHits;
+    // Search: project graphs parsed once per file change (key -> (mtime, graph)).
+    mutable std::map<std::string, std::pair<std::filesystem::file_time_type, std::shared_ptr<const ScriptGraph>>> m_SearchCache;
     // Graphs handed to a script system by ProvideTo (by key), so closed ones can be taken back.
     mutable std::map<std::string, std::filesystem::path> m_Provided;
+    glm::vec4 m_CanvasRect{0.0f}, m_TimelineCurveRect{0.0f};
     // Timeline editor.
     std::string m_Timeline;
     int         m_TimelineTrack = 0, m_TimelineKey = -1, m_TimelineComponent = 0;
