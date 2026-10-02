@@ -33,6 +33,7 @@
 #include <format>
 #include <fstream>
 #include <latch>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -912,6 +913,53 @@ TEST_CASE(Physics_TriggerScaleAndHierarchy)
     CHECK(Near(world, {-8.0f, 0.5f, 0.0f}, 0.03f)); // local +Z rotated by 90 deg about Y = world +X
     const auto below = f.physics.Raycast(world + glm::vec3(0.0f, 5.0f, 0.0f), {0.0f, -1.0f, 0.0f}, 10.0f);
     CHECK(below && below->entity == child);
+}
+
+TEST_CASE(Physics_InvalidScaleDropsBody)
+{
+    PhysicsFixture f;
+    f.Ground();
+    const Entity ball = f.Body("Ball", {0.0f, 3.0f, 0.0f}, BodyType::Dynamic, PhysicsFixture::Sphere(0.5f));
+    f.physics.Sync(f.scene);
+    CHECK(f.physics.HasBody(ball));
+
+    // Degenerate scales are refused instead of feeding non-finite shape data to Jolt.
+    // (Negative scales are a documented limitation: Decompose loses the sign, Scaled() uses abs.)
+    f.scene.EditTransform(ball).scale = glm::vec3(0.0f);
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.HasBody(ball));
+    f.scene.EditTransform(ball).scale = glm::vec3(std::numeric_limits<float>::quiet_NaN());
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.HasBody(ball));
+    f.scene.EditTransform(ball).scale = glm::vec3(std::numeric_limits<float>::infinity());
+    f.physics.Sync(f.scene);
+    CHECK(!f.physics.HasBody(ball));
+
+    // A valid scale brings the body back (creation is retried every Sync, like pending meshes).
+    f.scene.EditTransform(ball).scale = glm::vec3(1.0f);
+    f.physics.Sync(f.scene);
+    CHECK(f.physics.HasBody(ball));
+    f.Run(2.0f);
+    CHECK(std::abs(f.WorldPosition(ball).y - 0.5f) < 0.03f); // falls and rests on the ground
+}
+
+TEST_CASE(Physics_LayerMatrixValidation)
+{
+    PhysicsSettings settings;
+    CHECK(settings.LayersCollide(0, 1)); // everything collides by default
+    settings.SetLayerCollision(0, 1, false);
+    CHECK(!settings.LayersCollide(0, 1) && !settings.LayersCollide(1, 0)); // kept symmetric
+    settings.SetLayerCollision(0, 1, true);
+    CHECK(settings.LayersCollide(0, 1) && settings.LayersCollide(1, 0));
+
+    // Out-of-range indices are ignored and never report a collision (was an out-of-bounds read).
+    const auto before = settings.layerCollision;
+    settings.SetLayerCollision(kPhysicsLayers, 0, false);
+    settings.SetLayerCollision(0, kPhysicsLayers + 3, false);
+    settings.SetLayerCollision(100, 100, false);
+    CHECK(settings.layerCollision == before);
+    CHECK(!settings.LayersCollide(kPhysicsLayers, 0));
+    CHECK(!settings.LayersCollide(0, 100));
 }
 
 TEST_CASE(Physics_CharacterWalksClimbsAndJumps)
