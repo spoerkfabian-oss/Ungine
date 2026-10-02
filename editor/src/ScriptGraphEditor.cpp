@@ -1707,9 +1707,9 @@ void ScriptGraphEditor::DrawWatch(Document& doc, const ScriptSystem* debug)
         frames.push_back(*at);
         for (std::size_t i = frames.size(); i-- > 0;) { // innermost first
             const ScriptDebugFrame& f = frames[i];
-            const std::string label = std::format("{} {}##frame{}", f.function.empty() ? "Event Graph" : f.function,
-                                                  i + 1 == frames.size() ? "(paused)" : "(call)", i);
-            if (ImGui::Selectable(label.c_str()))
+            const std::string frameLabel = std::format("{} {}##frame{}", f.function.empty() ? "Event Graph" : f.function,
+                                                       i + 1 == frames.size() ? "(paused)" : "(call)", i);
+            if (ImGui::Selectable(frameLabel.c_str()))
                 ShowHit({std::filesystem::path(f.file), f.function, f.node, {}});
         }
     }

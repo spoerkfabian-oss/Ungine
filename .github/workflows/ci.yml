@@ -140,7 +140,7 @@ jobs:
         shell: pwsh
         run: | # forward slashes: the path ends up in generated CMake code
           $deps = ($env:GITHUB_WORKSPACE -replace '\\', '/') + '/.deps'
-          cmake -B build -G "Visual Studio 17 2022" -A x64 -DENGINE_GPU_TESTS=OFF "-DFETCHCONTENT_BASE_DIR=$deps"
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DENGINE_GPU_TESTS=OFF -DENGINE_WARNINGS_AS_ERRORS=ON "-DFETCHCONTENT_BASE_DIR=$deps"
 
       - name: Build
         run: cmake --build build --config Debug --parallel
