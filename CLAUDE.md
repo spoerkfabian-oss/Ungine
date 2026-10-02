@@ -31,7 +31,7 @@ engine/src/...   (privat: src/Renderer/GpuScene, GpuCulling, src/Scene/{SceneJso
 editor/include/Editor/{Editor,ScriptGraphEditor,ProjectLauncher}.h   editor/src/{ImGuiLayer,Editor,EditorCommands,Panels,ContentBrowser,ScriptGraphEditor,ProjectLauncher,History,FileDialog}.cpp   (Bibliothek `Editor`)
 apps/editor/main.cpp (UngineEditor)   apps/player/main.cpp (UnginePlayer)   apps/sandbox/main.cpp (Dev-Demo)
 templates/{Blank,Basic,Physics}/ (template.json + Content/; Basic: Sounds/hum+music_loop, Physics: Sounds/impact + Scripts/ImpactSound.ugraph + Reverb-Zone)   resources/ (ungine.png/.ico, windows/ungine.rc, linux/{desktop,mime,install-desktop-integration.sh})
-tests/{Test.h,CoreTests.cpp,ScriptTests.cpp,BlueprintTests.cpp,Blueprint2Tests.cpp,BlueprintTestUtil.h,ProjectTests.cpp,AudioTests.cpp,GpuTests.cpp,MakeProject.cmake}   tools/MakeSounds.cpp (Target `MakeSounds`, EXCLUDE_FROM_ALL: erzeugt die Beispiel-WAVs)
+tests/{Test.h,CoreTests.cpp,ScriptTests.cpp,BlueprintTests.cpp,Blueprint2Tests.cpp,BlueprintTestUtil.h,ProjectTests.cpp,AudioTests.cpp,GpuTests.cpp,MakeProject.cmake}   tools/{CMakeLists.txt,MakeSounds.cpp} (Target `MakeSounds`, EXCLUDE_FROM_ALL: erzeugt die Beispiel-WAVs)
 assets/models/{WaterBottle,MetalRoughSpheresNoTextures,BoxTextured}.glb + LICENSE.md (CC0 / CC-BY 4.0; kein NC-Material ins Repo)   assets/scripts/{Rotator,RainOnSpace}.ugraph   assets/sounds/{impact,hum,chime,music_loop}.wav + LICENSE.md (synthetisch, CC0)
 asset_cache/ (Sandbox: Texturen, pipelines.bin; gitignored)   Projekte: <Root>/Saved/{Cache/Textures,pipelines.bin,EditorLayout.ini,player.log}
 ```
