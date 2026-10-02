@@ -6,7 +6,10 @@ target_link_libraries(UngineEditor PRIVATE Engine Editor)
 add_executable(UnginePlayer player/main.cpp)
 target_link_libraries(UnginePlayer PRIVATE Engine)
 
-foreach(app UngineEditor UnginePlayer)
+add_executable(Sandbox sandbox/main.cpp)
+target_link_libraries(Sandbox PRIVATE Engine Editor)
+
+foreach(app UngineEditor UnginePlayer Sandbox)
     engine_set_warnings(${app})
     set_target_properties(${app} PROPERTIES FOLDER "Apps" VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
