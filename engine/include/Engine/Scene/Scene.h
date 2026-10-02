@@ -42,7 +42,8 @@ public:
     void   DestroyEntity(Entity entity); // destroys the whole subtree
     void   Clear();                      // destroys every entity
     // siblingIndex: position among the parent's children (clamped; roots have no order).
-    void   SetParent(Entity child, Entity parent, std::size_t siblingIndex = kAppend);
+    // Returns false (and changes nothing) for invalid entities or a cycle (parent inside child's subtree).
+    bool   SetParent(Entity child, Entity parent, std::size_t siblingIndex = kAppend);
     [[nodiscard]] std::size_t SiblingIndex(Entity entity) const; // 0 for roots
 
     [[nodiscard]] Entity FindByUuid(std::uint64_t uuid) const; // NullEntity if unknown

@@ -3,7 +3,8 @@
 
 namespace Engine {
 
-// 32-bit slot index + 32-bit generation. A destroyed entity's handle never aliases a new one.
+// 32-bit slot index + 32-bit generation. A destroyed entity's handle never aliases a new one: a
+// slot whose generation counter is used up (2^32 - 1 reuses) is retired by the Registry.
 enum class Entity : std::uint64_t {};
 inline constexpr Entity NullEntity{~std::uint64_t{0}};
 

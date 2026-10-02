@@ -21,14 +21,20 @@ Entity Scene::CreateEntity(std::string name, Entity parent, std::uint64_t uuid)
     while (uuid == 0 || m_ByUuid.contains(uuid))
         uuid = m_Random();
     const Entity e = m_Registry.Create();
-    m_ByUuid.emplace(uuid, e);
-    m_Registry.Emplace<Uuid>(e, uuid);
-    m_Registry.Emplace<Name>(e, std::move(name));
-    m_Registry.Emplace<Transform>(e);
-    m_Registry.Emplace<WorldTransform>(e);
-    m_Registry.Emplace<Hierarchy>(e);
+    try { // all or nothing (allocations may throw)
+        m_ByUuid.emplace(uuid, e);
+        m_Registry.Emplace<Uuid>(e, uuid);
+        m_Registry.Emplace<Name>(e, std::move(name));
+        m_Registry.Emplace<Transform>(e);
+        m_Registry.Emplace<WorldTransform>(e);
+        m_Registry.Emplace<Hierarchy>(e);
+    } catch (...) {
+        m_ByUuid.erase(uuid);
+        m_Registry.Destroy(e);
+        throw;
+    }
     if (parent != NullEntity)
-        SetParent(e, parent);
+        SetParent(e, parent); // an invalid parent leaves a root
     MarkDirty(e);
     return e;
 }
@@ -144,10 +150,18 @@ void Scene::Clear()
         DestroyEntity(e);
 }
 
-void Scene::SetParent(Entity child, Entity parent, std::size_t siblingIndex)
+bool Scene::SetParent(Entity child, Entity parent, std::size_t siblingIndex)
 {
-    assert(child != parent);
-    assert((parent == NullEntity || !IsAncestor(child, parent)) && "SetParent would create a cycle");
+    // Checked in release builds too: a bad handle or a cycle would corrupt the hierarchy.
+    if (!m_Registry.Has<Hierarchy>(child) || child == parent)
+        return false;
+    if (parent != NullEntity && (!m_Registry.Has<Hierarchy>(parent) || IsAncestor(child, parent)))
+        return false;
+    if (parent != NullEntity) { // allocate before changing anything
+        auto& children = m_Registry.Get<Hierarchy>(parent).children;
+        if (children.size() == children.capacity())
+            children.reserve(std::max<std::size_t>(4, children.size() * 2));
+    }
     Detach(child);
     MarkDirty(child);
     m_Registry.Get<Hierarchy>(child).parent = parent;
@@ -155,6 +169,7 @@ void Scene::SetParent(Entity child, Entity parent, std::size_t siblingIndex)
         auto& children = m_Registry.Get<Hierarchy>(parent).children;
         children.insert(children.begin() + static_cast<std::ptrdiff_t>(std::min(siblingIndex, children.size())), child);
     }
+    return true;
 }
 
 std::size_t Scene::SiblingIndex(Entity entity) const
@@ -200,9 +215,12 @@ void Scene::Detach(Entity child)
 
 bool Scene::IsAncestor(Entity ancestor, Entity entity) const
 {
-    for (Entity p = m_Registry.Get<Hierarchy>(entity).parent; p != NullEntity; p = m_Registry.Get<Hierarchy>(p).parent)
+    const Hierarchy* h = m_Registry.TryGet<Hierarchy>(entity);
+    for (Entity p = h ? h->parent : NullEntity; p != NullEntity; p = h ? h->parent : NullEntity) {
         if (p == ancestor)
             return true;
+        h = m_Registry.TryGet<Hierarchy>(p);
+    }
     return false;
 }
 

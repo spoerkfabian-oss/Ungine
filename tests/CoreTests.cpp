@@ -24,6 +24,7 @@
 #include <stb_image_write.h>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -353,6 +354,103 @@ TEST_CASE(ShadowAtlas_CubeFacesAndBorder)
     // 90 degrees plus a 4-texel border on a 256 tile: the face edge lands 4 texels inside.
     const float t = ShadowTanHalfWithBorder(1.0f, 256, 4.0f);
     CHECK(std::abs(1.0f / t - (1.0f - 8.0f / 256.0f)) < 1e-6f);
+}
+
+namespace {
+struct EcsValue {
+    int v = 0;
+};
+struct EcsThrowing {
+    explicit EcsThrowing(int value) : v(value)
+    {
+        if (value < 0)
+            throw std::runtime_error("boom");
+    }
+    int v;
+};
+} // namespace
+
+TEST_CASE(Ecs_ViewMutationAndExceptionSafety)
+{
+    { // destroying the current entity visits all
+        Registry            r;
+        std::vector<Entity> visited;
+        for (int i = 0; i < 10; ++i)
+            r.Emplace<EcsValue>(r.Create(), i);
+        r.ViewOf<EcsValue>().Each([&](Entity e, EcsValue&) {
+            visited.push_back(e);
+            r.Destroy(e);
+        });
+        CHECK(visited.size() == 10 && r.AliveCount() == 0);
+    }
+    { // destroying other entities (e.g. a subtree): no double visits, the dead ones are skipped
+        Registry            r;
+        std::vector<Entity> es;
+        for (int i = 0; i < 8; ++i) {
+            es.push_back(r.Create());
+            r.Emplace<EcsValue>(es.back(), i);
+        }
+        std::vector<int> seen;
+        r.ViewOf<EcsValue>().Each([&](Entity e, EcsValue& value) {
+            seen.push_back(value.v);
+            if (value.v == 5) {
+                r.Destroy(e);
+                r.Destroy(es[0]);
+                r.Destroy(es[7]);
+                r.Emplace<EcsValue>(r.Create(), 100); // created during iteration: not visited
+            }
+        });
+        std::ranges::sort(seen);
+        const bool visitedOnce = std::ranges::adjacent_find(seen) == seen.end();
+        CHECK(visitedOnce && std::ranges::find(seen, 100) == seen.end());
+        // 5 is visited first or after its peers; 0 and 7 only if visited before 5 destroyed them.
+        CHECK(std::ranges::find(seen, 5) != seen.end() && seen.size() >= 6 && seen.size() <= 8);
+    }
+    { // a throwing constructor leaves the pool unchanged
+        Registry     r;
+        const Entity a = r.Create();
+        const Entity b = r.Create();
+        r.Emplace<EcsThrowing>(a, 1);
+        bool threw = false;
+        try {
+            r.Emplace<EcsThrowing>(b, -1);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw && !r.Has<EcsThrowing>(b) && r.Has<EcsThrowing>(a) && r.Get<EcsThrowing>(a).v == 1);
+        r.Emplace<EcsThrowing>(b, 2);
+        r.Remove<EcsThrowing>(a);
+        CHECK(r.Get<EcsThrowing>(b).v == 2 && !r.Has<EcsThrowing>(a));
+        int count = 0;
+        r.ViewOf<EcsThrowing>().Each([&](Entity, EcsThrowing&) { ++count; });
+        CHECK(count == 1);
+        // Dead handles are rejected instead of corrupting the pool.
+        r.Destroy(a);
+        bool rejected = false;
+        try {
+            r.Emplace<EcsValue>(a, 3);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CHECK(rejected && !r.Has<EcsValue>(a));
+    }
+    { // SetParent validates in release builds too
+        Scene        scene;
+        const Entity root  = scene.CreateEntity("Root");
+        const Entity child = scene.CreateEntity("Child", root);
+        const Entity leaf  = scene.CreateEntity("Leaf", child);
+        const Entity dead  = scene.CreateEntity("Dead");
+        scene.DestroyEntity(dead);
+        CHECK(!scene.SetParent(root, leaf));  // cycle
+        CHECK(!scene.SetParent(child, child)); // self
+        CHECK(!scene.SetParent(dead, root) && !scene.SetParent(leaf, dead));
+        const Registry& r = scene.GetRegistry();
+        CHECK(r.Get<Hierarchy>(leaf).parent == child && r.Get<Hierarchy>(root).parent == NullEntity &&
+              r.Get<Hierarchy>(root).children.size() == 1);
+        CHECK(scene.SetParent(leaf, root, 0) && r.Get<Hierarchy>(root).children.front() == leaf);
+        const Entity orphan = scene.CreateEntity("Orphan", dead); // dead parent: a root
+        CHECK(r.Get<Hierarchy>(orphan).parent == NullEntity && !scene.IsAncestor(root, dead));
+    }
 }
 
 TEST_CASE(Scene_UuidsAndSiblingOrder)

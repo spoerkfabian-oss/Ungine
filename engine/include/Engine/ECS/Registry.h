@@ -2,12 +2,14 @@
 #include "Engine/ECS/Entity.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -15,14 +17,18 @@
 
 namespace Engine {
 
+// Components must move without throwing: pools swap-and-pop them, which could not be undone.
 template <class T>
-concept Component = std::is_object_v<T> && std::movable<T> && !std::is_const_v<T>;
+concept Component = std::is_object_v<T> && std::movable<T> && !std::is_const_v<T> &&
+                    std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>;
 
+// Registries are not thread-safe (use one from one thread at a time); component ids may be
+// assigned from any thread.
 namespace detail {
 inline std::size_t NextComponentId() noexcept
 {
-    static std::size_t counter = 0;
-    return counter++;
+    static std::atomic<std::size_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
 }
 template <class T>
 std::size_t ComponentId() noexcept
@@ -43,22 +49,34 @@ public:
 
 // Sparse set: O(1) add/remove/lookup, components tightly packed for cache-friendly iteration.
 // References returned by Get/Emplace are invalidated by any later Emplace/Remove on the same pool.
+// Get requires Contains (checked by assert only, like std::vector::operator[]).
 template <Component T>
 class ComponentPool final : public IComponentPool {
 public:
+    // Strong guarantee: if constructing T (or allocating) throws, the pool is unchanged.
+    // Already present: replaced (asserts in debug builds).
     template <class... Args>
     T& Emplace(Entity e, Args&&... args)
     {
-        assert(!Contains(e) && "Component already present");
+        if (T* existing = TryGet(e)) {
+            assert(false && "Component already present");
+            *existing = Make(std::forward<Args>(args)...);
+            return *existing;
+        }
         const std::uint32_t index = EntityIndex(e);
         if (index >= m_Sparse.size())
-            m_Sparse.resize(std::size_t{index} + 1, kInvalid);
-        m_Sparse[index] = static_cast<std::uint32_t>(m_Dense.size());
-        m_Dense.push_back(e);
+            m_Sparse.resize(std::size_t{index} + 1, kInvalid); // extra free entries are harmless
         if constexpr (std::is_aggregate_v<T>)
             m_Components.push_back(T{std::forward<Args>(args)...});
         else
             m_Components.emplace_back(std::forward<Args>(args)...);
+        try {
+            m_Dense.push_back(e);
+        } catch (...) {
+            m_Components.pop_back();
+            throw;
+        }
+        m_Sparse[index] = static_cast<std::uint32_t>(m_Dense.size() - 1);
         return m_Components.back();
     }
 
@@ -107,14 +125,25 @@ public:
     [[nodiscard]] std::span<T> Components() { return m_Components; }
 
 private:
+    template <class... Args>
+    static T Make(Args&&... args)
+    {
+        if constexpr (std::is_aggregate_v<T>)
+            return T{std::forward<Args>(args)...};
+        else
+            return T(std::forward<Args>(args)...);
+    }
+
     static constexpr std::uint32_t kInvalid = ~std::uint32_t{0};
     std::vector<std::uint32_t> m_Sparse;
     std::vector<Entity>        m_Dense;
     std::vector<T>             m_Components;
 };
 
-// Iterates entities that have all of Ts, driven by the smallest pool.
-// Iteration runs backwards, so removing components from / destroying the *current* entity is safe.
+// Iterates the entities that have all of Ts when Each starts (driven by the smallest pool). The
+// callback may add or remove components and create or destroy entities (any of them, e.g. whole
+// subtrees): entities that lose a component or die before their turn are skipped, new ones are
+// not visited, none is visited twice.
 template <Component... Ts>
 class View {
 public:
@@ -133,13 +162,13 @@ public:
                        : driver),
          ...);
 
-        for (std::size_t i = driver->Size(); i-- > 0;) {
-            if (i >= driver->Size()) // callback shrank the driver pool by more than one
-                continue;
-            const Entity e = driver->EntityAt(i);
-            if ((std::get<ComponentPool<Ts>*>(m_Pools)->Contains(e) && ...))
+        // Snapshot: swap-and-pop removals reorder the pool while the callback runs.
+        std::vector<Entity> entities(driver->Size());
+        for (std::size_t i = 0; i < entities.size(); ++i)
+            entities[i] = driver->EntityAt(i);
+        for (const Entity e : entities)
+            if ((std::get<ComponentPool<Ts>*>(m_Pools)->Contains(e) && ...)) // also rejects dead handles
                 fn(e, std::get<ComponentPool<Ts>*>(m_Pools)->Get(e)...);
-        }
     }
 
 private:
@@ -175,15 +204,17 @@ public:
         for (auto& pool : m_Pools)
             if (pool)
                 pool->Remove(e);
-        ++m_Generations[EntityIndex(e)];
-        m_FreeList.push_back(EntityIndex(e));
+        // A slot whose generation is used up is retired instead of reused: old handles never alias.
+        if (++m_Generations[EntityIndex(e)] != kRetiredGeneration)
+            m_FreeList.push_back(EntityIndex(e));
         --m_Alive;
     }
 
     [[nodiscard]] bool Valid(Entity e) const
     {
         const std::uint32_t index = EntityIndex(e);
-        return e != NullEntity && index < m_Generations.size() && m_Generations[index] == EntityGeneration(e);
+        return e != NullEntity && index < m_Generations.size() && m_Generations[index] == EntityGeneration(e) &&
+               EntityGeneration(e) != kRetiredGeneration;
     }
 
     // Handle with the slot's current generation (e.g. from a GPU entity-index buffer). A free slot
@@ -193,16 +224,20 @@ public:
         return index < m_Generations.size() ? MakeEntity(index, m_Generations[index]) : NullEntity;
     }
 
+    // Throws std::invalid_argument for a dead entity (a component on a dead slot would corrupt the pool).
     template <Component T, class... Args>
     T& Emplace(Entity e, Args&&... args)
     {
-        assert(Valid(e));
+        if (!Valid(e))
+            throw std::invalid_argument("Registry::Emplace: invalid entity");
         return Pool<T>().Emplace(e, std::forward<Args>(args)...);
     }
 
     template <Component T, class... Args>
     T& EmplaceOrReplace(Entity e, Args&&... args)
     {
+        if (!Valid(e))
+            throw std::invalid_argument("Registry::EmplaceOrReplace: invalid entity");
         auto& pool = Pool<T>();
         if (T* existing = pool.TryGet(e)) {
             *existing = T{std::forward<Args>(args)...};
@@ -283,6 +318,8 @@ private:
     }
 
     std::vector<std::unique_ptr<IComponentPool>> m_Pools; // indexed by component id
+    static constexpr std::uint32_t kRetiredGeneration = ~std::uint32_t{0};
+
     std::vector<std::uint32_t>                   m_Generations;
     std::vector<std::uint32_t>                   m_FreeList;
     std::size_t                                  m_Alive = 0;
