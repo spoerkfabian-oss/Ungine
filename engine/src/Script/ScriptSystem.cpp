@@ -7,6 +7,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Script/ScriptCondition.h"
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "ScriptExpand.h"
@@ -216,6 +217,7 @@ struct ScriptSystem::Impl {
     };
     // A running chain: where it is and what comes after.
     struct ChainState {
+        std::uint64_t             id    = 0; // distinguishes chains (stepping over / out)
         int                       node  = 0;
         int                       entry = 0;
         std::int32_t              data  = 0;
@@ -405,10 +407,17 @@ struct ScriptSystem::Impl {
         }
         void         KeepModel(std::uint32_t index, std::uint32_t generation) override
         {
-            m_Impl.spawned.push_back(ModelHandle{index, generation});
+            if (m_Impl.constructing) // lives with the constructed entities
+                m_Impl.constructionModels[m_Impl.constructing].push_back(ModelHandle{index, generation});
+            else
+                m_Impl.spawned.push_back(ModelHandle{index, generation});
         }
         std::int32_t SetTimer(const std::string& event, float seconds, bool loop) override
         {
+            if (m_Impl.constructing) {
+                Error("Timers do not run in the construction script");
+                return 0;
+            }
             if (event.empty() || !(seconds > 0.0f)) {
                 Error("A timer needs an event name and a time > 0");
                 return 0;
@@ -423,6 +432,11 @@ struct ScriptSystem::Impl {
         }
         void SetTicking(bool on) override
         {
+            if (m_Impl.constructing) {
+                if (on)
+                    Error("Timelines and tweens do not run in the construction script");
+                return;
+            }
             std::vector<int>& t = m_Instance.ticking;
             const auto        it = std::ranges::find(t, node);
             if (on && it == t.end())
@@ -578,7 +592,7 @@ struct ScriptSystem::Impl {
         if (diagnostics.empty())
             diagnostics = ValidateScriptGraph(graph);
         if (!breakpoints.contains(key))
-            breakpoints[key] = {graph.breakpoints.begin(), graph.breakpoints.end()};
+            breakpoints[key] = BreakpointsOf(graph);
         // Macros and library functions: copied in. Problems the copies cause (e.g. recursion through
         // a macro) are reported at their origin.
         std::unordered_map<std::uint32_t, ScriptOrigin> origins;
@@ -605,7 +619,7 @@ struct ScriptSystem::Impl {
         for (std::size_t i = 1; i < program->files.size(); ++i) // breakpoints saved in libraries
             if (const ScriptLibrary* lib = ScriptRegistry::FindLibrary(program->fileLibraries[i]);
                 lib && !breakpoints.contains(program->files[i]))
-                breakpoints[program->files[i]] = {lib->graph.breakpoints.begin(), lib->graph.breakpoints.end()};
+                breakpoints[program->files[i]] = BreakpointsOf(lib->graph);
         ScriptDebugInfo& info = debug[key];
         info.diagnostics      = program->diagnostics;
         if (!program->ok) {
@@ -623,6 +637,14 @@ struct ScriptSystem::Impl {
     // --- Instances ---
 
     Instance* CreateInstance(Scene& scene, Entity e, const std::string& graph)
+    {
+        auto      inst = MakeInstance(scene, e, graph);
+        Instance* raw  = inst.get();
+        instances[EntityKey(e)] = std::move(inst);
+        return raw;
+    }
+
+    std::unique_ptr<Instance> MakeInstance(Scene& scene, Entity e, const std::string& graph)
     {
         auto program  = ProgramFor(graph);
         auto inst     = std::make_unique<Instance>();
@@ -672,9 +694,89 @@ struct ScriptSystem::Impl {
                         inst->ticking.push_back(static_cast<int>(i));
                     }
         }
-        Instance* raw = inst.get();
-        instances[EntityKey(e)] = std::move(inst);
-        return raw;
+        return inst;
+    }
+
+    // --- Construction scripts ---
+
+    // Destroys what the owner's construction script made and releases its models.
+    void DestroyConstructed(Scene& scene, std::uint64_t owner)
+    {
+        std::vector<Entity> owned;
+        scene.GetRegistry().ViewOf<ConstructionOwned>().Each([&](Entity e, ConstructionOwned& o) {
+            if (o.owner == owner)
+                owned.push_back(e);
+        });
+        for (Entity e : owned)
+            if (scene.GetRegistry().Valid(e))
+                scene.DestroyEntity(e);
+        if (const auto it = constructionModels.find(owner); it != constructionModels.end()) {
+            if (assets)
+                for (ModelHandle h : it->second)
+                    assets->Release(h);
+            constructionModels.erase(it);
+        }
+    }
+
+    // Runs Event.Construction of the entity's script on a temporary instance; the entities it
+    // creates are marked as owned (rebuilt next time, not saved). False: no construction script.
+    bool Construct(Scene& scene, Entity e)
+    {
+        Registry& r = scene.GetRegistry();
+        if (!r.Valid(e) || !r.Has<Uuid>(e) || r.Has<ConstructionOwned>(e))
+            return false;
+        const std::uint64_t owner = r.Get<Uuid>(e).value;
+        DestroyConstructed(scene, owner);
+        const ScriptComponent* sc = r.TryGet<ScriptComponent>(e);
+        if (!sc || sc->graph.empty())
+            return false;
+        const std::shared_ptr<const Program> program = ProgramFor(sc->graph);
+        if (!program->ok || !program->events.contains("Event.Construction"))
+            return false;
+        std::unordered_set<std::uint64_t> before;
+        r.ViewOf<Uuid>().Each([&](Entity, Uuid& u) { before.insert(u.value); });
+        const std::unique_ptr<Instance> inst = MakeInstance(scene, e, sc->graph);
+        constructing                         = owner;
+        FireSimple(scene, *inst, "Event.Construction");
+        constructing = 0;
+        std::vector<Entity> created;
+        r.ViewOf<Uuid>().Each([&](Entity x, Uuid& u) {
+            if (!before.contains(u.value))
+                created.push_back(x);
+        });
+        for (Entity x : created)
+            if (r.Valid(x))
+                r.EmplaceOrReplace<ConstructionOwned>(x, ConstructionOwned{owner});
+        scene.UpdateTransforms();
+        return true;
+    }
+
+    std::size_t ConstructAll(Scene& scene)
+    {
+        Registry&                         r = scene.GetRegistry();
+        std::vector<Entity>               owners;
+        std::unordered_set<std::uint64_t> alive;
+        r.ViewOf<ScriptComponent>().Each([&](Entity e, ScriptComponent&) {
+            if (!r.Has<ConstructionOwned>(e)) {
+                owners.push_back(e);
+                alive.insert(r.Get<Uuid>(e).value);
+            }
+        });
+        // Leftovers of owners that are gone (or lost their script).
+        std::unordered_set<std::uint64_t> orphaned;
+        r.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned& o) {
+            if (!alive.contains(o.owner))
+                orphaned.insert(o.owner);
+        });
+        for (const auto& [owner, models] : constructionModels)
+            if (!alive.contains(owner))
+                orphaned.insert(owner);
+        for (std::uint64_t owner : orphaned)
+            DestroyConstructed(scene, owner);
+        std::size_t count = 0;
+        for (Entity e : owners)
+            count += Construct(scene, e) ? 1 : 0;
+        return count;
     }
 
     // Adds / removes instances to match the scene's ScriptComponents. Decides first, then fires
@@ -785,15 +887,49 @@ struct ScriptSystem::Impl {
         return frame.callNode;
     }
 
-    bool ShouldBreak(const Instance& inst, const ChainState& st) const
+    bool ShouldBreak(Instance& inst, const ChainState& st)
     {
-        if (st.skipBreak)
+        if (st.skipBreak || constructing)
             return false;
-        if (stepping)
-            return true;
+        switch (stepMode) {
+        case StepMode::Into: return true;
+        case StepMode::Over:
+            if (st.id != stepChain || st.calls.size() <= stepDepth)
+                return true;
+            break;
+        case StepMode::Out:
+            if (st.id != stepChain || st.calls.size() < stepDepth)
+                return true;
+            break;
+        case StepMode::None: break;
+        }
         const CompiledNode& c  = inst.program->nodes[static_cast<std::size_t>(st.node)];
         const auto          it = breakpoints.find(inst.program->files[static_cast<std::size_t>(c.file)]);
-        return it != breakpoints.end() && it->second.contains(c.id);
+        if (it == breakpoints.end())
+            return false;
+        const auto bp = it->second.find(c.id);
+        if (bp == it->second.end())
+            return false;
+        Breakpoint& b = bp->second;
+        if (!b.options.condition.empty()) {
+            // Variables as the node sees them: the running function's locals first.
+            const auto lookup = [&](std::string_view name) -> const ScriptValue* {
+                if (c.scope >= 0) {
+                    const CompiledFunction& f = inst.program->functions[static_cast<std::size_t>(c.scope)];
+                    if (const auto l = f.localIndex.find(std::string(name)); l != f.localIndex.end())
+                        return &inst.locals[static_cast<std::size_t>(c.scope)][static_cast<std::size_t>(l->second)];
+                }
+                const auto v = inst.program->variableIndex.find(std::string(name));
+                return v != inst.program->variableIndex.end() ? &inst.variables[static_cast<std::size_t>(v->second)] : nullptr;
+            };
+            std::string error;
+            const auto  result = EvaluateScriptCondition(b.options.condition, lookup, &error);
+            if (!result)
+                RuntimeError(inst, st.node, "Breakpoint condition: " + error); // stops: the condition needs fixing
+            else if (!*result)
+                return false;
+        }
+        return ++b.hits >= b.options.hitCount;
     }
 
     // Runs a chain until it ends (true) or stops at a breakpoint (false, state kept in `paused`).
@@ -813,7 +949,7 @@ struct ScriptSystem::Impl {
                 return true;
             }
             if (!nested && ShouldBreak(inst, st)) {
-                stepping = false;
+                stepMode = StepMode::None;
                 paused   = SuspendedChain{key, serial, std::move(st)};
                 return false;
             }
@@ -836,7 +972,9 @@ struct ScriptSystem::Impl {
                 // Continuations pushed now run after the chain that starts here: LIFO, pushed last = next.
                 for (auto it = ctx.pushed.rbegin(); it != ctx.pushed.rend(); ++it)
                     st.stack.push_back(*it);
-                if (ctx.suspended)
+                if (ctx.suspended && constructing)
+                    RuntimeError(inst, st.node, "Latent nodes do not run in the construction script");
+                else if (ctx.suspended)
                     waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds});
                 if (out == kScriptReturn) {
                     out = kScriptStop;
@@ -942,6 +1080,7 @@ struct ScriptSystem::Impl {
     void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
     {
         ChainState st;
+        st.id        = ++nextChain;
         st.node      = node;
         st.entry     = entry;
         st.data      = data;
@@ -1053,7 +1192,7 @@ struct ScriptSystem::Impl {
         collisions.clear();
         paused.reset();
         queued.clear();
-        stepping = false;
+        stepMode = StepMode::None;
         if (assets)
             for (ModelHandle h : spawned)
                 assets->Release(h);
@@ -1091,13 +1230,32 @@ struct ScriptSystem::Impl {
     std::filesystem::path                                           saveDirectory;
     std::map<std::string, nlohmann::json>                           saves; // slot -> values (cache)
     std::optional<ScriptLevelRequest>                               levelRequest;
+    std::uint64_t                                                   constructing = 0; // owner UUID while a construction script runs
+    std::unordered_map<std::uint64_t, std::vector<ModelHandle>>     constructionModels; // by owner UUID
     std::string                                                     currentLevel;
 
     // Debugger.
-    std::unordered_map<std::string, std::unordered_set<std::uint32_t>> breakpoints; // by program key
-    std::optional<SuspendedChain>                                      paused;
-    std::deque<SuspendedChain>                                         queued;
-    bool                                                               stepping = false;
+    struct Breakpoint {
+        ScriptBreakpointOptions options;
+        std::uint32_t           hits = 0; // since play began (condition true)
+    };
+    enum class StepMode : std::uint8_t { None, Into, Over, Out };
+    static std::unordered_map<std::uint32_t, Breakpoint> BreakpointsOf(const ScriptGraph& graph)
+    {
+        std::unordered_map<std::uint32_t, Breakpoint> out;
+        for (std::uint32_t node : graph.breakpoints) {
+            const auto o = graph.breakpointOptions.find(node);
+            out[node]    = {o != graph.breakpointOptions.end() ? o->second : ScriptBreakpointOptions{}, 0};
+        }
+        return out;
+    }
+    std::unordered_map<std::string, std::unordered_map<std::uint32_t, Breakpoint>> breakpoints; // by program key
+    std::optional<SuspendedChain>                                                   paused;
+    std::deque<SuspendedChain>                                                      queued;
+    StepMode                                                                        stepMode  = StepMode::None;
+    std::size_t                                                                     stepDepth = 0;
+    std::uint64_t                                                                   stepChain = 0;
+    std::uint64_t                                                                   nextChain = 0;
 };
 
 ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* physics, AssetManager* assets,
@@ -1106,7 +1264,14 @@ ScriptSystem::ScriptSystem(EventBus& events, const Input* input, PhysicsWorld* p
 {
 }
 
-ScriptSystem::~ScriptSystem() { m_Impl->Clear(); }
+ScriptSystem::~ScriptSystem()
+{
+    m_Impl->Clear();
+    if (m_Impl->assets)
+        for (const auto& [owner, models] : m_Impl->constructionModels)
+            for (ModelHandle h : models)
+                m_Impl->assets->Release(h);
+}
 
 std::string ScriptSystem::Key(const std::filesystem::path& file)
 {
@@ -1130,6 +1295,7 @@ void ScriptSystem::Begin(Scene& scene)
     w.running  = true;
     w.maxSteps = maxStepsPerEvent;
     scene.UpdateTransforms();
+    w.ConstructAll(scene); // fresh constructed entities before BeginPlay
     w.SyncInstances(scene);
     w.stats.instances = static_cast<std::uint32_t>(w.instances.size());
     for (const auto& [key, inst] : w.instances)
@@ -1304,7 +1470,7 @@ void ScriptSystem::End(Scene& scene)
         return;
     w.paused.reset(); // the debugger lets go: EndPlay runs to completion
     w.queued.clear();
-    w.stepping = false;
+    w.stepMode = Impl::StepMode::None;
     w.breakpoints.clear();
     std::vector<std::uint64_t> keys;
     for (const auto& [key, inst] : w.instances)
@@ -1347,6 +1513,24 @@ const ScriptStats&             ScriptSystem::Stats() const { return m_Impl->stat
 double                         ScriptSystem::Time() const { return m_Impl->time; }
 
 void ScriptSystem::SetViewport(const ScriptViewport& viewport) { m_Impl->viewport = viewport; }
+
+bool ScriptSystem::RunConstruction(Scene& scene, Entity entity)
+{
+    Impl& w = *m_Impl;
+    if (!w.running)
+        w.programs.clear(); // editing: the graph files may have changed
+    w.maxSteps = maxStepsPerEvent;
+    return w.Construct(scene, entity);
+}
+
+std::size_t ScriptSystem::RunAllConstruction(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.running)
+        w.programs.clear();
+    w.maxSteps = maxStepsPerEvent;
+    return w.ConstructAll(scene);
+}
 void ScriptSystem::SetInputMap(InputMap map) { m_Impl->inputMap = std::move(map); }
 void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)
 {
@@ -1358,7 +1542,21 @@ void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = s
 
 void ScriptSystem::SetBreakpoints(const std::filesystem::path& file, std::vector<std::uint32_t> nodes)
 {
-    m_Impl->breakpoints[Key(file)] = {nodes.begin(), nodes.end()};
+    std::vector<ScriptBreakpoint> list;
+    for (std::uint32_t n : nodes)
+        list.push_back({n, {}});
+    SetBreakpointList(file, list);
+}
+
+void ScriptSystem::SetBreakpointList(const std::filesystem::path& file, const std::vector<ScriptBreakpoint>& list)
+{
+    auto& map = m_Impl->breakpoints[Key(file)];
+    std::unordered_map<std::uint32_t, Impl::Breakpoint> next;
+    for (const ScriptBreakpoint& b : list) { // hits count on while the options stay
+        const auto old = map.find(b.node);
+        next[b.node]   = {b.options, old != map.end() && old->second.options == b.options ? old->second.hits : 0};
+    }
+    map = std::move(next);
 }
 
 bool ScriptSystem::DebugPaused() const { return m_Impl->paused.has_value(); }
@@ -1371,9 +1569,16 @@ std::optional<ScriptDebugFrame> ScriptSystem::PausedAt() const
     const auto it = w.instances.find(w.paused->entity);
     if (it == w.instances.end() || !it->second->program)
         return std::nullopt;
-    const Program&      p = *it->second->program;
-    const CompiledNode& c = p.nodes[static_cast<std::size_t>(w.paused->state.node)];
-    return ScriptDebugFrame{p.files[static_cast<std::size_t>(c.file)], c.id, c.function, it->second->entity};
+    const Program&      p     = *it->second->program;
+    const auto          frame = [&](int node) {
+        const CompiledNode& c = p.nodes[static_cast<std::size_t>(node)];
+        return ScriptDebugFrame{p.files[static_cast<std::size_t>(c.file)], c.id, c.function, it->second->entity, {}};
+    };
+    ScriptDebugFrame result = frame(w.paused->state.node);
+    for (const Impl::CallFrame& call : w.paused->state.calls)
+        if (call.callNode >= 0)
+            result.callers.push_back(frame(call.callNode));
+    return result;
 }
 
 void ScriptSystem::DebugContinue(Scene& scene)
@@ -1381,7 +1586,7 @@ void ScriptSystem::DebugContinue(Scene& scene)
     Impl& w = *m_Impl;
     if (!w.paused)
         return;
-    w.stepping = false;
+    w.stepMode = Impl::StepMode::None;
     w.ResumeChains(scene);
     scene.UpdateTransforms();
 }
@@ -1391,7 +1596,31 @@ void ScriptSystem::DebugStep(Scene& scene)
     Impl& w = *m_Impl;
     if (!w.paused)
         return;
-    w.stepping = true; // the next node that runs stops again (also in a later frame)
+    w.stepMode = Impl::StepMode::Into; // the next node that runs stops again (also in a later frame)
+    w.ResumeChains(scene);
+    scene.UpdateTransforms();
+}
+
+void ScriptSystem::DebugStepOver(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.paused)
+        return;
+    w.stepMode  = Impl::StepMode::Over;
+    w.stepDepth = w.paused->state.calls.size();
+    w.stepChain = w.paused->state.id;
+    w.ResumeChains(scene);
+    scene.UpdateTransforms();
+}
+
+void ScriptSystem::DebugStepOut(Scene& scene)
+{
+    Impl& w = *m_Impl;
+    if (!w.paused)
+        return;
+    w.stepMode  = Impl::StepMode::Out;
+    w.stepDepth = w.paused->state.calls.size();
+    w.stepChain = w.paused->state.id;
     w.ResumeChains(scene);
     scene.UpdateTransforms();
 }

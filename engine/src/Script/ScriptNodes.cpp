@@ -437,6 +437,9 @@ std::vector<NodeDesc> BuildRegistry()
     add(Event("Event.BeginPlay", "Event BeginPlay", {}, "When play starts (or the script is added while playing)"));
     add(Event("Event.Tick", "Event Tick", {Out("Delta Seconds", P::Float)}, "Every frame while playing"));
     add(Event("Event.EndPlay", "Event EndPlay", {}, "When play stops or the script / entity is removed"));
+    add(Event("Event.Construction", "Construction Script",  {},
+              "Runs in the editor after changes and when play starts (before BeginPlay); entities it creates are rebuilt "
+              "each time and not saved. No latent nodes, timers or timelines"));
     add(Event("Event.CollisionBegin", "On Collision Begin", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
               "This entity starts touching another body (physics)"));
     add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
@@ -824,6 +827,20 @@ std::vector<NodeDesc> BuildRegistry()
         if (const auto e = Target(c, 2))
             c.GetScene().DestroyEntity(*e);
     }, "Destroys the entity and its children"));
+    add(Action("Entity.SpawnEmpty", "Spawn Entity", "Entity",
+               {In("Location", P::Vec3), In("Name", P::String), In("Parent", P::Entity), Out("Spawned", P::Entity)},
+               [](ScriptContext& c) {
+                   Scene&       scene  = c.GetScene();
+                   const Entity parent = c.Connected(4) ? c.InEntity(4) : NullEntity; // unconnected: a root
+                   if (parent != NullEntity && !Alive(c, parent)) {
+                       c.Error("Parent is not a valid entity");
+                       return;
+                   }
+                   const std::string name = c.InString(3);
+                   const Entity      e    = scene.CreateEntity(name.empty() ? std::string("Entity") : name, parent);
+                   SetWorldPosition(c, e, c.InVec3(2));
+                   c.Out(5, e);
+               }, "Creates an empty entity at a world location (optionally under a parent); add components with other nodes"));
     add(WithParam(WithDefaults(Action("Entity.SpawnPrimitive", "Spawn Primitive", "Entity",
                          {In("Location", P::Vec3), In("Size", P::Float), In("Simulate Physics", P::Bool), In("Name", P::String),
                           Out("Spawned", P::Entity)},

@@ -418,6 +418,8 @@ void ScriptGraph::SetBreakpoint(std::uint32_t node, bool enabled)
     std::erase(breakpoints, node);
     if (enabled)
         breakpoints.push_back(node);
+    else
+        breakpointOptions.erase(node);
 }
 
 std::vector<PinInfo> NodePins(const ScriptGraph& graph, const ScriptNode& node)
@@ -579,6 +581,12 @@ std::string ScriptGraphToJson(const ScriptGraph& graph)
         root["library"] = true;
     if (!graph.breakpoints.empty())
         root["breakpoints"] = graph.breakpoints;
+    if (!graph.breakpointOptions.empty()) {
+        json options = json::array();
+        for (const auto& [node, o] : graph.breakpointOptions)
+            options.push_back({{"node", node}, {"condition", o.condition}, {"hitCount", o.hitCount}});
+        root["breakpointOptions"] = std::move(options);
+    }
     return root.dump(2);
 }
 
@@ -679,6 +687,9 @@ ScriptGraph ScriptGraphFromJson(const std::string& text)
             maxId = std::max(maxId, comment.id);
             graph.comments.push_back(std::move(comment));
         }
+        for (const json& o : root.value("breakpointOptions", json::array()))
+            graph.breakpointOptions[o.at("node").get<std::uint32_t>()] = {o.value("condition", std::string()),
+                                                                          o.value("hitCount", 0u)};
         for (const json& b : root.value("breakpoints", json::array()))
             if (graph.FindNode(b.get<std::uint32_t>()))
                 graph.breakpoints.push_back(b.get<std::uint32_t>());

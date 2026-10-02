@@ -23,6 +23,7 @@ using json = nlohmann::json;
 using SceneJson::CollectSubtree;
 using SceneJson::EntityToJson;
 using SceneJson::FromUtf8;
+using SceneJson::IsConstructed;
 using SceneJson::ModelRefs;
 using SceneJson::PathMode;
 using SceneJson::ToUtf8;
@@ -463,6 +464,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
             j["prefabInstance"] = {{"file", instance->prefab}};
         if (const auto* link = r.TryGet<PrefabLink>(e))
             j["prefabLink"] = {{"instance", link->instance}, {"source", link->source}};
+        if (const auto* owned = r.TryGet<ConstructionOwned>(e))
+            j["constructionOwned"] = owned->owner;
     }
     return j;
 }
@@ -564,8 +567,19 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         ApplyOptional<PrefabLink>(r, e, j, "prefabLink", [](const json& l) {
             return PrefabLink{.instance = l.value("instance", std::uint64_t{0}), .source = l.value("source", std::uint64_t{0})};
         });
+        ApplyOptional<ConstructionOwned>(r, e, j, "constructionOwned",
+                                         [](const json& o) { return ConstructionOwned{o.get<std::uint64_t>()}; });
     }
     scene.MarkChanged(e); // bounds / shadow caches
+}
+
+// Made by a construction script (itself or below such an entity)?
+bool IsConstructed(const Registry& r, Entity e)
+{
+    for (; e != NullEntity && r.Valid(e); e = r.Get<Hierarchy>(e).parent)
+        if (r.Has<ConstructionOwned>(e))
+            return true;
+    return false;
 }
 
 // Pre-order (parents first) over the subtree of `root`, children in their order.
@@ -747,6 +761,8 @@ void SaveSceneFile(const std::filesystem::path& file, const Scene& scene, const 
         for (Entity e : subtree) {
             if (PrefabDetail::IsMember(r, e))
                 continue; // rebuilt from the prefab + the instance's overrides
+            if (IsConstructed(r, e))
+                continue; // rebuilt by the owner's construction script
             json j;
             if (r.Has<PrefabInstance>(e)) {
                 const Transform& t = r.Get<Transform>(e);

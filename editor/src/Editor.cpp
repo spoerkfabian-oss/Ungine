@@ -66,6 +66,16 @@ Editor::Editor(const EditorContext& context)
     ReloadScriptRegistry();
 }
 
+void Editor::RunConstructionScripts()
+{
+    m_ConstructedRevision = m_History->Revision();
+    if (!m_Ctx.scripts || m_PlayState != PlayState::Edit)
+        return;
+    m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits count
+    (void)m_Ctx.scripts->RunAllConstruction(m_Ctx.scene);
+    ValidateSelection();
+}
+
 std::vector<std::string> Editor::ReloadScriptRegistry()
 {
     if (!m_Ctx.project)
@@ -192,6 +202,9 @@ void Editor::Update(float dt)
         const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
     }
+    // Edit mode: construction scripts follow every edit (History change, New / Open, Stop).
+    if (m_PlayState == PlayState::Edit && m_Ctx.scripts && m_History->Revision() != m_ConstructedRevision)
+        RunConstructionScripts();
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)
         m_Ctx.physics->Sync(m_Ctx.scene);

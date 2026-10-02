@@ -35,12 +35,20 @@ struct ScriptDebugInfo {
     std::vector<ScriptDiagnostic>                          diagnostics;
 };
 
-// Where the debugger stopped (a breakpoint or a step): the next node to run.
+// Where the debugger stopped (a breakpoint or a step): the next node to run, and the function
+// calls it is in (outermost first: the Call nodes).
 struct ScriptDebugFrame {
-    std::string   file;     // ScriptSystem::Key of the graph
+    std::string   file;     // ScriptSystem::Key of the graph (of a library for its copied nodes)
     std::uint32_t node = 0; // node id
     std::string   function; // empty: event graph
     Entity        entity = NullEntity;
+    std::vector<ScriptDebugFrame> callers;
+};
+
+// A breakpoint for SetBreakpoints (ScriptBreakpointOptions: condition, hit count).
+struct ScriptBreakpoint {
+    std::uint32_t           node = 0;
+    ScriptBreakpointOptions options;
 };
 
 // Values of one script instance for the debugger.
@@ -109,6 +117,14 @@ public:
 
     std::uint32_t maxStepsPerEvent = 100000;
 
+    // Construction scripts (Event.Construction): run on a temporary instance, outside play too
+    // (editor: after edits) and by Begin before BeginPlay. Entities they create get
+    // ConstructionOwned and are destroyed when the owner's script runs again (or the owner is
+    // gone); latent nodes, timers and timelines do not run there. RunConstruction: one entity
+    // (false: no construction script); RunAllConstruction: every scripted entity, returns how many ran.
+    bool        RunConstruction(Scene& scene, Entity entity);
+    std::size_t RunAllConstruction(Scene& scene);
+
     // Game view rectangle in window pixels (mouse / camera nodes).
     void SetViewport(const ScriptViewport& viewport);
     // Project input actions / axes (Input Action events, Is Action Down, Get Axis).
@@ -122,10 +138,13 @@ public:
     // --- Debugger. Breakpoints start as the graph's saved ones; SetBreakpoints replaces them for a
     // graph while running (also before Begin compiles it).
     void SetBreakpoints(const std::filesystem::path& file, std::vector<std::uint32_t> nodes);
+    void SetBreakpointList(const std::filesystem::path& file, const std::vector<ScriptBreakpoint>& breakpoints); // with options
     [[nodiscard]] bool                            DebugPaused() const;
     [[nodiscard]] std::optional<ScriptDebugFrame> PausedAt() const;
     void DebugContinue(Scene& scene); // runs on until the next breakpoint
-    void DebugStep(Scene& scene);     // runs the paused node, stops at the next one that runs
+    void DebugStep(Scene& scene);     // step into: runs the paused node, stops at the next one that runs
+    void DebugStepOver(Scene& scene); // stops at the next node of this chain outside the called functions
+    void DebugStepOut(Scene& scene);  // stops after the current function returned (or in another chain)
     // Entities running a graph, and the values of one of them.
     [[nodiscard]] std::vector<Entity>        InstancesOf(const std::filesystem::path& file) const;
     [[nodiscard]] std::optional<ScriptWatch> Watch(const std::filesystem::path& file, Entity entity) const;

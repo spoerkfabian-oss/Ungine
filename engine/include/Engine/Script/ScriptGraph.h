@@ -119,6 +119,14 @@ struct ScriptTimeline {
 // A track's value at `time` (clamped to the first / last key; no keys: zero).
 [[nodiscard]] glm::vec3 EvaluateTrack(const ScriptTimelineTrack& track, float time);
 
+// Optional settings of a breakpoint: stop only when the condition (ScriptCondition.h) holds, and
+// only from its hitCount-th such hit on (0 / 1: every hit).
+struct ScriptBreakpointOptions {
+    std::string   condition;
+    std::uint32_t hitCount = 0;
+    bool operator==(const ScriptBreakpointOptions&) const = default;
+};
+
 struct ScriptGraph {
     std::vector<ScriptNode>      nodes;     // all scopes (event graph, functions, macros)
     std::vector<ScriptLink>      links;     // between nodes of the same scope
@@ -132,6 +140,7 @@ struct ScriptGraph {
     std::vector<ScriptTimeline>  timelines;
     bool                         library = false; // function / macro library (no events or variables)
     std::vector<std::uint32_t>   breakpoints; // node ids (debugger; saved with the graph)
+    std::map<std::uint32_t, ScriptBreakpointOptions> breakpointOptions; // of some breakpoints
     std::uint32_t                nextId = 1; // nodes and comments
 
     [[nodiscard]] ScriptNode*           FindNode(std::uint32_t id);

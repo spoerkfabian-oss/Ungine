@@ -3,6 +3,8 @@
 
 #include "Engine/Core/Input.h"
 #include "Engine/Core/Project.h"
+#include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptCondition.h"
 #include "Engine/Script/ScriptRegistry.h"
 
 #include <filesystem>
@@ -829,4 +831,157 @@ TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
         CHECK(loaded && loaded->settings.input == map);
     }
     fs::remove_all(pdir);
+}
+
+TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
+{
+    ScriptRegistry::Clear();
+    // Conditions.
+    const ScriptValue health = 7.0f, name = std::string("Bob"), dead = false, count = std::int32_t{6};
+    const auto vars = [&](std::string_view n) -> const ScriptValue* {
+        return n == "health" ? &health : n == "name" ? &name : n == "dead" ? &dead : n == "count" ? &count : nullptr;
+    };
+    const auto eval = [&](const char* e) { return EvaluateScriptCondition(e, vars); };
+    CHECK(eval("health < 10 && !dead") == true && eval("health >= 10 || dead") == false);
+    CHECK(eval("name == \"Bob\"") == true && eval("name != \"Bob\"") == false && eval("count % 3 == 0") == true);
+    CHECK(eval("(count + 1) * 2 == 14") == true && eval("-health < 0") == true && eval("count / 4 > 1.4") == true);
+    std::string error;
+    CHECK(!EvaluateScriptCondition("missing > 1", vars, &error) && error.find("missing") != std::string::npos);
+    CHECK(CheckScriptCondition("a < (b") != "" && CheckScriptCondition("a <= b && \"x\" == c").empty() &&
+          CheckScriptCondition("a b") != "");
+
+    // Stepping: BeginPlay -> A -> Call F -> B; F: F1 -> F2 -> Return. Loop body with a conditional
+    // breakpoint (counter == 3) and one with a hit count (2nd hit).
+    Graph g;
+    g.g.variables.push_back({"counter", PinType::Int, std::int32_t{0}, false});
+    CHECK(g.g.AddFunction("F"));
+    const std::uint32_t f1 = Print(g, "f1", "F"), f2 = Print(g, "f2", "F");
+    g.Link(g.Find("Function.Entry", "F"), "Then", f1, "In");
+    g.Link(f1, "Then", f2, "In");
+    g.Link(f2, "Then", g.Find("Function.Return", "F"), "In");
+    const std::uint32_t begin = g.Node("Event.BeginPlay"), a = Print(g, "a"), call = g.Node("Function.Call", "F"), b = Print(g, "b");
+    g.Link(begin, "Out", a, "In");
+    g.Link(a, "Then", call, "In");
+    g.Link(call, "Then", b, "In");
+    const std::uint32_t loop = g.Node("Flow.ForLoop");
+    g.Set(loop, "First Index", std::int32_t{1});
+    g.Set(loop, "Last Index", std::int32_t{5});
+    g.Link(b, "Then", loop, "In");
+    const std::uint32_t add = g.Node("Math.AddInt");
+    g.Set(add, "B", std::int32_t{1});
+    g.Link(g.Node("Variable.Get", "counter"), "Value", add, "A");
+    const std::uint32_t set = SetVar(g, loop, "Loop Body", "counter", add, "Result");
+    const std::uint32_t inLoop = Print(g, "loop");
+    g.Link(set, "Then", inLoop, "In");
+    const std::uint32_t hit = Print(g, "hit");
+    g.Link(inLoop, "Then", hit, "In");
+    g.g.SetBreakpoint(call, true);
+    g.g.SetBreakpoint(inLoop, true);
+    g.g.breakpointOptions[inLoop] = {"counter == 3", 0};
+    g.g.SetBreakpoint(hit, true);
+    g.g.breakpointOptions[hit] = {"", 2};
+    CHECK(g.Valid());
+    CHECK(ScriptGraphFromJson(ScriptGraphToJson(g.g)).breakpointOptions == g.g.breakpointOptions);
+
+    const auto counter = [](Runner& r, Entity e) { return IntOf(r.Var("step.ugraph", e, "counter")); };
+    {
+        Runner       r;
+        const Entity e = r.Add("S", "step.ugraph", g.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.scripts.DebugPaused() && r.scripts.PausedAt()->node == call);
+        r.scripts.DebugStepOver(r.scene); // the function runs through
+        CHECK(r.scripts.PausedAt() && r.scripts.PausedAt()->node == b && r.Printed("f2") && !r.Printed("b"));
+        r.scripts.DebugContinue(r.scene); // hit count 2: the first loop round passes "hit"
+        auto at = r.scripts.PausedAt();
+        CHECK(at && at->node == hit && counter(r, e) == 2);
+        r.scripts.DebugContinue(r.scene); // condition counter == 3
+        at = r.scripts.PausedAt();
+        CHECK(at && at->node == inLoop && counter(r, e) == 3);
+        r.scripts.DebugContinue(r.scene); // "hit" (3rd hit) then nothing more
+        CHECK(r.scripts.PausedAt() && r.scripts.PausedAt()->node == hit);
+        r.scripts.SetBreakpoints("step.ugraph", {});
+        r.scripts.DebugContinue(r.scene);
+        CHECK(!r.scripts.DebugPaused() && counter(r, e) == 5);
+        r.scripts.End(r.scene);
+    }
+    {
+        Runner r;
+        r.Add("S", "step.ugraph", g.g);
+        r.scripts.Begin(r.scene);
+        r.scripts.DebugStep(r.scene); // into F
+        auto at = r.scripts.PausedAt();
+        CHECK(at && at->node == f1 && at->function == "F" && at->callers.size() == 1 && at->callers[0].node == call);
+        r.scripts.DebugStepOver(r.scene); // next node in F
+        CHECK(r.scripts.PausedAt() && r.scripts.PausedAt()->node == f2);
+        r.scripts.DebugStepOut(r.scene); // back in the event graph after the call
+        at = r.scripts.PausedAt();
+        CHECK(at && at->node == b && at->callers.empty());
+        // A broken condition stops (and reports) instead of being ignored.
+        r.scripts.SetBreakpointList("step.ugraph", {{inLoop, {"nope > 1", 0}}});
+        r.scripts.DebugContinue(r.scene);
+        CHECK(r.scripts.PausedAt() && r.scripts.PausedAt()->node == inLoop && r.scripts.Stats().errors == 1);
+        r.scripts.SetBreakpoints("step.ugraph", {});
+        r.scripts.DebugContinue(r.scene);
+        r.scripts.End(r.scene);
+    }
+
+    // Construction script: Count posts (exposed) as children, rebuilt on every run, not saved.
+    Graph c;
+    c.g.variables.push_back({"Count", PinType::Int, std::int32_t{3}, true});
+    const std::uint32_t cons = c.Node("Event.Construction"), floop = c.Node("Flow.ForLoop");
+    c.Link(cons, "Out", floop, "In");
+    const std::uint32_t last = c.Node("Math.SubtractInt");
+    c.Set(last, "B", std::int32_t{1});
+    c.Link(c.Node("Variable.Get", "Count"), "Value", last, "A");
+    c.Link(last, "Result", floop, "Last Index");
+    const std::uint32_t spawn = c.Node("Entity.SpawnEmpty"), toFloat = c.Node("Convert.IntToFloat"), vec = c.Node("Vector.Make");
+    c.Set(spawn, "Name", std::string("Post"));
+    c.Link(floop, "Loop Body", spawn, "In");
+    c.Link(floop, "Index", toFloat, "Value");
+    c.Link(toFloat, "Result", vec, "X");
+    c.Link(vec, "Vector", spawn, "Location");
+    c.Link(c.Node("Entity.Self"), "Self", spawn, "Parent");
+    const std::uint32_t delay = c.Node("Flow.Delay"); // reported, does not run
+    c.Link(floop, "Completed", delay, "In");
+    CHECK(c.Valid());
+    {
+        Runner           r;
+        const Entity     fence = r.Add("Fence", "fence.ugraph", c.g);
+        const std::uint64_t fenceUuid = r.scene.GetRegistry().Get<Uuid>(fence).value;
+        Registry&        reg   = r.scene.GetRegistry();
+        const auto posts = [&] {
+            std::size_t n = 0;
+            reg.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned& o) { n += o.owner == fenceUuid ? 1 : 0; });
+            return n;
+        };
+        CHECK(r.scripts.RunConstruction(r.scene, fence) && posts() == 3);
+        CHECK(reg.Get<Hierarchy>(fence).children.size() == 3 && r.scripts.Stats().errors == 1); // the Delay
+        r.scene.GetRegistry().Get<ScriptComponent>(fence).variables["Count"] = {std::int32_t{5}, 0};
+        CHECK(r.scripts.RunAllConstruction(r.scene) == 1 && posts() == 5);
+        // Saved without the posts; a snapshot (undo / play) keeps them marked.
+        const fs::path dir = TempDir("ungine_construct");
+        SaveSceneFile(dir / "s.uscene", r.scene, nullptr);
+        Scene loaded;
+        (void)LoadSceneFile(dir / "s.uscene", loaded, nullptr);
+        std::size_t entities = 0;
+        loaded.GetRegistry().ViewOf<Uuid>().Each([&](Entity, Uuid&) { ++entities; });
+        CHECK(entities == 1);
+        const std::vector<Entity> roots{fence};
+        const std::string         snapshot = SnapshotEntities(r.scene, roots);
+        r.scene.Clear();
+        (void)RestoreEntities(r.scene, snapshot, RestoreMode::Original);
+        CHECK(posts() == 5);
+        // Play: rebuilt before BeginPlay (no duplicates).
+        r.scripts.Begin(r.scene);
+        CHECK(posts() == 5);
+        r.scripts.End(r.scene);
+        // The owner gone: its posts go with the next run.
+        const Entity owner = r.scene.FindByUuid(fenceUuid);
+        r.scene.GetRegistry().Remove<ScriptComponent>(owner);
+        CHECK(r.scripts.RunAllConstruction(r.scene) == 0);
+        std::size_t left = 0;
+        reg.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned&) { ++left; });
+        CHECK(left == 0);
+        fs::remove_all(dir);
+    }
 }

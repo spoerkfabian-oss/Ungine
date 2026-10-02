@@ -243,4 +243,12 @@ struct PrefabLink {
     bool operator==(const PrefabLink&) const = default;
 };
 
+// Made by the construction script of another entity (the owner's UUID): rebuilt whenever it runs,
+// not saved in scene files (kept in memory snapshots: undo, play).
+struct ConstructionOwned {
+    std::uint64_t owner = 0;
+
+    bool operator==(const ConstructionOwned&) const = default;
+};
+
 } // namespace Engine

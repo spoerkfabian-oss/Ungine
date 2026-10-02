@@ -703,6 +703,7 @@ void Editor::Stop()
     m_EulerEntity   = NullEntity;
     m_PlaySnapshot.clear();
     m_PlayState     = PlayState::Edit;
+    m_ConstructedRevision = ~std::uint64_t{0}; // constructed entities of the snapshot: rebuilt
     m_StepRequested = false;
     m_Status        = "Stopped";
 }

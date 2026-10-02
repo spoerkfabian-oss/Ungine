@@ -119,6 +119,8 @@ public:
     // Project: (re)loads the blueprint types / interfaces / libraries of the content directory
     // (ScriptRegistry); done at start and before play. Returns the problems found.
     std::vector<std::string> ReloadScriptRegistry();
+    // Edit mode: runs the construction scripts again (after edits / Undo / Open automatically).
+    void RunConstructionScripts();
     // While playing: replaces the play scene by a scene file (scripts' Open Level); Stop returns
     // to the edited scene. False if the file does not load (the current level stays).
     bool PlayLevel(const std::filesystem::path& scene);
@@ -285,6 +287,7 @@ private:
     PlayState   m_PlayState = PlayState::Edit;
     std::string m_PlaySnapshot; // whole scene before Play
     std::vector<ModelHandle> m_PlayModels; // of levels opened by scripts while playing (released at Stop)
+    std::uint64_t            m_ConstructedRevision = ~std::uint64_t{0}; // History revision construction scripts ran for
     bool        m_StepRequested = false;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
