@@ -297,6 +297,14 @@ Pose Decompose(const glm::mat4& m)
     return p;
 }
 
+bool Finite(const glm::vec3& v) { return glm::all(glm::isfinite(v)); }
+bool Finite(const glm::quat& q) { return glm::all(glm::isfinite(glm::vec4(q.x, q.y, q.z, q.w))); }
+bool ValidPhysicsScale(const glm::vec3& scale)
+{
+    constexpr float kMinPhysicsScale = 1e-5f;
+    return Finite(scale) && glm::all(glm::greaterThan(glm::abs(scale), glm::vec3(kMinPhysicsScale)));
+}
+
 bool Moved(const glm::vec3& a, const glm::vec3& b) { return glm::any(glm::greaterThan(glm::abs(a - b), glm::vec3(1e-5f))); }
 bool Rotated(const glm::quat& a, const glm::quat& b) { return std::abs(glm::dot(a, b)) < 1.0f - 1e-6f; }
 bool Rescaled(const glm::vec3& a, const glm::vec3& b)
@@ -316,11 +324,12 @@ struct ScaledCollider {
 
 ScaledCollider Scaled(const Collider& c, const glm::vec3& scale)
 {
-    const float uniform = std::max({scale.x, scale.y, scale.z});
-    return {.halfExtents = glm::max(c.halfExtents * scale, glm::vec3(kMinExtent)),
-            .radius      = std::max(c.radius * (c.shape == ColliderShape::Capsule ? std::max(scale.x, scale.z) : uniform), kMinExtent),
-            .halfHeight  = std::max(c.halfHeight * scale.y, 0.0f),
-            .center      = c.center * scale};
+    const glm::vec3 safeScale = glm::abs(scale);
+    const float uniform = std::max({safeScale.x, safeScale.y, safeScale.z});
+    return {.halfExtents = glm::max(c.halfExtents * safeScale, glm::vec3(kMinExtent)),
+            .radius      = std::max(c.radius * (c.shape == ColliderShape::Capsule ? std::max(safeScale.x, safeScale.z) : uniform), kMinExtent),
+            .halfHeight  = std::max(c.halfHeight * safeScale.y, 0.0f),
+            .center      = c.center * safeScale};
 }
 
 } // namespace
