@@ -1,4 +1,6 @@
 #pragma once
+#include "Engine/Core/MoveOnlyFunction.h"
+
 #include <concepts>
 #include <cstdint>
 #include <functional>
@@ -51,6 +53,7 @@ private:
 };
 
 // Publish/Subscribe: main thread only. Enqueue: thread-safe, delivered on Flush().
+// Handlers only need to be movable.
 // Handlers returning `true` consume the event (stop propagation).
 // Subscribing/unsubscribing inside a handler is safe (applied after dispatch).
 class EventBus {
@@ -99,7 +102,7 @@ private:
     struct Handler {
         std::uint64_t                     id;
         bool                              alive;
-        std::function<bool(const void*)>  fn;
+        MoveOnlyFunction<bool(const void*)> fn;
     };
 
     void Dispatch(std::type_index type, const void* event);
@@ -113,7 +116,7 @@ private:
     bool          m_NeedsCompaction = false;
 
     std::mutex                         m_QueueMutex;
-    std::vector<std::function<void()>> m_Queue;
+    std::vector<MoveOnlyFunction<void()>> m_Queue;
 };
 
 inline void Subscription::Reset() noexcept

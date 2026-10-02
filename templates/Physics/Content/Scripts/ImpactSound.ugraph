@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "nextId": 6,
+  "variables": [],
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Event.CollisionBegin",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": 2,
+      "type": "Entity.GetPosition",
+      "position": [
+        240,
+        160
+      ]
+    },
+    {
+      "id": 3,
+      "type": "Math.RandomFloat",
+      "position": [
+        240,
+        272
+      ],
+      "defaults": {
+        "Min": {
+          "type": "float",
+          "value": 0.85
+        },
+        "Max": {
+          "type": "float",
+          "value": 1.2
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "Audio.PlaySoundAt",
+      "position": [
+        520,
+        0
+      ],
+      "param": "world",
+      "defaults": {
+        "Sound": {
+          "type": "string",
+          "value": "Content/Sounds/impact.wav"
+        },
+        "Volume": {
+          "type": "float",
+          "value": 0.7
+        }
+      }
+    }
+  ],
+  "links": [
+    {
+      "from": [
+        1,
+        "Out"
+      ],
+      "to": [
+        4,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        1,
+        "Other"
+      ],
+      "to": [
+        2,
+        "Target"
+      ]
+    },
+    {
+      "from": [
+        2,
+        "Position"
+      ],
+      "to": [
+        4,
+        "Location"
+      ]
+    },
+    {
+      "from": [
+        3,
+        "Result"
+      ],
+      "to": [
+        4,
+        "Pitch"
+      ]
+    }
+  ],
+  "comments": [
+    {
+      "id": 5,
+      "position": [
+        -24,
+        -48
+      ],
+      "size": [
+        820,
+        400
+      ],
+      "text": "Something lands on the ground: a thud where it hit (pitch varies)",
+      "color": [
+        0.3,
+        0.6,
+        0.55
+      ]
+    }
+  ]
+}

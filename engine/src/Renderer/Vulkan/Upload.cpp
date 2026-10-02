@@ -195,34 +195,47 @@ UploadTicket UploadQueue::Record(std::span<const std::byte> data, const PendingA
                                  const std::function<void(VkCommandBuffer, VkBuffer, VkDeviceSize)>& record)
 {
     assert(!data.empty());
-    std::scoped_lock lock{m_Mutex};
-    // Budget: a full batch is closed; Submit() sends at most frameBudget bytes per frame.
-    if (m_Open && m_Open->bytes > 0 && m_Open->bytes + data.size() > m_Desc.frameBudget)
-        m_Closed.push_back(std::move(m_Open));
-    if (!m_Open)
-        OpenBatchLocked();
-    Batch& batch = *m_Open;
+    // 1) Under the lock: pick the batch and reserve staging memory. The batch cannot be
+    //    submitted while it has pending writes.
+    Batch*                      batch = nullptr;
+    std::optional<VkDeviceSize> ringOffset;
+    {
+        std::scoped_lock lock{m_Mutex};
+        // Budget: a full batch is closed; Submit() sends at most frameBudget bytes per frame.
+        if (m_Open && m_Open->bytes > 0 && m_Open->bytes + data.size() > m_Desc.frameBudget)
+            m_Closed.push_back(std::move(m_Open));
+        if (!m_Open)
+            OpenBatchLocked();
+        batch      = m_Open.get();
+        ringOffset = RingAllocateLocked(data.size(), *batch);
+        batch->bytes += data.size();
+        ++batch->pendingWrites;
+    }
 
-    VkBuffer     src    = VK_NULL_HANDLE;
-    VkDeviceSize offset = 0;
-    if (const std::optional<VkDeviceSize> at = RingAllocateLocked(data.size(), batch)) {
-        std::memcpy(static_cast<std::byte*>(m_Ring.Mapped()) + *at, data.data(), data.size());
-        m_Ring.Flush(*at, data.size());
-        src    = m_Ring.Handle();
-        offset = *at;
+    // 2) Unlocked: copy into the ring or into an own staging buffer (large uploads, full ring),
+    //    so workers do not serialize on big textures.
+    Buffer staging;
+    if (ringOffset) {
+        std::memcpy(static_cast<std::byte*>(m_Ring.Mapped()) + *ringOffset, data.data(), data.size());
+        m_Ring.Flush(*ringOffset, data.size());
     } else {
-        Buffer staging(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                               .memory = MemoryUsage::Upload, .debugName = "staging"});
+        staging = Buffer(m_Ctx, {.size = data.size(), .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 .memory = MemoryUsage::Upload, .debugName = "staging"});
         staging.Write(data.data(), data.size());
-        src = staging.Handle();
-        batch.staging.push_back(std::move(staging));
+    }
+
+    // 3) Under the lock again: record the copy (the command buffer is shared by the batch).
+    std::scoped_lock lock{m_Mutex};
+    record(batch->cmd, ringOffset ? m_Ring.Handle() : staging.Handle(), ringOffset.value_or(0));
+    if (!ringOffset) {
+        batch->staging.push_back(std::move(staging));
         ++m_Stats.dedicatedStaging;
     }
-    record(batch.cmd, src, offset);
-    batch.acquires.push_back(acquire);
-    batch.bytes += data.size();
+    batch->acquires.push_back(acquire);
     m_Stats.totalBytes += data.size();
-    return batch.value;
+    if (--batch->pendingWrites == 0)
+        m_WritesDone.notify_all();
+    return batch->value;
 }
 
 Buffer UploadQueue::CreateBuffer(std::span<const std::byte> data, VkBufferUsageFlags usage, UploadTicket& ticket,
@@ -341,9 +354,17 @@ void UploadQueue::SubmitBatches(bool all)
     std::vector<std::unique_ptr<Batch>> batches;
     VkDeviceSize                        sent = 0;
     {
-        std::scoped_lock lock{m_Mutex};
-        // Oldest first; always at least one batch so large uploads make progress.
-        const auto fits = [&](const Batch& b) { return all || sent == 0 || sent + b.bytes <= m_Desc.frameBudget; };
+        std::unique_lock lock{m_Mutex};
+        if (all) // Flush: everything, so wait for copies still in progress
+            m_WritesDone.wait(lock, [&] {
+                return (!m_Open || m_Open->pendingWrites == 0) &&
+                       std::ranges::all_of(m_Closed, [](const auto& b) { return b->pendingWrites == 0; });
+            });
+        // Oldest first; always at least one batch so large uploads make progress. A batch whose
+        // staging memory is still being written stops the submission (order is kept).
+        const auto fits = [&](const Batch& b) {
+            return b.pendingWrites == 0 && (all || sent == 0 || sent + b.bytes <= m_Desc.frameBudget);
+        };
         while (!m_Closed.empty() && fits(*m_Closed.front())) {
             sent += m_Closed.front()->bytes;
             batches.push_back(std::move(m_Closed.front()));

@@ -1,5 +1,6 @@
 #include "Engine/Renderer/ShaderReload.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Core/Platform.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -74,7 +75,7 @@ std::string EscapeMake(const std::string& path)
 ShaderCompilerDesc DefaultShaderCompiler()
 {
     ShaderCompilerDesc desc;
-    desc.spvDirectory = ENGINE_SHADER_DIR;
+    desc.spvDirectory = ShaderDirectory(); // where the renderer loads them from
 #if defined(ENGINE_GLSLC) && defined(ENGINE_SHADER_INCLUDE_DIR)
     desc.compiler   = ENGINE_GLSLC;
     desc.includeDir = ENGINE_SHADER_INCLUDE_DIR;

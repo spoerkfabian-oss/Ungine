@@ -8,6 +8,12 @@ namespace Engine::Log {
 
 enum class Level { Trace, Info, Warn, Error };
 
+// Optional copy of all output (GUI apps without a console). Set once at startup, before other
+// threads log; closed by CloseFile (or at exit).
+inline std::FILE* g_File = nullptr;
+bool OpenFile(const char* utf8Path); // Platform.cpp
+void CloseFile();
+
 template <class... Args>
 void Write(Level level, std::format_string<Args...> fmt, Args&&... args)
 {
@@ -15,6 +21,11 @@ void Write(Level level, std::format_string<Args...> fmt, Args&&... args)
     const std::string msg = std::format(fmt, std::forward<Args>(args)...);
     std::FILE* out = level >= Level::Warn ? stderr : stdout;
     std::fprintf(out, "[%s] %s\n", kTags[static_cast<int>(level)], msg.c_str());
+    if (g_File) {
+        std::fprintf(g_File, "[%s] %s\n", kTags[static_cast<int>(level)], msg.c_str());
+        if (level >= Level::Warn)
+            std::fflush(g_File);
+    }
 }
 
 } // namespace Engine::Log

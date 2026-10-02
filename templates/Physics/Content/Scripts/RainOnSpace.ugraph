@@ -1,0 +1,284 @@
+{
+  "version": 1,
+  "nextId": 13,
+  "variables": [
+    {
+      "name": "Spawned",
+      "type": "int",
+      "value": 0
+    }
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Event.KeyPressed",
+      "position": [
+        0,
+        0
+      ],
+      "param": "Space"
+    },
+    {
+      "id": 2,
+      "type": "Flow.ForLoop",
+      "position": [
+        240,
+        0
+      ],
+      "defaults": {
+        "First Index": {
+          "type": "int",
+          "value": 1
+        },
+        "Last Index": {
+          "type": "int",
+          "value": 10
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "Entity.GetPosition",
+      "position": [
+        240,
+        208
+      ]
+    },
+    {
+      "id": 4,
+      "type": "Math.RandomFloat",
+      "position": [
+        0,
+        320
+      ],
+      "defaults": {
+        "Min": {
+          "type": "float",
+          "value": -1.5
+        },
+        "Max": {
+          "type": "float",
+          "value": 1.5
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "Math.RandomFloat",
+      "position": [
+        0,
+        432
+      ],
+      "defaults": {
+        "Min": {
+          "type": "float",
+          "value": -1.5
+        },
+        "Max": {
+          "type": "float",
+          "value": 1.5
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "Vector.Make",
+      "position": [
+        264,
+        336
+      ],
+      "defaults": {
+        "Y": {
+          "type": "float",
+          "value": 4.0
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "Vector.Add",
+      "position": [
+        520,
+        232
+      ]
+    },
+    {
+      "id": 8,
+      "type": "Entity.SpawnPrimitive",
+      "position": [
+        760,
+        0
+      ],
+      "param": "sphere",
+      "defaults": {
+        "Size": {
+          "type": "float",
+          "value": 0.3
+        },
+        "Simulate Physics": {
+          "type": "bool",
+          "value": true
+        },
+        "Name": {
+          "type": "string",
+          "value": "Drop"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "Debug.Print",
+      "position": [
+        520,
+        -96
+      ],
+      "defaults": {
+        "Text": {
+          "type": "string",
+          "value": "Spawned 10 spheres"
+        },
+        "Duration": {
+          "type": "float",
+          "value": 2.0
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "Event.BeginPlay",
+      "position": [
+        0,
+        -160
+      ]
+    },
+    {
+      "id": 11,
+      "type": "Debug.Print",
+      "position": [
+        240,
+        -160
+      ],
+      "defaults": {
+        "Text": {
+          "type": "string",
+          "value": "Press Space in the viewport to drop spheres"
+        },
+        "Duration": {
+          "type": "float",
+          "value": 6.0
+        }
+      }
+    }
+  ],
+  "links": [
+    {
+      "from": [
+        1,
+        "Out"
+      ],
+      "to": [
+        2,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        2,
+        "Loop Body"
+      ],
+      "to": [
+        8,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        2,
+        "Completed"
+      ],
+      "to": [
+        9,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        3,
+        "Position"
+      ],
+      "to": [
+        7,
+        "A"
+      ]
+    },
+    {
+      "from": [
+        4,
+        "Result"
+      ],
+      "to": [
+        6,
+        "X"
+      ]
+    },
+    {
+      "from": [
+        5,
+        "Result"
+      ],
+      "to": [
+        6,
+        "Z"
+      ]
+    },
+    {
+      "from": [
+        6,
+        "Vector"
+      ],
+      "to": [
+        7,
+        "B"
+      ]
+    },
+    {
+      "from": [
+        7,
+        "Result"
+      ],
+      "to": [
+        8,
+        "Location"
+      ]
+    },
+    {
+      "from": [
+        10,
+        "Out"
+      ],
+      "to": [
+        11,
+        "In"
+      ]
+    }
+  ],
+  "comments": [
+    {
+      "id": 12,
+      "position": [
+        -24,
+        -48
+      ],
+      "size": [
+        1040,
+        540
+      ],
+      "text": "Space: drop 10 dynamic spheres above this entity",
+      "color": [
+        0.45,
+        0.35,
+        0.7
+      ]
+    }
+  ]
+}

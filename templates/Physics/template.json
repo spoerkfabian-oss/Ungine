@@ -1,0 +1,5 @@
+{
+  "name": "Physics Playground",
+  "description": "Press Space while playing: a Blueprint drops spheres onto a box pyramid and a ramp; impacts are heard in a reverberant hall.",
+  "startScene": "Content/Scenes/Main.scene.json"
+}

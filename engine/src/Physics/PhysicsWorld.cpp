@@ -152,11 +152,17 @@ private:
     std::atomic<int> m_InFlight{0};
 };
 
-// --- Layers: static bodies never collide with each other ---
+// --- Layers: object layer = user collision layer << 1 | moving. Static bodies never collide
+// with each other; user layers follow PhysicsSettings::layerCollision. ---
 
 namespace Layers {
-constexpr JPH::ObjectLayer kNonMoving = 0;
-constexpr JPH::ObjectLayer kMoving    = 1;
+constexpr JPH::ObjectLayer Make(std::uint32_t userLayer, bool moving)
+{
+    return static_cast<JPH::ObjectLayer>(((userLayer & (kPhysicsLayers - 1)) << 1) | (moving ? 1u : 0u));
+}
+constexpr bool          IsMoving(JPH::ObjectLayer layer) { return (layer & 1u) != 0; }
+constexpr std::uint32_t User(JPH::ObjectLayer layer) { return static_cast<std::uint32_t>(layer) >> 1; }
+constexpr JPH::ObjectLayer kMoving = Make(0, true); // characters
 } // namespace Layers
 
 namespace BroadPhaseLayers {
@@ -170,7 +176,7 @@ public:
     JPH::uint GetNumBroadPhaseLayers() const override { return BroadPhaseLayers::kCount; }
     JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer layer) const override
     {
-        return layer == Layers::kNonMoving ? BroadPhaseLayers::kNonMoving : BroadPhaseLayers::kMoving;
+        return Layers::IsMoving(layer) ? BroadPhaseLayers::kMoving : BroadPhaseLayers::kNonMoving;
     }
 #if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
     const char* GetBroadPhaseLayerName(JPH::BroadPhaseLayer layer) const override
@@ -184,16 +190,31 @@ class ObjectVsBroadPhaseFilter final : public JPH::ObjectVsBroadPhaseLayerFilter
 public:
     bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer broadPhase) const override
     {
-        return layer == Layers::kMoving || broadPhase == BroadPhaseLayers::kMoving;
+        return Layers::IsMoving(layer) || broadPhase == BroadPhaseLayers::kMoving;
     }
 };
 
+// Reads the matrix copied from PhysicsSettings before every update (never during one).
 class ObjectPairFilter final : public JPH::ObjectLayerPairFilter {
 public:
+    explicit ObjectPairFilter(const std::array<std::uint16_t, kPhysicsLayers>& matrix) : m_Matrix(matrix) {}
     bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override
     {
-        return a == Layers::kMoving || b == Layers::kMoving;
+        return (Layers::IsMoving(a) || Layers::IsMoving(b)) && ((m_Matrix[Layers::User(a)] >> Layers::User(b)) & 1u) != 0;
     }
+
+private:
+    const std::array<std::uint16_t, kPhysicsLayers>& m_Matrix;
+};
+
+// Queries: bodies on the layers of the mask.
+class LayerMaskFilter final : public JPH::ObjectLayerFilter {
+public:
+    explicit LayerMaskFilter(std::uint16_t mask) : m_Mask(mask) {}
+    bool ShouldCollide(JPH::ObjectLayer layer) const override { return ((m_Mask >> Layers::User(layer)) & 1u) != 0; }
+
+private:
+    std::uint16_t m_Mask;
 };
 
 // --- Contacts: recorded on the physics threads, turned into events on the main thread ---
@@ -318,6 +339,8 @@ struct PhysicsWorld::Impl {
         std::uint32_t meshIndex = 0;
         std::uint32_t revision  = 0; // AssetManager::Revision(model): a reload rebuilds the shape
         Pose          last;  // entity world pose the body was last synced to
+        Pose          simPrevious, simCurrent; // dynamic: poses after the last two steps (Interpolate)
+        bool          between = false;         // the scene shows a pose between them
         bool          kinematicMove = false; // kinematic: target changed since the last Step
         std::uint32_t visit = 0;
     };
@@ -327,8 +350,12 @@ struct PhysicsWorld::Impl {
         CharacterController             settings;
         glm::vec3                       lastPosition{0.0f};
         glm::vec3                       input{0.0f};
+        glm::vec3                       simPrevious{0.0f}, simCurrent{0.0f}; // Interpolate
+        bool                            between = false;
         bool                            jump  = false;
         std::uint32_t                   visit = 0;
+        // Bodies it touches (BodyID index + sequence -> other entity, trigger): Begin / End events.
+        std::unordered_map<std::uint32_t, std::pair<Entity, bool>> touching;
     };
     struct Pair {
         Entity a, b;
@@ -365,6 +392,7 @@ struct PhysicsWorld::Impl {
             DestroyBody(record.id);
         bodies.clear();
         characters.clear(); // removes the inner bodies
+        innerBodies.clear();
         pairs.clear();
         meshShapes.clear();
         removedBodies.clear();
@@ -457,7 +485,9 @@ struct PhysicsWorld::Impl {
                                         : r.type == BodyType::Kinematic ? JPH::EMotionType::Kinematic
                                                                         : JPH::EMotionType::Dynamic;
         JPH::BodyCreationSettings settings(shape, JPH::RVec3(ToJolt(pose.position)), ToJolt(pose.rotation), motion,
-                                           r.type == BodyType::Static ? Layers::kNonMoving : Layers::kMoving);
+                                           Layers::Make(r.collider.layer, r.type != BodyType::Static));
+        settings.mMotionQuality = r.type == BodyType::Dynamic && r.body.continuous ? JPH::EMotionQuality::LinearCast
+                                                                                   : JPH::EMotionQuality::Discrete;
         settings.mUserData       = Key(r.entity);
         settings.mFriction       = r.collider.friction;
         settings.mRestitution    = r.collider.restitution;
@@ -476,8 +506,10 @@ struct PhysicsWorld::Impl {
             ENGINE_WARN("Physics: body limit reached");
             return false;
         }
-        r.scale = pose.scale;
-        r.last  = pose;
+        r.scale       = pose.scale;
+        r.last        = pose;
+        r.simPrevious = r.simCurrent = pose;
+        r.between     = false;
         return true;
     }
 
@@ -561,7 +593,9 @@ struct PhysicsWorld::Impl {
     // The entity was moved from outside (editor, game code).
     void Teleport(BodyRecord& r, const Pose& pose, bool stepping)
     {
-        r.last = pose;
+        r.last        = pose;
+        r.simPrevious = r.simCurrent = pose; // no interpolation across a teleport
+        r.between     = false;
         const JPH::RVec3 position(ToJolt(pose.position));
         const JPH::Quat  rotation = ToJolt(pose.rotation);
         switch (r.type) {
@@ -582,8 +616,7 @@ struct PhysicsWorld::Impl {
             Bodies().SetPositionAndRotation(r.id, position, rotation, JPH::EActivation::DontActivate);
             bounds.Encapsulate(Bodies().GetTransformedShape(r.id).GetWorldSpaceBounds());
             bounds.ExpandBy(JPH::Vec3::sReplicate(0.05f));
-            Bodies().ActivateBodiesInAABox(bounds, system->GetDefaultBroadPhaseLayerFilter(Layers::kMoving),
-                                           system->GetDefaultLayerFilter(Layers::kMoving));
+            Bodies().ActivateBodiesInAABox(bounds, {}, {}); // any layer
             break;
         }
         }
@@ -601,14 +634,17 @@ struct PhysicsWorld::Impl {
             if (Moved(position, r.lastPosition)) {
                 r.character->SetPosition(JPH::RVec3(ToJolt(position)));
                 r.character->SetLinearVelocity(JPH::Vec3::sZero());
-                r.lastPosition = position;
+                r.lastPosition = r.simPrevious = r.simCurrent = position;
+                r.between = false;
             }
             return;
         }
         glm::vec3 input{0.0f};
         if (it != characters.end()) {
             input = it->second.input;
+            EndCharacterContacts(it->second);
             EndPairsOf(it->second.character->GetInnerBodyID());
+            innerBodies.erase(it->second.character->GetInnerBodyID().GetIndexAndSequenceNumber());
             characters.erase(it);
             ++stats.removed;
         }
@@ -623,18 +659,48 @@ struct PhysicsWorld::Impl {
         settings.mMaxSlopeAngle     = cc.maxSlope;
         settings.mSupportingVolume  = JPH::Plane(JPH::Vec3::sAxisY(), -radius); // contacts below the lower hemisphere center
         settings.mInnerBodyShape    = capsule; // lets rigid bodies and queries see the character
-        settings.mInnerBodyLayer    = Layers::kMoving;
+        settings.mInnerBodyLayer    = Layers::kMoving; // user layer 0
 
         CharacterRecord r;
         r.entity       = e;
         r.settings     = cc;
-        r.lastPosition = position;
+        r.lastPosition = r.simPrevious = r.simCurrent = position;
+        r.between = false;
         r.input        = input;
         r.visit        = visit;
         r.character = new JPH::CharacterVirtual(&settings, JPH::RVec3(ToJolt(position)), JPH::Quat::sIdentity(), Key(e),
                                                 system.get());
+        innerBodies.insert(r.character->GetInnerBodyID().GetIndexAndSequenceNumber());
         characters.emplace(Key(e), std::move(r));
         ++stats.created;
+    }
+
+    // Character contacts (CharacterVirtual does not go through the contact listener): diff of the
+    // touched bodies after each update.
+    void UpdateCharacterContacts()
+    {
+        for (auto& [key, r] : characters) {
+            std::unordered_map<std::uint32_t, std::pair<Entity, bool>> now;
+            for (const JPH::CharacterContact& c : r.character->GetActiveContacts()) {
+                if (c.mBodyB.IsInvalid() || !(c.mHadCollision || c.mIsSensorB))
+                    continue;
+                now.try_emplace(c.mBodyB.GetIndexAndSequenceNumber(), Entity{c.mUserData}, c.mIsSensorB);
+            }
+            for (const auto& [id, other] : now)
+                if (!r.touching.contains(id))
+                    pendingEvents.push_back({r.entity, other.first, true, other.second});
+            for (const auto& [id, other] : r.touching)
+                if (!now.contains(id))
+                    pendingEvents.push_back({r.entity, other.first, false, other.second});
+            r.touching = std::move(now);
+        }
+    }
+
+    void EndCharacterContacts(CharacterRecord& r)
+    {
+        for (const auto& [id, other] : r.touching)
+            pendingEvents.push_back({r.entity, other.first, false, other.second});
+        r.touching.clear();
     }
 
     void StepCharacters(float dt, const glm::vec3& gravity, float airControl)
@@ -692,6 +758,9 @@ struct PhysicsWorld::Impl {
         };
 
         for (const auto& [key, acc] : accum) {
+            // Characters report their own contacts (UpdateCharacterContacts).
+            if (innerBodies.contains(acc.a.GetIndexAndSequenceNumber()) || innerBodies.contains(acc.b.GetIndexAndSequenceNumber()))
+                continue;
             auto it = pairs.find(key);
             if (it == pairs.end()) {
                 if (acc.delta <= 0)
@@ -738,21 +807,70 @@ struct PhysicsWorld::Impl {
 
     // --- Write-back ---
 
-    static void WriteWorldPose(Scene& scene, Entity e, const glm::vec3& position, const glm::quat* rotation)
+    struct PoseWrite {
+        Entity                   entity = NullEntity;
+        glm::vec3                position{0.0f};
+        std::optional<glm::quat> rotation; // characters keep theirs
+    };
+
+    // World poses -> local transforms, parents before children and each against its parent's new
+    // world (a dynamic child of a moving body follows it). Then remembers what the scene shows,
+    // so Sync does not mistake the write-back for a teleport.
+    void WritePoses(Scene& scene, const std::vector<PoseWrite>& writes)
     {
-        const Registry& registry = scene.GetRegistry();
-        const Entity    parent   = registry.Get<Hierarchy>(e).parent;
-        Transform&      t        = scene.EditTransform(e);
-        if (parent == NullEntity || !registry.Valid(parent)) {
-            t.position = position;
-            if (rotation)
-                t.rotation = *rotation;
+        if (writes.empty())
             return;
+        Registry&  registry = scene.GetRegistry();
+        const auto parentOf = [&](Entity e) {
+            const Entity p = registry.Get<Hierarchy>(e).parent;
+            return p != NullEntity && registry.Valid(p) ? p : NullEntity;
+        };
+        std::vector<std::pair<int, std::size_t>> order; // depth, index
+        for (std::size_t i = 0; i < writes.size(); ++i) {
+            int depth = 0;
+            for (Entity p = parentOf(writes[i].entity); p != NullEntity; p = parentOf(p))
+                ++depth;
+            order.emplace_back(depth, i);
         }
-        const glm::mat4& parentWorld = registry.Get<WorldTransform>(parent).matrix;
-        t.position = glm::vec3(glm::inverse(parentWorld) * glm::vec4(position, 1.0f));
-        if (rotation)
-            t.rotation = glm::normalize(glm::conjugate(Decompose(parentWorld).rotation) * *rotation);
+        std::ranges::sort(order);
+
+        std::unordered_map<std::uint64_t, glm::mat4> fresh; // new world matrices written so far
+        const auto worldOf = [&](Entity e) {
+            std::vector<Entity> chain; // e and its ancestors up to one with a new world
+            glm::mat4           world{1.0f};
+            for (Entity x = e; x != NullEntity; x = parentOf(x)) {
+                if (const auto it = fresh.find(Key(x)); it != fresh.end()) {
+                    world = it->second;
+                    break;
+                }
+                chain.push_back(x);
+            }
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                world = world * registry.Get<Transform>(*it).LocalMatrix();
+            return world;
+        };
+        for (const auto& [depth, i] : order) {
+            const PoseWrite& w      = writes[i];
+            const Entity     parent = parentOf(w.entity);
+            const glm::mat4  parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
+            Transform&       t           = scene.EditTransform(w.entity);
+            t.position = glm::vec3(glm::inverse(parentWorld) * glm::vec4(w.position, 1.0f));
+            if (w.rotation)
+                t.rotation = parent != NullEntity ? glm::normalize(glm::conjugate(Decompose(parentWorld).rotation) * *w.rotation)
+                                                  : *w.rotation;
+            fresh[Key(w.entity)] = parentWorld * t.LocalMatrix();
+        }
+
+        scene.UpdateTransforms();
+        for (const PoseWrite& w : writes) {
+            const Pose pose = Decompose(registry.Get<WorldTransform>(w.entity).matrix);
+            if (auto it = bodies.find(Key(w.entity)); it != bodies.end()) {
+                it->second.last.position = pose.position;
+                it->second.last.rotation = pose.rotation;
+            } else if (auto c = characters.find(Key(w.entity)); c != characters.end()) {
+                c->second.lastPosition = pose.position;
+            }
+        }
     }
 
     // --- State ---
@@ -760,8 +878,10 @@ struct PhysicsWorld::Impl {
     EventBus&                                    events;
     const AssetManager*                          assets;
     BroadPhaseLayerMap                           broadPhaseLayers;
+    std::array<std::uint16_t, kPhysicsLayers>    layerMatrix{}; // settings.layerCollision, copied per Step / Sync
     ObjectVsBroadPhaseFilter                     objectVsBroadPhase;
-    ObjectPairFilter                             objectPairs;
+    ObjectPairFilter                             objectPairs{layerMatrix};
+    std::unordered_set<std::uint32_t>            innerBodies; // BodyID index + sequence of character inner bodies
     ContactRecorder                              contacts;
     std::unique_ptr<JPH::TempAllocatorImpl>      tempAllocator;
     std::unique_ptr<EngineJobSystem>             jobSystem;
@@ -773,7 +893,6 @@ struct PhysicsWorld::Impl {
     std::map<MeshKey, JPH::RefConst<JPH::Shape>> meshShapes; // unscaled
     std::unordered_set<JPH::uint32>              removedBodies; // since the last EndRemovedPairs
     std::vector<CollisionEvent>                  pendingEvents;
-    std::vector<Entity>                          written; // write-back of the current Step
     PhysicsStats                                 stats;
     std::uint32_t                                visit = 0;
 };
@@ -833,7 +952,9 @@ void PhysicsWorld::Impl::SyncAll(Scene& scene, bool stepping)
     }
     for (auto it = w.characters.begin(); it != w.characters.end();) {
         if (it->second.visit != w.visit) {
+            w.EndCharacterContacts(it->second);
             w.EndPairsOf(it->second.character->GetInnerBodyID());
+            w.innerBodies.erase(it->second.character->GetInnerBodyID().GetIndexAndSequenceNumber());
             it = w.characters.erase(it);
             ++w.stats.removed;
         } else {
@@ -851,6 +972,7 @@ void PhysicsWorld::Impl::SyncAll(Scene& scene, bool stepping)
 
 void PhysicsWorld::Sync(Scene& scene)
 {
+    m_Impl->layerMatrix = settings.layerCollision;
     m_Impl->SyncAll(scene, false);
     m_Impl->PublishEvents();
 }
@@ -858,6 +980,7 @@ void PhysicsWorld::Sync(Scene& scene)
 void PhysicsWorld::Step(Scene& scene, float dt)
 {
     Impl& w = *m_Impl;
+    w.layerMatrix = settings.layerCollision; // read by the pair filter during Update
     w.SyncAll(scene, true);
     if (!(dt > 0.0f)) {
         w.PublishEvents();
@@ -875,13 +998,17 @@ void PhysicsWorld::Step(Scene& scene, float dt)
 
     w.system->SetGravity(ToJolt(settings.gravity));
     w.StepCharacters(dt, settings.gravity, settings.airControl);
+    w.UpdateCharacterContacts();
     const JPH::EPhysicsUpdateError error =
         w.system->Update(dt, std::max(settings.collisionSteps, 1), w.tempAllocator.get(), w.jobSystem.get());
     if (error != JPH::EPhysicsUpdateError::None)
         ENGINE_WARN("Physics: update error {:#x} (limits too small?)", static_cast<unsigned>(error));
 
-    // Write-back: moving dynamic bodies and characters.
-    w.written.clear();
+    // Write-back: moving dynamic bodies and characters (their previous poses kept for Interpolate).
+    std::vector<Impl::PoseWrite> writes;
+    for (auto& [key, r] : w.bodies)
+        if (r.type == BodyType::Dynamic)
+            r.simPrevious = r.simCurrent;
     JPH::BodyIDVector active;
     w.system->GetActiveBodies(JPH::EBodyType::RigidBody, active);
     for (const JPH::BodyID id : active) {
@@ -892,28 +1019,21 @@ void PhysicsWorld::Step(Scene& scene, float dt)
         JPH::Quat  rotation;
         w.Bodies().GetPositionAndRotation(id, position, rotation);
         const glm::quat q = glm::normalize(ToGlm(rotation));
-        Impl::WriteWorldPose(scene, it->second.entity, ToGlm(JPH::Vec3(position)), &q);
-        w.written.push_back(it->second.entity);
+        it->second.simCurrent.position = ToGlm(JPH::Vec3(position));
+        it->second.simCurrent.rotation = q;
+        it->second.between             = false;
+        writes.push_back({.entity = it->second.entity, .position = it->second.simCurrent.position, .rotation = q});
     }
     for (auto& [key, r] : w.characters) {
         const glm::vec3 position = ToGlm(JPH::Vec3(r.character->GetPosition()));
+        r.simPrevious = r.simCurrent;
+        r.simCurrent  = position;
         if (Moved(position, r.lastPosition)) {
-            Impl::WriteWorldPose(scene, r.entity, position, nullptr);
-            w.written.push_back(r.entity);
+            writes.push_back({.entity = r.entity, .position = position, .rotation = std::nullopt});
+            r.between = false;
         }
     }
-    // Remember what the scene actually shows (parents may round differently): no false teleports.
-    scene.UpdateTransforms();
-    const Registry& registry = scene.GetRegistry();
-    for (const Entity e : w.written) {
-        const Pose pose = Decompose(registry.Get<WorldTransform>(e).matrix);
-        if (auto it = w.bodies.find(Key(e)); it != w.bodies.end()) {
-            it->second.last.position = pose.position;
-            it->second.last.rotation = pose.rotation;
-        } else if (auto c = w.characters.find(Key(e)); c != w.characters.end()) {
-            c->second.lastPosition = pose.position;
-        }
-    }
+    w.WritePoses(scene, writes);
 
     w.ProcessContacts();
     w.stats.stepMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -925,8 +1045,35 @@ void PhysicsWorld::Reset()
     m_Impl->Clear();
 }
 
+void PhysicsWorld::Interpolate(Scene& scene, float alpha)
+{
+    // Without interpolation (or after it was switched off) bodies are snapped to their last step.
+    alpha   = settings.interpolate ? std::clamp(alpha, 0.0f, 1.0f) : 1.0f;
+    Impl& w = *m_Impl;
+    std::vector<Impl::PoseWrite> writes;
+    for (auto& [key, r] : w.bodies) {
+        if (r.type != BodyType::Dynamic)
+            continue;
+        const bool moving = r.simPrevious.position != r.simCurrent.position || r.simPrevious.rotation != r.simCurrent.rotation;
+        if (!moving && !r.between) // at rest and already shown at its last step
+            continue;
+        writes.push_back({.entity   = r.entity,
+                          .position = glm::mix(r.simPrevious.position, r.simCurrent.position, alpha),
+                          .rotation = glm::normalize(glm::slerp(r.simPrevious.rotation, r.simCurrent.rotation, alpha))});
+        r.between = moving && alpha < 1.0f;
+    }
+    for (auto& [key, r] : w.characters) {
+        const bool moving = r.simPrevious != r.simCurrent;
+        if (!moving && !r.between)
+            continue;
+        writes.push_back({.entity = r.entity, .position = glm::mix(r.simPrevious, r.simCurrent, alpha), .rotation = std::nullopt});
+        r.between = moving && alpha < 1.0f;
+    }
+    w.WritePoses(scene, writes);
+}
+
 std::optional<PhysicsHit> PhysicsWorld::Raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDistance,
-                                                Entity ignore) const
+                                                Entity ignore, std::uint16_t layerMask) const
 {
     const float length = glm::length(dir);
     if (!(length > 0.0f) || !(maxDistance > 0.0f))
@@ -937,7 +1084,8 @@ std::optional<PhysicsHit> PhysicsWorld::Raycast(const glm::vec3& origin, const g
     const JPH::RRayCast   ray{JPH::RVec3(ToJolt(origin)), ToJolt(direction * maxDistance)};
     JPH::RayCastResult    result;
     const QueryBodyFilter filter(ignore);
-    if (!w.system->GetNarrowPhaseQueryNoLock().CastRay(ray, result, {}, {}, filter))
+    const LayerMaskFilter layers(layerMask);
+    if (!w.system->GetNarrowPhaseQueryNoLock().CastRay(ray, result, {}, layers, filter))
         return std::nullopt;
 
     PhysicsHit hit;
@@ -954,7 +1102,7 @@ std::optional<PhysicsHit> PhysicsWorld::Raycast(const glm::vec3& origin, const g
 }
 
 std::optional<PhysicsHit> PhysicsWorld::SphereCast(const glm::vec3& origin, float radius, const glm::vec3& dir,
-                                                   float maxDistance, Entity ignore) const
+                                                   float maxDistance, Entity ignore, std::uint16_t layerMask) const
 {
     const float length = glm::length(dir);
     if (!(length > 0.0f) || !(maxDistance > 0.0f) || !(radius > 0.0f))
@@ -969,7 +1117,8 @@ std::optional<PhysicsHit> PhysicsWorld::SphereCast(const glm::vec3& origin, floa
     JPH::ShapeCastSettings                                       castSettings;
     JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
     const QueryBodyFilter                                        filter(ignore);
-    w.system->GetNarrowPhaseQueryNoLock().CastShape(cast, castSettings, JPH::RVec3::sZero(), collector, {}, {}, filter);
+    const LayerMaskFilter layers(layerMask);
+    w.system->GetNarrowPhaseQueryNoLock().CastShape(cast, castSettings, JPH::RVec3::sZero(), collector, {}, layers, filter);
     if (!collector.HadHit())
         return std::nullopt;
 

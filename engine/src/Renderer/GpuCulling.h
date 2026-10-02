@@ -30,6 +30,9 @@ inline constexpr std::uint32_t kCullViewCameraEarly = 2;
 inline constexpr std::uint32_t kCullViewCameraLate  = 4;
 inline constexpr std::uint32_t kCullViewOcclusion   = 8;
 inline constexpr std::uint32_t kCullViewSphere      = 16;
+// Sun cascade culled after the Hi-Z: sphere = (light direction, extrusion length). Must follow the
+// camera late view directly (views 2, 3, ...).
+inline constexpr std::uint32_t kCullViewShadowOcclusion = 32;
 
 // View slots of a frame: camera early + late first, then the shadow views.
 inline constexpr std::uint32_t kCameraEarlyView = 0;
@@ -46,12 +49,17 @@ struct GpuCullStats {
     std::uint32_t commands  = 0; // indirect commands, all views
     std::uint32_t triangles = 0; // camera
     std::uint32_t lodDraws  = 0; // camera: draws with a LOD > 0
+    std::uint32_t shadowOccluded = 0; // cascades: casters skipped, their shadow is behind the camera Hi-Z
 };
 
-// LOD selection of a frame (see SelectLod).
+// Per-frame culling parameters.
 struct GpuLodParams {
-    glm::vec4     camera{0.0f}; // xyz: camera position, w: pixels per unit of error at distance 1 / threshold (0: off)
+    glm::vec4     camera{0.0f}; // LOD: xyz camera position, w: pixels per unit of error at distance 1 / threshold (0: off)
     std::uint32_t forced = 0;   // forced LOD + 1 (debug), 0: by distance
+    // kCullViewShadowOcclusion: world box of the camera frustum up to the shadow distance (only
+    // receivers there sample the cascades).
+    glm::vec3 shadowRegionMin{0.0f};
+    glm::vec3 shadowRegionMax{0.0f};
 };
 
 // GPU-driven culling of a GpuScene: per-view visible lists, instance batching and indirect
@@ -102,8 +110,10 @@ private:
         glm::uvec4    depthSize{0};
         glm::vec4     lodCamera{0.0f};
         glm::uvec4    lodInfo{0};
+        glm::vec4     shadowRegionMin{0.0f};
+        glm::vec4     shadowRegionMax{0.0f};
     };
-    static_assert(sizeof(CullData) == 176);
+    static_assert(sizeof(CullData) == 208);
 
     void RecordDraw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucket);
     void Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_t firstView, std::uint32_t viewCount,
@@ -122,6 +132,7 @@ private:
     VkDeviceAddress            m_CullData = 0;
     std::vector<GpuCullView>   m_Views;
     std::uint32_t              m_ViewCount     = 0;
+    std::uint32_t              m_LateViews     = 1; // camera late + following kCullViewShadowOcclusion views
     std::uint32_t              m_BatchCapacity = 0;
     std::uint32_t              m_DrawCapacity  = 0;
     std::uint32_t              m_IndirectCalls = 0;

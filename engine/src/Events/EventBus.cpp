@@ -65,7 +65,7 @@ void EventBus::ApplyPendingChanges()
 
 void EventBus::Flush()
 {
-    std::vector<std::function<void()>> queue;
+    std::vector<MoveOnlyFunction<void()>> queue;
     {
         std::scoped_lock lock{m_QueueMutex};
         queue.swap(m_Queue);

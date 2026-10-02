@@ -5,6 +5,7 @@
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/Assets/TextureCooker.h"
+#include "Engine/Audio/Sound.h"
 #include "Engine/Renderer/Vulkan/Upload.h"
 
 #include <atomic>
@@ -84,6 +85,21 @@ struct TextureInfo {
     std::uint32_t tableEntry   = 0;
 };
 
+struct SoundInfo {
+    SoundHandle   handle;
+    AssetState    state    = AssetState::Invalid;
+    std::uint32_t refCount = 0;
+    std::string   path;
+    std::string   error;
+    std::uint32_t revision  = 0;
+    bool          reloading = false;
+    SoundLoadMode mode      = SoundLoadMode::Auto;
+    bool          streamed  = false;
+    std::uint32_t channels = 0, sampleRate = 0;
+    double        duration    = 0.0;
+    std::uint64_t memoryBytes = 0; // decoded PCM (streamed: 0)
+};
+
 struct AssetManagerDesc {
     // Texture import. Compression is also off when the GPU cannot sample BC formats.
     TextureCookSettings  textures{.compress = true, .cacheDirectory = "asset_cache/textures", .quality = 0};
@@ -158,12 +174,24 @@ public:
     [[nodiscard]] std::uint32_t   TableEntry(TextureHandle handle) const;
     [[nodiscard]] std::vector<TextureInfo> Textures() const;
 
+    // --- Sounds (CPU only: decoded PCM or, for long files / Stream, the file to stream from).
+    // Cached by path + mode. Playing voices keep their data alive across reloads and releases.
+    [[nodiscard]] SoundHandle LoadSound(const std::filesystem::path& path, SoundLoadMode mode = SoundLoadMode::Auto);
+    void Release(SoundHandle handle);
+    [[nodiscard]] std::shared_ptr<const SoundData> Get(SoundHandle handle) const; // nullptr unless Ready
+    [[nodiscard]] AssetState    State(SoundHandle handle) const;
+    [[nodiscard]] std::string   Error(SoundHandle handle) const;
+    [[nodiscard]] std::uint32_t RefCount(SoundHandle handle) const;
+    [[nodiscard]] std::uint32_t Revision(SoundHandle handle) const;
+    [[nodiscard]] std::vector<SoundInfo> Sounds() const;
+
     // --- Reload / retry. Re-reads the source: a Ready asset keeps its content until the new one
     // is resident (a failed reload keeps it for good), a Failed one is retried. While a load is
     // in flight the request is queued. False without a file / recipe (CreateModel, embedded
     // textures: reload their model).
     bool Reload(ModelHandle handle);
     bool Reload(TextureHandle handle);
+    bool Reload(SoundHandle handle);
     void SetHotReload(bool enabled);
     [[nodiscard]] bool HotReload() const { return m_HotReload; }
 
@@ -219,6 +247,11 @@ private:
         UploadTicket                            pendingTicket = 0;
     };
 
+    struct SoundEntry : EntryBase {
+        SoundLoadMode                    mode = SoundLoadMode::Auto;
+        std::shared_ptr<const SoundData> sound; // Ready (also kept by a failed reload)
+    };
+
     // Worker -> main thread.
     struct ModelResult {
         ModelHandle                        handle;
@@ -234,6 +267,12 @@ private:
         std::unique_ptr<Texture> texture; // may be partial if `error` is set
         UploadTicket             ticket = 0;
         std::string              error;
+    };
+
+    struct SoundResult {
+        SoundHandle                      handle;
+        std::shared_ptr<const SoundData> sound;
+        std::string                      error;
     };
 
     template <class E>
@@ -270,6 +309,10 @@ private:
     void FailTexture(TextureHandle handle, TextureEntry& e, std::string error);
     void DestroyTexture(std::unique_ptr<Texture> texture, UploadTicket ticket);
 
+    // Sounds
+    void StartSoundJob(SoundHandle handle);
+    void OnSoundResult(SoundResult& result);
+
     void PollFiles();
     [[nodiscard]] static std::vector<WatchedFile> Watch(std::vector<std::filesystem::path> files);
     void EnqueueJob(std::function<void()> job);
@@ -288,6 +331,8 @@ private:
     Table<TextureEntry>                              m_Textures;
     std::unordered_map<std::u8string, std::uint32_t> m_ModelCache;
     std::unordered_map<std::u8string, std::uint32_t> m_TextureCache;
+    Table<SoundEntry>                                m_Sounds;
+    std::unordered_map<std::u8string, std::uint32_t> m_SoundCache;
     std::vector<ModelHandle>                         m_PendingModels;   // content waiting to swap in
     std::vector<TextureHandle>                       m_PendingTextures;
 
@@ -306,6 +351,7 @@ private:
     std::condition_variable    m_JobsDone;
     std::vector<ModelResult>   m_ModelResults;   // guarded by m_ResultMutex
     std::vector<TextureResult> m_TextureResults; // guarded by m_ResultMutex
+    std::vector<SoundResult>   m_SoundResults;   // guarded by m_ResultMutex
     std::uint32_t              m_JobsInFlight = 0; // guarded by m_ResultMutex
     std::atomic<bool>          m_ShuttingDown{false};
 };

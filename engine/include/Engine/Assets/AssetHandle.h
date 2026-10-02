@@ -17,13 +17,15 @@ struct AssetHandle {
 
 struct Model;
 struct Texture;
+struct SoundData;
 using ModelHandle   = AssetHandle<Model>;
 using TextureHandle = AssetHandle<Texture>;
+using SoundHandle   = AssetHandle<SoundData>;
 
 enum class AssetState : std::uint8_t {
     Invalid,   // null or stale handle
     Loading,   // CPU work on a worker thread (file IO, decoding)
-    Uploading, // GPU resources created, transfer in flight
+    Uploading, // GPU resources created, transfer in flight (not for sounds)
     Ready,
     Failed,    // see AssetFailedEvent / AssetManager::Error
 };

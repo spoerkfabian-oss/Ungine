@@ -1,8 +1,13 @@
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 #include "Engine/Core/Window.h"
+#include "Engine/Renderer/Vulkan/Pipeline.h"
 #include "Renderer/Vulkan/VkbUtil.h"
 
 #include <atomic>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <vector>
 
 namespace Engine {
 
@@ -36,6 +41,8 @@ VulkanContext::VulkanContext(const Window& window, const VulkanContextDesc& desc
         SelectPhysicalDevice();
         CreateDevice();
         CreateAllocator();
+        m_PipelineCachePath = desc.pipelineCache;
+        CreatePipelineCache();
     } catch (...) {
         Shutdown(); // destructor won't run if the constructor throws
         throw;
@@ -55,6 +62,15 @@ void VulkanContext::CreateInstance(const VulkanContextDesc& desc)
     builder.set_app_name(desc.appName.c_str())
            .set_engine_name("Engine")
            .require_api_version(1, 3, 0);
+
+    // Optional: surface maintenance (prerequisite of swapchain maintenance, see CreateDevice).
+    if (auto info = vkb::SystemInfo::get_system_info(vkGetInstanceProcAddr);
+        info && info->is_extension_available(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
+        info->is_extension_available(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+        builder.enable_extension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)
+               .enable_extension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+        m_SurfaceMaintenance = true;
+    }
 
     if (desc.enableValidation) {
         builder.request_validation_layers(true)
@@ -116,6 +132,15 @@ void VulkanContext::CreateDevice()
     if (!m_TextureCompressionBC)
         ENGINE_WARN("GPU without BC texture compression: textures stay uncompressed (RGBA8)");
 
+    if (m_SurfaceMaintenance && m_PhysicalDevice.enable_extension_if_present(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance{};
+        maintenance.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+        maintenance.swapchainMaintenance1 = VK_TRUE;
+        m_SwapchainMaintenance            = m_PhysicalDevice.enable_extension_features_if_present(maintenance);
+    }
+    if (!m_SwapchainMaintenance)
+        ENGINE_INFO("No VK_EXT_swapchain_maintenance1: swapchain recreation waits for the device");
+
     m_Device = Expect(vkb::DeviceBuilder{m_PhysicalDevice}.build(), "Device creation failed");
     volkLoadDevice(m_Device.device); // direct device dispatch, skips loader trampoline
 
@@ -160,8 +185,68 @@ void VulkanContext::WaitIdle() const
         VK_CHECK(vkDeviceWaitIdle(m_Device.device));
 }
 
+void VulkanContext::CreatePipelineCache()
+{
+    // Only data written by this exact device / driver is used (the header says who wrote it).
+    std::vector<char> data;
+    if (!m_PipelineCachePath.empty()) {
+        std::ifstream file(m_PipelineCachePath, std::ios::binary);
+        data.assign(std::istreambuf_iterator<char>(file), {});
+        const VkPhysicalDeviceProperties& props = Properties();
+        VkPipelineCacheHeaderVersionOne   header{};
+        if (data.size() < sizeof(header)) {
+            data.clear();
+        } else {
+            std::memcpy(&header, data.data(), sizeof(header));
+            if (header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || header.vendorID != props.vendorID ||
+                header.deviceID != props.deviceID ||
+                std::memcmp(header.pipelineCacheUUID, props.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+                data.clear();
+        }
+    }
+    VkPipelineCacheCreateInfo info{};
+    info.sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    info.initialDataSize = data.size();
+    info.pInitialData    = data.empty() ? nullptr : data.data();
+    VK_CHECK(vkCreatePipelineCache(m_Device.device, &info, nullptr, &m_PipelineCache));
+    RegisterPipelineCache(m_Device.device, m_PipelineCache);
+    if (!data.empty())
+        ENGINE_INFO("Pipeline cache: {} KB from '{}'", data.size() >> 10, m_PipelineCachePath.string());
+}
+
+void VulkanContext::SavePipelineCache() const
+{
+    if (m_PipelineCachePath.empty() || !m_PipelineCache)
+        return;
+    std::size_t size = 0;
+    if (vkGetPipelineCacheData(m_Device.device, m_PipelineCache, &size, nullptr) != VK_SUCCESS || size == 0)
+        return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(m_Device.device, m_PipelineCache, &size, data.data()) != VK_SUCCESS)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(m_PipelineCachePath.parent_path(), ec);
+    const std::filesystem::path tmp = std::filesystem::path(m_PipelineCachePath) += ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        file.write(data.data(), static_cast<std::streamsize>(size));
+        if (!file)
+            return;
+    }
+    std::filesystem::rename(tmp, m_PipelineCachePath, ec);
+}
+
 void VulkanContext::Shutdown() noexcept
 {
+    if (m_PipelineCache) {
+        try {
+            SavePipelineCache();
+        } catch (...) { // best effort
+        }
+        RegisterPipelineCache(m_Device.device, VK_NULL_HANDLE);
+        vkDestroyPipelineCache(m_Device.device, m_PipelineCache, nullptr);
+        m_PipelineCache = VK_NULL_HANDLE;
+    }
     if (m_Allocator) {
         vmaDestroyAllocator(m_Allocator);
         m_Allocator = VK_NULL_HANDLE;

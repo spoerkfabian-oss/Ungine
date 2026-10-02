@@ -10,10 +10,12 @@ Application::Application(const ApplicationDesc& desc)
     , m_Window(std::make_unique<Window>(desc.window, m_Events))
     , m_Context(std::make_unique<VulkanContext>(
           *m_Window, VulkanContextDesc{.appName = desc.window.title,
-                                       .enableValidation = desc.enableValidation}))
+                                       .enableValidation = desc.enableValidation,
+                                       .pipelineCache    = desc.pipelineCache}))
     , m_Renderer(std::make_unique<Renderer>(*m_Context, *m_Window, m_Events, desc.renderer))
     , m_Jobs(std::make_unique<ThreadPool>(desc.workerThreads))
     , m_Assets(std::make_unique<AssetManager>(*m_Renderer, *m_Jobs, m_Events, m_Desc.assets))
+    , m_Audio(std::make_unique<AudioEngine>(m_Desc.audio))
 {
     ENGINE_INFO("Worker threads: {}", m_Jobs->ThreadCount());
 }
@@ -35,8 +37,12 @@ void Application::Run()
         m_Events.Flush();       // deferred events (e.g. from loader threads)
 
         if (m_Window->IsMinimized()) {
-            m_Window->WaitEvents();   // sleep instead of spinning
-            previous = Clock::now();  // don't count minimized time as a frame
+            // No frames: sleep, but wake up regularly so background loads still finish (their
+            // uploads are submitted and acquired directly instead of by BeginFrame).
+            m_Window->WaitEvents(0.1);
+            m_Renderer->GetUploader().Flush();
+            m_Assets->Update();
+            previous = Clock::now(); // don't count minimized time as a frame
             continue;
         }
 

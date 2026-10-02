@@ -1,15 +1,21 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Editor/ScriptGraphEditor.h"
 #include "FileDialog.h"
 #include "History.h"
 #include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Core/Project.h"
+#include "Engine/Audio/AudioSystem.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptSystem.h"
 
 #include <imgui.h>
 #include <imgui_internal.h> // ActiveIdWindow (inspector edit sessions)
@@ -153,6 +159,34 @@ bool ComboRow(const char* label, E* value, const char* const (&names)[N])
 }
 
 constexpr const char* kBodyTypeNames[]      = {"Static", "Kinematic", "Dynamic"};
+constexpr const char* kAttenuationNames[]   = {"Inverse", "Linear", "Exponential"};
+
+// Buses a sound can play on (Master is the sum).
+bool BusComboRow(const char* label, AudioBus* bus)
+{
+    PropertyRow(label);
+    bool changed = false;
+    if (ImGui::BeginCombo("##v", ToString(*bus))) {
+        for (AudioBus option : {AudioBus::World, AudioBus::Music, AudioBus::Ui, AudioBus::Ambient})
+            if (ImGui::Selectable(ToString(option), option == *bus)) {
+                *bus    = option;
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+bool ReverbRows(ReverbParams* r)
+{
+    bool changed = false;
+    changed |= SliderFloatRow("Room size", &r->roomSize, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Damping", &r->damping, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Wet", &r->wet, 0.0f, 1.0f);
+    changed |= SliderFloatRow("Width", &r->width, 0.0f, 1.0f);
+    return changed;
+}
 constexpr const char* kColliderShapeNames[] = {"Box", "Sphere", "Capsule", "Mesh"};
 constexpr const char* kActivityNames[]      = {"-", "static", "kinematic", "active", "sleeping", "character"};
 
@@ -206,6 +240,17 @@ void Editor::DrawHierarchy()
             Select(CreateLight(LightType::Point, NullEntity));
         if (ImGui::MenuItem("Spot Light"))
             Select(CreateLight(LightType::Spot, NullEntity));
+        ImGui::Separator();
+        if (ImGui::MenuItem("Audio Source"))
+            CreateAudioEntity({}, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+        if (ImGui::MenuItem("Reverb Zone")) {
+            const Entity e = m_Ctx.scene.CreateEntity("Reverb Zone");
+            m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<ReverbZone>(e);
+            const Entity roots[] = {e};
+            PushCreated("Create reverb zone", roots);
+            Select(e);
+        }
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -252,8 +297,11 @@ void Editor::DrawHierarchyNode(Entity entity)
         flags |= ImGuiTreeNodeFlags_Leaf;
     if (IsSelected(entity))
         flags |= ImGuiTreeNodeFlags_Selected;
-    const bool tinted = registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
-    if (tinted)
+    const Entity prefabRoot = PrefabInstanceRoot(m_Ctx.scene, entity);
+    const bool   tinted     = prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
+    if (prefabRoot != NullEntity) // prefab instances: root bright blue, members lighter
+        ImGui::PushStyleColor(ImGuiCol_Text, prefabRoot == entity ? ImVec4(0.35f, 0.65f, 1.0f, 1.0f) : ImVec4(0.6f, 0.78f, 1.0f, 1.0f));
+    else if (tinted)
         ImGui::PushStyleColor(ImGuiCol_Text, registry.Has<Light>(entity) ? ImVec4(1.0f, 0.85f, 0.4f, 1.0f)
                                                                         : ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
     const bool open = ImGui::TreeNodeEx(EntityId(entity), flags, "%s", name.empty() ? "(unnamed)" : name.c_str());
@@ -293,6 +341,27 @@ void Editor::DrawHierarchyNode(Entity entity)
             m_PendingDuplicate = true;
         if (ImGui::MenuItem("Delete", "Del"))
             m_PendingDelete = m_Selection; // after the tree was drawn
+        ImGui::Separator();
+        if (ImGui::MenuItem("Create prefab...", nullptr, false, m_PlayState == PlayState::Edit)) {
+            m_PrefabTarget  = entity;
+            m_DialogPurpose = DialogPurpose::CreatePrefab;
+            std::error_code ec;
+            const std::filesystem::path dir = ContentRoot() / "Prefabs";
+            std::filesystem::create_directories(dir, ec);
+            m_FileDialog->Open("Create prefab", FileDialog::Mode::Save, dir, {std::string(kPrefabExtension)},
+                               name + std::string(kPrefabExtension));
+        }
+        if (prefabRoot != NullEntity) {
+            const bool edit = m_PlayState == PlayState::Edit;
+            if (prefabRoot != entity && ImGui::MenuItem("Select prefab root"))
+                Select(prefabRoot);
+            if (ImGui::MenuItem("Apply to prefab", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+            if (ImGui::MenuItem(prefabRoot == entity ? "Revert instance" : "Revert entity", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), {}};
+            if (ImGui::MenuItem("Unlink prefab", nullptr, false, edit))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Unlink, UuidOf(entity), {}};
+        }
         ImGui::EndPopup();
     }
 
@@ -317,9 +386,8 @@ void Editor::DrawInspector()
     Registry& registry = m_Ctx.scene.GetRegistry();
     const Entity e     = Selected();
     if (e == NullEntity) {
-        if (m_InspectorEdit) { // the edited entity was deselected mid-edit
-            PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
-        }
+        if (m_InspectorEdit) // the edited entity was deselected mid-edit
+            PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
         ImGui::TextDisabled("Nothing selected");
         ImGui::End();
         return;
@@ -330,9 +398,11 @@ void Editor::DrawInspector()
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputText("##name", &registry.Get<Name>(e).value);
     if (m_Selection.size() > 1)
-        ImGui::TextDisabled("%zu selected - showing the last one", m_Selection.size());
+        ImGui::TextDisabled("%zu selected - edits apply to all (values of the last one shown)", m_Selection.size());
     ImGui::TextDisabled("Entity %u (gen %u), uuid %016llx", EntityIndex(e), EntityGeneration(e),
                         static_cast<unsigned long long>(registry.Get<Uuid>(e).value));
+    if (PrefabInstanceRoot(m_Ctx.scene, e) != NullEntity)
+        DrawPrefabHeader(e);
 
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("transform")) {
         // Edited as a copy: writing back only on change keeps the entity (and its shadow caches) clean.
@@ -436,6 +506,7 @@ void Editor::DrawInspector()
             DragFloatRow("Linear damping", &body->linearDamping, 0.005f, 0.0f, 10.0f);
             DragFloatRow("Angular damping", &body->angularDamping, 0.005f, 0.0f, 10.0f);
             CheckboxRow("Allow sleeping", &body->allowSleeping);
+            CheckboxRow("Continuous (CCD)", &body->continuous);
         }
         if (m_Ctx.physics) {
             PropertyRow("State");
@@ -477,6 +548,9 @@ void Editor::DrawInspector()
         DragFloatRow("Friction", &collider->friction, 0.005f, 0.0f, 10.0f);
         DragFloatRow("Restitution", &collider->restitution, 0.005f, 0.0f, 1.0f);
         CheckboxRow("Trigger", &collider->trigger);
+        std::uint32_t layer = collider->layer;
+        if (SliderUintRow("Layer", &layer, 0, kPhysicsLayers - 1))
+            collider->layer = static_cast<std::uint8_t>(layer);
         ImGui::EndTable();
         if (collider->shape == ColliderShape::Mesh && registry.Has<RigidBody>(e) &&
             registry.Get<RigidBody>(e).type == BodyType::Dynamic)
@@ -518,6 +592,162 @@ void Editor::DrawInspector()
             registry.Remove<CharacterController>(e);
     }
 
+    if (CameraComponent* cam = registry.TryGet<CameraComponent>(e);
+        cam && ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("camera component")) {
+        PropertyRow("Field of view");
+        ImGui::SliderAngle("##v", &cam->fovY, 10.0f, 150.0f);
+        ImGui::PopID();
+        DragFloatRow("Near plane", &cam->nearPlane, 0.001f, 0.001f, 10.0f);
+        CheckboxRow("Primary", &cam->primary);
+        ImGui::EndTable();
+        ImGui::TextDisabled("The player renders through the first primary camera.");
+        if (ImGui::Button("Remove camera"))
+            registry.Remove<CameraComponent>(e);
+    }
+
+    if (ScriptComponent* script = registry.TryGet<ScriptComponent>(e);
+        script && ImGui::CollapsingHeader("Script (Blueprint)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##graph", "path/to/script.ugraph", &script->graph);
+        std::error_code             ec;
+        const std::filesystem::path dir = !script->graph.empty() ? std::filesystem::path(script->graph).parent_path()
+                                          : !m_ScenePath.empty() ? m_ScenePath.parent_path()
+                                                                 : std::filesystem::current_path(ec);
+        if (ImGui::Button("Edit") && !script->graph.empty()) {
+            if (m_Graphs->Open(script->graph)) {
+                m_ShowBlueprint = true;
+                m_Graphs->Focus();
+            } else {
+                m_Status = "Cannot open script (see log)";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            m_ScriptTarget  = e;
+            m_DialogPurpose = DialogPurpose::AssignScript;
+            m_FileDialog->Open("Choose script", FileDialog::Mode::Open, dir, {".ugraph"});
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New...")) {
+            m_ScriptTarget  = e;
+            m_DialogPurpose = DialogPurpose::NewScript;
+            m_FileDialog->Open("New script", FileDialog::Mode::Save, dir, {".ugraph"}, registry.Get<Name>(e).value + ".ugraph");
+        }
+        if (m_Ctx.scripts && m_Ctx.scripts->Running() && !script->graph.empty())
+            if (const ScriptDebugInfo* info = m_Ctx.scripts->Debug(script->graph)) {
+                const auto errors = std::ranges::count_if(info->diagnostics, [](const ScriptDiagnostic& d) { return d.error; });
+                if (errors)
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%d error(s) - see the Blueprint window", static_cast<int>(errors));
+                else
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Running");
+            }
+        DrawScriptVariables(*script);
+        if (ImGui::Button("Remove script"))
+            registry.Remove<ScriptComponent>(e);
+    }
+
+    if (Tags* tags = registry.TryGet<Tags>(e); tags && ImGui::CollapsingHeader("Tags", ImGuiTreeNodeFlags_DefaultOpen)) {
+        std::optional<std::size_t> remove;
+        for (std::size_t i = 0; i < tags->values.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            if (i && ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize(tags->values[i].c_str()).x + 40.0f)
+                ImGui::SameLine();
+            if (ImGui::SmallButton((tags->values[i] + "  x").c_str()))
+                remove = i;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Remove tag");
+            ImGui::PopID();
+        }
+        if (remove)
+            tags->values.erase(tags->values.begin() + static_cast<std::ptrdiff_t>(*remove));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputTextWithHint("##newtag", "add a tag (Enter)", &m_NewTag, ImGuiInputTextFlags_EnterReturnsTrue)) {
+            if (!m_NewTag.empty() && !tags->Has(m_NewTag))
+                tags->values.push_back(m_NewTag);
+            m_NewTag.clear();
+            ImGui::SetKeyboardFocusHere(-1);
+        }
+        if (ImGui::Button("Remove tags"))
+            registry.Remove<Tags>(e);
+    }
+
+    if (AudioSource* audio = registry.TryGet<AudioSource>(e);
+        audio && ImGui::CollapsingHeader("Audio Source", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##sound", "path/to/sound.wav", &audio->sound);
+        const std::filesystem::path dir = !audio->sound.empty() ? PathFromUtf8(audio->sound).parent_path()
+                                                                : ContentRoot();
+        if (ImGui::Button("Browse...##sound")) {
+            m_SoundTarget   = e;
+            m_DialogPurpose = DialogPurpose::AssignSound;
+            m_FileDialog->Open("Choose sound", FileDialog::Mode::Open, dir, {".wav", ".ogg", ".mp3", ".flac"});
+        }
+        if (m_Ctx.audio) {
+            ImGui::SameLine();
+            if (m_Ctx.audio->Previewing()) {
+                if (ImGui::Button("Stop preview"))
+                    m_Ctx.audio->StopPreview();
+            } else if (ImGui::Button("Preview") && !audio->sound.empty()) {
+                m_Ctx.audio->Preview(audio->sound);
+            }
+        }
+        if (BeginProperties("audio")) {
+            BusComboRow("Bus", &audio->bus);
+            DragFloatRow("Volume", &audio->volume, 0.01f, 0.0f, 4.0f);
+            DragFloatRow("Pitch", &audio->pitch, 0.01f, 0.01f, 16.0f);
+            CheckboxRow("Loop", &audio->loop);
+            CheckboxRow("Play on start", &audio->playOnStart);
+            CheckboxRow("Stream", &audio->stream);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Always stream from the file (music); longer than %.0f s streams anyway",
+                                  kSoundStreamThresholdSeconds);
+            DragFloatRow("Fade in", &audio->fadeIn, 0.01f, 0.0f, 60.0f, "%.2f s");
+            CheckboxRow("3D (spatial)", &audio->spatial);
+            if (audio->spatial) {
+                ComboRow("Attenuation", &audio->attenuation, kAttenuationNames);
+                DragFloatRow("Min distance", &audio->minDistance, 0.01f, 0.01f, 1e4f);
+                DragFloatRow("Max distance", &audio->maxDistance, 0.1f, audio->minDistance, 1e5f);
+                DragFloatRow("Rolloff", &audio->rolloff, 0.01f, 0.0f, 10.0f);
+                DragFloatRow("Doppler", &audio->doppler, 0.01f, 0.0f, 10.0f);
+                CheckboxRow("Occlusion", &audio->occlusion);
+            }
+            if (m_Ctx.audio && m_Ctx.audio->Running()) {
+                PropertyRow("State");
+                ImGui::TextUnformatted(m_Ctx.audio->IsPlaying(e) ? "playing" : "stopped");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (m_Ctx.audio && m_Ctx.audio->Running()) {
+            if (ImGui::Button("Play"))
+                m_Ctx.audio->Play(e);
+            ImGui::SameLine();
+            if (ImGui::Button("Stop"))
+                m_Ctx.audio->Stop(e, 0.1f);
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Remove audio source"))
+            registry.Remove<AudioSource>(e);
+    }
+
+    if (registry.Has<AudioListener>(e) && ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("The scene is heard from here (else from the primary camera).");
+        if (ImGui::Button("Remove listener"))
+            registry.Remove<AudioListener>(e);
+    }
+
+    if (ReverbZone* zone = registry.TryGet<ReverbZone>(e);
+        zone && ImGui::CollapsingHeader("Reverb Zone", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("reverb")) {
+        Vec3Row("Half extents", &zone->halfExtents, 0.01f, 5.0f);
+        zone->halfExtents = glm::max(zone->halfExtents, glm::vec3(0.0f));
+        DragFloatRow("Blend distance", &zone->blendDistance, 0.01f, 0.0f, 100.0f);
+        ReverbRows(&zone->reverb);
+        ImGui::EndTable();
+        ImGui::TextDisabled("World-bus sounds get this room while the listener is inside.");
+        if (ImGui::Button("Remove reverb zone"))
+            registry.Remove<ReverbZone>(e);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -551,25 +781,60 @@ void Editor::DrawInspector()
         }
         if (ImGui::MenuItem("Character Controller", nullptr, false, !registry.Has<CharacterController>(e)))
             registry.Emplace<CharacterController>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Script (Blueprint)", nullptr, false, !registry.Has<ScriptComponent>(e)))
+            registry.Emplace<ScriptComponent>(e);
+        if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
+            registry.Emplace<CameraComponent>(e);
+        if (ImGui::MenuItem("Tags", nullptr, false, !registry.Has<Tags>(e)))
+            registry.Emplace<Tags>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Audio Source", nullptr, false, !registry.Has<AudioSource>(e)))
+            registry.Emplace<AudioSource>(e);
+        if (ImGui::MenuItem("Audio Listener", nullptr, false, !registry.Has<AudioListener>(e)))
+            registry.Emplace<AudioListener>(e);
+        if (ImGui::MenuItem("Reverb Zone", nullptr, false, !registry.Has<ReverbZone>(e)))
+            registry.Emplace<ReverbZone>(e);
         ImGui::EndPopup();
     }
 
     // One undo step per edit: instant widgets (checkbox, combo, buttons) push right away, drags and
     // text fields when they are released. Detected by comparing the entity's state.
-    const std::uint64_t uuid    = registry.Get<Uuid>(e).value;
-    const bool          editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
-    const bool          changed = SnapshotEntityState(m_Ctx.scene, e) != frameState;
-    if (changed)
+    // Multi-selection: the same change (changed fields, added / removed components) goes to the
+    // other selected entities.
+    const std::uint64_t    uuid    = registry.Get<Uuid>(e).value;
+    const bool             editing = ImGui::IsAnyItemActive() && GImGui->ActiveIdWindow == ImGui::GetCurrentWindow();
+    const std::string      after   = SnapshotEntityState(m_Ctx.scene, e);
+    const bool             changed = after != frameState;
+    std::vector<StateEdit> others;
+    if (changed) {
         m_Ctx.scene.MarkChanged(e); // light / mesh edits: bounds and shadow caches
-    if (m_InspectorEdit && m_InspectorEdit->uuid == uuid && editing) {
-        // still dragging / typing
-    } else if (m_InspectorEdit) {
-        PushStateChange("Edit properties", {std::exchange(m_InspectorEdit, std::nullopt).value()});
+        for (Entity other : m_Selection) {
+            if (other == e)
+                continue;
+            std::string before = SnapshotEntityState(m_Ctx.scene, other);
+            if (ApplyEntityStateDiff(m_Ctx.scene, other, frameState, after))
+                others.push_back({UuidOf(other), std::move(before)});
+        }
+    }
+    const auto addOthers = [&](std::vector<StateEdit>& edit) { // first change of each entity only
+        for (StateEdit& o : others)
+            if (std::ranges::none_of(edit, [&](const StateEdit& x) { return x.uuid == o.uuid; }))
+                edit.push_back(std::move(o));
+    };
+    if (m_InspectorEdit && m_InspectorEdit->front().uuid != uuid) // the primary changed mid-edit
+        PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
+    if (m_InspectorEdit) {
+        addOthers(*m_InspectorEdit);
+        if (!editing) // released: one step for the whole drag / typing session
+            PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
     } else if (changed) {
+        std::vector<StateEdit> edit{StateEdit{uuid, frameState}};
+        addOthers(edit);
         if (editing)
-            m_InspectorEdit = StateEdit{uuid, frameState};
+            m_InspectorEdit = std::move(edit);
         else
-            PushStateChange("Edit properties", {StateEdit{uuid, frameState}});
+            PushStateChange("Edit properties", std::move(edit));
     }
     ImGui::End();
 }
@@ -586,6 +851,152 @@ std::optional<std::pair<glm::vec3, glm::vec3>> Editor::MeshBounds(Entity entity)
         hi = glm::max(hi, sm.boundsMax);
     }
     return std::pair{lo, hi};
+}
+
+void Editor::DrawPrefabHeader(Entity entity)
+{
+    const Registry& registry = m_Ctx.scene.GetRegistry();
+    const Entity    root     = PrefabInstanceRoot(m_Ctx.scene, entity);
+    const auto&     instance = registry.Get<PrefabInstance>(root);
+    const bool      edit     = m_PlayState == PlayState::Edit;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.2f, 0.32f, 1.0f));
+    ImGui::BeginChild("prefab", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    ImGui::TextColored(ImVec4(0.45f, 0.72f, 1.0f, 1.0f), "Prefab %s", PathToUtf8(PathFromUtf8(instance.prefab).filename()).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", instance.prefab.c_str());
+    if (!instance.built && instance.unresolved)
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "The prefab file is missing: the instance keeps its saved data");
+    if (root != entity) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("member of '%s'", registry.Get<Name>(root).value.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Select root"))
+            Select(root);
+    }
+    // Overridden values of this entity (each can go back to the prefab's).
+    const std::vector<std::string> keys = PrefabOverriddenKeys(m_Ctx.scene, &m_Ctx.assets, entity);
+    if (!keys.empty()) {
+        ImGui::TextDisabled("Overrides:");
+        for (const std::string& key : keys) {
+            ImGui::SameLine();
+            ImGui::PushID(key.c_str());
+            ImGui::BeginDisabled(!edit);
+            if (ImGui::SmallButton((key + "  x").c_str()))
+                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), key};
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Revert '%s' to the prefab", key.c_str());
+            ImGui::PopID();
+        }
+    }
+    if (root == entity) {
+        const std::size_t changes = PrefabOverrides(m_Ctx.scene, &m_Ctx.assets, root).size();
+        ImGui::BeginDisabled(!edit);
+        if (ImGui::Button("Apply to prefab"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Writes this instance into the prefab file; the other instances update (their overrides stay)");
+        ImGui::SameLine();
+        if (ImGui::Button("Revert all"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), {}};
+        ImGui::SameLine();
+        if (ImGui::Button("Unlink"))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Unlink, UuidOf(entity), {}};
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled(changes ? "%zu changed entit%s" : "matches the prefab", changes, changes == 1 ? "y" : "ies");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+const ScriptGraph* Editor::GraphFor(const std::string& file)
+{
+    if (file.empty())
+        return nullptr;
+    if (const ScriptGraph* open = m_Graphs->Find(PathFromUtf8(file)))
+        return open; // unsaved edits count
+    std::error_code ec;
+    const auto      mtime = std::filesystem::last_write_time(PathFromUtf8(file), ec);
+    if (ec)
+        return nullptr;
+    auto it = m_GraphCache.find(file);
+    if (it == m_GraphCache.end() || it->second.first != mtime) {
+        try {
+            m_GraphCache[file] = {mtime, LoadScriptGraph(PathFromUtf8(file))};
+        } catch (const std::exception&) {
+            m_GraphCache.erase(file);
+            return nullptr;
+        }
+        it = m_GraphCache.find(file);
+    }
+    return &it->second.second;
+}
+
+void Editor::DrawScriptVariables(ScriptComponent& script)
+{
+    const ScriptGraph* graph = GraphFor(script.graph);
+    if (!graph)
+        return;
+    bool any = false;
+    for (const ScriptVariable& v : graph->variables)
+        any |= v.exposed;
+    if (!any) {
+        ImGui::TextDisabled("No instance editable variables (tick the box next to a variable in the Blueprint)");
+        return;
+    }
+    if (!BeginProperties("scriptvars"))
+        return;
+    std::optional<std::string> reset;
+    for (const ScriptVariable& v : graph->variables) {
+        if (!v.exposed)
+            continue;
+        const auto overridden = script.variables.find(v.name);
+        PropertyRow(v.name.c_str());
+        if (overridden == script.variables.end())
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.6f); // the graph's default
+        const float width = overridden != script.variables.end() ? -28.0f : -FLT_MIN;
+        if (v.type == PinType::Entity) { // pick an entity of the scene (stored by UUID)
+            const std::uint64_t current = overridden != script.variables.end() ? overridden->second.entityUuid : 0;
+            const Entity        target  = current ? m_Ctx.scene.FindByUuid(current) : NullEntity;
+            const std::string   preview = !current ? "(self / none)"
+                                          : target != NullEntity ? m_Ctx.scene.GetRegistry().Get<Name>(target).value
+                                                                 : "(missing)";
+            ImGui::SetNextItemWidth(width);
+            if (ImGui::BeginCombo("##entity", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+                if (ImGui::Selectable("(self / none)", current == 0))
+                    reset = v.name;
+                int shown = 0;
+                m_Ctx.scene.GetRegistry().ViewOf<Name>().Each([&](Entity other, Name& name) {
+                    if (++shown > 2000)
+                        return;
+                    const std::uint64_t uuid = UuidOf(other);
+                    ImGui::PushID(static_cast<int>(EntityIndex(other)));
+                    if (ImGui::Selectable(name.value.c_str(), uuid == current))
+                        script.variables[v.name] = ScriptVariableOverride{.value = NullEntity, .entityUuid = uuid};
+                    ImGui::PopID();
+                });
+                ImGui::EndCombo();
+            }
+        } else {
+            ScriptValue value = overridden != script.variables.end() ? Convert(overridden->second.value, v.type) : v.value;
+            if (ScriptGraphEditor::EditValue("##value", value, v.type, width))
+                script.variables[v.name] = ScriptVariableOverride{.value = std::move(value), .entityUuid = 0};
+        }
+        if (overridden == script.variables.end()) {
+            ImGui::PopStyleVar();
+        } else {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                reset = v.name;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Back to the graph's value");
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+    if (reset)
+        script.variables.erase(*reset);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -760,6 +1171,8 @@ void Editor::DrawRendererSettings()
         ImGui::EndTable();
     }
 
+    DrawAudioSettings();
+
     if (m_Ctx.physics && ImGui::CollapsingHeader("Physics") && BeginProperties("physics")) {
         PhysicsSettings& ps = m_Ctx.physics->settings;
         Vec3Row("Gravity", &ps.gravity, 0.05f, 0.0f);
@@ -767,8 +1180,40 @@ void Editor::DrawRendererSettings()
         ImGui::SliderInt("##v", &ps.collisionSteps, 1, 8);
         ImGui::PopID();
         DragFloatRow("Air control", &ps.airControl, 0.01f, 0.0f, 20.0f, "%.2f /s");
+        CheckboxRow("Interpolate", &ps.interpolate);
         CheckboxRow("Show colliders", &m_ShowColliders);
         ImGui::EndTable();
+
+        // Lower triangle of the symmetric layer matrix: row a, column b <= a.
+        if (ImGui::TreeNode("Layer collision")) {
+            static int shownLayers = 4;
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Layers shown", &shownLayers, 1, static_cast<int>(kPhysicsLayers));
+            const int n = std::clamp(shownLayers, 1, static_cast<int>(kPhysicsLayers));
+            if (ImGui::BeginTable("layers", n + 1, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX)) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                for (int b = 0; b < n; ++b) {
+                    ImGui::TableSetColumnIndex(b + 1);
+                    ImGui::Text("%d", b);
+                }
+                for (int a = 0; a < n; ++a) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%d", a);
+                    for (int b = 0; b <= a; ++b) {
+                        ImGui::TableSetColumnIndex(b + 1);
+                        ImGui::PushID(a * static_cast<int>(kPhysicsLayers) + b);
+                        bool collide = ps.LayersCollide(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b));
+                        if (ImGui::Checkbox("##c", &collide))
+                            ps.SetLayerCollision(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b), collide);
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
     }
 
     if (ImGui::CollapsingHeader("Camera") && BeginProperties("camera")) {
@@ -895,6 +1340,23 @@ void Editor::DrawStats()
             ImGui::Text("Sync / step    %.3f / %.3f ms  (+%u -%u, %u meshes pending)", ps.syncMs, ps.stepMs, ps.created,
                         ps.removed, ps.pendingMeshes);
         }
+        if (m_Ctx.scripts) {
+            const ScriptStats& ss = m_Ctx.scripts->Stats();
+            ImGui::SeparatorText("Scripts");
+            ImGui::Text("Instances      %u  (%s)", ss.instances, m_Ctx.scripts->Running() ? "running" : "stopped");
+            ImGui::Text("Last frame     %u events, %u nodes, %u waiting", ss.eventsFired, ss.nodesExecuted, ss.waiting);
+            ImGui::Text("Errors         %u", ss.errors);
+        }
+        if (m_Ctx.audio) {
+            const AudioSystemStats& as = m_Ctx.audio->Stats();
+            const AudioStats&       es = m_Ctx.audio->Engine().Stats();
+            ImGui::SeparatorText("Audio");
+            ImGui::Text("Voices         %u  (%u streamed, %u dropped)", es.voices, es.streamed, es.dropped);
+            ImGui::Text("Sources        %u  (%u playing, %u loading)", as.sources, as.playing, as.waiting);
+            ImGui::Text("One-shots      %u", as.oneShots);
+            ImGui::Text("Occlusion      %u rays, %u occluded", as.rays, as.occluded);
+            ImGui::Text("Reverb         %u zone(s), wet %.2f, room %.2f", as.zones, as.reverb.wet, as.reverb.roomSize);
+        }
 
         ImGui::SeparatorText("Memory");
         const VkPhysicalDeviceMemoryProperties* memory = nullptr;
@@ -1011,6 +1473,10 @@ void Editor::DrawAssets()
             DrawTextureAssets();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Sounds")) {
+            DrawSoundAssets();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::End();
@@ -1020,6 +1486,92 @@ void Editor::DrawAssets()
         m_Ctx.modelRefs.erase(std::ranges::find(m_Ctx.modelRefs, toRelease));
         m_Ctx.assets.Release(toRelease);
     }
+}
+
+void Editor::DrawSoundAssets()
+{
+    const std::vector<SoundInfo> sounds = m_Ctx.assets.Sounds();
+    if (sounds.empty()) {
+        ImGui::TextDisabled("No sounds loaded (audio sources load theirs when play starts, previews at once).");
+        return;
+    }
+    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    if (!ImGui::BeginTable("sounds", 6, flags))
+        return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Sound", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Refs", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+    ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+    ImGui::TableSetupColumn("Memory", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+    ImGui::TableHeadersRow();
+    for (const SoundInfo& info : sounds) {
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(info.handle.index));
+        ImGui::TableNextColumn();
+        const std::string name = PathToUtf8(PathFromUtf8(info.path).filename());
+        ImGui::TextUnformatted(name.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", info.path.c_str());
+        ImGui::TableNextColumn();
+        StateCell(info.state, info.reloading, info.error);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", info.refCount);
+        ImGui::TableNextColumn();
+        if (info.sampleRate)
+            ImGui::Text("%u Hz %s, %.1f s", info.sampleRate, info.channels == 1 ? "mono" : info.channels == 2 ? "stereo" : "multi",
+                        info.duration);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(info.streamed ? "streamed" : Bytes(info.memoryBytes).c_str());
+        ImGui::TableNextColumn();
+        if (m_Ctx.audio && ImGui::SmallButton("Play"))
+            m_Ctx.audio->Preview(PathFromUtf8(info.path));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(info.state == AssetState::Failed ? "Retry" : "Reload"))
+            m_Ctx.assets.Reload(info.handle);
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
+void Editor::DrawAudioSettings()
+{
+    if (!m_Ctx.audio || !ImGui::CollapsingHeader("Audio"))
+        return;
+    AudioSettings settings = m_Ctx.audio->Settings();
+    bool          changed  = false;
+    if (BeginProperties("audio")) {
+        for (std::size_t i = 0; i < kAudioBusCount; ++i) {
+            PropertyRow(ToString(static_cast<AudioBus>(i)));
+            ImGui::PushID(static_cast<int>(i));
+            changed |= ImGui::Checkbox("##mute", &settings.muted[i]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Muted");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= ImGui::SliderFloat("##v", &settings.volume[i], 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopID();
+            ImGui::PopID();
+        }
+        changed |= CheckboxRow("Occlusion", &settings.occlusion);
+        changed |= SliderFloatRow("Occlusion strength", &settings.occlusionStrength, 0.0f, 1.0f);
+        changed |= SliderUintRow("Rays per frame", &settings.occlusionRays, 1, 256);
+        ImGui::EndTable();
+    }
+    if (changed) {
+        m_Ctx.audio->Apply(settings);
+        if (m_Ctx.project) {
+            m_Ctx.project->settings.audio = settings;
+            m_ProjectDirty                = true;
+        }
+    }
+    const AudioEngine& engine = m_Ctx.audio->Engine();
+    ImGui::TextDisabled("%s, %u Hz, %u ch", engine.HasDevice() ? engine.DeviceName().c_str() : "no output device (offline)",
+                        engine.SampleRate(), engine.Channels());
+    if (m_Ctx.project)
+        ImGui::TextDisabled(m_ProjectDirty ? "Saved with the project (File > Save all)" : "Stored in the project file");
 }
 
 void Editor::DrawModelAssets(ModelHandle& toRelease)

@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "nextId": 10,
+  "variables": [
+    {
+      "name": "DegreesPerSecond",
+      "type": "float",
+      "value": 45.0
+    }
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Event.BeginPlay",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": 2,
+      "type": "Debug.Print",
+      "position": [
+        260,
+        0
+      ],
+      "defaults": {
+        "Text": {
+          "type": "string",
+          "value": "Rotator started"
+        },
+        "Duration": {
+          "type": "float",
+          "value": 3.0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "Event.Tick",
+      "position": [
+        0,
+        176
+      ]
+    },
+    {
+      "id": 4,
+      "type": "Variable.Get",
+      "position": [
+        0,
+        296
+      ],
+      "param": "DegreesPerSecond"
+    },
+    {
+      "id": 5,
+      "type": "Vector.Make",
+      "position": [
+        264,
+        256
+      ]
+    },
+    {
+      "id": 6,
+      "type": "Entity.AddRotation",
+      "position": [
+        520,
+        176
+      ]
+    },
+    {
+      "id": 8,
+      "type": "Math.MultiplyFloat",
+      "position": [
+        0,
+        400
+      ]
+    }
+  ],
+  "links": [
+    {
+      "from": [
+        1,
+        "Out"
+      ],
+      "to": [
+        2,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        3,
+        "Out"
+      ],
+      "to": [
+        6,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        4,
+        "Value"
+      ],
+      "to": [
+        8,
+        "A"
+      ]
+    },
+    {
+      "from": [
+        3,
+        "Delta Seconds"
+      ],
+      "to": [
+        8,
+        "B"
+      ]
+    },
+    {
+      "from": [
+        8,
+        "Result"
+      ],
+      "to": [
+        5,
+        "Y"
+      ]
+    },
+    {
+      "from": [
+        5,
+        "Vector"
+      ],
+      "to": [
+        6,
+        "Degrees"
+      ]
+    }
+  ],
+  "comments": [
+    {
+      "id": 9,
+      "position": [
+        -24,
+        128
+      ],
+      "size": [
+        800,
+        300
+      ],
+      "text": "Spin around the world Y axis",
+      "color": [
+        0.3,
+        0.45,
+        0.7
+      ]
+    }
+  ]
+}

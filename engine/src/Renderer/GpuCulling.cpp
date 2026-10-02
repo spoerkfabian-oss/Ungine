@@ -9,7 +9,7 @@ namespace Engine {
 
 namespace {
 constexpr std::uint32_t kGroupSize     = 64; // gpu_cull.comp
-constexpr std::uint32_t kStatCount     = 9;
+constexpr std::uint32_t kStatCount     = 10;
 constexpr std::uint32_t kCommandStride = sizeof(VkDrawIndexedIndirectCommand);
 static_assert(kCommandStride == 20);
 
@@ -114,7 +114,7 @@ void GpuCulling::ReadStats(std::uint32_t frameIndex)
     readback.Invalidate(0, VK_WHOLE_SIZE);
     std::uint32_t values[kStatCount];
     std::memcpy(values, readback.Mapped(), sizeof(values));
-    m_Stats = {values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]};
+    m_Stats = {values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]};
 }
 
 void GpuCulling::Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_t firstView, std::uint32_t viewCount,
@@ -142,6 +142,9 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
     // Per view: a visible list (one slice per batch), batch counters, 4 command buckets.
     const std::uint32_t listSize = scene.VisibleCapacity();
     m_Views.assign(views.begin(), views.end());
+    m_LateViews = 1;
+    while (kCameraLateView + m_LateViews < m_ViewCount && (m_Views[kCameraLateView + m_LateViews].flags & kCullViewShadowOcclusion) != 0)
+        ++m_LateViews;
     for (std::uint32_t v = 0; v < m_ViewCount; ++v) {
         m_Views[v].listBase    = v * listSize;
         m_Views[v].counterBase = v * m_BatchCapacity;
@@ -178,7 +181,9 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
                         .hizInfo       = glm::uvec4(m_HiZSize, m_HiZLevels, 0u),
                         .depthSize     = glm::uvec4(depthExtent.width, depthExtent.height, 0u, 0u),
                         .lodCamera     = lod.camera,
-                        .lodInfo       = glm::uvec4(lod.forced, 0u, 0u, 0u)};
+                        .lodInfo       = glm::uvec4(lod.forced, 0u, 0u, 0u),
+                        .shadowRegionMin = glm::vec4(lod.shadowRegionMin, 0.0f),
+                        .shadowRegionMax = glm::vec4(lod.shadowRegionMax, 0.0f)};
     m_CullData = m_Renderer.PushTransient(m_Data, 16);
 
     // Earlier frames: indirect reads, vertex shader reads of the lists, culling (WAR / WAW), stats copy.
@@ -245,9 +250,9 @@ void GpuCulling::CullLate(VkCommandBuffer cmd)
     m_Data.hizInfo = glm::uvec4(m_HiZSize, m_HiZLevels, 0u);
     m_CullData     = m_Renderer.PushTransient(m_Data, 16);
     m_Renderer.GetBindless().Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
-    Dispatch(cmd, 1, kCameraLateView, 1, m_DrawCapacity);
+    Dispatch(cmd, 1, kCameraLateView, m_LateViews, m_DrawCapacity);
     Barrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, kRW);
-    Dispatch(cmd, 2, kCameraLateView, 1, m_BatchCapacity);
+    Dispatch(cmd, 2, kCameraLateView, m_LateViews, m_BatchCapacity);
     Barrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kDrawStages, kDrawReads);
 }
 

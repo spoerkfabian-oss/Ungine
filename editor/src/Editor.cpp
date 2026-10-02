@@ -1,16 +1,22 @@
 #include "Editor/Editor.h"
+#include "Editor/ScriptGraphEditor.h"
 #include "FileDialog.h"
 #include "History.h"
 #include "ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/AudioSystem.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Core/Project.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptSystem.h"
 
 #include <ImGuizmo.h>
 #include <imgui.h>
@@ -20,6 +26,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include <algorithm>
+#include <format>
 #include <utility>
 
 namespace Engine {
@@ -48,9 +55,10 @@ bool SetWorldMatrix(Scene& scene, Entity entity, const glm::mat4& world)
 
 Editor::Editor(const EditorContext& context)
     : m_Ctx(context),
-      m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer)),
+      m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer, PathToUtf8(context.layoutFile))),
       m_History(std::make_unique<History>()),
-      m_FileDialog(std::make_unique<FileDialog>())
+      m_FileDialog(std::make_unique<FileDialog>()),
+      m_Graphs(std::make_unique<ScriptGraphEditor>())
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
@@ -110,6 +118,10 @@ void Editor::Update(float dt)
         BuildDefaultLayout(dockspace); // first run (no editor.ini yet)
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport());
 
+    if (m_Ctx.scripts && m_Ctx.scripts->DebugPaused())
+        m_ShowBlueprint = true; // a breakpoint hit: the graph editor shows where (and syncs breakpoints)
+    if (m_ShowBlueprint) // before the viewport: new dock tabs are selected in submission order
+        m_Graphs->Draw(&m_ShowBlueprint, m_Ctx.scripts, &m_Ctx.scene);
     DrawViewport();
     if (m_ShowHierarchy)
         DrawHierarchy();
@@ -119,28 +131,60 @@ void Editor::Update(float dt)
         DrawRendererSettings();
     if (m_ShowAssets)
         DrawAssets();
-    if (m_ShowStats) // after Assets: the visible tab of the shared dock node on first run
+    if (m_ShowProjectSettings)
+        DrawProjectSettings();
+    if (m_ShowStats)
         DrawStats();
+    if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
+        DrawContentBrowser();
     if (m_ShowDemo)
         ImGui::ShowDemoWindow(&m_ShowDemo);
     DrawDialogs();
 
     HandleHotkeys();
     ApplyPendingEdits();
+    UpdatePendingInstances();
+    // Prefab files changed on disk (another editor, version control): instances follow.
+    if (m_PlayState == PlayState::Edit && ImGui::GetTime() - m_PrefabPollTime > 1.0) {
+        m_PrefabPollTime = ImGui::GetTime();
+        if (const std::size_t updated = RefreshPrefabInstances(m_Ctx.scene, &m_Ctx.assets, m_Ctx.modelRefs))
+            m_Status = std::format("Updated {} prefab instance(s)", updated);
+    }
     ValidateSelection();
+
+    // Script debugger stopped: sound waits with the world (physics skips its steps).
+    const bool debugPaused = m_Ctx.scripts && m_PlayState == PlayState::Playing && m_Ctx.scripts->DebugPaused();
+    if (m_Ctx.audio && debugPaused != m_DebugPauseAudio) {
+        m_Ctx.audio->SetPaused(debugPaused);
+        m_DebugPauseAudio = debugPaused;
+    }
+
+    // Scripts tick with the frame while playing; they see the keyboard when the viewport has it.
+    if (m_Ctx.scripts && m_PlayState == PlayState::Playing)
+        m_Ctx.scripts->Update(m_Ctx.scene, dt, (m_ViewportHovered || m_ViewportFocused) && !WantsKeyboard());
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
+    // Audio follows the scene (while playing) and the editor camera (previews, no listener entity).
+    if (m_Ctx.audio) {
+        const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
+        m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
+    }
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)
         m_Ctx.physics->Sync(m_Ctx.scene);
     UpdateSelectionOverlay();
 }
 
-void Editor::Render(const FrameContext& frame)
+void Editor::Render(const FrameContext& frame, float physicsAlpha)
 {
+    // Paused: the fixed tick keeps running without steps, so show the last step as it is.
+    const bool running = m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused());
+    if (m_Ctx.physics && m_PlayState != PlayState::Edit)
+        m_Ctx.physics->Interpolate(m_Ctx.scene, running ? physicsAlpha : 1.0f);
+
     const VkCommandBuffer cmd = frame.cmd;
-    if (m_ViewportImage) {
+    if (m_ViewportImage && m_ViewportVisible) {
         // Shared by all frames in flight: the previous frame's UI pass may still sample it.
         CmdImageBarrier(cmd, {.image     = m_ViewportImage.Handle(),
                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -148,7 +192,14 @@ void Editor::Render(const FrameContext& frame)
                               .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                               .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
-        m_Ctx.sceneRenderer.Render(frame, m_Ctx.scene, m_Ctx.camera.GetData(ViewportAspect()),
+        CameraData camera = m_Ctx.camera.GetData(ViewportAspect());
+        if (m_GameCamera) // preview through the game camera (what the player shows)
+            if (const Entity e = m_Ctx.scene.FindPrimaryCamera(); e != NullEntity) {
+                const CameraComponent& cam = m_Ctx.scene.GetRegistry().Get<CameraComponent>(e);
+                camera = CameraFromWorld(m_Ctx.scene.GetRegistry().Get<WorldTransform>(e).matrix, cam.fovY, cam.nearPlane,
+                                         ViewportAspect());
+            }
+        m_Ctx.sceneRenderer.Render(frame, m_Ctx.scene, camera,
                                    {.image  = m_ViewportImage.Handle(),
                                     .view   = m_ViewportImage.View(),
                                     .format = kViewportFormat,
@@ -196,6 +247,9 @@ void Editor::BuildDefaultLayout(ImGuiID dockspace)
     ImGuiID       rightBottom = 0;
     const ImGuiID rightTop    = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.45f, nullptr, &rightBottom);
 
+    ImGui::DockBuilderDockWindow("Content", bottom);
+    ImGui::DockBuilderDockWindow("Blueprint", center); // tab behind the viewport
+    m_FocusViewport = 2;
     ImGui::DockBuilderDockWindow("Viewport", center);
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", rightTop);
@@ -216,13 +270,13 @@ void Editor::DrawMenuBar()
             RequestSceneChange([this] {
                 m_DialogPurpose = DialogPurpose::OpenScene;
                 m_FileDialog->Open("Open scene", FileDialog::Mode::Open,
-                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   m_ScenePath.empty() ? ContentRoot() : m_ScenePath.parent_path(),
                                    {".json"});
             });
         if (ImGui::MenuItem("Save scene", "Ctrl+S")) {
             if (m_ScenePath.empty()) {
                 m_DialogPurpose = DialogPurpose::SaveScene;
-                m_FileDialog->Open("Save scene", FileDialog::Mode::Save, std::filesystem::current_path(),
+                m_FileDialog->Open("Save scene", FileDialog::Mode::Save, ContentRoot(),
                                    {".scene.json", ".json"}, "untitled.scene.json");
             } else {
                 SaveScene(m_ScenePath);
@@ -231,13 +285,31 @@ void Editor::DrawMenuBar()
         if (ImGui::MenuItem("Save scene as...", "Ctrl+Shift+S")) {
             m_DialogPurpose = DialogPurpose::SaveScene;
             m_FileDialog->Open("Save scene", FileDialog::Mode::Save,
-                               m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                               m_ScenePath.empty() ? ContentRoot() : m_ScenePath.parent_path(),
                                {".scene.json", ".json"},
                                m_ScenePath.empty() ? "untitled.scene.json" : m_ScenePath.filename().string());
         }
+        if (ImGui::MenuItem("Save all"))
+            SaveAll();
         ImGui::Separator();
+        if (m_Ctx.project) {
+            if (ImGui::MenuItem("Project settings..."))
+                m_ShowProjectSettings = true;
+            if (ImGui::MenuItem("Show project folder"))
+                (void)OpenInFileBrowser(m_Ctx.project->Root());
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("Exit", "Esc"))
             m_Ctx.window.RequestClose();
+        ImGui::EndMenu();
+    }
+    if (m_Ctx.project && ImGui::BeginMenu("Build")) {
+        if (ImGui::MenuItem("Build & Run", "Ctrl+B"))
+            BuildAndRun();
+        if (ImGui::MenuItem("Package project...")) {
+            m_DialogPurpose = DialogPurpose::Package;
+            m_FileDialog->Open("Package into folder", FileDialog::Mode::Folder, m_Ctx.project->Root().parent_path(), {});
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
@@ -262,11 +334,14 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("Renderer", nullptr, &m_ShowRenderer);
         ImGui::MenuItem("Stats", nullptr, &m_ShowStats);
         ImGui::MenuItem("Assets", nullptr, &m_ShowAssets);
+        ImGui::MenuItem("Content browser", nullptr, &m_ShowContent);
+        if (ImGui::MenuItem("Blueprint", nullptr, &m_ShowBlueprint) && m_ShowBlueprint)
+            m_Graphs->Focus();
         ImGui::Separator();
         ImGui::MenuItem("ImGui demo", nullptr, &m_ShowDemo);
         ImGui::EndMenu();
     }
-    if (m_Ctx.physics) {
+    if (m_Ctx.physics || m_Ctx.scripts) {
         ImGui::Separator();
         const bool playing = m_PlayState == PlayState::Playing;
         if (playing)
@@ -291,10 +366,16 @@ void Editor::DrawMenuBar()
 void Editor::DrawViewport()
 {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    // Default layout: the viewport becomes the visible tab once the dock node has its tabs (new
+    // tabs are selected in their first frame, focus wins afterwards).
+    if (m_FocusViewport > 0 && --m_FocusViewport == 0)
+        ImGui::SetNextWindowFocus();
     const bool visible = ImGui::Begin("Viewport");
     ImGui::PopStyleVar();
+    m_ViewportVisible = visible; // hidden tab / collapsed: the scene is not rendered (Render)
     if (!visible) {
         m_ViewportHovered = false;
+        m_ViewportPress = m_BoxSelecting = false;
         ImGui::End();
         return;
     }
@@ -305,28 +386,134 @@ void Editor::DrawViewport()
     EnsureViewportTarget(width, height);
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
+    if (m_Ctx.scripts) { // mouse / camera nodes: the viewport in window coordinates
+        const ImVec2 window = ImGui::GetMainViewport()->Pos;
+        m_Ctx.scripts->SetViewport({.origin = glm::vec2(origin.x - window.x, origin.y - window.y),
+                                    .size   = glm::vec2(static_cast<float>(width), static_cast<float>(height))});
+    }
     ImGui::Image(ImTextureRef(m_ViewportTexture), ImVec2(static_cast<float>(width), static_cast<float>(height)));
+    // Content browser drops: models are placed where the cursor points, blueprints go to the selection.
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("UNGINE_CONTENT")) {
+            const std::filesystem::path file = PathFromUtf8(static_cast<const char*>(payload->Data));
+            const std::string           ext  = file.extension().string();
+            if (ext == ".ugraph") {
+                if (Selected() != NullEntity)
+                    AssignScript(Selected(), file);
+                else
+                    m_Status = "Select an entity to give it the script";
+            } else if (ext == kPrefabExtension) { // an instance on the surface under the cursor
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                    target = cam.position + dir * hit->distance;
+                else if (dir.y < -1e-3f)
+                    target = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
+                if (m_PlayState == PlayState::Edit)
+                    PlacePrefab(file, target);
+                else
+                    m_Status = "Stop playing to place prefabs";
+            } else if (IsSoundFile(file)) { // a new audio source where the cursor points
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                    target = cam.position + dir * hit->distance;
+                CreateAudioEntity(file, target);
+            } else {
+                const std::size_t before = m_PendingInstances.size();
+                OpenAsset(file);
+                if (m_PendingInstances.size() > before) { // a model: under the cursor
+                    const ImVec2     mouse  = ImGui::GetIO().MousePos;
+                    const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                         1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                    const CameraData cam    = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                    const glm::mat4  inv    = glm::inverse(cam.projection * cam.view);
+                    const glm::vec4  far    = inv * glm::vec4(ndc, 0.5f, 1.0f);
+                    const glm::vec3  dir    = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                    glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                    if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                        target = cam.position + dir * hit->distance;
+                    else if (dir.y < -1e-3f)
+                        target = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
+                    m_PendingInstances.back().second = target;
+                }
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
     m_ViewportHovered  = ImGui::IsItemHovered();
     m_ViewportFocused  = ImGui::IsWindowFocused();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
-    const bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
+    if (m_ShowAudio)
+        iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics)
         DrawColliderOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
-    if (m_PlayState != PlayState::Edit) // frame: this is the simulated scene, changes are temporary
+    // Script prints (like UE's on-screen debug messages), newest at the top.
+    if (m_Ctx.scripts && m_Ctx.scripts->Running()) {
+        const auto  messages = m_Ctx.scripts->Messages();
+        ImDrawList* list     = ImGui::GetWindowDrawList();
+        float       y        = origin.y + 40.0f;
+        for (auto it = messages.rbegin(); it != messages.rend() && y < origin.y + static_cast<float>(height) - 20.0f; ++it) {
+            const ImU32 color = it->error ? IM_COL32(255, 90, 90, 255) : IM_COL32(120, 200, 255, 255);
+            list->AddText(ImVec2(origin.x + 11.0f, y + 1.0f), IM_COL32(0, 0, 0, 200), it->text.c_str());
+            list->AddText(ImVec2(origin.x + 10.0f, y), color, it->text.c_str());
+            y += ImGui::GetTextLineHeightWithSpacing();
+        }
+    }
+    if (m_PlayState != PlayState::Edit) { // frame: this is the simulated scene, changes are temporary
+        const bool breakpoint = m_Ctx.scripts && m_Ctx.scripts->DebugPaused();
         ImGui::GetWindowDrawList()->AddRect(origin, ImVec2(origin.x + static_cast<float>(width), origin.y + static_cast<float>(height)),
-                                            m_PlayState == PlayState::Playing ? IM_COL32(60, 200, 90, 255)
-                                                                              : IM_COL32(230, 170, 40, 255),
+                                            breakpoint                           ? IM_COL32(230, 60, 60, 255)
+                                            : m_PlayState == PlayState::Playing ? IM_COL32(60, 200, 90, 255)
+                                                                                : IM_COL32(230, 170, 40, 255),
                                             0.0f, 3.0f);
+        if (breakpoint)
+            ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 10.0f, origin.y + static_cast<float>(height) - 24.0f),
+                                                IM_COL32(255, 120, 120, 255), "Breakpoint - see the Blueprint window (F5 continue, F10 step)");
+    }
+    // Left button: a click picks (on release), a drag selects everything in the box.
+    const ImGuiIO&  io    = ImGui::GetIO();
+    const glm::vec2 mouse = glm::vec2(io.MousePos.x - origin.x, io.MousePos.y - origin.y);
     if (clicked && !iconHit) {
-        // GPU picking: the entity under the cursor arrives a few frames later (Update).
-        const ImVec2 mouse = ImGui::GetIO().MousePos;
-        const float  px    = mouse.x - origin.x;
-        const float  py    = mouse.y - origin.y;
-        if (px >= 0.0f && py >= 0.0f && px < static_cast<float>(width) && py < static_cast<float>(height)) {
-            m_Ctx.sceneRenderer.RequestPick(static_cast<std::uint32_t>(px), static_cast<std::uint32_t>(py));
-            m_PickAdditive = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+        m_ViewportPress = true;
+        m_BoxSelecting  = false;
+        m_PressPos      = mouse;
+    }
+    if (m_ViewportPress) {
+        const glm::vec2 lo = glm::min(m_PressPos, mouse), hi = glm::max(m_PressPos, mouse);
+        if (!m_BoxSelecting && glm::distance(m_PressPos, mouse) > 4.0f && !ImGuizmo::IsUsing())
+            m_BoxSelecting = true;
+        if (m_BoxSelecting) {
+            ImDrawList* list = ImGui::GetWindowDrawList();
+            const ImVec2 a(origin.x + lo.x, origin.y + lo.y), b(origin.x + hi.x, origin.y + hi.y);
+            list->AddRectFilled(a, b, IM_COL32(90, 150, 255, 40));
+            list->AddRect(a, b, IM_COL32(90, 150, 255, 200));
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const bool additive = io.KeyCtrl || io.KeyShift;
+            if (m_BoxSelecting) {
+                SelectInRect(lo, hi, additive);
+            } else if (m_PressPos.x >= 0.0f && m_PressPos.y >= 0.0f && m_PressPos.x < static_cast<float>(width) &&
+                       m_PressPos.y < static_cast<float>(height)) {
+                // GPU picking: the entity under the cursor arrives a few frames later (Update).
+                m_Ctx.sceneRenderer.RequestPick(static_cast<std::uint32_t>(m_PressPos.x),
+                                                static_cast<std::uint32_t>(m_PressPos.y));
+                m_PickAdditive = additive;
+            }
+            m_ViewportPress = m_BoxSelecting = false;
         }
     }
 
@@ -355,9 +542,16 @@ void Editor::DrawViewport()
         m_ShowBvh = !m_ShowBvh;
     if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
         m_ShowColliders = !m_ShowColliders;
+    if (toolButton("Audio", m_ShowAudio))
+        m_ShowAudio = !m_ShowAudio;
+    if (toolButton("Game cam", m_GameCamera))
+        m_GameCamera = !m_GameCamera;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Look through the scene's primary Camera component (as the player will)");
     ImGui::NewLine();
 
-    DrawGizmo(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    if (!m_GameCamera) // the gizmo works in the editor camera
+        DrawGizmo(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     ImGui::End();
 }
 
@@ -532,6 +726,70 @@ bool Editor::DrawLightOverlay(float x, float y, float width, float height, bool 
     return clicked && hit != NullEntity;
 }
 
+bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool clicked)
+{
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+
+    // Reverb zones: oriented boxes (entity transform).
+    registry.ViewOf<ReverbZone, WorldTransform>().Each([&](Entity e, ReverbZone& zone, WorldTransform& world) {
+        const glm::vec3& h = zone.halfExtents;
+        glm::vec3        c[8];
+        for (int i = 0; i < 8; ++i)
+            c[i] = glm::vec3(world.matrix * glm::vec4((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z, 1.0f));
+        static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                              {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        const ImU32 color = IsSelected(e) ? IM_COL32(90, 255, 220, 255) : IM_COL32(60, 190, 170, 140);
+        for (const auto& edge : kEdges)
+            projector.Line(list, c[edge[0]], c[edge[1]], color);
+    });
+
+    // Sources: speaker icons (click selects), distance spheres of the selected ones.
+    constexpr float kIcon       = 7.0f;
+    const ImVec2    mouse       = ImGui::GetIO().MousePos;
+    Entity          hit         = NullEntity;
+    float           hitDistance = kIcon + 3.0f;
+    registry.ViewOf<AudioSource, WorldTransform>().Each([&](Entity e, AudioSource& source, WorldTransform& world) {
+        const glm::vec3 pos = world.matrix[3];
+        ImVec2          p;
+        if (!projector.Project(pos, p))
+            return;
+        const bool  selected = IsSelected(e);
+        const bool  playing  = m_Ctx.audio && m_Ctx.audio->Running() && m_Ctx.audio->IsPlaying(e);
+        const ImU32 fill     = playing ? IM_COL32(120, 230, 120, 240) : IM_COL32(120, 190, 255, 230);
+        const ImU32 outline  = selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(0, 0, 0, 200);
+        // Speaker: box + cone.
+        const ImVec2 box0(p.x - kIcon, p.y - kIcon * 0.4f), box1(p.x - kIcon * 0.3f, p.y + kIcon * 0.4f);
+        list->AddRectFilled(box0, box1, fill);
+        list->AddTriangleFilled(ImVec2(box1.x, p.y - kIcon * 0.4f), ImVec2(p.x + kIcon, p.y - kIcon),
+                                ImVec2(p.x + kIcon, p.y + kIcon), fill);
+        list->AddQuadFilled(ImVec2(box1.x, p.y - kIcon * 0.4f), ImVec2(p.x + kIcon, p.y - kIcon),
+                            ImVec2(p.x + kIcon, p.y + kIcon), ImVec2(box1.x, p.y + kIcon * 0.4f), fill);
+        list->AddCircle(p, kIcon + 3.0f, outline, 0, selected ? 2.5f : 1.0f);
+        if (!source.spatial)
+            list->AddText(ImVec2(p.x + kIcon + 4.0f, p.y - kIcon), IM_COL32(200, 200, 200, 200), "2D");
+        const float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+        if (d < hitDistance) {
+            hitDistance = d;
+            hit         = e;
+        }
+        if (selected && source.spatial)
+            for (const auto& [radius, color] : {std::pair{source.minDistance, IM_COL32(120, 190, 255, 200)},
+                                                std::pair{source.maxDistance, IM_COL32(120, 190, 255, 90)}}) {
+                projector.Circle(list, pos, {1, 0, 0}, {0, 1, 0}, radius, color);
+                projector.Circle(list, pos, {1, 0, 0}, {0, 0, 1}, radius, color);
+                projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, radius, color);
+            }
+    });
+    if (clicked && hit != NullEntity)
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
+    list->PopClipRect();
+    return clicked && hit != NullEntity;
+}
+
 void Editor::DrawBvhOverlay(float x, float y, float width, float height)
 {
     const CameraData        camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
@@ -678,6 +936,15 @@ void Editor::HandleHotkeys()
     const ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput || m_Ctx.camera.IsCaptured() || ImGui::IsAnyItemActive() || m_FileDialog->IsOpen())
         return;
+    if (m_Graphs->Focused()) { // the graph editor has its own undo / copy / delete keys
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+            if (m_PlayState == PlayState::Edit)
+                Play();
+            else
+                Stop();
+        }
+        return;
+    }
 
     // Global shortcuts (any editor window).
     if (io.KeyCtrl) {
@@ -697,20 +964,22 @@ void Editor::HandleHotkeys()
             else
                 Stop();
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_B, false) && m_Ctx.project)
+            BuildAndRun();
         if (ImGui::IsKeyPressed(ImGuiKey_N, false))
             RequestSceneChange([this] { NewScene(); });
         if (ImGui::IsKeyPressed(ImGuiKey_O, false))
             RequestSceneChange([this] {
                 m_DialogPurpose = DialogPurpose::OpenScene;
                 m_FileDialog->Open("Open scene", FileDialog::Mode::Open,
-                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   m_ScenePath.empty() ? ContentRoot() : m_ScenePath.parent_path(),
                                    {".json"});
             });
         if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
             if (m_ScenePath.empty() || io.KeyShift) {
                 m_DialogPurpose = DialogPurpose::SaveScene;
                 m_FileDialog->Open("Save scene", FileDialog::Mode::Save,
-                                   m_ScenePath.empty() ? std::filesystem::current_path() : m_ScenePath.parent_path(),
+                                   m_ScenePath.empty() ? ContentRoot() : m_ScenePath.parent_path(),
                                    {".scene.json", ".json"},
                                    m_ScenePath.empty() ? "untitled.scene.json" : m_ScenePath.filename().string());
             } else {
@@ -780,6 +1049,47 @@ void Editor::ToggleSelection(Entity entity)
 bool Editor::IsSelected(Entity entity) const
 {
     return std::ranges::find(m_Selection, entity) != m_Selection.end();
+}
+
+void Editor::SelectInRect(glm::vec2 min, glm::vec2 max, bool additive)
+{
+    if (!m_ViewportImage)
+        return;
+    const VkExtent2D extent = m_ViewportImage.Extent2D();
+    const glm::vec2  size(static_cast<float>(extent.width), static_cast<float>(extent.height));
+    const CameraData camera   = m_Ctx.camera.GetData(size.x / std::max(size.y, 1.0f));
+    const glm::mat4  viewProj = camera.projection * camera.view;
+    const auto inside = [&](const glm::vec3& p) {
+        const glm::vec4 clip = viewProj * glm::vec4(p, 1.0f);
+        if (clip.w <= 1e-4f)
+            return false;
+        const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+        const glm::vec2 px((ndc.x * 0.5f + 0.5f) * size.x, (0.5f - ndc.y * 0.5f) * size.y);
+        return glm::all(glm::greaterThanEqual(px, min)) && glm::all(glm::lessThanEqual(px, max));
+    };
+
+    Registry&           registry = m_Ctx.scene.GetRegistry();
+    const SpatialIndex& spatial  = m_Ctx.sceneRenderer.Spatial();
+    std::vector<Entity> hits;
+    registry.ViewOf<MeshRenderer>().Each([&](Entity e, MeshRenderer&) {
+        if (const std::optional<Aabb> b = spatial.Bounds(e); b && inside((b->min + b->max) * 0.5f))
+            hits.push_back(e);
+    });
+    if (m_ShowLightIcons)
+        registry.ViewOf<Light, WorldTransform>().Each([&](Entity e, Light&, WorldTransform& world) {
+            if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
+                hits.push_back(e);
+        });
+    if (m_ShowAudio)
+        registry.ViewOf<AudioSource, WorldTransform>().Each([&](Entity e, AudioSource&, WorldTransform& world) {
+            if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
+                hits.push_back(e);
+        });
+    if (!additive)
+        m_Selection.clear();
+    for (Entity e : hits)
+        if (!IsSelected(e))
+            m_Selection.push_back(e);
 }
 
 void Editor::SelectFromClick(Entity entity, bool additive)

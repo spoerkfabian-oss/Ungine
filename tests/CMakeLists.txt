@@ -1,5 +1,6 @@
-add_executable(EngineTests CoreTests.cpp Test.h)
-target_link_libraries(EngineTests PRIVATE Engine stb)
+add_executable(EngineTests CoreTests.cpp ScriptTests.cpp ProjectTests.cpp AudioTests.cpp BlueprintTests.cpp Test.h)
+target_link_libraries(EngineTests PRIVATE Engine stb nlohmann_json::nlohmann_json)
+target_compile_definitions(EngineTests PRIVATE ENGINE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 engine_set_warnings(EngineTests)
 set_target_properties(EngineTests PROPERTIES FOLDER "Tests")
 add_test(NAME EngineTests COMMAND EngineTests)
@@ -32,4 +33,19 @@ if(ENGINE_GPU_TESTS)
     # Hot reload of assets + shaders polling every frame, LOD debug view (7) on the stress grid.
     add_test(NAME SandboxHotReloadSmoke COMMAND Sandbox assets/models/BoxTextured.glb --frames 60 --hot-reload --instances 500 --debug-view 7
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # The editor and the player on a project made from the physics template (Blueprint spawner).
+    set(smoke_project "${CMAKE_BINARY_DIR}/smoke_project")
+    add_test(NAME SmokeProjectSetup COMMAND ${CMAKE_COMMAND} -DTEMPLATE=${CMAKE_SOURCE_DIR}/templates/Physics
+             -DDIR=${smoke_project} -DNAME=SmokeGame -P ${CMAKE_CURRENT_SOURCE_DIR}/MakeProject.cmake)
+    set_tests_properties(SmokeProjectSetup PROPERTIES FIXTURES_SETUP smoke_project)
+    add_test(NAME UngineEditorSmoke COMMAND UngineEditor ${smoke_project}/SmokeGame.ungineproj --frames 120)
+    add_test(NAME UnginePlayerSmoke COMMAND UnginePlayer ${smoke_project}/SmokeGame.ungineproj --frames 200)
+    set_tests_properties(UngineEditorSmoke UnginePlayerSmoke PROPERTIES FIXTURES_REQUIRED smoke_project RESOURCE_LOCK smoke_project)
+    # Basic template: streamed music + a 3D looping source (audio through the AssetManager).
+    set(smoke_basic "${CMAKE_BINARY_DIR}/smoke_basic")
+    add_test(NAME SmokeBasicProjectSetup COMMAND ${CMAKE_COMMAND} -DTEMPLATE=${CMAKE_SOURCE_DIR}/templates/Basic
+             -DDIR=${smoke_basic} -DNAME=BasicGame -P ${CMAKE_CURRENT_SOURCE_DIR}/MakeProject.cmake)
+    set_tests_properties(SmokeBasicProjectSetup PROPERTIES FIXTURES_SETUP smoke_basic)
+    add_test(NAME UnginePlayerBasicSmoke COMMAND UnginePlayer ${smoke_basic}/BasicGame.ungineproj --frames 200)
+    set_tests_properties(UnginePlayerBasicSmoke PROPERTIES FIXTURES_REQUIRED smoke_basic)
 endif()

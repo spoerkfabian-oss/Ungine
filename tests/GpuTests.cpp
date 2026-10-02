@@ -2,21 +2,30 @@
 #include "Test.h"
 
 #include "Editor/Editor.h"
+#include "Editor/ProjectLauncher.h"
+#include "Editor/ScriptGraphEditor.h"
+#include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
+#include "Engine/Audio/AudioSystem.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
+#include "Engine/Script/ScriptSystem.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
+#include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -568,14 +577,21 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     FlyCamera camera;
     camera.position = glm::vec3(4.0f, 5.0f, 6.0f);
     camera.yaw      = 1.25f;
+    PhysicsSettings physics;
+    physics.gravity        = {0.0f, -3.0f, 0.0f};
+    physics.collisionSteps = 3;
+    physics.interpolate    = false;
+    physics.SetLayerCollision(2, 7, false);
 
     const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_roundtrip.scene.json"; // next to the models
-    SaveSceneFile(file, scene, *F().assets, {.renderer = &settings, .camera = &camera});
+    SaveSceneFile(file, scene, *F().assets, {.renderer = &settings, .camera = &camera, .physics = &physics});
 
     Scene         loaded;
     SceneRenderer settings2(*F().renderer, *F().context, *F().assets);
-    FlyCamera     camera2;
-    const auto    handles = LoadSceneFile(file, loaded, *F().assets, {.renderer = &settings2, .camera = &camera2});
+    FlyCamera       camera2;
+    PhysicsSettings physics2;
+    const auto      handles =
+        LoadSceneFile(file, loaded, *F().assets, {.renderer = &settings2, .camera = &camera2, .physics = &physics2});
     fs::remove(file);
 
     Registry& r2 = loaded.GetRegistry();
@@ -597,6 +613,8 @@ TEST_CASE(SceneFile_SaveLoadRoundTrip)
     CHECK(settings2.post.tonemapper == Tonemapper::Aces && settings2.localShadows.maxLights == 3);
     CHECK(!settings2.culling.occlusion && settings2.culling.gpuDriven);
     CHECK(camera2.position == glm::vec3(4.0f, 5.0f, 6.0f) && camera2.yaw == 1.25f);
+    CHECK(physics2.gravity == physics.gravity && physics2.collisionSteps == 3 && !physics2.interpolate);
+    CHECK(physics2.layerCollision == physics.layerCollision && !physics2.LayersCollide(7, 2));
 
     // Broken files throw and leave the scene alone.
     const fs::path broken = fs::path(ENGINE_ASSET_DIR) / "test_broken.scene.json";
@@ -765,6 +783,16 @@ TEST_CASE(Editor_UndoRedoDuplicateAndSceneFiles)
     CHECK(editor.Redo() && r.AliveCount() == 0);
     CHECK(editor.Undo() && r.AliveCount() == initial);
     runFrames(2); // restored entities render
+
+    // Box selection: meshes whose bounds center and lights whose position project into the box.
+    std::size_t meshes = 0;
+    r.ViewOf<MeshRenderer>().Each([&](Entity, MeshRenderer&) { ++meshes; });
+    editor.SelectInRect({0.0f, 0.0f}, {1e5f, 1e5f}, false);
+    CHECK(meshes > 0 && editor.Selection().size() == meshes + 1);
+    editor.SelectInRect({0.0f, 0.0f}, {2.0f, 2.0f}, true); // additive, empty corner: unchanged
+    CHECK(editor.Selection().size() == meshes + 1);
+    editor.SelectInRect({0.0f, 0.0f}, {2.0f, 2.0f}, false);
+    CHECK(editor.Selection().empty());
 
     // Save, new scene, open: same content, clean history, model refs owned by the application.
     const fs::path file = fs::path(ENGINE_ASSET_DIR) / "test_editor.scene.json";
@@ -1351,6 +1379,13 @@ TEST_CASE(Render_MeshLodSelection)
     CHECK(nearCpu.lodDraws == 0 && nearCpu.triangles == full);
     CHECK(farCpu.lodDraws == 1 && farCpu.triangles == coarsest);
 
+    // Inside the fade band before LOD 1 takes over: both levels drawn (complementary dithering).
+    const float w      = 0.5f * 120.0f / std::tan(glm::radians(30.0f)); // pixels per unit at distance 1, 1 px
+    const float inBand = sm.lods[1].error * w * 0.9f + std::sqrt(3.0f);   // + box radius
+    const std::uint64_t both = full + sm.lods[1].indexCount / 3;
+    CHECK(measure(true, inBand).triangles == both && measure(false, inBand).triangles == both);
+    CHECK(renderer.Stats().drawCalls == 2 && renderer.Stats().lodDraws == 2);
+
     renderer.culling.forceLod = 2;
     CHECK(measure(true, 1.75f).triangles == sm.lods[2].indexCount / 3);
     CHECK(measure(false, 1.75f).triangles == sm.lods[2].indexCount / 3);
@@ -1450,6 +1485,83 @@ TEST_CASE(Upload_RingBudgetAndLargeUploads)
     F().context->WaitIdle();
 }
 
+TEST_CASE(Renderer_ResizeWithoutDeviceWait)
+{
+    // With swapchain maintenance the old swapchain is retired (no device wait) and destroyed
+    // once its presents are done; either way the resize must be clean under validation.
+    const VkExtent2D before = F().renderer->GetSwapchain().Extent();
+    for (const auto& [w, h] : {std::pair{400, 300}, std::pair{256, 200}, std::pair{static_cast<int>(before.width), static_cast<int>(before.height)}}) {
+        glfwSetWindowSize(F().window->Native(), w, h);
+        CHECK(F().Pump([&] {
+            const VkExtent2D e = F().renderer->GetSwapchain().Extent();
+            return e.width == static_cast<std::uint32_t>(w) && e.height == static_cast<std::uint32_t>(h);
+        }, 500));
+    }
+    CHECK(F().Pump([] { return F().renderer->RetiredSwapchains() == 0; }, 50));
+}
+
+TEST_CASE(Render_TransparentAndShadowOcclusion)
+{
+    const ModelHandle box   = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    const ModelHandle glass = F().assets->CreateModel(MakeBox(
+        "Glass", 1.0f, MaterialData{.name = "Glass", .baseColorFactor = {0.1f, 0.3f, 1.0f, 0.4f}, .alphaBlend = true}));
+    CHECK(F().Pump([&] { return Settled(box) && Settled(glass); }));
+
+    Scene     scene;
+    Registry& r   = scene.GetRegistry();
+    const auto add = [&](ModelHandle model, glm::vec3 position, glm::vec3 scale) {
+        const Entity e = scene.CreateEntity("E");
+        r.Emplace<MeshRenderer>(e, MeshRenderer{.model = model, .meshIndex = 0});
+        scene.EditTransform(e).position = position;
+        scene.EditTransform(e).scale    = scale;
+        return e;
+    };
+    add(box, {0.0f, -0.5f, 0.0f}, {40.0f, 1.0f, 40.0f});  // ground
+    add(box, {0.0f, 5.0f, -2.0f}, {60.0f, 20.0f, 0.5f});  // wall filling the view (no sky in the Hi-Z)
+    add(box, {0.0f, 0.5f, -8.0f}, {1.0f, 1.0f, 1.0f});    // caster behind the wall, shadow straight down
+    add(glass, {0.0f, 1.0f, 2.0f}, {1.0f, 1.0f, 1.0f});   // transparent box in front of the wall
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure       = false;
+
+    renderer.shadows.resolution      = 512;
+    renderer.shadows.maxDistance     = 20.0f;
+    renderer.lighting.sky.sunDirection = glm::normalize(glm::vec3(0.01f, -1.0f, 0.02f));
+    const glm::vec3  eye{0.0f, 1.0f, 8.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+
+    // Transparent: blended over the wall, sorted CPU pass on both paths, never an indirect command.
+    renderer.culling.gpuDriven          = false;
+    const std::vector<std::uint8_t> cpu = RenderImage(renderer, scene, camera, 3);
+    CHECK(renderer.Stats().transparentDraws == 1);
+    renderer.culling.gpuDriven          = true;
+    const std::vector<std::uint8_t> gpu = RenderImage(renderer, scene, camera, 6);
+    const SceneRenderStats          stats = renderer.Stats();
+    CHECK(stats.transparentDraws == 1);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < cpu.size(); ++i)
+        differing += std::abs(static_cast<int>(cpu[i]) - static_cast<int>(gpu[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0);
+    const glm::ivec3 center = CenterPixel(gpu);
+    CHECK(center.b > center.r + 20); // blue glass over the grey wall
+
+    // The hidden caster's shadow falls behind the wall: culled against the Hi-Z; the image is the
+    // same without that culling.
+    CHECK(stats.shadowOccluded >= 1);
+    renderer.culling.shadowOcclusion = false;
+    const std::vector<std::uint8_t> reference = RenderImage(renderer, scene, camera, 6);
+    CHECK(renderer.Stats().shadowOccluded == 0);
+    differing = 0;
+    for (std::size_t i = 0; i < gpu.size(); ++i)
+        differing += std::abs(static_cast<int>(reference[i]) - static_cast<int>(gpu[i])) > 2 ? 1u : 0u;
+    CHECK(differing == 0);
+    F().assets->Release(glass);
+    F().assets->Release(box);
+}
+
 int main(int argc, char** argv)
 {
     int result = 1;
@@ -1466,4 +1578,510 @@ int main(int argc, char** argv)
     const std::uint32_t errors = VulkanContext::ValidationErrorCount(); // teardown included
     std::printf("Vulkan validation errors: %u\n", errors);
     return errors == 0 ? result : 1;
+}
+
+TEST_CASE(Editor_BlueprintPlayAndGraphEditing)
+{
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    const Entity actor = scene.CreateEntity("Spawner");
+    scene.EditTransform(actor).position = {0.0f, 1.0f, 0.0f};
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts});
+    camera.position = {0.0f, 2.0f, 8.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto countNamed = [&](const std::string& name) {
+        int n = 0;
+        r.ViewOf<Name>().Each([&](Entity, Name& e) { n += e.value == name ? 1 : 0; });
+        return n;
+    };
+
+    // A new blueprint from the template (BeginPlay -> Print), extended: For 1..3 spawn a sphere at (0, i, 0).
+    const fs::path     file = fs::path(ENGINE_ASSET_DIR) / "test_blueprint.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Count() == 1 && !bp.Dirty() && bp.Graph() && bp.Graph()->nodes.size() == 3);
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, spawn = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes)
+        if (n.type == "Debug.Print")
+            print = n.id;
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        const std::uint32_t loop = g.AddNode("Flow.ForLoop", {200.0f, 200.0f});
+        const std::uint32_t make = g.AddNode("Vector.Make", {200.0f, 360.0f});
+        spawn                    = g.AddNode("Entity.SpawnPrimitive", {500.0f, 200.0f}, "sphere");
+        g.FindNode(loop)->defaults["First Index"] = std::int32_t{1};
+        g.FindNode(loop)->defaults["Last Index"]  = std::int32_t{3};
+        g.FindNode(spawn)->defaults["Simulate Physics"] = false;
+        CHECK(g.Connect(print, "Then", loop, "In").empty());
+        CHECK(g.Connect(loop, "Loop Body", spawn, "In").empty());
+        CHECK(g.Connect(loop, "Index", make, "Y").empty());
+        CHECK(g.Connect(make, "Vector", spawn, "Location").empty());
+    });
+    CHECK(bp.Dirty() && bp.CanUndo() && bp.Graph()->nodes.size() == 6);
+    CHECK(bp.Undo() && bp.Graph()->nodes.size() == 3 && !bp.Dirty()); // back at the saved state
+    CHECK(bp.Redo() && bp.Graph()->nodes.size() == 6 && bp.Dirty());
+    bp.Select({spawn});
+    bp.DuplicateSelection();
+    CHECK(bp.Graph()->nodes.size() == 7 && bp.SelectedNodes().size() == 1 && bp.SelectedNodes()[0] != spawn);
+    bp.DeleteSelection();
+    CHECK(bp.Graph()->nodes.size() == 6);
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+
+    // Play runs the unsaved graph: three spheres; Stop removes them again.
+    r.Emplace<ScriptComponent>(actor, ScriptComponent{file.string()});
+    const std::uint64_t actorUuid = r.Get<Uuid>(actor).value; // Stop recreates the entities
+    runFrames(2);
+    editor.Play();
+    runFrames(6);
+    CHECK(scripts.Running() && countNamed("sphere") == 3);
+    const auto messages = scripts.Messages();
+    CHECK(std::ranges::any_of(messages, [](const ScriptMessage& m) { return m.text == "Hello from test_blueprint"; }));
+    const ScriptDebugInfo* info = scripts.Debug(file);
+    CHECK(info && info->nodeTimes.contains(spawn));
+    bp.Focus(); // the Blueprint tab in front: canvas with execution highlight, viewport hidden
+    runFrames(3);
+    editor.Stop();
+    const Entity restored = scene.FindByUuid(actorUuid);
+    CHECK(!scripts.Running() && countNamed("sphere") == 0 && restored != NullEntity && r.Has<ScriptComponent>(restored));
+
+    // Save, close, reopen.
+    CHECK(bp.Save() && !bp.Dirty());
+    bp.Close(0);
+    CHECK(bp.Count() == 0 && bp.Open(file) && bp.Graph()->nodes.size() == 6);
+    runFrames(2);
+    bp.Close(0);
+    fs::remove(file);
+}
+
+TEST_CASE(Editor_ProjectLauncherAndContent)
+{
+    const fs::path root = fs::temp_directory_path() / "ungine_tests" / "gpu_project";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+#ifndef _WIN32
+    setenv("XDG_CONFIG_HOME", (root / "config").c_str(), 1); // the test's own recent-projects list
+#endif
+    // Project browser: a new project from the physics template.
+    std::optional<fs::path> chosen;
+    {
+        ProjectLauncher launcher(*F().window, *F().renderer);
+        const auto&     templates = launcher.Templates();
+        const auto      physics   = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Physics"; });
+        CHECK(templates.size() >= 3 && physics != templates.end());
+        for (int i = 0; i < 2; ++i) {
+            F().window->PollEvents();
+            launcher.Update();
+            if (auto frame = F().renderer->BeginFrame()) {
+                launcher.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+        CHECK(!launcher.CreateProject("bad/name", root, 0) && !launcher.Error().empty());
+        CHECK(launcher.CreateProject("LauncherGame", root, static_cast<std::size_t>(physics - templates.begin())));
+        chosen = launcher.Chosen();
+        F().renderer->GetContext().WaitIdle(); // the launcher's ImGui textures
+    }
+    CHECK(chosen.has_value());
+    if (!chosen)
+        return;
+    const auto recent = LoadRecentProjects();
+    CHECK(!recent.empty() && recent.front().name == "LauncherGame");
+    std::optional<Project> project = Project::Load(*chosen);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+
+    // Editor on the project: content root, start scene, blueprint and model from the content browser.
+    Scene        scene;
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .physics       = &physics,
+                       .scripts       = &scripts,
+                       .project       = &*project,
+                       .layoutFile    = project->SavedDirectory() / "EditorLayout.ini"});
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                editor.FixedUpdate(1.0f / 60.0f);
+                F().assets->Update();
+                editor.Update(1.0f / 60.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        CHECK(editor.ContentRoot() == project->ContentDirectory());
+        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 11);
+        CHECK(scene.FindPrimaryCamera() != NullEntity);
+        editor.OpenAsset(project->ContentDirectory() / "Scripts" / "RainOnSpace.ugraph");
+        CHECK(editor.Blueprints().Count() == 1);
+        fs::copy_file(fs::path(ENGINE_ASSET_DIR) / "models" / "BoxTextured.glb", project->ContentDirectory() / "Models" / "Box.glb", ec);
+        editor.OpenAsset(project->ContentDirectory() / "Models" / "Box.glb");
+        CHECK(F().Pump([&] {
+            runFrames(1);
+            return scene.GetRegistry().AliveCount() > 11;
+        }));
+        CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
+        CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
+        CHECK(!editor.BuildAndRun()); // no UnginePlayer next to the test executable: reported, no crash
+        runFrames(3);                 // content browser, project menus
+        editor.NewScene();
+    }
+    for (ModelHandle h : modelRefs)
+        F().assets->Release(h);
+    CHECK(fs::exists(project->SavedDirectory() / "EditorLayout.ini"));
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE(Audio_SoundAssetsAndEditorPlay)
+{
+    const fs::path  dir = fs::temp_directory_path() / "ungine_gpu_audio";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path toneFile = dir / "tone.wav";
+    WriteWav(toneFile, MakeTone(440.0f, 0.5f, 48000, 0.5f));
+
+    // --- Sound assets: async load, cache, stream mode, failure, hot reload, release.
+    AssetManager&            assets = *F().assets;
+    std::vector<SoundHandle> loadedSounds, reloadedSounds, failedSounds;
+    Subscription s1 = F().events.Subscribe<AssetLoadedEvent<SoundData>>([&](const auto& e) { loadedSounds.push_back(e.handle); });
+    Subscription s2 = F().events.Subscribe<AssetReloadedEvent<SoundData>>([&](const auto& e) { reloadedSounds.push_back(e.handle); });
+    Subscription s3 = F().events.Subscribe<AssetFailedEvent<SoundData>>([&](const auto& e) { failedSounds.push_back(e.handle); });
+    const SoundHandle tone = assets.LoadSound(toneFile);
+    CHECK(assets.State(tone) == AssetState::Loading);
+    CHECK(F().Pump([&] { return assets.State(tone) == AssetState::Ready; }, 2000));
+    CHECK(loadedSounds.size() == 1 && loadedSounds[0] == tone);
+    const auto data = assets.Get(tone);
+    CHECK(data && !data->Streamed() && data->frames == 24000 && data->sampleRate == 48000);
+    CHECK(assets.LoadSound(dir / "." / "tone.wav") == tone && assets.RefCount(tone) == 2);
+    const SoundHandle streamed = assets.LoadSound(toneFile, SoundLoadMode::Stream);
+    CHECK(streamed != tone);
+    CHECK(F().Pump([&] { return assets.State(streamed) == AssetState::Ready; }, 2000) && assets.Get(streamed)->Streamed());
+    const SoundHandle missing = assets.LoadSound(dir / "missing.wav");
+    CHECK(F().Pump([&] { return assets.State(missing) == AssetState::Failed; }, 2000));
+    CHECK(failedSounds.size() == 1 && !assets.Error(missing).empty());
+    const auto infos = assets.Sounds();
+    CHECK(infos.size() == 3 && std::ranges::any_of(infos, [&](const SoundInfo& i) { return i.handle == streamed && i.streamed; }));
+
+    // Hot reload: a changed file replaces the content (voices playing the old one keep it).
+    assets.SetHotReload(true);
+    WriteWav(toneFile, MakeTone(440.0f, 0.25f, 48000, 0.5f));
+    fs::last_write_time(toneFile, fs::file_time_type::clock::now() + std::chrono::seconds(2), ec); // distinct mtime
+    CHECK(F().Pump([&] { return !reloadedSounds.empty() && assets.Get(tone) && assets.Get(tone)->frames == 12000; }));
+    CHECK(data->frames == 24000); // the old data is still intact
+    assets.SetHotReload(false);
+    assets.Release(streamed);
+    assets.Release(missing);
+    assets.Release(tone);
+    CHECK(assets.RefCount(tone) == 1);
+
+    // --- Editor: an Audio Source plays while playing, pauses with Pause, stops with Stop.
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    AudioEngine  engine(AudioEngineDesc{.device = false});
+    AudioSystem  audio(engine, F().assets.get(), &physics);
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get(), &audio);
+    const Entity speaker = scene.CreateEntity("Speaker");
+    scene.EditTransform(speaker).position = {0.0f, 1.0f, 0.0f};
+    r.Emplace<AudioSource>(speaker, AudioSource{.sound = PathToUtf8(toneFile), .loop = true});
+    const Entity zone = scene.CreateEntity("Room");
+    // Dry room: a reverb tail would keep sounding while paused.
+    r.Emplace<ReverbZone>(zone, ReverbZone{.halfExtents = glm::vec3(20.0f), .reverb = {.wet = 0.0f}});
+    r.Emplace<AudioListener>(scene.CreateEntity("Ears"));
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts,
+                   .audio         = &audio});
+    camera.position = {0.0f, 2.0f, 8.0f};
+    std::vector<float> mix(4800 * 2);
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            engine.Render(std::span<float>(mix).first(800 * 2)); // ~1/60 s
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto level = [&] {
+        engine.Render(mix);
+        double sum = 0.0;
+        for (float v : mix)
+            sum += static_cast<double>(v) * v;
+        return std::sqrt(sum / static_cast<double>(mix.size()));
+    };
+
+    editor.Select(speaker); // inspector draws the Audio Source section, the viewport its icon and range
+    runFrames(3);
+    CHECK(!audio.Running() && engine.Stats().voices == 0);
+    editor.Play();
+    for (int i = 0; i < 200 && !audio.IsPlaying(speaker); ++i)
+        runFrames(1);
+    runFrames(3);
+    CHECK(audio.Running() && audio.IsPlaying(speaker) && engine.Stats().voices == 1 && audio.Stats().zones == 1);
+    CHECK(level() > 0.05);
+    editor.Pause();
+    runFrames(1);
+    CHECK(level() < 1e-4 && audio.IsPlaying(speaker));
+    editor.Play(); // resume
+    runFrames(1);
+    CHECK(level() > 0.05);
+    editor.Stop();
+    runFrames(2);
+    CHECK(!audio.Running() && engine.Stats().voices == 0 && level() < 1e-4);
+
+    // Content browser / double-click: preview on the UI bus.
+    editor.OpenAsset(toneFile);
+    runFrames(2);
+    CHECK(audio.Previewing() && engine.Stats().voices == 1);
+    audio.StopPreview();
+    runFrames(2);
+    CHECK(!audio.Previewing());
+    fs::remove_all(dir, ec);
+}
+
+TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_p19_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts});
+    camera.position = {0.0f, 3.0f, 10.0f};
+    TextOverlay text(*F().renderer);
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                text.Add("Overlay text\nsecond line", {4.0f, 4.0f}, glm::vec4(1.0f, 0.8f, 0.2f, 1.0f), 1.0f);
+                text.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+
+    // --- Blueprint: a function, an exposed variable, a breakpoint --------------------------------
+    const fs::path     file = dir / "Counter.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Graph());
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, begin = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes) {
+        if (n.type == "Debug.Print")
+            print = n.id;
+        if (n.type == "Event.BeginPlay")
+            begin = n.id;
+    }
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        g.variables.push_back({"Count", PinType::Int, std::int32_t{0}});
+        g.variables.push_back({"Speed", PinType::Float, 1.0f, true});
+        CHECK(g.AddFunction("Bump", {0.0f, 0.0f}));
+        std::uint32_t entry = 0, ret = 0;
+        for (const ScriptNode& n : g.nodes) {
+            if (n.type == "Function.Entry" && n.function == "Bump")
+                entry = n.id;
+            if (n.type == "Function.Return" && n.function == "Bump")
+                ret = n.id;
+        }
+        g.FindFunction("Bump")->inputs.push_back({"Amount", PinType::Int});
+        g.FunctionSignatureChanged("Bump");
+        const std::uint32_t get = g.AddNode("Variable.Get", {100.0f, 150.0f}, "Count", "Bump");
+        const std::uint32_t add = g.AddNode("Math.AddInt", {250.0f, 150.0f}, {}, "Bump");
+        const std::uint32_t set = g.AddNode("Variable.Set", {400.0f, 0.0f}, "Count", "Bump");
+        CHECK(g.Connect(entry, "Then", set, "In").empty());
+        CHECK(g.Connect(set, "Then", ret, "In").empty());
+        CHECK(g.Connect(get, "Value", add, "A").empty());
+        CHECK(g.Connect(entry, "Amount", add, "B").empty());
+        CHECK(g.Connect(add, "Result", set, "Value").empty());
+        const std::uint32_t call  = g.AddNode("Function.Call", {200.0f, 0.0f}, "Bump");
+        const std::uint32_t count = g.AddNode("Variable.Get", {200.0f, 120.0f}, "Count");
+        g.FindNode(call)->defaults["Amount"] = std::int32_t{5};
+        CHECK(g.Connect(begin, "Out", call, "In").empty());
+        CHECK(g.Connect(call, "Then", print, "In").empty());
+        CHECK(g.Connect(count, "Value", print, "Text").empty());
+        g.FindNode(print)->defaults["Duration"] = 100.0f;
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    bp.OpenScope("Bump");
+    CHECK(bp.Scope() && *bp.Scope() == "Bump");
+    bp.Focus();
+    runFrames(3); // function scope on the canvas, signature + locals in the sidebar, minimap
+    bp.OpenScope({});
+    bp.Select({print});
+    bp.ToggleBreakpoints();
+    CHECK(bp.Graph()->HasBreakpoint(print));
+    std::uint32_t a = 0, b = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes)
+        if (n.function.empty() && n.type == "Variable.Get")
+            a = n.id;
+    b = begin;
+    bp.Select({a, b});
+    bp.AlignSelection(ScriptGraphEditor::Align::Left);
+    CHECK(bp.Graph()->FindNode(a)->position.x == bp.Graph()->FindNode(b)->position.x);
+    CHECK(bp.Save());
+
+    const Entity actor = scene.CreateEntity("Counter");
+    ScriptComponent component{file.string()};
+    component.variables["Speed"] = {2.5f, 0};
+    r.Emplace<ScriptComponent>(actor, component);
+    editor.Select(actor); // inspector: exposed variables
+    runFrames(2);
+
+    // Play: the breakpoint stops before Print with Count = 5; the graph opens there.
+    editor.Play();
+    runFrames(4);
+    CHECK(scripts.DebugPaused() && scripts.PausedAt() && scripts.PausedAt()->node == print);
+    const Entity running = actor;
+    const auto   watch   = scripts.Watch(file, running);
+    CHECK(watch && std::ranges::any_of(watch->variables, [](const auto& v) {
+              return v.first == "Count" && ValuesEqual(v.second, std::int32_t{5});
+          }));
+    CHECK(watch && std::ranges::any_of(watch->variables, [](const auto& v) {
+              return v.first == "Speed" && ValuesEqual(v.second, 2.5f);
+          }));
+    CHECK(bp.Scope() && bp.Scope()->empty() && bp.SelectedNodes().size() == 1 && bp.SelectedNodes()[0] == print);
+    scripts.DebugContinue(scene);
+    runFrames(2);
+    CHECK(!scripts.DebugPaused() && std::ranges::any_of(scripts.Messages(), [](const ScriptMessage& m) { return m.text == "5"; }));
+    editor.Stop();
+    runFrames(1);
+
+    // --- Prefabs with meshes: create, place, override, revert, apply (+ undo), scene file ---------
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    modelRefs.push_back(box);
+    const Entity crate = scene.CreateEntity("Crate");
+    r.Emplace<MeshRenderer>(crate, MeshRenderer{.model = box, .meshIndex = 0});
+    const Entity lamp = scene.CreateEntity("Lamp", crate);
+    scene.EditTransform(lamp).position = {0.0f, 1.0f, 0.0f};
+    r.Emplace<Light>(lamp, Light{.intensity = 3.0f, .range = 4.0f});
+    const fs::path prefabFile = dir / "Prefabs" / "Crate.uprefab";
+    const std::uint64_t crateUuid = r.Get<Uuid>(crate).value, lampUuid = r.Get<Uuid>(lamp).value;
+    CHECK(editor.CreatePrefabFrom(crate, prefabFile) && r.Has<PrefabInstance>(crate) && r.Has<PrefabLink>(lamp));
+    const Entity crate2 = editor.PlacePrefab(prefabFile, {3.0f, 0.0f, 0.0f});
+    CHECK(crate2 != NullEntity && r.Has<MeshRenderer>(crate2) && r.Get<MeshRenderer>(crate2).model == box);
+    const Entity        lamp2     = r.Get<Hierarchy>(crate2).children.at(0);
+    const std::uint64_t lamp2Uuid = r.Get<Uuid>(lamp2).value; // handles change when undo restores subtrees
+    editor.Select(crate2);
+    runFrames(2); // inspector prefab header, hierarchy tint
+
+    r.Get<Light>(lamp2).intensity = 9.0f;
+    CHECK(PrefabOverriddenKeys(scene, F().assets.get(), lamp2) == std::vector<std::string>{"light"});
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Revert, lamp2, "light"));
+    const Entity lamp2b = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2b != NullEntity && r.Get<Light>(lamp2b).intensity == 3.0f);
+    CHECK(editor.Undo()); // back to the override (subtree restored)
+    const Entity lamp2c = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2c != NullEntity && r.Get<Light>(lamp2c).intensity == 9.0f);
+
+    r.Get<Light>(scene.FindByUuid(lampUuid)).color = {0.0f, 1.0f, 0.0f};
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Apply, scene.FindByUuid(crateUuid)));
+    const Entity lamp2d = scene.FindByUuid(lamp2Uuid);
+    CHECK(lamp2d != NullEntity && r.Get<Light>(lamp2d).color == glm::vec3(0.0f, 1.0f, 0.0f) && r.Get<Light>(lamp2d).intensity == 9.0f);
+    runFrames(3);
+
+    const fs::path sceneFile = dir / "Prefabs.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    editor.NewScene();
+    CHECK(editor.OpenScene(sceneFile));
+    runFrames(6);
+    int instances = 0, meshes = 0;
+    r.ViewOf<PrefabInstance>().Each([&](Entity, PrefabInstance&) { ++instances; });
+    r.ViewOf<MeshRenderer>().Each([&](Entity, MeshRenderer& m) { meshes += F().assets->State(m.model) == AssetState::Ready ? 1 : 0; });
+    CHECK(instances == 2 && meshes == 2);
+    CHECK(sceneRenderer.Stats().gpuDriven ? sceneRenderer.Stats().instances >= 2 : true);
+    Entity loadedLamp = NullEntity;
+    r.ViewOf<Light>().Each([&](Entity e, Light& l) {
+        if (l.intensity == 9.0f)
+            loadedLamp = e;
+    });
+    CHECK(loadedLamp != NullEntity && r.Get<Light>(loadedLamp).color == glm::vec3(0.0f, 1.0f, 0.0f));
+    CHECK(editor.RunPrefabOp(Editor::PrefabOp::Unlink, loadedLamp) && PrefabInstanceRoot(scene, loadedLamp) == NullEntity);
+    runFrames(2);
+
+    editor.NewScene();
+    bp.Close(0);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

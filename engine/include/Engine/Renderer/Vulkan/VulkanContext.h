@@ -5,6 +5,7 @@
 #include <vk_mem_alloc.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace Engine {
@@ -12,8 +13,9 @@ namespace Engine {
 class Window;
 
 struct VulkanContextDesc {
-    std::string appName          = "Engine";
-    bool        enableValidation = false;
+    std::string           appName          = "Engine";
+    bool                  enableValidation = false;
+    std::filesystem::path pipelineCache{}; // loaded at startup, saved at shutdown; empty: memory only
 };
 
 struct Queue {
@@ -49,6 +51,11 @@ public:
     [[nodiscard]] const VkPhysicalDeviceProperties& Properties() const { return m_PhysicalDevice.properties; }
     // Optional features, enabled when present.
     [[nodiscard]] bool SupportsBC() const { return m_TextureCompressionBC; } // BC1-7 sampling
+    // VK_EXT_swapchain_maintenance1: present fences -> swapchain recreation without a device wait.
+    [[nodiscard]] bool SupportsSwapchainMaintenance() const { return m_SwapchainMaintenance; }
+
+    // Shared by every pipeline creation (see Pipeline.h), persisted in VulkanContextDesc::pipelineCache.
+    [[nodiscard]] VkPipelineCache PipelineCache() const { return m_PipelineCache; }
 
     // Keeps the original vkb objects accessible for the swapchain builder (Phase 2).
     [[nodiscard]] const vkb::Device& VkbDevice() const { return m_Device; }
@@ -58,6 +65,8 @@ private:
     void SelectPhysicalDevice();
     void CreateDevice();
     void CreateAllocator();
+    void CreatePipelineCache();
+    void SavePipelineCache() const;
     void Shutdown() noexcept;
 
     vkb::Instance       m_Instance{};
@@ -65,9 +74,13 @@ private:
     vkb::Device         m_Device{};
     VkSurfaceKHR        m_Surface   = VK_NULL_HANDLE;
     VmaAllocator        m_Allocator = VK_NULL_HANDLE;
+    VkPipelineCache     m_PipelineCache = VK_NULL_HANDLE;
+    std::filesystem::path m_PipelineCachePath;
 
     Queue m_Graphics{}, m_Present{}, m_Transfer{};
     bool  m_TextureCompressionBC = false;
+    bool  m_SurfaceMaintenance   = false; // instance: VK_EXT_surface_maintenance1
+    bool  m_SwapchainMaintenance = false; // device: VK_EXT_swapchain_maintenance1 (feature enabled)
 };
 
 } // namespace Engine

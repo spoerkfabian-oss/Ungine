@@ -1,4 +1,5 @@
 #pragma once
+#include "Engine/Core/Platform.h"
 #include "Engine/Renderer/Vulkan/VkCommon.h"
 
 #include <filesystem>
@@ -9,13 +10,17 @@
 
 namespace Engine {
 
-// Compiled SPIR-V lives next to the build (see cmake/Shaders.cmake).
+// Compiled SPIR-V: next to the executable when installed, else in the build tree (Platform.h).
 [[nodiscard]] inline std::filesystem::path ShaderPath(std::string_view spvName)
 {
-    return std::filesystem::path{ENGINE_SHADER_DIR} / spvName;
+    return ShaderDirectory() / spvName;
 }
 
 [[nodiscard]] VkShaderModule LoadShaderModule(VkDevice device, const std::filesystem::path& path);
+
+// Pipeline cache used by every pipeline created for `device` (VulkanContext registers its own).
+void                          RegisterPipelineCache(VkDevice device, VkPipelineCache cache);
+[[nodiscard]] VkPipelineCache PipelineCacheFor(VkDevice device);
 
 class Pipeline {
 public:

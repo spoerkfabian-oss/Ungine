@@ -168,12 +168,14 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
     Registry&           registry = scene.GetRegistry();
     const Entity        root     = scene.CreateEntity(model.name, parent);
     std::vector<Entity> entities(model.nodes.size(), NullEntity);
+    registry.Emplace<ModelInstance>(root, ModelInstance{.model = handle});
 
     for (std::size_t i = 0; i < model.nodes.size(); ++i) {
         const ModelNode& node       = model.nodes[i];
         const Entity     nodeParent = node.parent >= 0 ? entities[static_cast<std::size_t>(node.parent)] : root;
         const Entity     e          = scene.CreateEntity(node.name, nodeParent);
         scene.SetTransform(e, node.local);
+        registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
         if (node.mesh >= 0)
             registry.Emplace<MeshRenderer>(e, handle, static_cast<std::uint32_t>(node.mesh));
         if (node.light)
@@ -181,6 +183,83 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
         entities[i] = e;
     }
     return root;
+}
+
+std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model& model)
+{
+    Registry&           registry = scene.GetRegistry();
+    std::vector<Entity> roots;
+    registry.ViewOf<ModelInstance>().Each([&](Entity e, ModelInstance& instance) {
+        if (instance.model == handle)
+            roots.push_back(e);
+    });
+
+    for (const Entity root : roots) {
+        // This instance's node entities (nested instances are left alone).
+        std::vector<Entity> existing;
+        std::vector<Entity> stack(registry.Get<Hierarchy>(root).children);
+        while (!stack.empty()) {
+            const Entity e = stack.back();
+            stack.pop_back();
+            if (registry.Has<ModelInstance>(e))
+                continue;
+            if (registry.Has<ModelNodeRef>(e))
+                existing.push_back(e);
+            const auto& children = registry.Get<Hierarchy>(e).children;
+            stack.insert(stack.end(), children.begin(), children.end());
+        }
+        // Match by name (exports keep names when nodes are added or removed), same index first.
+        std::vector<Entity> byNode(model.nodes.size(), NullEntity);
+        std::vector<bool>   used(existing.size(), false);
+        for (int pass = 0; pass < 2; ++pass)
+            for (std::size_t i = 0; i < model.nodes.size(); ++i)
+                for (std::size_t k = 0; k < existing.size() && byNode[i] == NullEntity; ++k)
+                    if (!used[k] && registry.Get<Name>(existing[k]).value == model.nodes[i].name &&
+                        (pass == 1 || registry.Get<ModelNodeRef>(existing[k]).node == i)) {
+                        byNode[i] = existing[k];
+                        used[k]   = true;
+                    }
+        std::vector<Entity> stale;
+        for (std::size_t k = 0; k < existing.size(); ++k)
+            if (!used[k])
+                stale.push_back(existing[k]);
+
+        for (std::size_t i = 0; i < model.nodes.size(); ++i) { // parents first
+            const ModelNode& node   = model.nodes[i];
+            const Entity     parent = node.parent >= 0 ? byNode[static_cast<std::size_t>(node.parent)] : root;
+            Entity&          e      = byNode[i];
+            if (e == NullEntity) {
+                e = scene.CreateEntity(node.name, parent);
+                registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
+            } else {
+                if (registry.Get<Hierarchy>(e).parent != parent)
+                    scene.SetParent(e, parent);
+                registry.Get<ModelNodeRef>(e).node = static_cast<std::uint32_t>(i);
+            }
+            scene.SetTransform(e, node.local);
+            if (node.mesh >= 0)
+                registry.EmplaceOrReplace<MeshRenderer>(e, MeshRenderer{handle, static_cast<std::uint32_t>(node.mesh)});
+            else if (const MeshRenderer* mesh = registry.TryGet<MeshRenderer>(e); mesh && mesh->model == handle)
+                registry.Remove<MeshRenderer>(e);
+            if (node.light)
+                registry.EmplaceOrReplace<Light>(e, *node.light);
+            else
+                registry.Remove<Light>(e);
+            scene.MarkChanged(e);
+        }
+
+        // Nodes the model no longer has: keep what the user attached to them.
+        for (const Entity e : stale) {
+            if (!registry.Valid(e))
+                continue;
+            const std::vector<Entity> children = registry.Get<Hierarchy>(e).children;
+            for (const Entity child : children)
+                if (std::ranges::find(stale, child) == stale.end())
+                    scene.SetParent(child, root);
+            scene.DestroyEntity(e);
+        }
+    }
+    return roots.size();
 }
 
 } // namespace Engine

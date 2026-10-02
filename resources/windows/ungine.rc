@@ -1,0 +1,2 @@
+// Executable icon (Explorer, taskbar, .ungineproj files via the installer's file association).
+IDI_ICON1 ICON "../ungine.ico"

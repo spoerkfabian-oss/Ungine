@@ -254,7 +254,7 @@ void SceneRenderer::CreatePipelines()
     // Built completely before anything is replaced: a failure keeps the old pipelines.
     struct {
         Pipeline Prepass, PrepassPicking, Mesh, Sky, Shadow, ShadowMasked, LocalShadow, LocalShadowMasked, BloomDown,
-            BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull;
+            BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull, MeshBlend;
     } built;
     const VkDevice         device = m_Renderer.GetContext().Device();
     const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
@@ -286,6 +286,16 @@ void SceneRenderer::CreatePipelines()
                      .SetDynamicCulling(true)
                      .SetDebugName("MeshPbr")
                      .Build(device, layout);
+
+    built.MeshBlend = GraphicsPipelineBuilder{}
+                          .SetShaders(ShaderPath("mesh.vert.spv"), ShaderPath("mesh_blend.frag.spv"))
+                          .AddColorAttachment(kHdrFormat)
+                          .SetDepthFormat(kDepthFormat)
+                          .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                          .SetDynamicCulling(true)
+                          .SetBlend(BlendMode::Alpha)
+                          .SetDebugName("MeshBlend")
+                          .Build(device, layout);
 
     // Depth 0 = infinity: passes only where no geometry was drawn. No depth writes.
     built.Sky = GraphicsPipelineBuilder{}
@@ -356,6 +366,7 @@ void SceneRenderer::CreatePipelines()
     replace(m_Histogram, built.Histogram);
     replace(m_ExposureAverage, built.ExposureAverage);
     replace(m_LightCull, built.LightCull);
+    replace(m_MeshBlend, built.MeshBlend);
     for (auto& [format, pipeline] : m_Tonemap) // rebuilt on demand
         m_Renderer.DeferRelease(std::move(pipeline));
     m_Tonemap.clear();
@@ -547,7 +558,7 @@ bool SceneRenderer::GpuPath() const
     return culling.gpuDriven;
 }
 
-void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out)
+void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out, Gather mode)
 {
     out.draws.clear();
     out.address       = 0;
@@ -556,6 +567,7 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
         const glm::vec3 closest = glm::clamp(glm::vec3(sphere), box.min, box.max);
         return glm::dot(closest - glm::vec3(sphere), closest - glm::vec3(sphere)) <= sphere.w * sphere.w;
     };
+    std::vector<std::pair<float, std::uint32_t>> sorted; // transparent: (distance, entry)
     m_Spatial.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& proxy) {
         if (range && !near(proxy.bounds))
             return;
@@ -565,22 +577,60 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
         // Whole meshes were culled by the BVH; multi-part meshes (and light ranges) also per submesh.
         const bool perSubmesh = inst->drawCount > 1 || range;
         for (std::uint32_t d = inst->firstDraw; d < inst->firstDraw + inst->drawCount; ++d) {
-            if (perSubmesh) {
-                const GpuSubmesh& sm  = m_GpuScene->DrawSubmesh(d);
-                const Aabb        box = TransformAabb({sm.boundsMin, sm.boundsMax}, inst->model);
-                if (!frustum.Intersects(box) || (range && !near(box)))
-                    continue;
+            const GpuSubmesh& sm    = m_GpuScene->DrawSubmesh(d);
+            const bool        blend = (sm.flags & kMaterialAlphaBlend) != 0;
+            if ((mode == Gather::Camera && blend) || (mode == Gather::Transparent && !blend))
+                continue;
+            const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, inst->model);
+            if (perSubmesh && (!frustum.Intersects(box) || (range && !near(box))))
+                continue;
+            const LodChoice lod   = SelectLod(sm, inst->model, m_LodCamera, m_LodForced);
+            const std::uint32_t e = d | (lod.lod << kVisibleLodShift);
+            if (mode == Gather::Transparent) {
+                sorted.emplace_back(glm::distance(glm::vec3(m_LodCamera), (box.min + box.max) * 0.5f), e); // xyz: camera
+            } else if (mode == Gather::Camera && lod.fade > 0) { // cross-fade: both levels, complementary dither
+                out.draws.push_back(e | (lod.fade << kVisibleFadeShift));
+                out.draws.push_back(d | ((lod.lod + 1) << kVisibleLodShift) | (lod.fade << kVisibleFadeShift) | kVisibleFadeIn);
+            } else {
+                out.draws.push_back(e);
             }
-            const std::uint32_t lod = SelectLod(m_GpuScene->DrawSubmesh(d), inst->model, m_LodCamera, m_LodForced);
-            out.draws.push_back(d | (lod << kVisibleLodShift));
         }
     });
+    if (mode == Gather::Transparent) { // far to near: blending needs back to front
+        std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (const auto& [distance, entry] : sorted)
+            out.draws.push_back(entry);
+    }
     if (!out.draws.empty()) { // visible list of the pass: firstInstance = position in it
         const TransientAllocation a = m_Renderer.AllocateTransient(out.draws.size() * sizeof(std::uint32_t), 16);
         std::memcpy(a.cpu, out.draws.data(), out.draws.size() * sizeof(std::uint32_t));
         out.address = a.gpu;
     }
     m_Stats.drawItems += static_cast<std::uint32_t>(out.draws.size());
+}
+
+void SceneRenderer::DrawTransparent(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress,
+                                    std::uint32_t flags)
+{
+    if (list.draws.empty())
+        return;
+    const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
+    const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = 0, .flags = flags};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_MeshBlend.Handle());
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+    for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
+        const std::uint32_t d        = list.draws[i] & kVisibleRecordMask;
+        const auto          lod      = static_cast<glm::length_t>((list.draws[i] >> kVisibleLodShift) & 3u);
+        const GpuSubmesh&   sm       = m_GpuScene->DrawSubmesh(d);
+        const bool          mirrored = (m_GpuScene->InstanceData(m_GpuScene->Draw(d).instance).flags & kInstanceMirrored) != 0;
+        vkCmdSetCullMode(cmd, (sm.flags & kMaterialDoubleSided) != 0 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+        vkCmdSetFrontFace(cmd, mirrored ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        vkCmdDrawIndexed(cmd, sm.lodIndexCount[lod], 1, sm.lodFirstIndex[lod], sm.vertexOffset, i);
+        ++m_Stats.drawCalls;
+        ++m_Stats.transparentDraws;
+        m_Stats.triangles += sm.lodIndexCount[lod] / 3;
+    }
 }
 
 void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats,
@@ -595,7 +645,7 @@ void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkD
     std::uint32_t bucket = ~0u;
     for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
         const std::uint32_t d   = list.draws[i] & kVisibleRecordMask;
-        const auto          lod = static_cast<glm::length_t>(list.draws[i] >> kVisibleLodShift);
+        const auto          lod = static_cast<glm::length_t>((list.draws[i] >> kVisibleLodShift) & 3u);
         const GpuSubmesh&   sm  = m_GpuScene->DrawSubmesh(d);
         const std::uint32_t b   = m_GpuScene->Batch(m_GpuScene->Draw(d).batch).cameraBucket;
         if (b != bucket) {
@@ -607,7 +657,7 @@ void SceneRenderer::DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkD
         if (countStats) {
             ++m_Stats.drawCalls;
             m_Stats.triangles += sm.lodIndexCount[lod] / 3;
-            m_Stats.lodDraws += lod > 0 ? 1u : 0u;
+            m_Stats.lodDraws += list.draws[i] >> kVisibleLodShift != 0 ? 1u : 0u; // LOD > 0 or fading
         }
     }
 }
@@ -621,18 +671,24 @@ void SceneRenderer::DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkD
     const MeshPush push{.frame = frameAddress, .visible = list.address, .cascade = cascade, .flags = 0};
     vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
-    VkPipeline bound = VK_NULL_HANDLE;
-    for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
-        const std::uint32_t d        = list.draws[i] & kVisibleRecordMask;
-        const auto          lod      = static_cast<glm::length_t>(list.draws[i] >> kVisibleLodShift);
-        const GpuSubmesh&   sm       = m_GpuScene->DrawSubmesh(d);
-        const VkPipeline    pipeline = (sm.flags & kMaterialAlphaMask) != 0 ? masked.Handle() : plain.Handle();
-        if (pipeline != bound) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            bound = pipeline;
+    // Plain casters first, then alpha-tested ones (like the GPU path's buckets): two binds at most.
+    for (const bool alphaTested : {false, true}) {
+        bool bound = false;
+        for (std::uint32_t i = 0; i < list.draws.size(); ++i) {
+            const std::uint32_t d   = list.draws[i] & kVisibleRecordMask;
+            const auto          lod = static_cast<glm::length_t>((list.draws[i] >> kVisibleLodShift) & 3u);
+            const GpuSubmesh&   sm  = m_GpuScene->DrawSubmesh(d);
+            if (((sm.flags & (kMaterialAlphaMask | kMaterialAlphaBlend)) != 0) != alphaTested)
+                continue;
+            if (!std::exchange(bound, true)) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, alphaTested ? masked.Handle() : plain.Handle());
+                // Again after the bind: lavapipe drops fragment-stage push constants set while a
+                // pipeline without a fragment shader was bound (valid per spec, crashes there).
+                vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+            }
+            vkCmdDrawIndexed(cmd, sm.lodIndexCount[lod], 1, sm.lodFirstIndex[lod], sm.vertexOffset, i);
+            ++drawCounter;
         }
-        vkCmdDrawIndexed(cmd, sm.lodIndexCount[lod], 1, sm.lodFirstIndex[lod], sm.vertexOffset, i);
-        ++drawCounter;
     }
 }
 
@@ -656,6 +712,8 @@ void SceneRenderer::DrawGpuShadow(VkCommandBuffer cmd, std::uint32_t view, VkDev
     vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
     m_GpuCulling->Draw(cmd, view, kShadowBuckets, [&](std::uint32_t bucket) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bucket != 0 ? masked.Handle() : plain.Handle());
+        // See DrawCpuShadow: re-push after switching to / from the depth-only pipeline.
+        vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     });
 }
 
@@ -682,8 +740,13 @@ void SceneRenderer::CullGpu(VkCommandBuffer cmd, const CameraData& camera,
     const std::uint32_t occlusion = culling.occlusion ? kCullViewOcclusion : 0u;
     views.push_back(makeView(cameraViewProj, true, kCullViewCameraEarly | occlusion));
     views.push_back(makeView(cameraViewProj, true, kCullViewCameraLate | kCullViewOcclusion));
-    for (std::uint32_t c = 0; c < cascadeCount; ++c) // casters towards the light stay (depth clamp)
-        views.push_back(makeView(cascades[c].viewProj, false, kCullViewShadow));
+    // Casters towards the light stay (depth clamp). With occlusion culling, cascades are culled after
+    // the Hi-Z against it (m_ShadowOcclusion: rendered after the prepass).
+    for (std::uint32_t c = 0; c < cascadeCount; ++c) {
+        GpuCullView view = makeView(cascades[c].viewProj, false, kCullViewShadow | (m_ShadowOcclusion ? kCullViewShadowOcclusion : 0u));
+        view.sphere      = glm::vec4(glm::normalize(lighting.sky.sunDirection), 2.0f * shadows.maxDistance);
+        views.push_back(view);
+    }
     for (ShadowTile& tile : m_ShadowTiles) {
         if (!tile.render)
             continue;
@@ -692,7 +755,23 @@ void SceneRenderer::CullGpu(VkCommandBuffer cmd, const CameraData& camera,
         view.sphere      = glm::vec4(tile.lightPosition, tile.lightRange);
         views.push_back(view);
     }
-    m_GpuCulling->CullEarly(cmd, *m_GpuScene, views, extent, {.camera = m_LodCamera, .forced = m_LodForced});
+    // World box of the camera frustum between the near plane and the shadow distance.
+    const glm::mat4 toWorld = glm::inverse(camera.view);
+    const float     tanY    = 1.0f / std::abs(camera.projection[1][1]);
+    const float     tanX    = 1.0f / std::abs(camera.projection[0][0]);
+    glm::vec3       regionMin(std::numeric_limits<float>::max()), regionMax(std::numeric_limits<float>::lowest());
+    for (const float d : {camera.nearPlane, std::max(shadows.maxDistance, camera.nearPlane)})
+        for (int corner = 0; corner < 4; ++corner) {
+            const glm::vec3 p = glm::vec3(toWorld * glm::vec4((corner & 1 ? 1.0f : -1.0f) * d * tanX,
+                                                              (corner & 2 ? 1.0f : -1.0f) * d * tanY, -d, 1.0f));
+            regionMin = glm::min(regionMin, p);
+            regionMax = glm::max(regionMax, p);
+        }
+    m_GpuCulling->CullEarly(cmd, *m_GpuScene, views, extent,
+                            {.camera          = m_LodCamera,
+                             .forced          = m_LodForced,
+                             .shadowRegionMin = regionMin,
+                             .shadowRegionMax = regionMax});
 }
 
 const Pipeline& SceneRenderer::TonemapPipeline(VkFormat outputFormat)
@@ -763,10 +842,13 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
                             culling.lod && culling.lodPixelError > 0.0f ? pixelsPerUnit / culling.lodPixelError : 0.0f);
     m_LodForced = culling.forceLod >= 0 ? static_cast<std::uint32_t>(culling.forceLod) + 1u : 0u;
     if (!m_GpuFrame) {
-        GatherDraws(frustum, glm::vec4(0.0f), m_CameraDraws);
+        GatherDraws(frustum, glm::vec4(0.0f), m_CameraDraws, Gather::Camera);
         m_Stats.culled = static_cast<std::uint32_t>(m_Spatial.SubmeshCount() -
                                                     std::min<std::uint64_t>(m_CameraDraws.draws.size(), m_Spatial.SubmeshCount()));
     }
+    m_TransparentDraws.draws.clear();
+    if (m_GpuScene->BlendDraws() > 0) // both paths: blending needs a CPU sort
+        GatherDraws(frustum, glm::vec4(0.0f), m_TransparentDraws, Gather::Transparent);
     CollectLights(scene, frustum);
     m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
@@ -828,11 +910,14 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     }
     const VkDeviceAddress frameAddress = m_Renderer.PushTransient(uniforms);
 
+    // Cascade casters can be culled against the camera Hi-Z (GPU path with occlusion): then the
+    // cascades are rendered after the prepass, which builds it.
+    m_ShadowOcclusion = m_GpuFrame && culling.occlusion && culling.shadowOcclusion && !culling.freeze;
     if (m_GpuFrame) {
         GpuScope scope(profiler, cmd, "GPU culling");
         CullGpu(cmd, camera, cascades, cascadeCount, extent);
     }
-    if (cascadeCount > 0) {
+    if (cascadeCount > 0 && !m_ShadowOcclusion) {
         GpuScope scope(profiler, cmd, "Shadows");
         RenderShadows(cmd, frameAddress, cascades, cascadeCount);
     }
@@ -844,6 +929,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     {
         GpuScope scope(profiler, cmd, "Depth + normals");
         RenderPrepass(cmd, extent, frameAddress, frame.frameIndex);
+    }
+    if (cascadeCount > 0 && m_ShadowOcclusion) {
+        GpuScope scope(profiler, cmd, "Shadows");
+        RenderShadows(cmd, frameAddress, cascades, cascadeCount);
     }
     if (ao.enabled) {
         GpuScope scope(profiler, cmd, "GTAO");
@@ -902,6 +991,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         m_Stats.gpuLate          = gpu.late;
         m_Stats.gpuCommands      = gpu.commands;
         m_Stats.lodDraws         = gpu.lodDraws;
+        m_Stats.shadowOccluded   = gpu.shadowOccluded;
     }
 
     // --- Tone mapping into the swapchain image ---
@@ -1184,7 +1274,8 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
             m_Stats.localShadowDraws += kShadowBuckets; // indirect multi-draws
         } else {
             DrawList list;
-            GatherDraws(Frustum::FromViewProjection(tile.viewProj), glm::vec4(tile.lightPosition, tile.lightRange), list);
+            GatherDraws(Frustum::FromViewProjection(tile.viewProj), glm::vec4(tile.lightPosition, tile.lightRange), list,
+                        Gather::Shadow);
             DrawCpuShadow(cmd, list, frameAddress, cascade, m_LocalShadow, m_LocalShadowMasked, m_Stats.localShadowDraws);
         }
     }
@@ -1300,7 +1391,7 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
             DrawGpuShadow(cmd, kCameraLateView + 1 + c, frameAddress, c, m_Shadow, m_ShadowMasked);
         } else {
             DrawList list;
-            GatherDraws(Frustum::FromViewProjection(cascades[c].viewProj, false), glm::vec4(0.0f), list);
+            GatherDraws(Frustum::FromViewProjection(cascades[c].viewProj, false), glm::vec4(0.0f), list, Gather::Shadow);
             DrawCpuShadow(cmd, list, frameAddress, c, m_Shadow, m_ShadowMasked, m_Stats.shadowDraws);
         }
         vkCmdEndRendering(cmd);
@@ -1634,6 +1725,8 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceA
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+    // Transparent surfaces last, over opaque geometry and sky (depth tested, not written).
+    DrawTransparent(cmd, m_TransparentDraws, frameAddress, lodTint);
     vkCmdEndRendering(cmd);
 }
 

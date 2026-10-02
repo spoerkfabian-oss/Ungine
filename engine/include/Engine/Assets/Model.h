@@ -197,8 +197,15 @@ void ReleaseModel(Renderer& renderer, Model&& model);
 [[nodiscard]] std::uint64_t ModelGpuBytes(const Model& model);
 [[nodiscard]] std::uint64_t ModelCpuBytes(const Model& model);
 
-// Creates one entity per node under a new root entity; returns the root. The entities
-// reference the model by handle only: releasing it makes them render nothing.
+// Creates one entity per node under a new root entity (ModelInstance; nodes get ModelNodeRef);
+// returns the root. The entities reference the model by handle only: releasing it makes them
+// render nothing.
 Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, Entity parent = NullEntity);
+
+// Re-syncs every instance of `handle` with the model's current nodes (after a reload): node
+// entities are matched by name (same index first), created, re-parented, updated (local
+// transform, mesh, light) or removed (their other children move to the instance root). The
+// roots keep their own transforms. Returns the number of instances.
+std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model& model);
 
 } // namespace Engine

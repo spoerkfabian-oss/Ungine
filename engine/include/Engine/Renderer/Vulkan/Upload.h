@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -124,6 +125,7 @@ private:
         VkDeviceSize                bytes     = 0;
         VkDeviceSize                ringBytes = 0; // ring space (incl. padding) freed when the batch completes
         VkDeviceSize                ringEnd   = 0; // ring head after its last allocation
+        std::uint32_t               pendingWrites = 0; // uploads copying into their staging memory (unlocked)
     };
 
     // Copies `data` into staging memory, opens / closes batches for the budget and runs `record`
@@ -147,6 +149,7 @@ private:
 
     UploadQueueDesc                     m_Desc;
     mutable std::mutex                  m_Mutex; // guards the batches, the ring, m_NextValue and m_Stats
+    std::condition_variable m_WritesDone; // pendingWrites of some batch reached 0 (Flush waits)
     std::unique_ptr<Batch>              m_Open;
     std::deque<std::unique_ptr<Batch>>  m_Closed; // over the budget, waiting for Submit
     Buffer                              m_Ring;

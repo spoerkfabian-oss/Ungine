@@ -105,6 +105,9 @@ struct CullingSettings {
     bool          lod           = true;
     float         lodPixelError = 1.0f;
     std::int32_t  forceLod      = -1;    // debug: >= 0 draws that level (clamped per submesh)
+    // GPU + occlusion: skip sun cascade casters whose shadow volume lies behind the camera Hi-Z
+    // (cascades are then rendered after the depth prepass).
+    bool          shadowOcclusion = true;
 };
 
 // Mirrors GpuShadowView in lights.glsl.
@@ -165,7 +168,9 @@ struct SceneRenderStats {
     std::uint32_t gpuEarly        = 0; // drawn by the early pass (visible last frame)
     std::uint32_t gpuLate         = 0; // newly visible, drawn by the late pass
     std::uint32_t gpuCommands     = 0; // indirect commands written, all views
-    std::uint32_t lodDraws        = 0; // camera draws with a LOD > 0 (GPU: counter, CPU: this frame)
+    std::uint32_t lodDraws        = 0; // camera draws with a LOD > 0 or cross-fading (GPU: counter, CPU: this frame)
+    std::uint32_t transparentDraws = 0; // alpha-blended draws (sorted CPU pass, both paths)
+    std::uint32_t shadowOccluded  = 0; // GPU: cascade casters culled against the camera Hi-Z
     std::uint32_t geometryVertices = 0, geometryVertexCapacity = 0; // geometry pool use
     std::uint32_t geometryIndices  = 0, geometryIndexCapacity  = 0;
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
@@ -239,7 +244,11 @@ private:
     // CPU path: draws of the meshes the BVH finds in the frustum (+ within `sphere` if radius > 0).
     void CreatePipelines();  // all but the per-format tone mapping ones (TonemapPipeline)
     void RebuildPipelines(); // shader hot reload: also environment, GPU scene, culling
-    void GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out);
+    // Camera: opaque + masked draws (LOD cross-fades as two entries). Shadow: every draw, one LOD.
+    // Transparent: alpha-blended draws only, sorted back to front.
+    enum class Gather : std::uint8_t { Camera, Shadow, Transparent };
+    void GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out, Gather mode);
+    void DrawTransparent(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t flags);
     void DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats,
                        std::uint32_t flags);
     void DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t cascade,
@@ -279,6 +288,7 @@ private:
     Environment         m_Environment;
     std::uint64_t       m_ShaderGeneration = 0; // Renderer::ShaderGeneration the pipelines were built for
     Pipeline            m_Mesh; // cull mode + front face are dynamic
+    Pipeline            m_MeshBlend; // alpha-blended, depth test without writes
     Pipeline            m_Sky;
     std::vector<std::pair<VkFormat, Pipeline>> m_Tonemap; // one per output format, built on demand
     Pipeline            m_Shadow, m_ShadowMasked; // depth only / alpha-tested
@@ -315,8 +325,10 @@ private:
     SpatialIndex                m_Spatial;
     std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
     std::unique_ptr<GpuCulling> m_GpuCulling;
+    bool                        m_ShadowOcclusion = false; // this frame: cascades culled against the Hi-Z
     glm::vec4                   m_LodCamera{0.0f}; // this frame's LOD selection (see SelectLod)
     std::uint32_t               m_LodForced = 0;
+    DrawList                    m_TransparentDraws; // sorted back to front
     DrawList                    m_CameraDraws; // CPU path: prepass + lighting pass
     bool                        m_GpuFrame = false; // this frame uses the GPU path
     // Frozen culling (debug): camera of the moment `culling.freeze` was set.

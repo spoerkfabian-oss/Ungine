@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,7 +27,8 @@ struct PhysicsHit {
 
 // Published on the EventBus (EventBus::Publish, main thread) at the end of PhysicsWorld::Step
 // when two bodies start / stop touching. One Begin and one End per pair, however many shapes touch.
-// End is also sent when a body is removed; its entity may already be destroyed then.
+// End is also sent when a body is removed; its entity may already be destroyed then. Characters
+// report their contacts too (a = the character).
 struct CollisionEvent {
     Entity a       = NullEntity;
     Entity b       = NullEntity;
@@ -36,10 +38,35 @@ struct CollisionEvent {
 
 enum class BodyActivity : std::uint8_t { None, Static, Kinematic, Active, Sleeping, Character };
 
+inline constexpr std::uint32_t kPhysicsLayers = 16;
+
 struct PhysicsSettings {
     glm::vec3 gravity{0.0f, -9.81f, 0.0f};
     int       collisionSteps = 1;    // sub-steps per Step (more for fast objects at low rates)
     float     airControl     = 2.0f; // characters in the air: rate (1/s) at which the velocity approaches the input
+    // Interpolate(): shown poses of moving bodies blend between the last two steps (smooth motion
+    // when the frame rate differs from the fixed step).
+    bool interpolate = true;
+    // Bit b of layerCollision[a]: layer a collides with layer b (kept symmetric by SetLayerCollision).
+    std::array<std::uint16_t, kPhysicsLayers> layerCollision = MakeAllLayersCollide();
+
+    void SetLayerCollision(std::uint32_t a, std::uint32_t b, bool collide)
+    {
+        const auto set = [&](std::uint32_t x, std::uint32_t y) {
+            layerCollision[x] = static_cast<std::uint16_t>(collide ? layerCollision[x] | (1u << y) : layerCollision[x] & ~(1u << y));
+        };
+        set(a, b);
+        set(b, a);
+    }
+    [[nodiscard]] bool LayersCollide(std::uint32_t a, std::uint32_t b) const { return ((layerCollision[a] >> b) & 1u) != 0; }
+
+private:
+    static constexpr std::array<std::uint16_t, kPhysicsLayers> MakeAllLayersCollide()
+    {
+        std::array<std::uint16_t, kPhysicsLayers> all{};
+        all.fill(0xFFFF);
+        return all;
+    }
 };
 
 struct PhysicsStats {
@@ -84,8 +111,8 @@ struct ColliderDebugShape {
 // Scene ownership: bodies follow the scene. Sync creates / recreates / removes bodies when the
 // components or the world scale change and teleports bodies whose transform was changed from
 // outside (kinematic bodies are moved to it instead). Step writes the transforms of moving
-// dynamic bodies and characters back through Scene::EditTransform. Dynamic bodies should not be
-// children of moving bodies (their local transform is recomputed from the parent's).
+// dynamic bodies and characters back through Scene::EditTransform, parents before children (a
+// dynamic child of a moving body gets its local transform from the parent's new pose).
 class PhysicsWorld {
 public:
     // assets: resolves MeshRenderer models for mesh colliders (null: mesh colliders stay pending).
@@ -101,14 +128,18 @@ public:
     void Sync(Scene& scene);
     // Sync, character movement, simulation over dt, write-back, collision events.
     void Step(Scene& scene, float dt);
+    // Before rendering: shows moving bodies / characters between their last two steps (alpha 0..1
+    // = time since the last step / fixed step). No effect without settings.interpolate.
+    void Interpolate(Scene& scene, float alpha);
     // Removes every body and character without events (scene replaced / restored).
     void Reset();
 
-    // Closest hit along dir (normalized internally), triggers ignored.
+    // Closest hit along dir (normalized internally), triggers ignored; layerMask: bit per collision layer.
     [[nodiscard]] std::optional<PhysicsHit> Raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDistance,
-                                                    Entity ignore = NullEntity) const;
+                                                    Entity ignore = NullEntity, std::uint16_t layerMask = 0xFFFF) const;
     [[nodiscard]] std::optional<PhysicsHit> SphereCast(const glm::vec3& origin, float radius, const glm::vec3& dir,
-                                                       float maxDistance, Entity ignore = NullEntity) const;
+                                                       float maxDistance, Entity ignore = NullEntity,
+                                                       std::uint16_t layerMask = 0xFFFF) const;
 
     // Dynamic bodies only (wakes them up); no effect on others.
     void AddImpulse(Entity entity, const glm::vec3& impulse);

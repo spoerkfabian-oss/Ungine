@@ -4,9 +4,33 @@
 #include <cstdint>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace Engine {
+
+namespace {
+std::mutex                                       g_CacheMutex;
+std::unordered_map<VkDevice, VkPipelineCache>    g_Caches;
+} // namespace
+
+void RegisterPipelineCache(VkDevice device, VkPipelineCache cache)
+{
+    std::scoped_lock lock{g_CacheMutex};
+    if (cache)
+        g_Caches[device] = cache;
+    else
+        g_Caches.erase(device);
+}
+
+VkPipelineCache PipelineCacheFor(VkDevice device)
+{
+    std::scoped_lock lock{g_CacheMutex};
+    const auto it = g_Caches.find(device);
+    return it != g_Caches.end() ? it->second : VK_NULL_HANDLE;
+}
+
 
 VkShaderModule LoadShaderModule(VkDevice device, const std::filesystem::path& path)
 {
@@ -104,7 +128,7 @@ Pipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout, const s
     info.layout       = layout;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline));
+    VK_CHECK(vkCreateComputePipelines(device, PipelineCacheFor(device), 1, &info, nullptr, &pipeline));
     if (debugName)
         Engine::SetDebugName(device, VK_OBJECT_TYPE_PIPELINE, pipeline, debugName);
     return Pipeline{device, pipeline};
@@ -206,7 +230,7 @@ Pipeline GraphicsPipelineBuilder::Build(VkDevice device, VkPipelineLayout layout
     info.layout              = layout;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline));
+    VK_CHECK(vkCreateGraphicsPipelines(device, PipelineCacheFor(device), 1, &info, nullptr, &pipeline));
     if (!m_DebugName.empty())
         Engine::SetDebugName(device, VK_OBJECT_TYPE_PIPELINE, pipeline, m_DebugName.c_str());
     return Pipeline{device, pipeline};
