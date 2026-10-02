@@ -5,6 +5,7 @@
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Script/ScriptNodes.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 
 #include <imgui.h>
@@ -34,15 +35,16 @@ constexpr std::size_t kMaxUndo = 200;
 ImU32 PinColor(PinType type, float alpha = 1.0f)
 {
     const auto c = [&](int r, int g, int b) { return IM_COL32(r, g, b, static_cast<int>(alpha * 255.0f)); };
-    switch (ElementType(type)) { // arrays: the element's color (drawn as a square pin)
-    case PinType::Exec: return c(235, 235, 235);
-    case PinType::Bool: return c(210, 50, 50);
-    case PinType::Int: return c(40, 205, 160);
-    case PinType::Float: return c(150, 225, 70);
-    case PinType::Vec3: return c(245, 195, 45);
-    case PinType::String: return c(235, 90, 210);
-    case PinType::Entity: return c(70, 150, 255);
-    default: break;
+    switch (type.kind) { // containers: the element's color (drawn as a square / diamond pin)
+    case PinKind::Exec: return c(235, 235, 235);
+    case PinKind::Bool: return c(210, 50, 50);
+    case PinKind::Int: return c(40, 205, 160);
+    case PinKind::Float: return c(150, 225, 70);
+    case PinKind::Vec3: return c(245, 195, 45);
+    case PinKind::String: return c(235, 90, 210);
+    case PinKind::Entity: return c(70, 150, 255);
+    case PinKind::Enum: return c(20, 120, 90);
+    case PinKind::Struct: return c(40, 80, 200);
     }
     return c(255, 255, 255);
 }
@@ -50,23 +52,61 @@ ImU32 PinColor(PinType type, float alpha = 1.0f)
 bool IsReroute(const ScriptNode& node) { return node.type == "Utility.Reroute" || node.type == "Utility.RerouteExec"; }
 bool IsFunctionFrame(const ScriptNode& node) { return node.type == "Function.Entry" || node.type == "Function.Return"; }
 
-// Combo over every value type; true when `type` changed.
+// Every value base type: built-ins, then the registered enums and structs.
+std::vector<PinType> BaseTypes(bool keysOnly)
+{
+    std::vector<PinType> types;
+    for (PinType t : {PinType::Bool, PinType::Int, PinType::Float, PinType::Vec3, PinType::String, PinType::Entity})
+        if (!keysOnly || IsKeyType(t))
+            types.push_back(t);
+    for (const std::string& e : ScriptRegistry::EnumNames())
+        types.push_back(PinType::Enum(e));
+    if (!keysOnly)
+        for (const std::string& st : ScriptRegistry::StructNames())
+            types.push_back(PinType::Struct(st));
+    return types;
+}
+
+// Type picker: container (single / array / map), value type, map key type. True when changed.
 bool TypeCombo(const char* id, PinType& type, float width)
 {
     bool changed = false;
     ImGui::SetNextItemWidth(width);
-    if (ImGui::BeginCombo(id, ToString(type), ImGuiComboFlags_HeightLarge)) {
-        for (int t = 1; t < static_cast<int>(PinType::Count); ++t) {
-            const PinType candidate = static_cast<PinType>(t);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(candidate)));
-            if (ImGui::Selectable(ToString(candidate), candidate == type)) {
-                type    = candidate;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(type)));
+    const bool open = ImGui::BeginCombo(id, DisplayName(type).c_str(), ImGuiComboFlags_HeightLarge);
+    ImGui::PopStyleColor();
+    if (!open)
+        return false;
+    int container = static_cast<int>(type.container);
+    if (ImGui::RadioButton("Single", &container, 0) | (ImGui::SameLine(), ImGui::RadioButton("Array", &container, 1)) |
+        (ImGui::SameLine(), ImGui::RadioButton("Map", &container, 2))) {
+        const PinType value = ElementType(type);
+        type    = container == 1 ? ArrayOf(value) : container == 2 ? PinType::Map(PinType::String, value) : value;
+        changed = true;
+    }
+    if (IsMap(type)) {
+        ImGui::SeparatorText("Key");
+        for (PinType key : BaseTypes(true)) {
+            ImGui::PushID(ToString(key).c_str());
+            if (ImGui::Selectable(DisplayName(key).c_str(), KeyType(type) == key, ImGuiSelectableFlags_NoAutoClosePopups)) {
+                type    = PinType::Map(key, ElementType(type));
                 changed = true;
             }
-            ImGui::PopStyleColor();
+            ImGui::PopID();
         }
-        ImGui::EndCombo();
+        ImGui::SeparatorText("Value");
     }
+    for (PinType base : BaseTypes(false)) {
+        ImGui::PushID(ToString(base).c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(base)));
+        if (ImGui::Selectable(DisplayName(base).c_str(), ElementType(type) == base)) {
+            type    = IsArray(type) ? ArrayOf(base) : IsMap(type) ? PinType::Map(KeyType(type), base) : base;
+            changed = true;
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+    ImGui::EndCombo();
     return changed;
 }
 
@@ -108,22 +148,27 @@ std::string NodeTitle(const NodeDesc* desc, const ScriptNode& node)
     case ParamKind::TypeAndCount:
     case ParamKind::PinType: return desc->title + " (" + node.param + ")";
     case ParamKind::Text: return desc->title + ": " + node.param;
-    case ParamKind::Function: return desc->title + " " + node.param;
+    case ParamKind::Function:
+    case ParamKind::StructField: return desc->title + " " + node.param;
+    case ParamKind::StructType:
+    case ParamKind::EnumType: return desc->title + " (" + node.param + ")";
+    case ParamKind::EnumValue: return node.param.empty() ? desc->title : node.param;
     default: return desc->title;
     }
 }
 
 float WidgetWidth(PinType type)
 {
-    if (IsArray(type))
-        return 44.0f; // "[n]" button with a popup editor
-    switch (type) {
-    case PinType::Bool: return 20.0f;
-    case PinType::Int: return 50.0f;
-    case PinType::Float: return 56.0f;
-    case PinType::Vec3: return 156.0f;
-    case PinType::String: return 96.0f;
-    case PinType::Entity: return 30.0f;
+    if (IsContainer(type) || type.kind == PinKind::Struct)
+        return 44.0f; // a button with a popup editor
+    switch (type.kind) {
+    case PinKind::Bool: return 20.0f;
+    case PinKind::Int: return 50.0f;
+    case PinKind::Float: return 56.0f;
+    case PinKind::Vec3: return 156.0f;
+    case PinKind::String: return 96.0f;
+    case PinKind::Entity: return 30.0f;
+    case PinKind::Enum: return 90.0f;
     default: return 0.0f;
     }
 }
@@ -235,7 +280,7 @@ bool ArrayWidget(const char* id, ScriptValue& value, PinType type, float width)
         ImGui::SetTooltip("%s", ToDisplayString(value).c_str());
     if (ImGui::BeginPopup("items")) {
         const PinType element = ElementType(type);
-        ImGui::TextDisabled("%s, %zu item(s)", ToString(type), count);
+        ImGui::TextDisabled("%s, %zu item(s)", DisplayName(type).c_str(), count);
         std::optional<std::size_t> remove;
         for (std::size_t i = 0; i < ArrayItems(value).items.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
@@ -266,22 +311,136 @@ bool ArrayWidget(const char* id, ScriptValue& value, PinType type, float width)
     return changed;
 }
 
+// Structs: a "{..}" button opening the field editors (types from the definition).
+bool StructWidget(const char* id, ScriptValue& value, PinType type, float width)
+{
+    bool               changed = false;
+    const std::string& name    = UserTypeName(type);
+    ImGui::PushID(id);
+    if (ImGui::Button("{..}", ImVec2(width, 0.0f)))
+        ImGui::OpenPopup("fields");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s %s", name.c_str(), ToDisplayString(value).c_str());
+    if (ImGui::BeginPopup("fields")) {
+        const ScriptStructDef* def = ScriptRegistry::FindStruct(name);
+        ImGui::TextDisabled("%s", name.c_str());
+        if (!def)
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unknown struct");
+        else
+            for (const ScriptStructField& f : def->fields) {
+                ImGui::PushID(f.name.c_str());
+                ImGui::TextUnformatted(f.name.c_str());
+                ImGui::SameLine(110.0f);
+                const ScriptValue* current = StructField(value, f.name);
+                ScriptValue        field   = current ? *current : f.value;
+                if (ValueWidget("##field", field, f.type, 180.0f)) {
+                    SetStructField(value, name, f.name, std::move(field));
+                    changed = true;
+                }
+                ImGui::PopID();
+            }
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+// Maps: a "{n}" button opening the entry list (key + value, add / remove).
+bool MapWidget(const char* id, ScriptValue& value, PinType type, float width)
+{
+    bool              changed = false;
+    const PinType     key     = KeyType(type), element = ElementType(type);
+    const std::size_t count   = MapOf(value).items.size();
+    ImGui::PushID(id);
+    if (ImGui::Button(std::format("{{{}}}", count).c_str(), ImVec2(width, 0.0f)))
+        ImGui::OpenPopup("entries");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", ToDisplayString(value).c_str());
+    if (ImGui::BeginPopup("entries")) {
+        ImGui::TextDisabled("%s, %zu entr%s", DisplayName(type).c_str(), count, count == 1 ? "y" : "ies");
+        std::optional<ScriptValue>                      remove;
+        std::optional<std::pair<ScriptValue, ScriptValue>> rekey;
+        int                                             i = 0;
+        for (const auto& [k, v] : MapOf(value).items) {
+            ImGui::PushID(i++);
+            ScriptValue newKey = k;
+            if (ValueWidget("##key", newKey, key, 120.0f) && !ValuesEqual(newKey, k))
+                rekey = std::pair{k, newKey};
+            ImGui::SameLine();
+            ScriptValue item = v;
+            if (ValueWidget("##value", item, element, 160.0f)) {
+                MutableMap(value, key, element).items[k] = std::move(item);
+                changed                                  = true;
+                ImGui::PopID();
+                break; // iterators changed
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove = k;
+            ImGui::PopID();
+        }
+        if (remove) {
+            MutableMap(value, key, element).items.erase(*remove);
+            changed = true;
+        } else if (rekey && !MapOf(value).items.contains(rekey->second)) {
+            auto& items           = MutableMap(value, key, element).items;
+            ScriptValue moved     = items[rekey->first];
+            items.erase(rekey->first);
+            items[rekey->second] = std::move(moved);
+            changed              = true;
+        }
+        if (ImGui::SmallButton("+ Entry")) { // a key not used yet
+            auto&       items = MutableMap(value, key, element).items;
+            ScriptValue k     = DefaultValue(key);
+            for (std::int32_t n = 1; items.contains(k) && n < 10000; ++n)
+                k = key.kind == PinKind::String ? ScriptValue(std::string("key") + std::to_string(n))
+                    : key.kind == PinKind::Bool ? ScriptValue(true)
+                                                : ScriptValue(n);
+            if (!items.contains(k)) {
+                items[k] = DefaultValue(element);
+                changed  = true;
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
 // Value editor shared by inline pins, variables, details and the inspector. Returns true when changed.
 bool ValueWidget(const char* id, ScriptValue& value, PinType type, float width)
 {
-    if (TypeOf(value) != type)
+    if (!ValueFits(value, type))
         value = Convert(value, type);
     if (IsArray(type))
         return ArrayWidget(id, value, type, width);
+    if (IsMap(type))
+        return MapWidget(id, value, type, width);
     ImGui::SetNextItemWidth(width);
-    switch (type) {
-    case PinType::Bool: return ImGui::Checkbox(id, &std::get<bool>(value));
-    case PinType::Int: return ImGui::DragInt(id, &std::get<std::int32_t>(value), 0.2f);
-    case PinType::Float: return ImGui::DragFloat(id, &std::get<float>(value), 0.01f, 0.0f, 0.0f, "%.3g");
-    case PinType::Vec3: return ImGui::DragFloat3(id, &std::get<glm::vec3>(value).x, 0.01f, 0.0f, 0.0f, "%.3g");
-    case PinType::String: return ImGui::InputText(id, &std::get<std::string>(value));
-    case PinType::Entity: ImGui::TextDisabled("self"); return false;
-    default: break;
+    switch (type.kind) {
+    case PinKind::Bool: return ImGui::Checkbox(id, &std::get<bool>(value));
+    case PinKind::Int: return ImGui::DragInt(id, &std::get<std::int32_t>(value), 0.2f);
+    case PinKind::Float: return ImGui::DragFloat(id, &std::get<float>(value), 0.01f, 0.0f, 0.0f, "%.3g");
+    case PinKind::Vec3: return ImGui::DragFloat3(id, &std::get<glm::vec3>(value).x, 0.01f, 0.0f, 0.0f, "%.3g");
+    case PinKind::String: return ImGui::InputText(id, &std::get<std::string>(value));
+    case PinKind::Entity: ImGui::TextDisabled("self"); return false;
+    case PinKind::Enum: {
+        const ScriptEnum* e       = ScriptRegistry::FindEnum(UserTypeName(type));
+        std::int32_t&     current = std::get<std::int32_t>(value);
+        const std::string preview = ScriptRegistry::EnumValueName(UserTypeName(type), current);
+        bool              changed = false;
+        if (ImGui::BeginCombo(id, preview.empty() ? std::to_string(current).c_str() : preview.c_str())) {
+            for (std::size_t i = 0; e && i < e->values.size(); ++i)
+                if (ImGui::Selectable(e->values[i].c_str(), static_cast<std::size_t>(current) == i)) {
+                    current = static_cast<std::int32_t>(i);
+                    changed = true;
+                }
+            ImGui::EndCombo();
+        }
+        return changed;
+    }
+    case PinKind::Struct: return StructWidget(id, value, type, width);
+    case PinKind::Exec: break;
     }
     return false;
 }
@@ -1515,6 +1674,63 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
         }
         break;
     }
+    case ParamKind::StructType:
+    case ParamKind::EnumType: {
+        const bool structs = desc->paramKind == ParamKind::StructType;
+        if (ImGui::BeginCombo(desc->paramLabel.c_str(), param.c_str())) {
+            for (const std::string& name : structs ? ScriptRegistry::StructNames() : ScriptRegistry::EnumNames())
+                if (ImGui::Selectable(name.c_str(), name == param)) {
+                    param  = name;
+                    commit = true;
+                }
+            ImGui::EndCombo();
+        }
+        break;
+    }
+    case ParamKind::EnumValue:
+    case ParamKind::StructField: { // "<type>.<member>": two combos
+        const bool        isEnum = desc->paramKind == ParamKind::EnumValue;
+        const std::size_t dot    = param.find('.');
+        std::string       type   = param.substr(0, dot), member = dot == std::string::npos ? "" : param.substr(dot + 1);
+        if (ImGui::BeginCombo(isEnum ? "Enum" : "Struct", type.c_str())) {
+            for (const std::string& name : isEnum ? ScriptRegistry::EnumNames() : ScriptRegistry::StructNames())
+                if (ImGui::Selectable(name.c_str(), name == type)) {
+                    type   = name;
+                    member.clear();
+                    if (isEnum) {
+                        if (const ScriptEnum* e = ScriptRegistry::FindEnum(name); e && !e->values.empty())
+                            member = e->values.front();
+                    } else if (const ScriptStructDef* st = ScriptRegistry::FindStruct(name); st && !st->fields.empty()) {
+                        member = st->fields.front().name;
+                    }
+                    commit = true;
+                }
+            ImGui::EndCombo();
+        }
+        if (ImGui::BeginCombo(isEnum ? "Value" : "Field", member.c_str())) {
+            std::vector<std::string> members;
+            if (isEnum) {
+                if (const ScriptEnum* e = ScriptRegistry::FindEnum(type))
+                    members = e->values;
+            } else if (const ScriptStructDef* st = ScriptRegistry::FindStruct(type)) {
+                for (const ScriptStructField& f : st->fields)
+                    members.push_back(f.name);
+            }
+            for (const std::string& m : members)
+                if (ImGui::Selectable(m.c_str(), m == member)) {
+                    member = m;
+                    commit = true;
+                }
+            ImGui::EndCombo();
+        }
+        param = type + "." + member;
+        break;
+    }
+    case ParamKind::Cases:
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##cases", "comma separated, e.g. 0, 1, 2", &param);
+        commit = ImGui::IsItemDeactivatedAfterEdit();
+        break;
     case ParamKind::Key:
         if (ImGui::BeginCombo(desc->paramLabel.c_str(), param.c_str(), ImGuiComboFlags_HeightLarge)) {
             for (const std::string& k : KeyNames())
@@ -2130,7 +2346,7 @@ void ScriptGraphEditor::DrawCanvas(Document& doc, const ScriptSystem* debug)
                 else if (pin.output || key.first != pinHit.node)
                     value = "\nValue: (not evaluated yet)";
             }
-            ImGui::SetTooltip("%s (%s)%s\nAlt+click: break links", pin.name.c_str(), ToString(pin.type), value.c_str());
+            ImGui::SetTooltip("%s (%s)%s\nAlt+click: break links", pin.name.c_str(), DisplayName(pin.type).c_str(), value.c_str());
         } else if (linkHit) {
             ImGui::SetTooltip("Double-click: add a reroute knot");
         } else if (nodeHit) {

@@ -2,6 +2,8 @@
 #include "Engine/Script/ScriptGraph.h"
 
 #include <functional>
+#include <optional>
+#include <utility>
 #include <span>
 #include <string>
 #include <vector>
@@ -20,13 +22,23 @@ enum class NodeKind : std::uint8_t { Event, Impure, Pure };
 
 // What the node's param means (the editor shows a matching widget).
 //   Function     name of a function of the graph (Entry / Return / Call nodes)
-//   ElementType  element type of the array pins ("bool".."entity"; set on connect)
-//   TypeAndCount "<element type>:<n>" (Make Array)
-//   PinType      type of a reroute node (set on connect / by the editor; not shown)
-enum class ParamKind : std::uint8_t { None, Text, Variable, Key, Count, Choice, Function, ElementType, TypeAndCount, PinType };
+//   ElementType  element type of the array pins ("bool".."entity", "enum:X", "struct:Y"; set on connect)
+//   TypeAndCount "<element type>:<n>" (Make Array, Select)
+//   PinType      a value type ("float", "map:string:int", ...; reroutes, map nodes)
+//   StructType   struct name (Make / Break Struct)        EnumType   enum name (Switch on Enum)
+//   EnumValue    "<enum>.<value>" (enum literal)          StructField "<struct>.<field>" (Set Field)
+//   Cases        comma separated case values (Switch on Int / String)
+enum class ParamKind : std::uint8_t {
+    None, Text, Variable, Key, Count, Choice, Function, ElementType, TypeAndCount, PinType,
+    StructType, EnumType, EnumValue, StructField, Cases
+};
 
-// How the param adapts when a link is made to the node (ScriptGraph::Connect).
-enum class ParamInference : std::uint8_t { None, PinType, ElementType };
+// How the param adapts when a link is made to the node (ScriptGraph::Connect):
+//   PinType      the param becomes the connected pin's type (reroutes)
+//   ElementType  array pins: the param becomes the connected array's element type
+//   MapType      map pins: the param becomes the connected map type
+//   UserType     struct / enum pins: the param becomes the connected struct / enum name
+enum class ParamInference : std::uint8_t { None, PinType, ElementType, MapType, UserType };
 
 // NodeDesc::execute results besides an exec output pin index.
 inline constexpr int kScriptStop = -1; // the chain ends here (a pushed continuation resumes)
@@ -120,7 +132,12 @@ struct NodeDesc {
     ParamInference           inference     = ParamInference::None;
     bool                     latent        = false; // suspends (not allowed in functions)
     bool                     arrayVariable = false; // ParamKind::Variable: needs an array variable
+    bool                     mapVariable   = false; // ParamKind::Variable: needs a map variable
     bool                     hidden        = false; // not offered in the node palette (function nodes)
+    // Inference only from links on these pins (null: any pin).
+    std::function<bool(std::string_view pin)> infers;
+    // Unconnected input values beyond `defaults` (e.g. struct field defaults); nullopt: the type's.
+    std::function<std::optional<ScriptValue>(const ScriptNode&, const PinInfo&)> pinDefault;
 
     // Pins that depend on the param or the graph (variables, output counts); null: `pins`.
     std::function<std::vector<PinInfo>(const ScriptGraph&, const ScriptNode&)> resolvePins;
@@ -130,8 +147,11 @@ struct NodeDesc {
 
 [[nodiscard]] std::span<const NodeDesc> ScriptNodeTypes();
 [[nodiscard]] const NodeDesc*           FindScriptNodeType(std::string_view type);
-// Element type names for ParamKind::ElementType / TypeAndCount ("bool", "int", ...).
-[[nodiscard]] std::span<const std::string> ElementTypeNames();
+// Element type names for ParamKind::ElementType / TypeAndCount: built-ins ("bool", "int", ...) and
+// the registered enums / structs ("enum:Color", "struct:Item").
+[[nodiscard]] std::vector<std::string> ElementTypeNames();
+// "<type>:<count>" (TypeAndCount params): the type and the count (`fallback` without one).
+[[nodiscard]] std::pair<std::string, int> SplitTypeAndCount(std::string_view param, int fallback);
 // Value of an unconnected input: the node's own default, else the type's, else DefaultValue.
 [[nodiscard]] ScriptValue PinDefault(const ScriptNode& node, const NodeDesc* desc, const PinInfo& pin);
 

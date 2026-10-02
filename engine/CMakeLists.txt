@@ -47,6 +47,7 @@ add_library(Engine STATIC
     src/Script/ScriptGraph.cpp
     src/Script/ScriptNodes.cpp
     src/Script/ScriptValue.cpp
+    src/Script/ScriptRegistry.cpp
     src/Script/ScriptSystem.cpp
     src/ThirdParty/ThirdPartyImpl.cpp)
 

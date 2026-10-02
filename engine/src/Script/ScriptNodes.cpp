@@ -6,6 +6,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Prefab.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Scene/Scene.h"
 
 #include <glm/gtc/quaternion.hpp>
@@ -183,26 +184,18 @@ PinType VariableElement(const ScriptGraph& graph, const ScriptNode& node)
     return IsArray(t) ? ElementType(t) : PinType::Float;
 }
 
-// Scalar type named by a param ("int", "vec3:3" -> Vec3); float if it names none.
+// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3); float if it names none.
 PinType ElementParam(const std::string& param)
 {
-    const auto t = PinTypeFromString(std::string_view(param).substr(0, param.find(':')));
-    return t && *t != PinType::Exec && !IsArray(*t) && *t != PinType::Count ? *t : PinType::Float;
+    const auto t = PinTypeFromString(SplitTypeAndCount(param, 0).first);
+    return t && t->kind != PinKind::Exec && !IsContainer(*t) ? *t : PinType::Float;
 }
 
-// Any value type named by a param (scalars and arrays).
+// Any value type named by a param (scalars and containers).
 PinType ValueParam(const std::string& param)
 {
     const auto t = PinTypeFromString(param);
-    return t && *t != PinType::Exec && *t != PinType::Count ? *t : PinType::Float;
-}
-
-std::vector<std::string> ValueTypeNames()
-{
-    std::vector<std::string> names;
-    for (int i = 1; i < static_cast<int>(PinType::Count); ++i)
-        names.emplace_back(ToString(static_cast<PinType>(i)));
-    return names;
+    return t && t->kind != PinKind::Exec ? *t : PinType::Float;
 }
 
 std::vector<ScriptParam> FunctionParams(const ScriptGraph& graph, const std::string& name, bool inputs)
@@ -217,6 +210,37 @@ int MouseButtonFromName(const std::string& name) { return name == "Right" ? 1 : 
 Entity CameraOf(ScriptContext& c, int pin)
 {
     return c.Connected(pin) ? c.InEntity(pin) : c.GetScene().FindPrimaryCamera();
+}
+
+// "Item.count" -> {"Item", "count"} (the part after the first dot may be empty).
+std::pair<std::string, std::string> SplitDotted(const std::string& param)
+{
+    const std::size_t dot = param.find('.');
+    return dot == std::string::npos ? std::pair{param, std::string()} : std::pair{param.substr(0, dot), param.substr(dot + 1)};
+}
+
+// Comma separated case values, trimmed.
+std::vector<std::string> SplitCases(const std::string& param)
+{
+    std::vector<std::string> cases;
+    std::size_t              start = 0;
+    while (start <= param.size()) {
+        const std::size_t comma = std::min(param.find(',', start), param.size());
+        std::string       c     = param.substr(start, comma - start);
+        c.erase(0, c.find_first_not_of(' '));
+        c.erase(c.find_last_not_of(' ') + 1);
+        if (!c.empty())
+            cases.push_back(std::move(c));
+        start = comma + 1;
+    }
+    return cases;
+}
+
+// Map type of a param / map variable (a string -> int map if it names none).
+PinType MapParam(const std::string& param)
+{
+    const PinType t = ValueParam(param);
+    return IsMap(t) ? t : PinType::Map(PinType::String, PinType::Int);
 }
 
 std::uint32_t CountParam(const std::string& param, std::uint32_t min, std::uint32_t max)
@@ -936,8 +960,7 @@ std::vector<NodeDesc> BuildRegistry()
               }, "First index of Item, -1 if missing");
     {
         const auto count = [](const std::string& param) {
-            const std::size_t colon = param.find(':');
-            return colon == std::string::npos ? 2u : CountParam(param.substr(colon + 1), 1, 16);
+            return static_cast<std::uint32_t>(std::clamp(SplitTypeAndCount(param, 2).second, 1, 16));
         };
         NodeDesc d = Pure("Array.Make", "Make Array", "Array", {}, [count](ScriptContext& c) {
             const PinType            e = ElementParam(c.Param());
@@ -1301,7 +1324,7 @@ std::vector<NodeDesc> BuildRegistry()
             return std::vector<PinInfo>{In("Target", P::Entity), In("Name", P::String), Out("Value", ValueParam(n.param)),
                                         Out("Found", P::Bool)};
         };
-        add(WithParam(std::move(get), ParamKind::Choice, "Type", "float", ValueTypeNames()));
+        add(WithParam(std::move(get), ParamKind::PinType, "Type", "float"));
         NodeDesc set = Flow("Script.SetVariable", "Set Script Variable", {}, [](ScriptContext& c, int) {
             ScriptValue* v = c.InstanceVariable(c.InEntity(2), c.InString(3));
             const bool   ok = v && CanConvert(ValueParam(c.Param()), TypeOf(*v));
@@ -1315,13 +1338,303 @@ std::vector<NodeDesc> BuildRegistry()
             return std::vector<PinInfo>{ExecIn(), ExecOut(), In("Target", P::Entity), In("Name", P::String),
                                         In("Value", ValueParam(n.param)), Out("Success", P::Bool)};
         };
-        add(WithParam(std::move(set), ParamKind::Choice, "Type", "float", ValueTypeNames()));
+        add(WithParam(std::move(set), ParamKind::PinType, "Type", "float"));
     }
     add(WithDefaults(Action("Script.CallEvent", "Call Event on Entity", "Script",
                             {In("Target", P::Entity), In("Event", P::String), Out("Called", P::Bool)},
                             [](ScriptContext& c) { c.Out(4, c.CallEventOn(c.InEntity(2), c.InString(3))); },
                             "Runs the Custom Event of another entity's script now"),
                      {{"Event", std::string("MyEvent")}}));
+
+    // Structs (ScriptRegistry definitions).
+    {
+        NodeDesc d = Pure("Struct.Make", "Make Struct", "Struct", {}, [](ScriptContext& c) {
+            const std::string&     name  = c.Param();
+            ScriptValue            value = MakeStruct(name);
+            const ScriptStructDef* def   = ScriptRegistry::FindStruct(name);
+            const std::size_t      count = def ? def->fields.size() : 0;
+            for (std::size_t i = 0; i < count; ++i)
+                SetStructField(value, name, def->fields[i].name, c.In(static_cast<int>(i)));
+            c.Out(static_cast<int>(count), std::move(value));
+        }, "A struct from its field values");
+        d.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins;
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    pins.push_back(In(f.name, f.type));
+            pins.push_back(Out("Struct", PinType::Struct(n.param)));
+            return pins;
+        };
+        d.pinDefault = [](const ScriptNode& n, const PinInfo& pin) -> std::optional<ScriptValue> {
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    if (f.name == pin.name)
+                        return f.value;
+            return std::nullopt;
+        };
+        d.inference = ParamInference::UserType;
+        add(WithParam(std::move(d), ParamKind::StructType, "Struct", ""));
+
+        NodeDesc b = Pure("Struct.Break", "Break Struct", "Struct", {}, [](ScriptContext& c) {
+            const ScriptValue      value = c.In(0);
+            const ScriptStructDef* def   = ScriptRegistry::FindStruct(c.Param());
+            for (std::size_t i = 0; def && i < def->fields.size(); ++i) {
+                const ScriptValue* field = StructField(value, def->fields[i].name);
+                c.Out(static_cast<int>(i) + 1, field ? Convert(*field, def->fields[i].type) : def->fields[i].value);
+            }
+        }, "The field values of a struct");
+        b.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{In("Struct", PinType::Struct(n.param))};
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(n.param))
+                for (const ScriptStructField& f : def->fields)
+                    pins.push_back(Out(f.name, f.type));
+            return pins;
+        };
+        b.inference = ParamInference::UserType;
+        add(WithParam(std::move(b), ParamKind::StructType, "Struct", ""));
+
+        NodeDesc f = Pure("Struct.SetField", "Set Struct Field", "Struct", {}, [](ScriptContext& c) {
+            const auto [name, field] = SplitDotted(c.Param());
+            ScriptValue value        = c.In(0);
+            SetStructField(value, name, field, c.In(1));
+            c.Out(2, std::move(value));
+        }, "A copy of the struct with one field changed");
+        f.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            const auto [name, field] = SplitDotted(n.param);
+            PinType type             = PinType::Float;
+            if (const ScriptStructDef* def = ScriptRegistry::FindStruct(name))
+                for (const ScriptStructField& x : def->fields)
+                    if (x.name == field)
+                        type = x.type;
+            return std::vector<PinInfo>{In("Struct", PinType::Struct(name)), In("Value", type), Out("Struct", PinType::Struct(name))};
+        };
+        add(WithParam(std::move(f), ParamKind::StructField, "Field", ""));
+    }
+
+    // Enums.
+    {
+        NodeDesc lit = Pure("Enum.Literal", "Enum Value", "Enum", {}, [](ScriptContext& c) {
+            const auto [name, value] = SplitDotted(c.Param());
+            c.Out(0, std::max(ScriptRegistry::EnumValueIndex(name, value), 0));
+        }, "A constant enum value");
+        lit.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{Out("Value", PinType::Enum(SplitDotted(n.param).first))};
+        };
+        add(WithParam(std::move(lit), ParamKind::EnumValue, "Value", ""));
+
+        NodeDesc sw = Flow("Enum.Switch", "Switch on Enum", {}, [](ScriptContext& c, int) {
+            const ScriptEnum*  e     = ScriptRegistry::FindEnum(c.Param());
+            const std::int32_t value = c.InInt(1);
+            const std::int32_t count = e ? static_cast<std::int32_t>(e->values.size()) : 0;
+            return 2 + (value >= 0 && value < count ? value : count);
+        }, "Continues at the output of the value (Default for unknown values)");
+        sw.category    = "Enum";
+        sw.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), In("Selection", PinType::Enum(n.param))};
+            if (const ScriptEnum* e = ScriptRegistry::FindEnum(n.param))
+                for (const std::string& v : e->values)
+                    pins.push_back(ExecOut(v));
+            pins.push_back(ExecOut("Default"));
+            return pins;
+        };
+        sw.inference = ParamInference::UserType;
+        add(WithParam(std::move(sw), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc name = Pure("Enum.ToName", "Enum to Name", "Enum", {}, [](ScriptContext& c) {
+            c.Out(1, ScriptRegistry::EnumValueName(c.Param(), c.InInt(0)));
+        });
+        name.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{In("Value", PinType::Enum(n.param)), Out("Name", P::String)};
+        };
+        name.inference = ParamInference::UserType;
+        add(WithParam(std::move(name), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc from = Pure("Enum.FromName", "Name to Enum", "Enum", {}, [](ScriptContext& c) {
+            const std::int32_t index = ScriptRegistry::EnumValueIndex(c.Param(), c.InString(0));
+            c.Out(1, std::max(index, 0));
+            c.Out(2, index >= 0);
+        });
+        from.resolvePins = [](const ScriptGraph&, const ScriptNode& n) {
+            return std::vector<PinInfo>{In("Name", P::String), Out("Value", PinType::Enum(n.param)), Out("Found", P::Bool)};
+        };
+        add(WithParam(std::move(from), ParamKind::EnumType, "Enum", ""));
+
+        NodeDesc count = Pure("Enum.Count", "Enum Value Count", "Enum", {Out("Count", P::Int)}, [](ScriptContext& c) {
+            const ScriptEnum* e = ScriptRegistry::FindEnum(c.Param());
+            c.Out(0, e ? static_cast<std::int32_t>(e->values.size()) : 0);
+        });
+        add(WithParam(std::move(count), ParamKind::EnumType, "Enum", ""));
+    }
+
+    // Maps.
+    const auto mapRead = [&](const char* type, const char* title, auto pins, auto eval, const char* tooltip = "") {
+        NodeDesc d = Pure(type, title, "Map", {}, [eval](ScriptContext& c) {
+            const PinType     t     = MapParam(c.Param());
+            const ScriptValue value = c.In(0);
+            eval(c, MapOf(value), t);
+        }, tooltip);
+        d.resolvePins = [pins](const ScriptGraph&, const ScriptNode& n) { return pins(MapParam(n.param)); };
+        d.inference   = ParamInference::MapType;
+        add(WithParam(std::move(d), ParamKind::PinType, "Map type", "map:string:int"));
+    };
+    mapRead("Map.Find", "Find",
+            [](PinType t) {
+                return std::vector<PinInfo>{In("Map", t), In("Key", KeyType(t)), Out("Value", ElementType(t)), Out("Found", P::Bool)};
+            },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                const auto it = m.items.find(c.In(1));
+                c.Out(2, it != m.items.end() ? it->second : DefaultValue(ElementType(t)));
+                c.Out(3, it != m.items.end());
+            }, "The value stored for Key");
+    mapRead("Map.Contains", "Contains Key",
+            [](PinType t) { return std::vector<PinInfo>{In("Map", t), In("Key", KeyType(t)), Out("Result", P::Bool)}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType) { c.Out(2, m.items.contains(c.In(1))); });
+    mapRead("Map.Length", "Length (map)", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Length", P::Int)}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType) { c.Out(1, static_cast<std::int32_t>(m.items.size())); });
+    mapRead("Map.Keys", "Keys", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Keys", ArrayOf(KeyType(t)))}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                std::vector<ScriptValue> keys;
+                for (const auto& [k, v] : m.items)
+                    keys.push_back(k);
+                c.Out(1, MakeArray(KeyType(t), std::move(keys)));
+            }, "All keys (sorted)");
+    mapRead("Map.Values", "Values", [](PinType t) { return std::vector<PinInfo>{In("Map", t), Out("Values", ArrayOf(ElementType(t)))}; },
+            [](ScriptContext& c, const ScriptMap& m, PinType t) {
+                std::vector<ScriptValue> values;
+                for (const auto& [k, v] : m.items)
+                    values.push_back(v);
+                c.Out(1, MakeArray(ElementType(t), std::move(values)));
+            }, "All values (in key order)");
+    const auto mapWrite = [&](const char* type, const char* title, auto data, auto run, const char* tooltip = "") {
+        NodeDesc d = Flow(type, title, {}, [run](ScriptContext& c, int) {
+            ScriptValue* v = c.Variable(c.Param());
+            if (!v || !IsMap(TypeOf(*v))) {
+                c.Error("'" + c.Param() + "' is not a map variable");
+                return 1;
+            }
+            run(c, *v, TypeOf(*v)); // reads its inputs before changing the map
+            return 1;
+        }, tooltip);
+        d.category    = "Map";
+        d.mapVariable = true;
+        d.resolvePins = [data](const ScriptGraph& g, const ScriptNode& n) {
+            const PinType        t = VariableType(g, n);
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            const std::vector<PinInfo> extra = data(IsMap(t) ? t : PinType::Map(PinType::String, PinType::Int));
+            pins.insert(pins.end(), extra.begin(), extra.end());
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Variable, "Map", ""));
+    };
+    mapWrite("Map.Add", "Add (map)", [](PinType t) { return std::vector<PinInfo>{In("Key", KeyType(t)), In("Value", ElementType(t))}; },
+             [](ScriptContext& c, ScriptValue& v, PinType t) {
+                 ScriptValue key = c.In(2), value = c.In(3);
+                 MutableMap(v, KeyType(t), ElementType(t)).items[std::move(key)] = std::move(value);
+             }, "Stores Value for Key (replaces an existing one)");
+    mapWrite("Map.Remove", "Remove (map)", [](PinType t) { return std::vector<PinInfo>{In("Key", KeyType(t)), Out("Removed", P::Bool)}; },
+             [](ScriptContext& c, ScriptValue& v, PinType t) {
+                 const ScriptValue key = c.In(2);
+                 c.Out(3, MutableMap(v, KeyType(t), ElementType(t)).items.erase(key) > 0);
+             });
+    mapWrite("Map.Clear", "Clear (map)", [](PinType) { return std::vector<PinInfo>{}; },
+             [](ScriptContext&, ScriptValue& v, PinType t) { MutableMap(v, KeyType(t), ElementType(t)).items.clear(); });
+
+    // Switches, select, multi gate, retriggerable delay.
+    for (const bool strings : {false, true}) {
+        NodeDesc d = Flow(strings ? "Flow.SwitchString" : "Flow.SwitchInt", strings ? "Switch on String" : "Switch on Int", {},
+                          [strings](ScriptContext& c, int) {
+                              const std::vector<std::string> cases = SplitCases(c.Param());
+                              for (std::size_t i = 0; i < cases.size(); ++i)
+                                  if (strings ? c.InString(1) == cases[i] : c.InInt(1) == std::atoi(cases[i].c_str()))
+                                      return 2 + static_cast<int>(i);
+                              return 2 + static_cast<int>(cases.size()); // Default
+                          },
+                          "Continues at the matching case, else at Default");
+        d.resolvePins = [strings](const ScriptGraph&, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), In("Selection", strings ? P::String : P::Int)};
+            for (const std::string& c : SplitCases(n.param))
+                pins.push_back(ExecOut(c));
+            pins.push_back(ExecOut("Default"));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Cases, "Cases", strings ? "A, B, C" : "0, 1, 2"));
+    }
+    {
+        const auto count = [](const std::string& param) { return std::clamp(SplitTypeAndCount(param, 2).second, 2, 16); };
+        NodeDesc   d     = Pure("Utility.Select", "Select", "Utility", {}, [count](ScriptContext& c) {
+            const int n     = count(c.Param());
+            const int index = c.InInt(0);
+            c.Out(n + 1, index >= 0 && index < n ? c.In(1 + index) : DefaultValue(ElementParam(c.Param())));
+        }, "The option at Index (only that one is evaluated; bools pick 0 / 1)");
+        d.resolvePins = [count](const ScriptGraph&, const ScriptNode& n) {
+            const PinType        t = ElementParam(n.param);
+            std::vector<PinInfo> pins{In("Index", P::Int)};
+            for (int i = 0, c = count(n.param); i < c; ++i)
+                pins.push_back(In("Option " + std::to_string(i), t));
+            pins.push_back(Out("Result", t));
+            return pins;
+        };
+        d.inference = ParamInference::PinType;
+        d.infers    = [](std::string_view pin) { return pin != "Index"; };
+        add(WithParam(std::move(d), ParamKind::TypeAndCount, "Type : options", "float:2"));
+    }
+    {
+        NodeDesc d = Flow("Flow.MultiGate", "Multi Gate", {}, [](ScriptContext& c, int entry) {
+            ScriptContext::NodeState& s = c.State();
+            const int                 n = static_cast<int>(CountParam(c.Param(), 2, 16));
+            if (entry == 1) { // Reset
+                s.counter = 0;
+                s.flag2   = false;
+                return kScriptStop;
+            }
+            const std::int32_t all = (1 << n) - 1;
+            if ((s.counter & all) == all) {
+                if (!c.InBool(3)) // done until Reset
+                    return kScriptStop;
+                s.counter = 0;
+            }
+            if (!s.flag2) { // first run: the start index
+                s.flag2 = true;
+                s.value = std::clamp(c.InInt(4), 0, n - 1);
+            }
+            int pick = -1;
+            if (c.InBool(2)) { // random among the unused outputs
+                std::vector<int> unused;
+                for (int i = 0; i < n; ++i)
+                    if (!(s.counter & (1 << i)))
+                        unused.push_back(i);
+                pick = unused[std::uniform_int_distribution<std::size_t>(0, unused.size() - 1)(Rng())];
+            } else {
+                const int start = std::get<std::int32_t>(Convert(s.value, P::Int));
+                for (int k = 0; k < n && pick < 0; ++k)
+                    if (!(s.counter & (1 << ((start + k) % n))))
+                        pick = (start + k) % n;
+                s.value = (pick + 1) % n;
+            }
+            s.counter |= 1 << pick;
+            return 5 + pick;
+        }, "Each run fires the next unused output (or a random one); Loop starts over when all were used");
+        d.resolvePins = [](const ScriptGraph&, const ScriptNode& node) {
+            std::vector<PinInfo> pins{ExecIn(), ExecIn("Reset"), In("Is Random", P::Bool), In("Loop", P::Bool), In("Start Index", P::Int)};
+            for (std::uint32_t i = 0, n = CountParam(node.param, 2, 16); i < n; ++i)
+                pins.push_back(ExecOut("Out " + std::to_string(i)));
+            return pins;
+        };
+        add(WithParam(std::move(d), ParamKind::Count, "Outputs", "3"));
+    }
+    add(WithDefaults(Flow("Flow.RetriggerableDelay", "Retriggerable Delay",
+                          {ExecIn(), In("Duration", P::Float), ExecOut("Completed")},
+                          [](ScriptContext& c, int entry) {
+                              ScriptContext::NodeState& s = c.State();
+                              if (entry == kScriptResume) // only the latest trigger completes
+                                  return c.ResumeData() == s.counter ? 2 : kScriptStop;
+                              ++s.counter;
+                              c.Suspend(std::max(c.InFloat(1), 0.0f), s.counter);
+                              return kScriptStop;
+                          },
+                          "Continues Duration seconds after the last trigger (each trigger restarts the countdown)"),
+                     {{"Duration", 1.0f}}));
+    r.back().latent = true;
     return r;
 }
 
@@ -1337,10 +1650,14 @@ ScriptValue PinDefault(const ScriptNode& node, const NodeDesc* desc, const PinIn
 {
     if (const auto it = node.defaults.find(pin.name); it != node.defaults.end())
         return Convert(it->second, pin.type);
-    if (desc)
+    if (desc) {
         for (const auto& [name, value] : desc->defaults)
             if (name == pin.name)
                 return Convert(value, pin.type);
+        if (desc->pinDefault)
+            if (auto value = desc->pinDefault(node, pin))
+                return Convert(*value, pin.type);
+    }
     return DefaultValue(pin.type);
 }
 
@@ -1356,10 +1673,24 @@ const NodeDesc* FindScriptNodeType(std::string_view type)
     return it != index.end() ? it->second : nullptr;
 }
 
-std::span<const std::string> ElementTypeNames()
+std::vector<std::string> ElementTypeNames()
 {
-    static const std::vector<std::string> names{"bool", "int", "float", "vec3", "string", "entity"};
+    std::vector<std::string> names{"bool", "int", "float", "vec3", "string", "entity"};
+    for (const std::string& e : ScriptRegistry::EnumNames())
+        names.push_back("enum:" + e);
+    for (const std::string& s : ScriptRegistry::StructNames())
+        names.push_back("struct:" + s);
     return names;
+}
+
+std::pair<std::string, int> SplitTypeAndCount(std::string_view param, int fallback)
+{
+    const std::size_t colon = param.rfind(':');
+    if (colon != std::string_view::npos && colon + 1 < param.size() &&
+        std::all_of(param.begin() + static_cast<std::ptrdiff_t>(colon + 1), param.end(),
+                    [](char ch) { return ch >= '0' && ch <= '9'; }))
+        return {std::string(param.substr(0, colon)), std::atoi(std::string(param.substr(colon + 1)).c_str())};
+    return {std::string(param), fallback};
 }
 
 int KeyFromName(std::string_view name)

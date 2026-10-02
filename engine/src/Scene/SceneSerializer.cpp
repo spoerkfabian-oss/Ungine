@@ -530,7 +530,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
                 if (type == PinType::Entity) {
                     v.value      = NullEntity;
                     v.entityUuid = it->value("uuid", std::uint64_t{0});
-                } else if (type != PinType::Exec && type != PinType::Count) {
+                } else if (type.kind != PinKind::Exec) {
                     v.value = ScriptValueFromJson(it->value("value", json()), type);
                 }
                 script.variables[it.key()] = std::move(v);

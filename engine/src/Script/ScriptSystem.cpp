@@ -151,6 +151,7 @@ struct ScriptSystem::Impl {
         std::vector<char>                      active;  // per function: on the call stack
         std::vector<std::vector<ScriptValue>>  outputs; // per node, per pin
         std::vector<ScriptContext::NodeState>  states;
+        std::vector<std::uint32_t>             evalStamp; // per node: the execution its pure outputs were computed for
         std::vector<Timer>                     timers;
         std::unordered_set<int>                reported; // nodes whose runtime error was logged
         std::string                            graph;    // ScriptComponent::graph it was made for
@@ -190,7 +191,11 @@ struct ScriptSystem::Impl {
     // The context node implementations see: one per running node / evaluation.
     class Exec final : public ScriptContext {
     public:
-        Exec(Impl& impl, Scene& scene, Instance& instance) : m_Impl(impl), m_Scene(scene), m_Instance(instance) {}
+        // Each context is one execution: pure nodes are evaluated once per context (cached by stamp).
+        Exec(Impl& impl, Scene& scene, Instance& instance)
+            : m_Impl(impl), m_Scene(scene), m_Instance(instance), stamp(++impl.evalCounter)
+        {
+        }
 
         int                       node       = 0;
         std::int32_t              resumeData = 0;
@@ -209,7 +214,7 @@ struct ScriptSystem::Impl {
             if (src.node < 0)
                 return c.defaults[static_cast<std::size_t>(pin)];
             const CompiledNode& from = m_Instance.program->nodes[static_cast<std::size_t>(src.node)];
-            if (from.desc->kind == NodeKind::Pure) {
+            if (from.desc->kind == NodeKind::Pure && m_Instance.evalStamp[static_cast<std::size_t>(src.node)] != stamp) {
                 if (depth > 256) {
                     Error("Pure evaluation too deep");
                     return DefaultValue(c.pins[static_cast<std::size_t>(pin)].type);
@@ -223,9 +228,10 @@ struct ScriptSystem::Impl {
                     from.desc->evaluate(*this);
                 --depth;
                 node = saved;
+                m_Instance.evalStamp[static_cast<std::size_t>(src.node)] = stamp;
             }
-            return Convert(m_Instance.outputs[static_cast<std::size_t>(src.node)][static_cast<std::size_t>(src.pin)],
-                           c.pins[static_cast<std::size_t>(pin)].type);
+            return ConvertFrom(m_Instance.outputs[static_cast<std::size_t>(src.node)][static_cast<std::size_t>(src.pin)],
+                               from.pins[static_cast<std::size_t>(src.pin)].type, c.pins[static_cast<std::size_t>(pin)].type);
         }
         void Out(int pin, ScriptValue value) override
         {
@@ -312,6 +318,9 @@ struct ScriptSystem::Impl {
         Impl&     m_Impl;
         Scene&    m_Scene;
         Instance& m_Instance;
+
+    public:
+        const std::uint32_t stamp;
     };
 
     Impl(EventBus& bus, const Input* in, PhysicsWorld* phys, AssetManager* am, AudioSystem* au)
@@ -411,6 +420,7 @@ struct ScriptSystem::Impl {
                         inst->outputs[i][p] = DefaultValue(c.pins[p].type);
             }
             inst->states.resize(program->nodes.size());
+            inst->evalStamp.assign(program->nodes.size(), 0);
         }
         Instance* raw = inst.get();
         instances[EntityKey(e)] = std::move(inst);
@@ -752,6 +762,7 @@ struct ScriptSystem::Impl {
     double         time        = 0.0;
     std::uint32_t  maxSteps    = 100000;
     int            callDepth   = 0;
+    std::uint32_t  evalCounter = 0; // Exec stamps (pure evaluation cache)
     std::uint64_t  nextSerial  = 0;
     std::int32_t   nextTimer   = 0;
     ScriptViewport viewport;

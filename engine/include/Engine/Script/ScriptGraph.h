@@ -77,20 +77,48 @@ struct ScriptFunction {
     std::string                 description;
 };
 
+// A macro: a group of nodes copied into the graph wherever a Macro node uses it (so it may contain
+// latent nodes and several exec inputs / outputs; no events). Its nodes carry the macro's name like
+// function nodes; a Macro Inputs and a Macro Outputs node connect them to the outside.
+struct ScriptMacro {
+    std::string              name;
+    std::vector<ScriptParam> inputs;  // exec (PinType::Exec) and data
+    std::vector<ScriptParam> outputs;
+    std::string              description;
+};
+
+// A custom event with parameters, or an event dispatcher (other scripts bind their custom events
+// to it; calling it runs all of them with the arguments).
+struct ScriptEventDecl {
+    std::string              name;
+    std::vector<ScriptParam> params;
+};
+
 struct ScriptGraph {
-    std::vector<ScriptNode>     nodes;     // all scopes (event graph and functions)
-    std::vector<ScriptLink>     links;     // between nodes of the same scope
-    std::vector<ScriptComment>  comments;
-    std::vector<ScriptVariable> variables;
-    std::vector<ScriptFunction> functions;
-    std::vector<std::uint32_t>  breakpoints; // node ids (debugger; saved with the graph)
-    std::uint32_t               nextId = 1; // nodes and comments
+    std::vector<ScriptNode>      nodes;     // all scopes (event graph, functions, macros)
+    std::vector<ScriptLink>      links;     // between nodes of the same scope
+    std::vector<ScriptComment>   comments;
+    std::vector<ScriptVariable>  variables;
+    std::vector<ScriptFunction>  functions;
+    std::vector<ScriptMacro>     macros;
+    std::vector<ScriptEventDecl> events;      // custom events with parameters
+    std::vector<ScriptEventDecl> dispatchers; // event dispatchers of this script
+    std::vector<std::string>     interfaces;  // implemented interfaces (ScriptRegistry)
+    bool                         library = false; // function / macro library (no events or variables)
+    std::vector<std::uint32_t>   breakpoints; // node ids (debugger; saved with the graph)
+    std::uint32_t                nextId = 1; // nodes and comments
 
     [[nodiscard]] ScriptNode*           FindNode(std::uint32_t id);
     [[nodiscard]] const ScriptNode*     FindNode(std::uint32_t id) const;
     [[nodiscard]] ScriptComment*        FindComment(std::uint32_t id);
     [[nodiscard]] ScriptVariable*       FindVariable(std::string_view name);
     [[nodiscard]] const ScriptVariable* FindVariable(std::string_view name) const;
+    [[nodiscard]] ScriptMacro*          FindMacro(std::string_view name);
+    [[nodiscard]] const ScriptMacro*    FindMacro(std::string_view name) const;
+    [[nodiscard]] const ScriptEventDecl* FindEvent(std::string_view name) const;
+    [[nodiscard]] const ScriptEventDecl* FindDispatcher(std::string_view name) const;
+    // A function or macro of that name (both share the scope names of nodes).
+    [[nodiscard]] bool HasScope(std::string_view name) const;
     [[nodiscard]] ScriptFunction*       FindFunction(std::string_view name);
     [[nodiscard]] const ScriptFunction* FindFunction(std::string_view name) const;
     // A variable as seen from a scope: the function's locals first, then the graph's variables.
@@ -120,6 +148,11 @@ struct ScriptGraph {
     bool RenameFunction(const std::string& from, const std::string& to);
     void RemoveFunction(const std::string& name); // its nodes and comments and every call
     void SetFunctionPure(const std::string& name, bool pure);
+    // Macros: AddMacro creates the macro (exec "In" -> "Out") with its Inputs / Outputs nodes;
+    // rename / remove update its nodes and every Macro node using it.
+    bool AddMacro(const std::string& name, glm::vec2 inputsPosition = {0.0f, 0.0f});
+    bool RenameMacro(const std::string& from, const std::string& to);
+    void RemoveMacro(const std::string& name);
     void FunctionSignatureChanged(const std::string& name); // after editing inputs / outputs
     [[nodiscard]] bool HasBreakpoint(std::uint32_t node) const;
     void               SetBreakpoint(std::uint32_t node, bool enabled);

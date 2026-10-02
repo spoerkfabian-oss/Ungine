@@ -1,5 +1,6 @@
 #include "Engine/Script/ScriptGraph.h"
 #include "Engine/Script/ScriptNodes.h"
+#include "Engine/Script/ScriptRegistry.h"
 
 #include "ScriptJson.h"
 
@@ -48,6 +49,19 @@ bool IsFunctionNode(const std::string& type)
     return type == "Function.Entry" || type == "Function.Return" || type == "Function.Call" || type == "Function.CallPure";
 }
 
+// Enums / structs must be registered (ScriptRegistry).
+bool KnownType(PinType t)
+{
+    const auto check = [](PinKind kind, std::uint16_t name) {
+        if (kind == PinKind::Enum)
+            return ScriptRegistry::FindEnum(TypeNameOf(name)) != nullptr;
+        if (kind == PinKind::Struct)
+            return ScriptRegistry::FindStruct(TypeNameOf(name)) != nullptr;
+        return true;
+    };
+    return check(t.kind, t.name) && (!IsMap(t) || check(t.keyKind, t.keyName));
+}
+
 bool UsesVariable(const ScriptNode& node, const std::string& name)
 {
     const NodeDesc* desc = FindScriptNodeType(node.type);
@@ -62,6 +76,11 @@ const ScriptNode*     ScriptGraph::FindNode(std::uint32_t id) const { return Fin
 ScriptComment*        ScriptGraph::FindComment(std::uint32_t id) { return FindById(comments, id); }
 ScriptVariable*       ScriptGraph::FindVariable(std::string_view name) { return FindByName(variables, name); }
 const ScriptVariable* ScriptGraph::FindVariable(std::string_view name) const { return FindByName(variables, name); }
+ScriptMacro*          ScriptGraph::FindMacro(std::string_view name) { return FindByName(macros, name); }
+const ScriptMacro*    ScriptGraph::FindMacro(std::string_view name) const { return FindByName(macros, name); }
+const ScriptEventDecl* ScriptGraph::FindEvent(std::string_view name) const { return FindByName(events, name); }
+const ScriptEventDecl* ScriptGraph::FindDispatcher(std::string_view name) const { return FindByName(dispatchers, name); }
+bool ScriptGraph::HasScope(std::string_view name) const { return FindFunction(name) || FindMacro(name); }
 ScriptFunction*       ScriptGraph::FindFunction(std::string_view name) { return FindByName(functions, name); }
 const ScriptFunction* ScriptGraph::FindFunction(std::string_view name) const { return FindByName(functions, name); }
 
@@ -130,18 +149,23 @@ std::string ScriptGraph::Connect(std::uint32_t from, const std::string& fromPin,
         return "Connect an output to an input";
 
     // Generic nodes adapt their param to what is connected: reroutes take the pin type, array
-    // nodes the element type.
+    // nodes the element type, map nodes the map type, struct / enum nodes the type's name.
     bool            changed = false;
     const NodeDesc* descA   = FindScriptNodeType(a->type);
     const NodeDesc* descB   = FindScriptNodeType(b->type);
     const auto      adapt   = [&](ScriptNode& node, const NodeDesc& desc, PinType wanted, bool output) {
         if (wanted == PinType::Exec)
             return;
-        std::string param = desc.inference == ParamInference::PinType ? ToString(wanted) : ToString(ElementType(wanted));
-        if (desc.paramKind == ParamKind::TypeAndCount) { // keep the count
-            const std::size_t colon = node.param.find(':');
-            param += colon == std::string::npos ? std::string(":2") : node.param.substr(colon);
+        std::string param;
+        switch (desc.inference) {
+        case ParamInference::PinType:
+        case ParamInference::MapType: param = ToString(wanted); break;
+        case ParamInference::ElementType: param = ToString(ElementType(wanted)); break;
+        case ParamInference::UserType: param = TypeNameOf(wanted.name); break;
+        case ParamInference::None: return;
         }
+        if (desc.paramKind == ParamKind::TypeAndCount) // keep the count
+            param += ":" + std::to_string(SplitTypeAndCount(node.param, 2).second);
         // A reroute whose input is connected keeps its type: only a free one adapts to its target.
         if (node.param == param ||
             (output && desc.inference == ParamInference::PinType &&
@@ -150,15 +174,24 @@ std::string ScriptGraph::Connect(std::uint32_t from, const std::string& fromPin,
         node.param = param;
         changed    = true;
     };
-    if (descB && descB->inference == ParamInference::PinType && inB->type != outA->type)
-        adapt(*b, *descB, outA->type, false);
-    else if (descB && descB->inference == ParamInference::ElementType && IsArray(inB->type) && IsArray(outA->type) &&
-             inB->type != outA->type)
+    // Whether `desc` adapts when its pin (of type `own`) meets `other`.
+    const auto infers = [](const NodeDesc* desc, const std::string& pin, PinType own, PinType other) {
+        if (!desc || (desc->infers && !desc->infers(pin)))
+            return false;
+        switch (desc->inference) {
+        case ParamInference::PinType: return true;
+        case ParamInference::ElementType: return IsArray(own) && IsArray(other);
+        case ParamInference::MapType: return IsMap(own) && IsMap(other);
+        case ParamInference::UserType:
+            return !IsContainer(own) && !IsContainer(other) && IsUserType(own) && own.kind == other.kind;
+        case ParamInference::None: break;
+        }
+        return false;
+    };
+    if (inB->type != outA->type && infers(descB, toPin, inB->type, outA->type))
         adapt(*b, *descB, outA->type, false);
     inB = FindPin(*this, *b, toPin, false);
-    if (inB && !CanConvert(outA->type, inB->type) && descA &&
-        (descA->inference == ParamInference::PinType ||
-         (descA->inference == ParamInference::ElementType && IsArray(outA->type) && IsArray(inB->type))))
+    if (inB && !CanConvert(outA->type, inB->type) && infers(descA, fromPin, outA->type, inB->type))
         adapt(*a, *descA, inB->type, true);
     outA = FindPin(*this, *a, fromPin, true);
     inB  = FindPin(*this, *b, toPin, false);
@@ -167,7 +200,7 @@ std::string ScriptGraph::Connect(std::uint32_t from, const std::string& fromPin,
     if (!CanConvert(outA->type, inB->type)) {
         if (changed)
             RemoveDanglingLinks();
-        return std::format("{} is not compatible with {}", ToString(outA->type), ToString(inB->type));
+        return std::format("{} is not compatible with {}", DisplayName(outA->type), DisplayName(inB->type));
     }
 
     const ScriptLink link{.fromNode = from, .fromPin = fromPin, .toNode = to, .toPin = toPin};
@@ -235,7 +268,7 @@ void ScriptGraph::SetVariableType(const std::string& name, PinType type, const s
     if (!function.empty())
         if (ScriptFunction* f = FindFunction(function))
             v = FindByName(f->locals, name);
-    if (!v || v->type == type || type == PinType::Exec || type == PinType::Count)
+    if (!v || v->type == type || type.kind == PinKind::Exec)
         return;
     v->type  = type;
     v->value = DefaultValue(type);
@@ -255,7 +288,7 @@ bool IsValidScriptName(std::string_view name)
 
 bool ScriptGraph::AddFunction(const std::string& name, glm::vec2 entryPosition)
 {
-    if (!IsValidScriptName(name) || FindFunction(name))
+    if (!IsValidScriptName(name) || HasScope(name))
         return false;
     functions.push_back({.name = name, .inputs = {}, .outputs = {}, .locals = {}, .pure = false, .description = {}});
     const std::uint32_t entry = AddNode("Function.Entry", entryPosition, name, name);
@@ -267,7 +300,7 @@ bool ScriptGraph::AddFunction(const std::string& name, glm::vec2 entryPosition)
 bool ScriptGraph::RenameFunction(const std::string& from, const std::string& to)
 {
     ScriptFunction* f = FindFunction(from);
-    if (!f || !IsValidScriptName(to) || FindFunction(to))
+    if (!f || !IsValidScriptName(to) || HasScope(to))
         return false;
     f->name = to;
     for (ScriptNode& n : nodes) {
@@ -304,6 +337,47 @@ void ScriptGraph::SetFunctionPure(const std::string& name, bool pure)
         if ((n.type == "Function.Call" || n.type == "Function.CallPure") && n.param == name)
             n.type = pure ? "Function.CallPure" : "Function.Call";
     RemoveDanglingLinks(); // exec links of the calls
+}
+
+bool ScriptGraph::AddMacro(const std::string& name, glm::vec2 inputsPosition)
+{
+    if (!IsValidScriptName(name) || HasScope(name))
+        return false;
+    macros.push_back({.name = name, .inputs = {{"In", PinType::Exec}}, .outputs = {{"Out", PinType::Exec}}, .description = {}});
+    const std::uint32_t in  = AddNode("Macro.Inputs", inputsPosition, name, name);
+    const std::uint32_t out = AddNode("Macro.Outputs", inputsPosition + glm::vec2(400.0f, 0.0f), name, name);
+    Connect(in, "In", out, "Out");
+    return true;
+}
+
+bool ScriptGraph::RenameMacro(const std::string& from, const std::string& to)
+{
+    ScriptMacro* m = FindMacro(from);
+    if (!m || !IsValidScriptName(to) || HasScope(to))
+        return false;
+    m->name = to;
+    for (ScriptNode& n : nodes) {
+        if (n.function == from)
+            n.function = to;
+        if ((n.type == "Macro.Inputs" || n.type == "Macro.Outputs" || n.type == "Macro.Use") && n.param == from)
+            n.param = to;
+    }
+    for (ScriptComment& c : comments)
+        if (c.function == from)
+            c.function = to;
+    return true;
+}
+
+void ScriptGraph::RemoveMacro(const std::string& name)
+{
+    std::vector<std::uint32_t> remove;
+    for (const ScriptNode& n : nodes)
+        if (n.function == name || (n.type == "Macro.Use" && n.param == name))
+            remove.push_back(n.id);
+    for (std::uint32_t id : remove)
+        RemoveNode(id);
+    std::erase_if(comments, [&](const ScriptComment& c) { return c.function == name; });
+    std::erase_if(macros, [&](const ScriptMacro& m) { return m.name == name; });
 }
 
 void ScriptGraph::FunctionSignatureChanged(const std::string& name)
@@ -353,7 +427,7 @@ ScriptVariable VariableFromJson(const json& v)
     ScriptVariable var;
     var.name = v.at("name").get<std::string>();
     var.type = PinTypeFromString(v.value("type", std::string("float"))).value_or(PinType::Float);
-    if (var.type == PinType::Exec || var.type == PinType::Count)
+    if (var.type.kind == PinKind::Exec)
         var.type = PinType::Float;
     var.value   = v.contains("value") ? ScriptValueFromJson(v["value"], var.type) : DefaultValue(var.type);
     var.exposed = v.value("exposed", false);
@@ -368,13 +442,13 @@ json ParamsToJson(const std::vector<ScriptParam>& params)
     return list;
 }
 
-std::vector<ScriptParam> ParamsFromJson(const json& j)
+std::vector<ScriptParam> ParamsFromJson(const json& j, bool allowExec = false)
 {
     std::vector<ScriptParam> params;
     for (const json& p : j) {
         ScriptParam param{p.at("name").get<std::string>(),
                           PinTypeFromString(p.value("type", std::string("float"))).value_or(PinType::Float)};
-        if (param.type == PinType::Exec || param.type == PinType::Count)
+        if (param.type.kind == PinKind::Exec && !allowExec)
             param.type = PinType::Float;
         params.push_back(std::move(param));
     }
@@ -431,6 +505,30 @@ std::string ScriptGraphToJson(const ScriptGraph& graph)
               {"nodes", std::move(nodes)},  {"links", std::move(links)}, {"comments", std::move(comments)}};
     if (!graph.functions.empty())
         root["functions"] = std::move(functions);
+    if (!graph.macros.empty()) {
+        json macros = json::array();
+        for (const ScriptMacro& m : graph.macros) {
+            json j{{"name", m.name}, {"inputs", ParamsToJson(m.inputs)}, {"outputs", ParamsToJson(m.outputs)}};
+            if (!m.description.empty())
+                j["description"] = m.description;
+            macros.push_back(std::move(j));
+        }
+        root["macros"] = std::move(macros);
+    }
+    const auto decls = [](const std::vector<ScriptEventDecl>& list) {
+        json out = json::array();
+        for (const ScriptEventDecl& d : list)
+            out.push_back({{"name", d.name}, {"params", ParamsToJson(d.params)}});
+        return out;
+    };
+    if (!graph.events.empty())
+        root["events"] = decls(graph.events);
+    if (!graph.dispatchers.empty())
+        root["dispatchers"] = decls(graph.dispatchers);
+    if (!graph.interfaces.empty())
+        root["interfaces"] = graph.interfaces;
+    if (graph.library)
+        root["library"] = true;
     if (!graph.breakpoints.empty())
         root["breakpoints"] = graph.breakpoints;
     return root.dump(2);
@@ -457,6 +555,18 @@ ScriptGraph ScriptGraphFromJson(const std::string& text)
                 fn.locals.push_back(VariableFromJson(v));
             graph.functions.push_back(std::move(fn));
         }
+        for (const json& m : root.value("macros", json::array()))
+            graph.macros.push_back({.name        = m.at("name").get<std::string>(),
+                                    .inputs      = ParamsFromJson(m.value("inputs", json::array()), true),
+                                    .outputs     = ParamsFromJson(m.value("outputs", json::array()), true),
+                                    .description = m.value("description", std::string())});
+        for (const char* key : {"events", "dispatchers"})
+            for (const json& d : root.value(key, json::array()))
+                (std::string_view(key) == "events" ? graph.events : graph.dispatchers)
+                    .push_back({d.at("name").get<std::string>(), ParamsFromJson(d.value("params", json::array()))});
+        for (const json& i : root.value("interfaces", json::array()))
+            graph.interfaces.push_back(i.get<std::string>());
+        graph.library = root.value("library", false);
         std::uint32_t maxId = 0;
         for (const json& n : root.at("nodes")) {
             ScriptNode node;
@@ -470,7 +580,7 @@ ScriptGraph ScriptGraphFromJson(const std::string& text)
                 for (auto it = d->begin(); it != d->end(); ++it) {
                     const PinType type =
                         PinTypeFromString(it->value("type", std::string("float"))).value_or(PinType::Float);
-                    if (type != PinType::Exec && type != PinType::Entity && type != PinType::Count)
+                    if (type.kind != PinKind::Exec && type != PinType::Entity)
                         node.defaults[it.key()] = ScriptValueFromJson(it->at("value"), type);
                 }
             if (node.id == 0 || graph.FindNode(node.id))
@@ -550,7 +660,9 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
                 error(0, "A variable" + where + " has no name");
             else if (!names.insert(v.name).second)
                 error(0, "Variable '" + v.name + "'" + where + " is defined twice");
-            if (TypeOf(v.value) != v.type)
+            if (!KnownType(v.type))
+                error(0, "Variable '" + v.name + "'" + where + ": unknown type " + DisplayName(v.type));
+            else if (!ValueFits(v.value, v.type))
                 error(0, "Variable '" + v.name + "'" + where + " has a value of the wrong type");
         }
     };
@@ -564,9 +676,12 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
         checkVariables(f.locals, " of function '" + f.name + "'");
         for (const auto* params : {&f.inputs, &f.outputs}) {
             std::unordered_set<std::string> names;
-            for (const ScriptParam& p : *params)
+            for (const ScriptParam& p : *params) {
                 if (p.name.empty() || !names.insert(p.name).second)
                     error(0, "Function '" + f.name + "': parameter names must be unique and not empty");
+                if (!KnownType(p.type))
+                    error(0, "Function '" + f.name + "', parameter '" + p.name + "': unknown type " + DisplayName(p.type));
+            }
         }
         const auto entries = std::ranges::count_if(graph.nodes, [&](const ScriptNode& n) {
             return n.type == "Function.Entry" && n.function == f.name;
@@ -591,6 +706,61 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
                 error(n.id, "Unknown variable '" + n.param + "'");
             else if (desc->arrayVariable && !IsArray(v->type))
                 error(n.id, "Variable '" + n.param + "' is not an array");
+            else if (desc->mapVariable && !IsMap(v->type))
+                error(n.id, "Variable '" + n.param + "' is not a map");
+        }
+        // Struct / enum parameters must name registered types.
+        const std::size_t dot = n.param.find('.');
+        switch (desc->paramKind) {
+        case ParamKind::StructType:
+            if (!ScriptRegistry::FindStruct(n.param))
+                error(n.id, "Unknown struct '" + n.param + "'");
+            break;
+        case ParamKind::EnumType:
+            if (!ScriptRegistry::FindEnum(n.param))
+                error(n.id, "Unknown enum '" + n.param + "'");
+            break;
+        case ParamKind::EnumValue:
+            if (dot == std::string::npos || ScriptRegistry::EnumValueIndex(n.param.substr(0, dot), n.param.substr(dot + 1)) < 0)
+                error(n.id, "Unknown enum value '" + n.param + "'");
+            break;
+        case ParamKind::StructField: {
+            const ScriptStructDef* def = dot == std::string::npos ? nullptr : ScriptRegistry::FindStruct(n.param.substr(0, dot));
+            if (!def || std::ranges::none_of(def->fields, [&](const ScriptStructField& f) { return f.name == n.param.substr(dot + 1); }))
+                error(n.id, "Unknown struct field '" + n.param + "'");
+            break;
+        }
+        case ParamKind::Cases: {
+            std::unordered_set<std::string> seen;
+            std::size_t                     count = 0;
+            for (std::size_t start = 0; start <= n.param.size();) {
+                const std::size_t comma = std::min(n.param.find(',', start), n.param.size());
+                std::string       c     = n.param.substr(start, comma - start);
+                c.erase(0, c.find_first_not_of(' '));
+                c.erase(c.find_last_not_of(' ') + 1);
+                start = comma + 1;
+                if (c.empty())
+                    continue;
+                ++count;
+                if (!seen.insert(c).second || c == "Default")
+                    error(n.id, "Case '" + c + "' is listed twice (or named Default)");
+                if (n.type == "Flow.SwitchInt" && c.find_first_not_of("-0123456789") != std::string::npos)
+                    error(n.id, "Case '" + c + "' is not a number");
+            }
+            if (count == 0)
+                error(n.id, "No cases");
+            break;
+        }
+        case ParamKind::PinType:
+            if (const auto t = PinTypeFromString(n.param); !t || !KnownType(*t))
+                error(n.id, "Unknown type '" + n.param + "'");
+            break;
+        case ParamKind::ElementType:
+        case ParamKind::TypeAndCount:
+            if (const auto t = PinTypeFromString(SplitTypeAndCount(n.param, 0).first); !t || !KnownType(*t))
+                error(n.id, "Unknown type '" + n.param + "'");
+            break;
+        default: break;
         }
         if (desc->paramKind == ParamKind::Function) {
             const ScriptFunction* f = graph.FindFunction(n.param);
@@ -641,8 +811,8 @@ std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph)
             continue;
         }
         if (!CanConvert(from->type, to->type))
-            error(l.toNode, std::format("Pin '{}': {} is not compatible with {}", l.toPin, ToString(from->type),
-                                        ToString(to->type)));
+            error(l.toNode, std::format("Pin '{}': {} is not compatible with {}", l.toPin, DisplayName(from->type),
+                                        DisplayName(to->type)));
         if (from->type == PinType::Exec && ++execOut[{l.fromNode, l.fromPin}] == 2)
             error(l.fromNode, "Exec output '" + l.fromPin + "' has several links");
         if (to->type != PinType::Exec && ++dataIn[{l.toNode, l.toPin}] == 2)
