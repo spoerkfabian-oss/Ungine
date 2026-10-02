@@ -1,4 +1,5 @@
 #pragma once
+#include "Engine/Core/InputMap.h"
 #include "Engine/Script/ScriptGraph.h"
 
 #include <functional>
@@ -30,11 +31,12 @@ enum class NodeKind : std::uint8_t { Event, Impure, Pure };
 //   Cases        comma separated case values (Switch on Int / String)
 //   Macro        a macro of the graph or "<Library>.<Macro>"   LibraryFunction "<Library>.<Function>"
 //   Interface    interface name             InterfaceFunction "<Interface>.<Function>"
-//   Dispatcher   an event dispatcher of the graph
+//   Dispatcher   an event dispatcher of the graph       Timeline   a timeline of the graph
+//   InputAction / InputAxis  a project input action / axis (InputMap)
 enum class ParamKind : std::uint8_t {
     None, Text, Variable, Key, Count, Choice, Function, ElementType, TypeAndCount, PinType,
     StructType, EnumType, EnumValue, StructField, Cases, Macro, LibraryFunction, Interface, InterfaceFunction,
-    Dispatcher
+    Dispatcher, Timeline, InputAction, InputAxis
 };
 
 // How the param adapts when a link is made to the node (ScriptGraph::Connect):
@@ -50,6 +52,8 @@ inline constexpr int kScriptStop = -1; // the chain ends here (a pushed continua
 inline constexpr int kScriptResume = -2;
 // NodeDesc::execute result of a Return node: back to the caller of the function.
 inline constexpr int kScriptReturn = -3;
+// NodeDesc::execute entry once per frame while the node ticks (ScriptContext::SetTicking).
+inline constexpr int kScriptTick = -4;
 
 // Where the game view is in the window (pixels) - mouse and camera nodes work relative to it.
 struct ScriptViewport {
@@ -86,6 +90,8 @@ public:
         bool         flag    = false;
         bool         flag2   = false;
         ScriptValue  value   = false; // e.g. the array a ForEach iterates
+        double       time    = 0.0;   // timelines, tweens
+        std::vector<ScriptValue> values;
     };
     [[nodiscard]] virtual NodeState& State() = 0;
 
@@ -131,6 +137,26 @@ public:
     virtual std::int32_t SetTimer(const std::string& event, float seconds, bool loop) = 0;
     virtual void         ClearTimer(std::int32_t handle) = 0;
     [[nodiscard]] virtual float TimerRemaining(std::int32_t handle) const = 0; // < 0: not active
+
+    // Per-frame work (timelines, tweens): while on, execute(kScriptTick) runs once per update,
+    // DeltaTime() long after the last one.
+    virtual void                SetTicking(bool on) = 0;
+    [[nodiscard]] virtual float DeltaTime() const   = 0;
+    [[nodiscard]] virtual const ScriptGraph& Graph() const = 0; // the running graph (timelines, variables)
+    [[nodiscard]] virtual const InputMap&    Inputs() const = 0; // project input actions / axes
+
+    // Save games: slots are JSON files in ScriptSystem's save directory, cached in memory (Set /
+    // Get work on the cache, Write / Read sync it with the file).
+    virtual void SaveSet(const std::string& slot, const std::string& key, const ScriptValue& value, PinType type) = 0;
+    [[nodiscard]] virtual std::optional<ScriptValue> SaveGet(const std::string& slot, const std::string& key, PinType type) = 0;
+    virtual bool               SaveWrite(const std::string& slot)  = 0;
+    virtual bool               SaveRead(const std::string& slot)   = 0;
+    [[nodiscard]] virtual bool SaveExists(const std::string& slot) = 0;
+    virtual bool               SaveDelete(const std::string& slot) = 0;
+
+    // Levels: the application handles the request after the update (ScriptSystem::TakeLevelRequest).
+    virtual void RequestLevel(std::string scene, bool quit) = 0;
+    [[nodiscard]] virtual const std::string& CurrentLevel() const = 0;
 };
 
 struct NodeDesc {
@@ -172,6 +198,15 @@ struct NodeDesc {
 [[nodiscard]] std::pair<std::string, int> SplitTypeAndCount(std::string_view param, int fallback);
 // Value of an unconnected input: the node's own default, else the type's, else DefaultValue.
 [[nodiscard]] ScriptValue PinDefault(const ScriptNode& node, const NodeDesc* desc, const PinInfo& pin);
+
+// Easing curves for tweens / Ease ("Linear", "Sine In", ..., "Bounce Out"); unknown names: linear.
+[[nodiscard]] float                        ScriptEase(std::string_view name, float t);
+[[nodiscard]] std::span<const std::string> ScriptEaseNames();
+
+// A keyboard key (KeyNames) or "MouseLeft" / "MouseRight" / "MouseMiddle": held, pressed or
+// released this frame. Unknown names: false.
+enum class KeyQuery : std::uint8_t { Down, Pressed, Released };
+[[nodiscard]] bool QueryKey(const Input& input, std::string_view key, KeyQuery query);
 
 // Key names for key events / Is Key Down ("A".."Z", "0".."9", "Space", "Enter", "Escape", "Tab",
 // "Left", "Right", "Up", "Down", "LeftShift", "LeftControl", "F1".."F12"). -1: unknown.

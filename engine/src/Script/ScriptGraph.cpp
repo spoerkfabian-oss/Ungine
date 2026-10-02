@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <format>
@@ -81,6 +82,29 @@ ScriptMacro*          ScriptGraph::FindMacro(std::string_view name) { return Fin
 const ScriptMacro*    ScriptGraph::FindMacro(std::string_view name) const { return FindByName(macros, name); }
 const ScriptEventDecl* ScriptGraph::FindEvent(std::string_view name) const { return FindByName(events, name); }
 const ScriptEventDecl* ScriptGraph::FindDispatcher(std::string_view name) const { return FindByName(dispatchers, name); }
+const ScriptTimeline* ScriptGraph::FindTimeline(std::string_view name) const { return FindByName(timelines, name); }
+ScriptTimeline*       ScriptGraph::FindTimeline(std::string_view name) { return FindByName(timelines, name); }
+
+glm::vec3 EvaluateTrack(const ScriptTimelineTrack& track, float time)
+{
+    const std::vector<ScriptTimelineKey>& k = track.keys;
+    if (k.empty())
+        return glm::vec3(0.0f);
+    if (time <= k.front().time)
+        return k.front().value;
+    if (time >= k.back().time)
+        return k.back().value;
+    const auto next = std::ranges::upper_bound(k, time, {}, &ScriptTimelineKey::time);
+    const ScriptTimelineKey& a = *(next - 1);
+    const ScriptTimelineKey& b = *next;
+    float t = (time - a.time) / std::max(b.time - a.time, 1e-6f);
+    switch (a.interp) {
+    case ScriptInterp::Constant: t = 0.0f; break;
+    case ScriptInterp::Smooth: t = t * t * (3.0f - 2.0f * t); break;
+    case ScriptInterp::Linear: break;
+    }
+    return a.value + (b.value - a.value) * t;
+}
 bool ScriptGraph::HasScope(std::string_view name) const { return FindFunction(name) || FindMacro(name); }
 ScriptFunction*       ScriptGraph::FindFunction(std::string_view name) { return FindByName(functions, name); }
 const ScriptFunction* ScriptGraph::FindFunction(std::string_view name) const { return FindByName(functions, name); }
@@ -528,6 +552,29 @@ std::string ScriptGraphToJson(const ScriptGraph& graph)
         root["dispatchers"] = decls(graph.dispatchers);
     if (!graph.interfaces.empty())
         root["interfaces"] = graph.interfaces;
+    if (!graph.timelines.empty()) {
+        static constexpr const char* kKinds[]  = {"float", "vector", "event"};
+        static constexpr const char* kInterp[] = {"linear", "constant", "smooth"};
+        json timelines = json::array();
+        for (const ScriptTimeline& t : graph.timelines) {
+            json tracks = json::array();
+            for (const ScriptTimelineTrack& track : t.tracks) {
+                json keys = json::array();
+                for (const ScriptTimelineKey& k : track.keys) {
+                    json key{{"t", k.time}, {"i", kInterp[static_cast<int>(k.interp)]}};
+                    if (track.kind == ScriptTrackKind::Vector)
+                        key["v"] = {k.value.x, k.value.y, k.value.z};
+                    else if (track.kind == ScriptTrackKind::Float)
+                        key["v"] = k.value.x;
+                    keys.push_back(std::move(key));
+                }
+                tracks.push_back({{"name", track.name}, {"kind", kKinds[static_cast<int>(track.kind)]}, {"keys", std::move(keys)}});
+            }
+            timelines.push_back({{"name", t.name}, {"length", t.length}, {"loop", t.loop}, {"autoPlay", t.autoPlay},
+                                 {"tracks", std::move(tracks)}});
+        }
+        root["timelines"] = std::move(timelines);
+    }
     if (graph.library)
         root["library"] = true;
     if (!graph.breakpoints.empty())
@@ -568,6 +615,32 @@ ScriptGraph ScriptGraphFromJson(const std::string& text)
         for (const json& i : root.value("interfaces", json::array()))
             graph.interfaces.push_back(i.get<std::string>());
         graph.library = root.value("library", false);
+        for (const json& t : root.value("timelines", json::array())) {
+            ScriptTimeline timeline;
+            timeline.name     = t.at("name").get<std::string>();
+            timeline.length   = t.value("length", 1.0f);
+            timeline.loop     = t.value("loop", false);
+            timeline.autoPlay = t.value("autoPlay", false);
+            for (const json& tr : t.value("tracks", json::array())) {
+                ScriptTimelineTrack track;
+                track.name              = tr.at("name").get<std::string>();
+                const std::string kind  = tr.value("kind", std::string("float"));
+                track.kind = kind == "vector" ? ScriptTrackKind::Vector : kind == "event" ? ScriptTrackKind::Event : ScriptTrackKind::Float;
+                for (const json& k : tr.value("keys", json::array())) {
+                    ScriptTimelineKey key;
+                    key.time                = k.value("t", 0.0f);
+                    const std::string interp = k.value("i", std::string("linear"));
+                    key.interp = interp == "constant" ? ScriptInterp::Constant : interp == "smooth" ? ScriptInterp::Smooth : ScriptInterp::Linear;
+                    if (const auto v = k.find("v"); v != k.end())
+                        key.value = v->is_array() ? glm::vec3(v->at(0).get<float>(), v->at(1).get<float>(), v->at(2).get<float>())
+                                                  : glm::vec3(v->get<float>(), 0.0f, 0.0f);
+                    track.keys.push_back(key);
+                }
+                std::ranges::stable_sort(track.keys, {}, &ScriptTimelineKey::time);
+                timeline.tracks.push_back(std::move(track));
+            }
+            graph.timelines.push_back(std::move(timeline));
+        }
         std::uint32_t maxId = 0;
         for (const json& n : root.at("nodes")) {
             ScriptNode node;
@@ -747,6 +820,25 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
             }
         }
     }
+    {
+        std::unordered_set<std::string> names;
+        for (const ScriptTimeline& t : graph.timelines) {
+            if (!IsValidScriptName(t.name) || !names.insert(t.name).second)
+                error(0, "Timeline names must be unique names ('" + t.name + "')");
+            if (!(t.length > 0.0f))
+                error(0, "Timeline '" + t.name + "': the length must be > 0");
+            std::unordered_set<std::string> tracks;
+            for (const ScriptTimelineTrack& track : t.tracks) {
+                static constexpr std::array<std::string_view, 4> kReserved{"Update", "Finished", "Reversed", "Time"};
+                if (!IsValidScriptName(track.name) || !tracks.insert(track.name).second ||
+                    std::ranges::find(kReserved, track.name) != kReserved.end())
+                    error(0, "Timeline '" + t.name + "': track names must be unique names, not Update / Finished / Reversed / Time ('" +
+                                 track.name + "')");
+                if (!std::ranges::is_sorted(track.keys, {}, &ScriptTimelineKey::time))
+                    error(0, "Timeline '" + t.name + "', track '" + track.name + "': keys are not sorted by time");
+            }
+        }
+    }
     for (const ScriptMacro& m : graph.macros) {
         if (!IsValidScriptName(m.name) || graph.FindFunction(m.name) ||
             std::ranges::count(graph.macros, m.name, &ScriptMacro::name) > 1)
@@ -914,7 +1006,10 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
         }
         if (desc->paramKind == ParamKind::Key && KeyFromName(n.param) < 0)
             error(n.id, "Unknown key '" + n.param + "'");
-        if ((desc->paramKind == ParamKind::Text) && n.param.empty())
+        if (desc->paramKind == ParamKind::Timeline && !graph.FindTimeline(n.param))
+            error(n.id, "Unknown timeline '" + n.param + "'");
+        if ((desc->paramKind == ParamKind::Text || desc->paramKind == ParamKind::InputAction ||
+             desc->paramKind == ParamKind::InputAxis) && n.param.empty())
             error(n.id, desc->paramLabel + " is empty");
         pins[n.id] = NodePins(graph, n);
     }

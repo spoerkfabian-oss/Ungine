@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -34,8 +35,9 @@ using namespace Engine;
 
 class PlayerApp final : public Application {
 public:
-    PlayerApp(const ApplicationDesc& desc, Project project, std::uint32_t exitAfterFrames)
-        : Application(desc), m_Project(std::move(project)), m_ExitAfterFrames(exitAfterFrames)
+    PlayerApp(const ApplicationDesc& desc, Project project, fs::path saveDirectory, std::uint32_t exitAfterFrames)
+        : Application(desc), m_Project(std::move(project)), m_SaveDirectory(std::move(saveDirectory)),
+          m_ExitAfterFrames(exitAfterFrames)
     {
         m_KeySub = GetEvents().Subscribe<KeyEvent>([this](const KeyEvent& e) {
             if (e.action != InputAction::Press)
@@ -58,26 +60,64 @@ protected:
         m_Audio         = std::make_unique<AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
         m_Audio->Apply(m_Project.settings.audio);
         m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
+        m_Scripts->SetInputMap(m_Project.settings.input);
+        m_Scripts->SetSaveDirectory(m_SaveDirectory);
 
         // Blueprint types, interfaces and libraries of the project (before the scene: values of them).
         ScriptRegistry::Clear();
         for (const std::string& problem : ScriptRegistry::LoadDirectory(m_Project.ContentDirectory()))
             ENGINE_WARN("[Blueprint types] {}", problem);
-        const fs::path scene = m_Project.StartScene();
+        if (!LoadLevel(m_Project.StartScene())) {
+            m_Failed = true;
+            GetWindow().RequestClose();
+        }
+    }
+
+    bool LoadLevel(const fs::path& scene)
+    {
         try {
             m_Models = LoadSceneFile(scene, m_Scene, GetAssets(),
                                      {.renderer = m_SceneRenderer.get(), .camera = &m_FallbackCamera, .physics = &m_Physics->settings});
         } catch (const std::exception& e) {
-            ENGINE_ERROR("Cannot load the start scene: {}", e.what());
-            m_Failed = true;
-            GetWindow().RequestClose();
-            return;
+            ENGINE_ERROR("Cannot load the scene: {}", e.what());
+            return false;
         }
         m_Scene.UpdateTransforms();
         m_Physics->Sync(m_Scene);
         m_Audio->Begin(m_Scene);
+        m_Scripts->SetCurrentLevel(m_Project.Relative(scene));
         m_Scripts->Begin(m_Scene);
         ENGINE_INFO("Playing '{}' ({})", m_Project.settings.name, PathToUtf8(scene));
+        return true;
+    }
+
+    // Open Level: the scene replaces the current one (scripts, audio and physics start over; save
+    // game values in memory stay). A file that does not load keeps the current level.
+    void ChangeLevel(const std::string& scene)
+    {
+        std::error_code ec;
+        const fs::path  file = fs::absolute(PathFromUtf8(scene), ec).lexically_normal(); // relative to the project root
+        std::vector<ModelHandle> probe; // keeps shared models loaded across the switch
+        try {
+            Scene scratch;
+            probe = LoadSceneFile(file, scratch, GetAssets());
+        } catch (const std::exception& e) {
+            ENGINE_ERROR("Open Level '{}' failed: {}", scene, e.what());
+            return;
+        }
+        m_Scripts->End(m_Scene);
+        m_Audio->End(m_Scene);
+        m_Scene.Clear();
+        m_Physics->Reset();
+        const std::vector<ModelHandle> previous = std::exchange(m_Models, {});
+        if (!LoadLevel(file)) {
+            m_Failed = true;
+            GetWindow().RequestClose();
+        }
+        for (ModelHandle h : probe)
+            GetAssets().Release(h);
+        for (ModelHandle h : previous)
+            GetAssets().Release(h);
     }
 
     void OnFixedUpdate(double dt) override
@@ -93,6 +133,12 @@ protected:
         // Mouse / camera nodes work in window coordinates of the whole window.
         m_Scripts->SetViewport({.origin = glm::vec2(0.0f), .size = GetWindow().WindowSize()});
         m_Scripts->Update(m_Scene, static_cast<float>(dt));
+        if (const auto request = m_Scripts->TakeLevelRequest()) {
+            if (request->quit)
+                GetWindow().RequestClose();
+            else
+                ChangeLevel(request->scene);
+        }
         m_Scene.UpdateTransforms();
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
         const CameraData view = m_FallbackCamera.GetData(1.0f);
@@ -148,6 +194,7 @@ protected:
 
 private:
     Project                        m_Project;
+    fs::path                       m_SaveDirectory;
     std::uint32_t                  m_ExitAfterFrames = 0;
     std::uint32_t                  m_Frames          = 0;
     bool                           m_Failed          = false;
@@ -225,7 +272,7 @@ int main(int argc, char** argv)
         desc.renderer      = {.vsync = project->settings.vsync};
         desc.pipelineCache = saved / "pipelines.bin";
         desc.assets.textures.cacheDirectory = saved / "Cache" / "Textures";
-        PlayerApp app(desc, *project, frames);
+        PlayerApp app(desc, *project, saved / "SaveGames", frames);
         app.Run();
         failed = app.Failed();
     } catch (const std::exception& e) {

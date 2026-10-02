@@ -94,6 +94,31 @@ struct ScriptEventDecl {
     std::vector<ScriptParam> params;
 };
 
+// A timeline: tracks of keyed values over `length` seconds, played by its Timeline node (Play,
+// Reverse, ...; per frame Update with the track values; event tracks fire exec outputs at their
+// keys). Float tracks use value.x.
+enum class ScriptTrackKind : std::uint8_t { Float, Vector, Event };
+enum class ScriptInterp : std::uint8_t { Linear, Constant, Smooth }; // towards the next key
+struct ScriptTimelineKey {
+    float        time = 0.0f;
+    glm::vec3    value{0.0f};
+    ScriptInterp interp = ScriptInterp::Linear;
+};
+struct ScriptTimelineTrack {
+    std::string                    name;
+    ScriptTrackKind                kind = ScriptTrackKind::Float;
+    std::vector<ScriptTimelineKey> keys; // sorted by time
+};
+struct ScriptTimeline {
+    std::string                      name;
+    float                            length   = 1.0f;
+    bool                             loop     = false;
+    bool                             autoPlay = false; // starts with BeginPlay
+    std::vector<ScriptTimelineTrack> tracks;
+};
+// A track's value at `time` (clamped to the first / last key; no keys: zero).
+[[nodiscard]] glm::vec3 EvaluateTrack(const ScriptTimelineTrack& track, float time);
+
 struct ScriptGraph {
     std::vector<ScriptNode>      nodes;     // all scopes (event graph, functions, macros)
     std::vector<ScriptLink>      links;     // between nodes of the same scope
@@ -104,6 +129,7 @@ struct ScriptGraph {
     std::vector<ScriptEventDecl> events;      // custom events with parameters
     std::vector<ScriptEventDecl> dispatchers; // event dispatchers of this script
     std::vector<std::string>     interfaces;  // implemented interfaces (ScriptRegistry)
+    std::vector<ScriptTimeline>  timelines;
     bool                         library = false; // function / macro library (no events or variables)
     std::vector<std::uint32_t>   breakpoints; // node ids (debugger; saved with the graph)
     std::uint32_t                nextId = 1; // nodes and comments
@@ -117,6 +143,8 @@ struct ScriptGraph {
     [[nodiscard]] const ScriptMacro*    FindMacro(std::string_view name) const;
     [[nodiscard]] const ScriptEventDecl* FindEvent(std::string_view name) const;
     [[nodiscard]] const ScriptEventDecl* FindDispatcher(std::string_view name) const;
+    [[nodiscard]] const ScriptTimeline*  FindTimeline(std::string_view name) const;
+    [[nodiscard]] ScriptTimeline*        FindTimeline(std::string_view name);
     // A function or macro of that name (both share the scope names of nodes).
     [[nodiscard]] bool HasScope(std::string_view name) const;
     [[nodiscard]] ScriptFunction*       FindFunction(std::string_view name);

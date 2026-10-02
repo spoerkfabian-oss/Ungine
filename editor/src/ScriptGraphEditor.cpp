@@ -158,7 +158,10 @@ std::string NodeTitle(const NodeDesc* desc, const ScriptNode& node)
     case ParamKind::LibraryFunction: return node.param.empty() ? desc->title : node.param;
     case ParamKind::InterfaceFunction: return node.param.empty() ? desc->title : node.param + " (Message)";
     case ParamKind::Interface:
-    case ParamKind::Dispatcher: return desc->title + " " + node.param;
+    case ParamKind::Dispatcher:
+    case ParamKind::Timeline:
+    case ParamKind::InputAction:
+    case ParamKind::InputAxis: return desc->title + " " + node.param;
     default: return desc->title;
     }
 }
@@ -1609,6 +1612,8 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
     switch (desc->paramKind) {
     case ParamKind::None: break;
     case ParamKind::Text:
+    case ParamKind::InputAction:
+    case ParamKind::InputAxis:
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::InputText("##param", &param);
         commit = ImGui::IsItemDeactivatedAfterEdit();
@@ -1650,7 +1655,8 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
     case ParamKind::LibraryFunction:
     case ParamKind::Interface:
     case ParamKind::InterfaceFunction:
-    case ParamKind::Dispatcher: {
+    case ParamKind::Dispatcher:
+    case ParamKind::Timeline: {
         if (node->type == "Macro.Inputs" || node->type == "Macro.Outputs") {
             ImGui::TextDisabled("Macro %s: edit its pins in the sidebar", node->function.c_str());
             break;
@@ -1672,6 +1678,10 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
                         names.push_back(lib + "." + f.name);
             break;
         case ParamKind::Interface: names = ScriptRegistry::InterfaceNames(); break;
+        case ParamKind::Timeline:
+            for (const ScriptTimeline& t : g.timelines)
+                names.push_back(t.name);
+            break;
         case ParamKind::InterfaceFunction:
             for (const std::string& i : ScriptRegistry::InterfaceNames())
                 for (const ScriptInterfaceFunction& f : ScriptRegistry::FindInterface(i)->functions)

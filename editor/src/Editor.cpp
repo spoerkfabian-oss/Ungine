@@ -175,8 +175,15 @@ void Editor::Update(float dt)
     }
 
     // Scripts tick with the frame while playing; they see the keyboard when the viewport has it.
-    if (m_Ctx.scripts && m_PlayState == PlayState::Playing)
+    if (m_Ctx.scripts && m_PlayState == PlayState::Playing) {
         m_Ctx.scripts->Update(m_Ctx.scene, dt, (m_ViewportHovered || m_ViewportFocused) && !WantsKeyboard());
+        if (const auto request = m_Ctx.scripts->TakeLevelRequest()) { // Open Level / Quit Game
+            if (request->quit)
+                Stop();
+            else
+                (void)PlayLevel(PathFromUtf8(request->scene));
+        }
+    }
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();

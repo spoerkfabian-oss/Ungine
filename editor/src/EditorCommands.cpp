@@ -591,11 +591,67 @@ void Editor::Play()
     }
     if (m_Ctx.scripts) {
         m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
+        if (m_Ctx.project) {
+            m_Ctx.scripts->SetInputMap(m_Ctx.project->settings.input);
+            m_Ctx.scripts->SetSaveDirectory(m_Ctx.project->SavedDirectory() / "SaveGames");
+        }
+        m_Ctx.scripts->SetCurrentLevel(m_ScenePath.empty() ? std::string()
+                                       : m_Ctx.project ? m_Ctx.project->Relative(m_ScenePath)
+                                                       : PathToUtf8(m_ScenePath));
         m_Ctx.scripts->Begin(m_Ctx.scene);
     }
     m_PlayState    = PlayState::Playing;
     m_StepRequested = false;
     m_Status       = "Playing";
+}
+
+bool Editor::PlayLevel(const std::filesystem::path& scene)
+{
+    if (m_PlayState == PlayState::Edit)
+        return false;
+    std::error_code ec;
+    const std::filesystem::path file = std::filesystem::absolute(scene, ec).lexically_normal(); // cwd = project root
+    std::vector<ModelHandle>    probe; // shared models stay loaded across the switch
+    try {
+        Scene scratch;
+        probe = LoadSceneFile(file, scratch, m_Ctx.assets);
+    } catch (const std::exception& e) {
+        ENGINE_ERROR("Open Level '{}' failed: {}", PathToUtf8(scene), e.what());
+        m_Status = "Open Level failed (see log)";
+        return false;
+    }
+    if (m_Ctx.scripts)
+        m_Ctx.scripts->End(m_Ctx.scene);
+    if (m_Ctx.audio)
+        m_Ctx.audio->End(m_Ctx.scene);
+    m_Ctx.scene.Clear();
+    if (m_Ctx.physics)
+        m_Ctx.physics->Reset();
+    m_Selection.clear();
+    m_GizmoEdit.reset();
+    m_InspectorEdit.reset();
+    m_EulerEntity = NullEntity;
+    bool loaded   = true;
+    try { // the editor keeps its renderer / camera / physics settings
+        const auto handles = LoadSceneFile(file, m_Ctx.scene, m_Ctx.assets);
+        m_PlayModels.insert(m_PlayModels.end(), handles.begin(), handles.end());
+    } catch (const std::exception& e) {
+        ENGINE_ERROR("Open Level '{}' failed: {}", PathToUtf8(scene), e.what());
+        loaded = false;
+    }
+    for (ModelHandle h : probe)
+        m_Ctx.assets.Release(h);
+    m_Ctx.scene.UpdateTransforms();
+    if (m_Ctx.physics)
+        m_Ctx.physics->Sync(m_Ctx.scene);
+    if (m_Ctx.audio)
+        m_Ctx.audio->Begin(m_Ctx.scene);
+    if (m_Ctx.scripts) {
+        m_Ctx.scripts->SetCurrentLevel(m_Ctx.project ? m_Ctx.project->Relative(file) : PathToUtf8(file));
+        m_Ctx.scripts->Begin(m_Ctx.scene);
+    }
+    m_Status = loaded ? "Playing " + PathToUtf8(file.filename()) : "Open Level failed (see log)";
+    return loaded;
 }
 
 void Editor::Pause()
@@ -635,6 +691,8 @@ void Editor::Stop()
     m_Ctx.scene.UpdateTransforms();
     if (m_Ctx.physics)
         m_Ctx.physics->Reset();
+    for (ModelHandle h : std::exchange(m_PlayModels, {}))
+        m_Ctx.assets.Release(h);
 
     m_Selection.clear();
     for (std::uint64_t uuid : selected)

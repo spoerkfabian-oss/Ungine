@@ -2,6 +2,7 @@
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
@@ -9,9 +10,13 @@
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "ScriptExpand.h"
+#include "ScriptJson.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <unordered_set>
 
@@ -197,6 +202,7 @@ struct ScriptSystem::Impl {
             std::string   event;
         };
         std::unordered_map<std::string, std::vector<Binding>> bindings; // dispatcher -> bound custom events
+        std::vector<int>                                      ticking;  // nodes run with kScriptTick per update
     };
     struct Continuation {
         int          node = 0;
@@ -415,6 +421,52 @@ struct ScriptSystem::Impl {
         {
             std::erase_if(m_Instance.timers, [&](const Timer& t) { return t.handle == handle; });
         }
+        void SetTicking(bool on) override
+        {
+            std::vector<int>& t = m_Instance.ticking;
+            const auto        it = std::ranges::find(t, node);
+            if (on && it == t.end())
+                t.push_back(node);
+            else if (!on && it != t.end())
+                t.erase(it);
+        }
+        float              DeltaTime() const override { return m_Impl.frameDt; }
+        const ScriptGraph& Graph() const override { return m_Instance.program->graph; }
+        const InputMap&    Inputs() const override { return m_Impl.inputMap; }
+        void SaveSet(const std::string& slot, const std::string& key, const ScriptValue& value, PinType type) override
+        {
+            if (nlohmann::json* j = SlotOrError(slot))
+                (*j)[key] = {{"type", ToString(type)}, {"value", ScriptValueToJson(value)}};
+        }
+        std::optional<ScriptValue> SaveGet(const std::string& slot, const std::string& key, PinType type) override
+        {
+            const nlohmann::json* j = SlotOrError(slot);
+            if (!j || !j->contains(key))
+                return std::nullopt;
+            const nlohmann::json& entry = j->at(key);
+            const auto stored = PinTypeFromString(entry.value("type", std::string()));
+            if (!stored || !CanConvert(*stored, type))
+                return std::nullopt;
+            return ConvertFrom(ScriptValueFromJson(entry.value("value", nlohmann::json()), *stored), *stored, type);
+        }
+        bool SaveWrite(const std::string& slot) override { return SlotOrError(slot) && m_Impl.WriteSlot(slot); }
+        bool SaveRead(const std::string& slot) override { return ValidSlot(slot) && m_Impl.ReadSlot(slot); }
+        bool SaveExists(const std::string& slot) override
+        {
+            std::error_code ec;
+            return ValidSlot(slot) && !m_Impl.saveDirectory.empty() && std::filesystem::exists(m_Impl.SlotFile(slot), ec);
+        }
+        bool SaveDelete(const std::string& slot) override
+        {
+            if (!ValidSlot(slot))
+                return false;
+            m_Impl.saves.erase(slot);
+            std::error_code ec;
+            return !m_Impl.saveDirectory.empty() && std::filesystem::remove(m_Impl.SlotFile(slot), ec);
+        }
+        void RequestLevel(std::string scene, bool quit) override { m_Impl.levelRequest = ScriptLevelRequest{std::move(scene), quit}; }
+        const std::string& CurrentLevel() const override { return m_Impl.currentLevel; }
+
         float TimerRemaining(std::int32_t handle) const override
         {
             for (const Timer& t : m_Instance.timers)
@@ -424,6 +476,15 @@ struct ScriptSystem::Impl {
         }
 
     private:
+        bool ValidSlot(const std::string& slot)
+        {
+            if (IsValidScriptName(slot))
+                return true;
+            Error("Invalid save slot name '" + slot + "' (letters, digits, '_', ' ')");
+            return false;
+        }
+        nlohmann::json* SlotOrError(const std::string& slot) { return ValidSlot(slot) ? &m_Impl.Slot(slot) : nullptr; }
+
         Impl&     m_Impl;
         Scene&    m_Scene;
         Instance& m_Instance;
@@ -446,6 +507,54 @@ struct ScriptSystem::Impl {
     {
         const auto it = instances.find(EntityKey(e));
         return it != instances.end() ? it->second.get() : nullptr;
+    }
+
+    // --- Save games ---
+
+    std::filesystem::path SlotFile(const std::string& slot) const { return saveDirectory / PathFromUtf8(slot + ".sav"); }
+
+    // The cached values of a slot (read from its file the first time).
+    nlohmann::json& Slot(const std::string& slot)
+    {
+        if (const auto it = saves.find(slot); it != saves.end())
+            return it->second;
+        if (!ReadSlot(slot))
+            saves[slot] = nlohmann::json::object();
+        return saves[slot];
+    }
+
+    bool ReadSlot(const std::string& slot)
+    {
+        if (saveDirectory.empty())
+            return saves.contains(slot); // memory only
+        std::ifstream in(SlotFile(slot), std::ios::binary);
+        if (!in)
+            return false;
+        try {
+            const nlohmann::json root = nlohmann::json::parse(in);
+            saves[slot]               = root.value("values", nlohmann::json::object());
+            return true;
+        } catch (const std::exception& e) {
+            PrintMessage("Save slot '" + slot + "' is damaged: " + e.what(), 4.0f, true);
+            return false;
+        }
+    }
+
+    bool WriteSlot(const std::string& slot)
+    {
+        if (saveDirectory.empty())
+            return true; // memory only
+        std::error_code ec;
+        std::filesystem::create_directories(saveDirectory, ec);
+        const std::filesystem::path file = SlotFile(slot), temp = file.string() + ".tmp";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            out << nlohmann::json{{"version", 1}, {"values", Slot(slot)}}.dump(2);
+            if (!out)
+                return false;
+        }
+        std::filesystem::rename(temp, file, ec);
+        return !ec;
     }
 
     // --- Programs ---
@@ -556,6 +665,12 @@ struct ScriptSystem::Impl {
             }
             inst->states.resize(program->nodes.size());
             inst->evalStamp.assign(program->nodes.size(), 0);
+            for (std::size_t i = 0; i < program->nodes.size(); ++i) // auto-play timelines
+                if (program->nodes[i].node->type == "Timeline.Play")
+                    if (const ScriptTimeline* t = program->graph.FindTimeline(program->nodes[i].node->param); t && t->autoPlay) {
+                        inst->states[i].flag = true;
+                        inst->ticking.push_back(static_cast<int>(i));
+                    }
         }
         Instance* raw = inst.get();
         instances[EntityKey(e)] = std::move(inst);
@@ -827,9 +942,10 @@ struct ScriptSystem::Impl {
     void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
     {
         ChainState st;
-        st.node  = node;
-        st.entry = entry;
-        st.data  = data;
+        st.node      = node;
+        st.entry     = entry;
+        st.data      = data;
+        st.skipBreak = entry == kScriptTick; // a breakpoint on a timeline stops when it is triggered, not every frame
         if (paused) {
             queued.push_back({EntityKey(inst.entity), inst.serial, std::move(st)});
             return;
@@ -954,6 +1070,7 @@ struct ScriptSystem::Impl {
     bool           running     = false;
     bool           acceptInput = true;
     double         time        = 0.0;
+    float          frameDt     = 0.0f;
     std::uint32_t  maxSteps    = 100000;
     int            callDepth   = 0;
     std::uint32_t  evalCounter = 0; // Exec stamps (pure evaluation cache)
@@ -970,6 +1087,11 @@ struct ScriptSystem::Impl {
     std::vector<ModelHandle>                                        spawned;
     std::vector<ScriptMessage>                                      messages;
     ScriptStats                                                     stats;
+    InputMap                                                        inputMap;
+    std::filesystem::path                                           saveDirectory;
+    std::map<std::string, nlohmann::json>                           saves; // slot -> values (cache)
+    std::optional<ScriptLevelRequest>                               levelRequest;
+    std::string                                                     currentLevel;
 
     // Debugger.
     std::unordered_map<std::string, std::unordered_set<std::uint32_t>> breakpoints; // by program key
@@ -1010,6 +1132,8 @@ void ScriptSystem::Begin(Scene& scene)
     scene.UpdateTransforms();
     w.SyncInstances(scene);
     w.stats.instances = static_cast<std::uint32_t>(w.instances.size());
+    for (const auto& [key, inst] : w.instances)
+        w.stats.ticking += static_cast<std::uint32_t>(inst->ticking.size());
     scene.UpdateTransforms();
 }
 
@@ -1023,6 +1147,7 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     w.stats.nodesExecuted = 0;
     w.stats.eventsFired   = 0;
     w.time += std::max(dt, 0.0f);
+    w.frameDt = std::max(dt, 0.0f);
     scene.UpdateTransforms();
 
     w.SyncInstances(scene);
@@ -1068,6 +1193,14 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
         });
         for (const std::string& event : fire)
             w.CallCustomEvent(scene, inst, event);
+    });
+
+    // Timelines and tweens.
+    forEach([&](Impl::Instance& inst) {
+        const std::vector<int> ticking = inst.ticking; // nodes stop / start ticking meanwhile
+        for (int node : ticking)
+            if (std::ranges::find(inst.ticking, node) != inst.ticking.end())
+                w.RunChain(scene, inst, node, kScriptTick, 0);
     });
 
     // Collisions since the last update (physics steps publish them).
@@ -1124,6 +1257,27 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
                     });
                 }
             }
+            // Input actions: pressed when a bound key goes down, released when the last one goes up.
+            for (const bool pressed : {true, false}) {
+                const std::string type   = pressed ? "Event.InputActionPressed" : "Event.InputActionReleased";
+                const auto        events = inst.program->events.find(type);
+                if (events == inst.program->events.end())
+                    continue;
+                std::vector<std::string> fired;
+                for (int node : events->second) {
+                    const std::string&        name   = inst.program->nodes[static_cast<std::size_t>(node)].node->param;
+                    const InputActionBinding* action = w.inputMap.FindAction(name);
+                    if (!action || std::ranges::find(fired, name) != fired.end())
+                        continue;
+                    const auto any = [&](KeyQuery q) {
+                        return std::ranges::any_of(action->keys, [&](const std::string& k) { return QueryKey(*w.input, k, q); });
+                    };
+                    if (pressed ? any(KeyQuery::Pressed) : any(KeyQuery::Released) && !any(KeyQuery::Down))
+                        fired.push_back(name);
+                }
+                for (const std::string& name : fired)
+                    w.Fire(scene, inst, type, &name, {});
+            }
         });
     }
     forEach([&](Impl::Instance& inst) {
@@ -1136,7 +1290,10 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     w.stats.timers    = 0;
     for (const auto& [key, inst] : w.instances)
         w.stats.timers += static_cast<std::uint32_t>(inst->timers.size());
-    w.stats.queued = static_cast<std::uint32_t>(w.queued.size());
+    w.stats.queued  = static_cast<std::uint32_t>(w.queued.size());
+    w.stats.ticking = 0;
+    for (const auto& [key, inst] : w.instances)
+        w.stats.ticking += static_cast<std::uint32_t>(inst->ticking.size());
     scene.UpdateTransforms();
 }
 
@@ -1190,6 +1347,14 @@ const ScriptStats&             ScriptSystem::Stats() const { return m_Impl->stat
 double                         ScriptSystem::Time() const { return m_Impl->time; }
 
 void ScriptSystem::SetViewport(const ScriptViewport& viewport) { m_Impl->viewport = viewport; }
+void ScriptSystem::SetInputMap(InputMap map) { m_Impl->inputMap = std::move(map); }
+void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)
+{
+    m_Impl->saveDirectory = std::move(directory);
+    m_Impl->saves.clear();
+}
+std::optional<ScriptLevelRequest> ScriptSystem::TakeLevelRequest() { return std::exchange(m_Impl->levelRequest, std::nullopt); }
+void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = std::move(scene); }
 
 void ScriptSystem::SetBreakpoints(const std::filesystem::path& file, std::vector<std::uint32_t> nodes)
 {

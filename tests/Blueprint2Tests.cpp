@@ -1,6 +1,8 @@
 #include "Test.h"
 #include "BlueprintTestUtil.h"
 
+#include "Engine/Core/Input.h"
+#include "Engine/Core/Project.h"
 #include "Engine/Script/ScriptRegistry.h"
 
 #include <filesystem>
@@ -562,4 +564,269 @@ TEST_CASE(Blueprint2_InterfacesAndDispatchers)
           !std::get<bool>(r.Var("attacker.ugraph", hero, "selfImplements")));
     CHECK(r.scripts.Stats().errors == 0);
     r.scripts.End(r.scene);
+}
+
+TEST_CASE(Blueprint2_TimelinesAndTweens)
+{
+    ScriptRegistry::Clear();
+    CHECK(ScriptEase("Quad In", 0.5f) == 0.25f && ScriptEase("Linear", 0.3f) == 0.3f && ScriptEase("Bounce Out", 1.0f) == 1.0f &&
+          ScriptEase("Sine In Out", 0.0f) == 0.0f && std::abs(ScriptEase("Back Out", 1.0f) - 1.0f) < 1e-5f);
+    ScriptTimelineTrack linear{"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {1.0f, glm::vec3(10.0f)}}};
+    CHECK(EvaluateTrack(linear, 0.25f).x == 2.5f && EvaluateTrack(linear, -1.0f).x == 0.0f && EvaluateTrack(linear, 3.0f).x == 10.0f);
+    linear.keys[0].interp = ScriptInterp::Constant;
+    CHECK(EvaluateTrack(linear, 0.9f).x == 0.0f);
+    linear.keys[0].interp = ScriptInterp::Linear;
+
+    Graph g;
+    for (const char* v : {"alpha", "x", "tf"})
+        g.g.variables.push_back({v, PinType::Float, 0.0f, false});
+    for (const char* v : {"pings", "finished"})
+        g.g.variables.push_back({v, PinType::Int, std::int32_t{0}, false});
+    g.g.variables.push_back({"moved", PinType::Bool, false, false});
+    g.g.variables.push_back({"tfDone", PinType::Bool, false, false});
+    g.g.variables.push_back({"pos", PinType::Vec3, glm::vec3(0.0f), false});
+    ScriptTimeline fade{"Fade", 1.0f, false, false, {}};
+    fade.tracks.push_back(linear);
+    fade.tracks.push_back({"Ping", ScriptTrackKind::Event, {{0.5f, glm::vec3(0.0f)}}});
+    fade.tracks.push_back({"Pos", ScriptTrackKind::Vector, {{0.0f, glm::vec3(0.0f)}, {1.0f, glm::vec3(0.0f, 4.0f, 0.0f)}}});
+    g.g.timelines.push_back(fade);
+    const ScriptGraph back = ScriptGraphFromJson(ScriptGraphToJson(g.g));
+    CHECK(back.timelines.size() == 1 && back.timelines[0].tracks.size() == 3 && back.timelines[0].tracks[2].keys[1].value.y == 4.0f &&
+          back.timelines[0].tracks[1].kind == ScriptTrackKind::Event);
+
+    const auto increment = [&](std::uint32_t after, const char* afterPin, const char* var) {
+        const std::uint32_t add = g.Node("Math.AddInt");
+        g.Set(add, "B", std::int32_t{1});
+        g.Link(g.Node("Variable.Get", var), "Value", add, "A");
+        return SetVar(g, after, afterPin, var, add, "Result");
+    };
+    // BeginPlay -> Fade from start: Update -> alpha, pos; Ping -> pings++; Finished -> finished++.
+    const std::uint32_t begin = g.Node("Event.BeginPlay"), tl = g.Node("Timeline.Play", "Fade");
+    g.Link(begin, "Out", tl, "Play from Start");
+    const std::uint32_t setA = SetVar(g, tl, "Update", "alpha", tl, "Alpha");
+    SetVar(g, setA, "Then", "pos", tl, "Pos");
+    increment(tl, "Ping", "pings");
+    increment(tl, "Finished", "finished");
+    // Custom event Back: reverse from the end.
+    g.Link(g.Node("Event.Custom", "Back"), "Out", tl, "Reverse from End");
+    // Tweens: move self to (10, 0, 0) linearly in 1 s; Tween Float 0 -> 1 in 0.5 s.
+    const std::uint32_t begin2 = g.Node("Event.BeginPlay"), move = g.Node("Tween.MoveTo", "Linear");
+    g.Set(move, "Location", glm::vec3(10.0f, 0.0f, 0.0f));
+    g.Link(begin2, "Out", move, "In");
+    const std::uint32_t moved = g.Node("Variable.Set", "moved");
+    g.Set(moved, "Value", true);
+    g.Link(move, "Completed", moved, "In");
+    const std::uint32_t tween = g.Node("Tween.Float", "Linear");
+    g.Set(tween, "Duration", 0.5f);
+    g.Link(moved, "Then", tween, "In");
+    const std::uint32_t begin3 = g.Node("Event.BeginPlay"), tween2 = g.Node("Tween.Float", "Linear");
+    g.Set(tween2, "Duration", 0.5f);
+    g.Link(begin3, "Out", tween2, "In");
+    SetVar(g, tween2, "Update", "tf", tween2, "Value");
+    const std::uint32_t done = g.Node("Variable.Set", "tfDone");
+    g.Set(done, "Value", true);
+    g.Link(tween2, "Completed", done, "In");
+    CHECK(g.Valid());
+    {
+        Graph bad = g; // timelines / tweens are latent: not in functions
+        CHECK(bad.g.AddFunction("F"));
+        bad.Node("Tween.MoveTo", "Linear", "F");
+        CHECK(HasError(bad.g, "latent"));
+        bad.g.timelines[0].tracks[0].name = "Update";
+        CHECK(HasError(bad.g, "track names"));
+    }
+
+    Runner       r;
+    const Entity e = r.Add("Mover", "tl.ugraph", g.g);
+    r.scripts.Begin(r.scene);
+    CHECK(r.scripts.Stats().ticking == 3);
+    r.Run(0.5f);
+    CHECK(std::abs(FloatOf(r.Var("tl.ugraph", e, "alpha")) - 5.0f) < 1e-3f && IntOf(r.Var("tl.ugraph", e, "pings")) == 1);
+    CHECK(std::abs(r.scene.GetRegistry().Get<Transform>(e).position.x - 5.0f) < 1e-3f);
+    CHECK(std::abs(FloatOf(r.Var("tl.ugraph", e, "tf")) - 1.0f) < 1e-4f && std::get<bool>(r.Var("tl.ugraph", e, "tfDone")));
+    r.Run(0.6f);
+    CHECK(FloatOf(r.Var("tl.ugraph", e, "alpha")) == 10.0f && IntOf(r.Var("tl.ugraph", e, "finished")) == 1 &&
+          IntOf(r.Var("tl.ugraph", e, "pings")) == 1);
+    CHECK(std::get<glm::vec3>(r.Var("tl.ugraph", e, "pos")).y == 4.0f);
+    CHECK(r.scene.GetRegistry().Get<Transform>(e).position.x == 10.0f && std::get<bool>(r.Var("tl.ugraph", e, "moved")));
+    CHECK(r.scripts.Stats().ticking == 1); // the second Tween Float runs now
+    // Reverse from the end: back to 0, Ping again (passed backwards), Finished again.
+    {
+        Graph caller;
+        const std::uint32_t b = caller.Node("Event.BeginPlay"), call = caller.Node("Script.CallEvent");
+        caller.Set(call, "Event", std::string("Back"));
+        caller.Link(b, "Out", call, "In");
+        const std::uint32_t find = caller.Node("Entity.FindByName");
+        caller.Set(find, "Name", std::string("Mover"));
+        caller.Link(find, "Entity", call, "Target");
+        CHECK(caller.Valid());
+        r.Add("Caller", "caller.ugraph", caller.g);
+    }
+    r.Run(1.2f);
+    CHECK(FloatOf(r.Var("tl.ugraph", e, "alpha")) == 0.0f && IntOf(r.Var("tl.ugraph", e, "finished")) == 2 &&
+          IntOf(r.Var("tl.ugraph", e, "pings")) == 2);
+    CHECK(r.scripts.Stats().ticking == 0 && r.scripts.Stats().errors == 0);
+    r.scripts.End(r.scene);
+}
+
+TEST_CASE(Blueprint2_InputActionsSaveGameAndLevels)
+{
+    ScriptRegistry::Clear();
+    // Input actions: Jump = Space or MouseLeft, axis MoveForward = W (+1) / S (-1).
+    InputMap map;
+    map.actions.push_back({"Jump", {"Space", "MouseLeft"}});
+    map.axes.push_back({"MoveForward", {{"W", 1.0f}, {"S", -1.0f}}});
+    Graph g;
+    for (const char* v : {"jumps", "releases"})
+        g.g.variables.push_back({v, PinType::Int, std::int32_t{0}, false});
+    g.g.variables.push_back({"axis", PinType::Float, 0.0f, false});
+    g.g.variables.push_back({"down", PinType::Bool, false, false});
+    const auto increment = [&](std::uint32_t after, const char* afterPin, const char* var) {
+        const std::uint32_t add = g.Node("Math.AddInt");
+        g.Set(add, "B", std::int32_t{1});
+        g.Link(g.Node("Variable.Get", var), "Value", add, "A");
+        return SetVar(g, after, afterPin, var, add, "Result");
+    };
+    increment(g.Node("Event.InputActionPressed", "Jump"), "Out", "jumps");
+    increment(g.Node("Event.InputActionReleased", "Jump"), "Out", "releases");
+    const std::uint32_t tick = g.Node("Event.Tick");
+    const std::uint32_t s1   = SetVar(g, tick, "Out", "axis", g.Node("Input.GetAxis", "MoveForward"), "Value");
+    SetVar(g, s1, "Then", "down", g.Node("Input.IsActionDown", "Jump"), "Down");
+    CHECK(g.Valid());
+
+    EventBus     bus;
+    Scene        scene;
+    Input        input{bus};
+    ScriptSystem scripts{bus, &input};
+    scripts.SetInputMap(map);
+    const Entity e = scene.CreateEntity("Player");
+    scene.GetRegistry().Emplace<ScriptComponent>(e, ScriptComponent{"input.ugraph"});
+    scripts.Provide("input.ugraph", g.g);
+    scripts.Begin(scene);
+    // Keys (codes >= 0) and the left mouse button (-1) this frame.
+    const auto frame = [&](std::initializer_list<std::pair<int, InputAction>> keys) {
+        input.NewFrame();
+        for (const auto& [key, action] : keys)
+            if (key < 0)
+                bus.Publish(MouseButtonEvent{0, action, 0});
+            else
+                bus.Publish(KeyEvent{key, 0, action, 0});
+        scripts.Update(scene, 0.016f);
+    };
+    const auto var = [&](const char* name) {
+        const auto watch = scripts.Watch("input.ugraph", e); // keep the copy alive while iterating
+        if (watch)
+            for (const auto& [n, v] : watch->variables)
+                if (n == name)
+                    return v;
+        return ScriptValue(false);
+    };
+    constexpr int kSpace = 32, kW = 87, kS = 83;
+    frame({{kSpace, InputAction::Press}, {kW, InputAction::Press}});
+    CHECK(IntOf(var("jumps")) == 1 && FloatOf(var("axis")) == 1.0f && std::get<bool>(var("down")));
+    frame({{kS, InputAction::Press}});
+    CHECK(FloatOf(var("axis")) == 0.0f && IntOf(var("jumps")) == 1);
+    frame({{-1, InputAction::Press}}); // a second bound key: pressed again
+    CHECK(IntOf(var("jumps")) == 2);
+    frame({{kSpace, InputAction::Release}});
+    CHECK(IntOf(var("releases")) == 0 && std::get<bool>(var("down"))); // the mouse button still holds it
+    frame({{-1, InputAction::Release}, {kW, InputAction::Release}});
+    CHECK(IntOf(var("releases")) == 1 && !std::get<bool>(var("down")) && FloatOf(var("axis")) == -1.0f);
+    scripts.End(scene);
+
+    // Save games: values + variables to a slot file, read by a new script system.
+    const fs::path dir = TempDir("ungine_saves");
+    Graph s;
+    s.g.variables.push_back({"score", PinType::Int, std::int32_t{7}, false});
+    s.g.variables.push_back({"name", PinType::String, std::string("Ada"), false});
+    s.g.variables.push_back({"loaded", PinType::Int, std::int32_t{0}, false});
+    s.g.variables.push_back({"found", PinType::Bool, false, false});
+    s.g.variables.push_back({"exists", PinType::Bool, false, false});
+    s.g.variables.push_back({"level", PinType::String, std::string(), false});
+    s.g.events.push_back({"Load", {}});
+    s.g.events.push_back({"Bad", {}});
+    {
+        const std::uint32_t begin = s.Node("Event.BeginPlay"), set = s.Node("SaveGame.SetValue", "int");
+        s.Set(set, "Key", std::string("best"));
+        s.Set(set, "Value", std::int32_t{42});
+        s.Link(begin, "Out", set, "In");
+        const std::uint32_t vars = s.Node("SaveGame.SaveVariables");
+        s.Set(vars, "Prefix", std::string("v."));
+        s.Link(set, "Then", vars, "In");
+        const std::uint32_t lvl = SetVar(s, vars, "Then", "level", s.Node("Game.CurrentLevel"), "Scene");
+        const std::uint32_t open = s.Node("Game.OpenLevel");
+        s.Set(open, "Scene", std::string("Content/Next.uscene"));
+        s.Link(lvl, "Then", open, "In");
+        // Load: variables back, best -> loaded, exists.
+        const std::uint32_t load = s.Node("Event.Custom", "Load"), lv = s.Node("SaveGame.LoadVariables");
+        s.Set(lv, "Prefix", std::string("v."));
+        s.Link(load, "Out", lv, "In");
+        const std::uint32_t get = s.Node("SaveGame.GetValue", "int");
+        s.Set(get, "Key", std::string("best"));
+        const std::uint32_t a = SetVar(s, lv, "Then", "loaded", get, "Value");
+        const std::uint32_t b = SetVar(s, a, "Then", "found", get, "Found");
+        const std::uint32_t c = SetVar(s, b, "Then", "exists", s.Node("SaveGame.Exists"), "Exists");
+        const std::uint32_t quit = s.Node("Game.Quit");
+        s.Link(c, "Then", quit, "In");
+        const std::uint32_t bad = s.Node("SaveGame.Save");
+        s.Set(bad, "Slot", std::string("../escape"));
+        s.Link(s.Node("Event.Custom", "Bad"), "Out", bad, "In");
+    }
+    CHECK(s.Valid());
+    {
+        Runner r;
+        r.scripts.SetSaveDirectory(dir);
+        r.scripts.SetCurrentLevel("Content/Main.uscene");
+        r.Add("Saver", "save.ugraph", s.g);
+        r.scripts.Begin(r.scene);
+        const auto request = r.scripts.TakeLevelRequest();
+        CHECK(request && !request->quit && request->scene == "Content/Next.uscene" && !r.scripts.TakeLevelRequest());
+        CHECK(fs::exists(dir / "Save1.sav"));
+        r.scripts.End(r.scene);
+    }
+    {
+        Runner r;
+        r.scripts.SetSaveDirectory(dir);
+        Graph changed = s; // different start values: Load Variables restores the saved ones
+        changed.g.variables[0].value = std::int32_t{0};
+        changed.g.variables[1].value = std::string("Bob");
+        changed.g.nodes.erase(std::ranges::find(changed.g.nodes, std::string("Event.BeginPlay"), &ScriptNode::type));
+        std::erase_if(changed.g.links, [&](const ScriptLink& l) { return !changed.g.FindNode(l.fromNode); });
+        CHECK(changed.Valid());
+        const Entity loader = r.Add("Loader", "load.ugraph", changed.g);
+        Graph trigger;
+        const std::uint32_t b = trigger.Node("Event.BeginPlay"), call = trigger.Node("Script.CallEvent");
+        trigger.Set(call, "Event", std::string("Load"));
+        trigger.Link(b, "Out", call, "In");
+        const std::uint32_t find = trigger.Node("Entity.FindByName");
+        trigger.Set(find, "Name", std::string("Loader"));
+        trigger.Link(find, "Entity", call, "Target");
+        const std::uint32_t call2 = trigger.Node("Script.CallEvent");
+        trigger.Set(call2, "Event", std::string("Bad"));
+        trigger.Link(call, "Then", call2, "In");
+        trigger.Link(find, "Entity", call2, "Target");
+        r.Add("Trigger", "trigger.ugraph", trigger.g);
+        r.scripts.Begin(r.scene);
+        CHECK(IntOf(r.Var("load.ugraph", loader, "score")) == 7 &&
+              std::get<std::string>(r.Var("load.ugraph", loader, "name")) == "Ada");
+        CHECK(IntOf(r.Var("load.ugraph", loader, "loaded")) == 42 && std::get<bool>(r.Var("load.ugraph", loader, "found")) &&
+              std::get<bool>(r.Var("load.ugraph", loader, "exists")));
+        const auto request = r.scripts.TakeLevelRequest();
+        CHECK(request && request->quit);
+        CHECK(r.scripts.Stats().errors == 1 && !fs::exists(dir.parent_path() / "escape.sav")); // invalid slot name
+        r.scripts.End(r.scene);
+    }
+    fs::remove_all(dir);
+
+    // Project input settings round trip.
+    const fs::path pdir = TempDir("ungine_input");
+    {
+        auto project = Project::Create(pdir, "InputGame", ProjectTemplates().front());
+        CHECK(project.has_value());
+        project->settings.input = map;
+        CHECK(project->Save());
+        const auto loaded = Project::Load(project->File());
+        CHECK(loaded && loaded->settings.input == map);
+    }
+    fs::remove_all(pdir);
 }

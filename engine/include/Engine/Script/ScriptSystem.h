@@ -52,6 +52,12 @@ struct ScriptWatch {
     std::map<std::pair<std::uint32_t, std::string>, ScriptValue> pins; // last value of each data output
 };
 
+// Asked for by Open Level / Quit Game; the application acts on it after the update.
+struct ScriptLevelRequest {
+    std::string scene; // relative to the working directory (= the project root)
+    bool        quit = false;
+};
+
 struct ScriptStats {
     std::uint32_t instances      = 0;
     std::uint32_t waiting        = 0; // latent threads (Delay)
@@ -60,6 +66,7 @@ struct ScriptStats {
     std::uint32_t errors         = 0; // since Begin
     std::uint32_t timers         = 0; // active
     std::uint32_t queued         = 0; // chains waiting while the debugger pauses
+    std::uint32_t ticking        = 0; // timelines / tweens running
 };
 
 // Runs the visual scripts of a scene (entities with ScriptComponent) while playing. Main thread.
@@ -104,6 +111,13 @@ public:
 
     // Game view rectangle in window pixels (mouse / camera nodes).
     void SetViewport(const ScriptViewport& viewport);
+    // Project input actions / axes (Input Action events, Is Action Down, Get Axis).
+    void SetInputMap(InputMap map);
+    // Where save game slots are written (<slot>.sav); empty: slots live in memory only.
+    void SetSaveDirectory(std::filesystem::path directory);
+    // Open Level / Quit Game since the last call (the latest wins).
+    [[nodiscard]] std::optional<ScriptLevelRequest> TakeLevelRequest();
+    void SetCurrentLevel(std::string scene); // Get Current Level
 
     // --- Debugger. Breakpoints start as the graph's saved ones; SetBreakpoints replaces them for a
     // graph while running (also before Begin compiles it).
