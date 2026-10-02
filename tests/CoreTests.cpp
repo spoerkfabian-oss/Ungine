@@ -6,6 +6,7 @@
 #include "Engine/Assets/Model.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Assets/TextureCooker.h"
+#include "Engine/Core/FlatMap.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -1505,4 +1506,35 @@ TEST_CASE(EventBus_MoveOnlyHandlers)
     bus.Enqueue(Ping{3});
     bus.Flush();
     CHECK(*seen == 5);
+}
+
+TEST_CASE(FlatMap_MapSubsetAndNothrowMove)
+{
+    // Components move without throwing on every standard library (MSVC's std::map does not).
+    static_assert(std::is_nothrow_move_constructible_v<FlatMap<std::string, int>>);
+    static_assert(std::is_nothrow_move_assignable_v<FlatMap<std::string, int>>);
+    static_assert(Component<ScriptComponent>);
+
+    FlatMap<std::string, int> m{{"b", 2}, {"a", 1}};
+    m["c"]              = 3;
+    m[std::string("a")] = 10;
+    CHECK(m.size() == 3 && m.at("a") == 10 && m.contains("b") && !m.contains("z"));
+    std::string keys;
+    for (const auto& [key, value] : m)
+        keys += key;
+    CHECK(keys == "abc"); // key order, like std::map
+    CHECK(m.find(std::string_view("c")) != m.end() && m.find("q") == m.end());
+    CHECK(m.erase("b") == 1 && m.erase("b") == 0 && m.size() == 2);
+    m.erase(m.begin());
+    CHECK(m.size() == 1 && m.begin()->first == "c");
+    bool threw = false;
+    try {
+        (void)m.at("a");
+    } catch (const std::out_of_range&) {
+        threw = true;
+    }
+    CHECK(threw);
+    FlatMap<std::string, int> moved = std::move(m);
+    const FlatMap<std::string, int> expected{{"c", 3}};
+    CHECK(moved.size() == 1 && moved == expected);
 }

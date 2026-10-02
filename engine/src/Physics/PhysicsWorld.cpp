@@ -429,8 +429,8 @@ struct PhysicsWorld::Impl {
                 triangles.push_back(JPH::IndexedTriangle(index(0), index(1), index(2)));
             }
         }
-        JPH::MeshShapeSettings settings(std::move(vertices), std::move(triangles));
-        const JPH::ShapeSettings::ShapeResult result = settings.Create();
+        JPH::MeshShapeSettings meshSettings(std::move(vertices), std::move(triangles));
+        const JPH::ShapeSettings::ShapeResult result = meshSettings.Create();
         if (result.HasError()) {
             ENGINE_WARN("Physics: mesh collider for '{}' mesh {} failed: {}", model.name, meshIndex, result.GetError().c_str());
             return nullptr;
@@ -484,23 +484,23 @@ struct PhysicsWorld::Impl {
         const JPH::EMotionType motion = r.type == BodyType::Static      ? JPH::EMotionType::Static
                                         : r.type == BodyType::Kinematic ? JPH::EMotionType::Kinematic
                                                                         : JPH::EMotionType::Dynamic;
-        JPH::BodyCreationSettings settings(shape, JPH::RVec3(ToJolt(pose.position)), ToJolt(pose.rotation), motion,
+        JPH::BodyCreationSettings bodySettings(shape, JPH::RVec3(ToJolt(pose.position)), ToJolt(pose.rotation), motion,
                                            Layers::Make(r.collider.layer, r.type != BodyType::Static));
-        settings.mMotionQuality = r.type == BodyType::Dynamic && r.body.continuous ? JPH::EMotionQuality::LinearCast
+        bodySettings.mMotionQuality = r.type == BodyType::Dynamic && r.body.continuous ? JPH::EMotionQuality::LinearCast
                                                                                    : JPH::EMotionQuality::Discrete;
-        settings.mUserData       = Key(r.entity);
-        settings.mFriction       = r.collider.friction;
-        settings.mRestitution    = r.collider.restitution;
-        settings.mIsSensor       = r.collider.trigger;
-        settings.mLinearDamping  = r.body.linearDamping;
-        settings.mAngularDamping = r.body.angularDamping;
-        settings.mGravityFactor  = r.body.gravityFactor;
-        settings.mAllowSleeping  = r.body.allowSleeping;
+        bodySettings.mUserData       = Key(r.entity);
+        bodySettings.mFriction       = r.collider.friction;
+        bodySettings.mRestitution    = r.collider.restitution;
+        bodySettings.mIsSensor       = r.collider.trigger;
+        bodySettings.mLinearDamping  = r.body.linearDamping;
+        bodySettings.mAngularDamping = r.body.angularDamping;
+        bodySettings.mGravityFactor  = r.body.gravityFactor;
+        bodySettings.mAllowSleeping  = r.body.allowSleeping;
         if (r.type == BodyType::Dynamic) {
-            settings.mOverrideMassProperties       = JPH::EOverrideMassProperties::CalculateInertia;
-            settings.mMassPropertiesOverride.mMass = std::max(r.body.mass, 1e-3f);
+            bodySettings.mOverrideMassProperties       = JPH::EOverrideMassProperties::CalculateInertia;
+            bodySettings.mMassPropertiesOverride.mMass = std::max(r.body.mass, 1e-3f);
         }
-        r.id = Bodies().CreateAndAddBody(settings, r.type == BodyType::Static ? JPH::EActivation::DontActivate
+        r.id = Bodies().CreateAndAddBody(bodySettings, r.type == BodyType::Static ? JPH::EActivation::DontActivate
                                                                                : JPH::EActivation::Activate);
         if (r.id.IsInvalid()) {
             ENGINE_WARN("Physics: body limit reached");
@@ -653,13 +653,13 @@ struct PhysicsWorld::Impl {
         const float halfHeight = std::max(cc.height * 0.5f - radius, 0.01f); // cylinder part
         const JPH::RefConst<JPH::Shape> capsule = new JPH::CapsuleShape(halfHeight, radius);
 
-        JPH::CharacterVirtualSettings settings;
-        settings.mShape             = capsule;
-        settings.mShapeOffset       = JPH::Vec3(0.0f, halfHeight + radius, 0.0f); // feet at the entity position
-        settings.mMaxSlopeAngle     = cc.maxSlope;
-        settings.mSupportingVolume  = JPH::Plane(JPH::Vec3::sAxisY(), -radius); // contacts below the lower hemisphere center
-        settings.mInnerBodyShape    = capsule; // lets rigid bodies and queries see the character
-        settings.mInnerBodyLayer    = Layers::kMoving; // user layer 0
+        JPH::CharacterVirtualSettings characterSettings;
+        characterSettings.mShape             = capsule;
+        characterSettings.mShapeOffset       = JPH::Vec3(0.0f, halfHeight + radius, 0.0f); // feet at the entity position
+        characterSettings.mMaxSlopeAngle     = cc.maxSlope;
+        characterSettings.mSupportingVolume  = JPH::Plane(JPH::Vec3::sAxisY(), -radius); // contacts below the lower hemisphere center
+        characterSettings.mInnerBodyShape    = capsule; // lets rigid bodies and queries see the character
+        characterSettings.mInnerBodyLayer    = Layers::kMoving; // user layer 0
 
         CharacterRecord r;
         r.entity       = e;
@@ -668,7 +668,7 @@ struct PhysicsWorld::Impl {
         r.between = false;
         r.input        = input;
         r.visit        = visit;
-        r.character = new JPH::CharacterVirtual(&settings, JPH::RVec3(ToJolt(position)), JPH::Quat::sIdentity(), Key(e),
+        r.character = new JPH::CharacterVirtual(&characterSettings, JPH::RVec3(ToJolt(position)), JPH::Quat::sIdentity(), Key(e),
                                                 system.get());
         innerBodies.insert(r.character->GetInnerBodyID().GetIndexAndSequenceNumber());
         characters.emplace(Key(e), std::move(r));

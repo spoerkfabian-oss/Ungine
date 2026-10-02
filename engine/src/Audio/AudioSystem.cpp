@@ -94,7 +94,7 @@ struct AudioSystem::Impl {
     AudioSystemStats stats;
     bool           running = false;
     bool           paused  = false;
-    Scene*         scene   = nullptr; // while running
+    Scene*         activeScene = nullptr; // while running
     double         time    = 0.0;
 
     std::unordered_map<std::string, SoundRef> sounds;
@@ -432,7 +432,7 @@ void AudioSystem::Begin(Scene& scene)
     if (s.running)
         End(scene);
     s.running = true;
-    s.scene   = &scene;
+    s.activeScene = &scene;
     s.sources.clear();
     s.hasListener = false;
 }
@@ -480,7 +480,7 @@ void AudioSystem::End(Scene& /*scene*/)
     s.engine.SetReverb({});
     s.engine.Update();
     s.running = false;
-    s.scene   = nullptr;
+    s.activeScene = nullptr;
 }
 
 bool AudioSystem::Running() const { return m_Impl->running; }
@@ -508,7 +508,7 @@ bool AudioSystem::Play(Entity entity)
         return false;
     auto it = s.sources.find(entity);
     if (it == s.sources.end()) { // added since the last Update (e.g. BeginPlay): sync it now
-        Registry& r = s.scene->GetRegistry();
+        Registry& r = s.activeScene->GetRegistry();
         const AudioSource* config = r.Valid(entity) ? r.TryGet<AudioSource>(entity) : nullptr;
         if (!config)
             return false;
