@@ -84,8 +84,12 @@ bool TypeCombo(const char* id, PinType& type, float width)
     if (!open)
         return false;
     int container = static_cast<int>(type.container);
-    if (ImGui::RadioButton("Single", &container, 0) | (ImGui::SameLine(), ImGui::RadioButton("Array", &container, 1)) |
-        (ImGui::SameLine(), ImGui::RadioButton("Map", &container, 2))) {
+    bool pickContainer = ImGui::RadioButton("Single", &container, 0); // all three drawn (no short circuit)
+    ImGui::SameLine();
+    pickContainer |= ImGui::RadioButton("Array", &container, 1);
+    ImGui::SameLine();
+    pickContainer |= ImGui::RadioButton("Map", &container, 2);
+    if (pickContainer) {
         const PinType value = ElementType(type);
         type    = container == 1 ? ArrayOf(value) : container == 2 ? PinType::Map(PinType::String, value) : value;
         changed = true;
@@ -1031,8 +1035,17 @@ const std::string* ScriptGraphEditor::Scope() const { return ActiveDoc() ? &Acti
 
 void ScriptGraphEditor::ProvideTo(ScriptSystem& scripts) const
 {
-    for (const auto& doc : m_Docs)
+    std::unordered_set<std::string> open;
+    for (const auto& doc : m_Docs) {
         scripts.Provide(doc->path, doc->graph);
+        open.insert(ScriptSystem::Key(doc->path));
+    }
+    for (const auto& [key, path] : m_Provided) // closed since: their files count again
+        if (!open.contains(key))
+            scripts.Provide(path, std::nullopt);
+    m_Provided.clear();
+    for (const auto& doc : m_Docs)
+        m_Provided.emplace(ScriptSystem::Key(doc->path), doc->path);
 }
 
 // --- Window -------------------------------------------------------------------------------------

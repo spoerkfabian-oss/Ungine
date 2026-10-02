@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -2204,6 +2205,13 @@ TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
     bp.OpenSearch("Print");
     editor.OpenAsset(dir / "Mood.uenum");
     runFrames(4);
+    if (const char* shot = std::getenv("UNGINE_TEST_SCREENSHOT")) { // documentation: the windows as they look
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(40);
+        (void)std::system((std::string("import -window root ") + shot).c_str());
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(5);
+    }
     CHECK(!bp.Search("Print", false).empty() && bp.Search("Count", true).size() >= 1 && bp.Search("AddOne", true).size() == 3); // Macro node + its Inputs / Outputs
     bp.OpenScope({});
 

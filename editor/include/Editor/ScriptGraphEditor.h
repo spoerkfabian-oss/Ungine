@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -162,6 +163,8 @@ private:
     std::string            m_SearchQuery;
     bool                   m_SearchReferences = false, m_SearchOpen = false, m_SearchFocus = false;
     std::vector<SearchHit> m_SearchHits;
+    // Graphs handed to a script system by ProvideTo (by key), so closed ones can be taken back.
+    mutable std::map<std::string, std::filesystem::path> m_Provided;
     // Timeline editor.
     std::string m_Timeline;
     int         m_TimelineTrack = 0, m_TimelineKey = -1, m_TimelineComponent = 0;
