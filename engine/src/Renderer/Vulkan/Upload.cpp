@@ -6,6 +6,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
 
 namespace Engine {
 
