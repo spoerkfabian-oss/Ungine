@@ -1,7 +1,7 @@
 // Editor operations that change the scene (all undoable) and scene files.
 #include "Editor/Editor.h"
-#include "FileDialog.h"
-#include "History.h"
+#include "Editor/FileDialog.h"
+#include "Editor/History.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"

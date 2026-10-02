@@ -52,13 +52,22 @@ struct PhysicsSettings {
 
     void SetLayerCollision(std::uint32_t a, std::uint32_t b, bool collide)
     {
+        if (a >= kPhysicsLayers || b >= kPhysicsLayers)
+            return;
         const auto set = [&](std::uint32_t x, std::uint32_t y) {
-            layerCollision[x] = static_cast<std::uint16_t>(collide ? layerCollision[x] | (1u << y) : layerCollision[x] & ~(1u << y));
+            const std::uint16_t bit = static_cast<std::uint16_t>(std::uint16_t{1} << y);
+            if (collide)
+                layerCollision[x] = static_cast<std::uint16_t>(layerCollision[x] | bit);
+            else
+                layerCollision[x] = static_cast<std::uint16_t>(layerCollision[x] & ~bit);
         };
         set(a, b);
         set(b, a);
     }
-    [[nodiscard]] bool LayersCollide(std::uint32_t a, std::uint32_t b) const { return ((layerCollision[a] >> b) & 1u) != 0; }
+    [[nodiscard]] bool LayersCollide(std::uint32_t a, std::uint32_t b) const
+    {
+        return a < kPhysicsLayers && b < kPhysicsLayers && ((layerCollision[a] >> b) & 1u) != 0;
+    }
 
 private:
     static constexpr std::array<std::uint16_t, kPhysicsLayers> MakeAllLayersCollide()

@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -297,8 +298,14 @@ Pose Decompose(const glm::mat4& m)
     return p;
 }
 
-bool Finite(const glm::vec3& v) { return glm::all(glm::isfinite(v)); }
-bool Finite(const glm::quat& q) { return glm::all(glm::isfinite(glm::vec4(q.x, q.y, q.z, q.w))); }
+bool Finite(const glm::vec3& v)
+{
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+bool Finite(const glm::quat& q)
+{
+    return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
+}
 bool ValidPhysicsScale(const glm::vec3& scale)
 {
     constexpr float kMinPhysicsScale = 1e-5f;
@@ -863,8 +870,8 @@ struct PhysicsWorld::Impl {
             const Entity     parent = parentOf(w.entity);
             const glm::mat4 parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
             if (!Finite(w.position) || (w.rotation && !Finite(*w.rotation)) ||
-                !glm::all(glm::isfinite(parentWorld[0])) || !glm::all(glm::isfinite(parentWorld[1])) ||
-                !glm::all(glm::isfinite(parentWorld[2])) || !glm::all(glm::isfinite(parentWorld[3]))) {
+                !Finite(glm::vec3(parentWorld[0])) || !Finite(glm::vec3(parentWorld[1])) ||
+                !Finite(glm::vec3(parentWorld[2])) || !Finite(glm::vec3(parentWorld[3]))) {
                 ENGINE_WARN("Physics: refusing invalid pose write for entity {}", static_cast<std::uint64_t>(w.entity));
                 continue;
             }

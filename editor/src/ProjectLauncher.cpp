@@ -1,6 +1,6 @@
 #include "Editor/ProjectLauncher.h"
-#include "FileDialog.h"
-#include "ImGuiLayer.h"
+#include "Editor/FileDialog.h"
+#include "Editor/ImGuiLayer.h"
 
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"

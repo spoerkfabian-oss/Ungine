@@ -1,5 +1,5 @@
 #include "Editor/ScriptGraphEditor.h"
-#include "FileDialog.h"
+#include "Editor/FileDialog.h"
 
 #include "Engine/Core/Log.h"
 #include "Engine/Scene/Components.h"

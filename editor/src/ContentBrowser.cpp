@@ -1,6 +1,6 @@
 #include "Editor/Editor.h"
 #include "Editor/ScriptGraphEditor.h"
-#include "FileDialog.h"
+#include "Editor/FileDialog.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
