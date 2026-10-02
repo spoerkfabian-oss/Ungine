@@ -191,6 +191,12 @@ struct ScriptGraph {
     bool RenameMacro(const std::string& from, const std::string& to);
     void RemoveMacro(const std::string& name);
     void FunctionSignatureChanged(const std::string& name); // after editing inputs / outputs
+    // Moves nodes of one scope into a new function / macro `name` and puts a call / Macro node
+    // (at `position`) in their place, wired like before: one parameter per outside data source
+    // (its type), one output per inside data source used outside. Functions take at most one exec
+    // entry and exit (pure when there are no exec links and no impure nodes); macros any number.
+    // Returns an error (the graph is unchanged then), empty on success.
+    std::string Collapse(const std::vector<std::uint32_t>& nodes, const std::string& name, bool macro, glm::vec2 position);
     [[nodiscard]] bool HasBreakpoint(std::uint32_t node) const;
     void               SetBreakpoint(std::uint32_t node, bool enabled);
 };

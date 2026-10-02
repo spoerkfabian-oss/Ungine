@@ -297,9 +297,12 @@ void Editor::DrawHierarchyNode(Entity entity)
         flags |= ImGuiTreeNodeFlags_Leaf;
     if (IsSelected(entity))
         flags |= ImGuiTreeNodeFlags_Selected;
-    const Entity prefabRoot = PrefabInstanceRoot(m_Ctx.scene, entity);
-    const bool   tinted     = prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
-    if (prefabRoot != NullEntity) // prefab instances: root bright blue, members lighter
+    const Entity prefabRoot  = PrefabInstanceRoot(m_Ctx.scene, entity);
+    const bool   constructed = registry.Has<ConstructionOwned>(entity);
+    const bool   tinted = constructed || prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
+    if (constructed) // made by a construction script: rebuilt, not saved
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+    else if (prefabRoot != NullEntity) // prefab instances: root bright blue, members lighter
         ImGui::PushStyleColor(ImGuiCol_Text, prefabRoot == entity ? ImVec4(0.35f, 0.65f, 1.0f, 1.0f) : ImVec4(0.6f, 0.78f, 1.0f, 1.0f));
     else if (tinted)
         ImGui::PushStyleColor(ImGuiCol_Text, registry.Has<Light>(entity) ? ImVec4(1.0f, 0.85f, 0.4f, 1.0f)

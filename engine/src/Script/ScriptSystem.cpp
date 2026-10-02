@@ -1514,13 +1514,21 @@ double                         ScriptSystem::Time() const { return m_Impl->time;
 
 void ScriptSystem::SetViewport(const ScriptViewport& viewport) { m_Impl->viewport = viewport; }
 
+// Outside play the compiled programs and breakpoints are not kept: graphs change while editing
+// and Begin must start from their saved breakpoints.
 bool ScriptSystem::RunConstruction(Scene& scene, Entity entity)
 {
     Impl& w = *m_Impl;
     if (!w.running)
-        w.programs.clear(); // editing: the graph files may have changed
-    w.maxSteps = maxStepsPerEvent;
-    return w.Construct(scene, entity);
+        w.programs.clear();
+    auto breakpoints = w.breakpoints;
+    w.maxSteps       = maxStepsPerEvent;
+    const bool ran   = w.Construct(scene, entity);
+    if (!w.running) {
+        w.programs.clear();
+        w.breakpoints = std::move(breakpoints);
+    }
+    return ran;
 }
 
 std::size_t ScriptSystem::RunAllConstruction(Scene& scene)
@@ -1528,8 +1536,14 @@ std::size_t ScriptSystem::RunAllConstruction(Scene& scene)
     Impl& w = *m_Impl;
     if (!w.running)
         w.programs.clear();
-    w.maxSteps = maxStepsPerEvent;
-    return w.ConstructAll(scene);
+    auto breakpoints = w.breakpoints;
+    w.maxSteps       = maxStepsPerEvent;
+    const std::size_t count = w.ConstructAll(scene);
+    if (!w.running) {
+        w.programs.clear();
+        w.breakpoints = std::move(breakpoints);
+    }
+    return count;
 }
 void ScriptSystem::SetInputMap(InputMap map) { m_Impl->inputMap = std::move(map); }
 void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)

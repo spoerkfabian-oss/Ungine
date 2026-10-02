@@ -985,3 +985,54 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
         fs::remove_all(dir);
     }
 }
+
+TEST_CASE(Blueprint2_CollapseToFunctionAndMacro)
+{
+    ScriptRegistry::Clear();
+    // BeginPlay -> Set x = y * 2 -> Print x -> Delay 0.2 -> Print "late".
+    Graph g;
+    g.g.variables.push_back({"x", PinType::Float, 0.0f, false});
+    g.g.variables.push_back({"y", PinType::Int, std::int32_t{21}, false});
+    const std::uint32_t begin = g.Node("Event.BeginPlay"), mul = g.Node("Math.MultiplyFloat"), gety = g.Node("Variable.Get", "y");
+    g.Set(mul, "B", 2.0f);
+    g.Link(gety, "Value", mul, "A");
+    const std::uint32_t setx = SetVar(g, begin, "Out", "x", mul, "Result");
+    const std::uint32_t print = Print(g);
+    g.Link(setx, "Then", print, "In");
+    g.Link(setx, "Value", print, "Text");
+    const std::uint32_t delay = g.Node("Flow.Delay"), late = Print(g, "late");
+    g.Set(delay, "Duration", 0.2f);
+    g.Link(print, "Then", delay, "In");
+    g.Link(delay, "Completed", late, "In");
+    CHECK(g.Valid());
+
+    Graph f = g;
+    CHECK(!f.g.Collapse({begin}, "Bad", false, {}).empty());            // events stay
+    CHECK(!f.g.Collapse({delay}, "Bad", false, {}).empty());            // latent: macro only
+    CHECK(!f.g.Collapse({mul}, "bad.name", false, {}).empty());
+    CHECK(f.g.Collapse({mul, setx}, "Double", false, {100.0f, 0.0f}).empty());
+    const ScriptFunction* fn = f.g.FindFunction("Double");
+    CHECK(fn && !fn->pure && fn->inputs.size() == 1 && fn->inputs[0].type == PinType::Int && fn->outputs.size() == 1 &&
+          fn->outputs[0].type == PinType::Float && f.g.FindNode(mul)->function == "Double");
+    CHECK(f.g.Collapse({print}, "Show", false, {}).empty()); // an impure node with exec in / out
+    CHECK(f.g.Collapse({delay, late}, "Wait", true, {}).empty());
+    CHECK(f.g.FindMacro("Wait") && f.g.FindMacro("Wait")->inputs.size() == 1 && f.g.FindMacro("Wait")->outputs.empty());
+    CHECK(f.Valid());
+    {
+        Graph p = g; // pure: just the multiply
+        CHECK(p.g.Collapse({mul}, "Twice", false, {}).empty() && p.g.FindFunction("Twice")->pure);
+        CHECK(p.Valid());
+        Runner r;
+        const Entity e = r.Add("P", "pure.ugraph", p.g);
+        r.scripts.Begin(r.scene);
+        CHECK(FloatOf(r.Var("pure.ugraph", e, "x")) == 42.0f);
+        r.scripts.End(r.scene);
+    }
+    Runner       r;
+    const Entity e = r.Add("C", "collapsed.ugraph", f.g);
+    r.scripts.Begin(r.scene);
+    CHECK(FloatOf(r.Var("collapsed.ugraph", e, "x")) == 42.0f && r.Printed("42") && !r.Printed("late"));
+    r.Run(0.3f);
+    CHECK(r.Printed("late") && r.scripts.Stats().errors == 0);
+    r.scripts.End(r.scene);
+}

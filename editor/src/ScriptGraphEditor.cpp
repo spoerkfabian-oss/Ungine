@@ -4,6 +4,7 @@
 #include "Engine/Core/Log.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Script/ScriptCondition.h"
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
@@ -16,7 +17,9 @@
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <deque>
 #include <map>
+#include <unordered_set>
 #include <set>
 
 namespace Engine {
@@ -50,7 +53,10 @@ ImU32 PinColor(PinType type, float alpha = 1.0f)
 }
 
 bool IsReroute(const ScriptNode& node) { return node.type == "Utility.Reroute" || node.type == "Utility.RerouteExec"; }
-bool IsFunctionFrame(const ScriptNode& node) { return node.type == "Function.Entry" || node.type == "Function.Return"; }
+bool IsFunctionFrame(const ScriptNode& node)
+{
+    return node.type == "Function.Entry" || node.type == "Function.Return" || node.type == "Macro.Inputs" || node.type == "Macro.Outputs";
+}
 
 // Every value base type: built-ins, then the registered enums and structs.
 std::vector<PinType> BaseTypes(bool keysOnly)
@@ -270,7 +276,7 @@ NodeLayout Layout(const ScriptGraph& graph, const ScriptNode& node)
 std::string UniqueName(const ScriptGraph& graph, const std::string& scope, const std::string& base, bool functions = false)
 {
     std::string name = base;
-    for (int i = 1; functions ? graph.FindFunction(name) != nullptr : graph.FindVariableInScope(scope, name) != nullptr; ++i)
+    for (int i = 1; functions ? graph.HasScope(name) : graph.FindVariableInScope(scope, name) != nullptr; ++i)
         name = base + std::to_string(i);
     return name;
 }
@@ -474,6 +480,81 @@ float BezierDistance(glm::vec2 p, glm::vec2 a, glm::vec2 b)
 
 } // namespace
 
+// Parameter list editor (macros, events, dispatchers): the edited list, and the old -> new name
+// of a renamed entry (links follow it).
+struct ParamEdit {
+    std::vector<ScriptParam> params;
+    std::string              from, to;
+};
+std::optional<ParamEdit> ParamListWidget(const std::vector<ScriptParam>& params, bool allowExec, const char* addLabel, int idBase)
+{
+    std::optional<ParamEdit> result;
+    for (std::size_t i = 0; i < params.size() && !result; ++i) {
+        ImGui::PushID(idBase + static_cast<int>(i));
+        std::string name = params[i].name;
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::InputText("##pname", &name);
+        if (ImGui::IsItemDeactivatedAfterEdit() && name != params[i].name && IsValidScriptName(name) &&
+            std::ranges::none_of(params, [&](const ScriptParam& p) { return p.name == name; })) {
+            result               = ParamEdit{params, params[i].name, name};
+            result->params[i].name = name;
+        }
+        ImGui::SameLine();
+        PinType type = params[i].type;
+        bool    exec = type.kind == PinKind::Exec;
+        if (allowExec && ImGui::Checkbox("##exec", &exec)) {
+            result                 = ParamEdit{params, {}, {}};
+            result->params[i].type = exec ? PinType::Exec : PinType::Float;
+        }
+        if (allowExec && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Exec pin");
+        if (allowExec)
+            ImGui::SameLine();
+        if (exec) {
+            ImGui::TextDisabled("exec");
+        } else if (TypeCombo("##ptype", type, 90.0f)) {
+            result                 = ParamEdit{params, {}, {}};
+            result->params[i].type = type;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) {
+            result = ParamEdit{params, {}, {}};
+            result->params.erase(result->params.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        ImGui::PopID();
+    }
+    ImGui::PushID(idBase + 999);
+    if (!result && ImGui::SmallButton(addLabel)) {
+        std::string name = "Value";
+        for (int n = 1; std::ranges::any_of(params, [&](const ScriptParam& p) { return p.name == name; }); ++n)
+            name = "Value" + std::to_string(n);
+        result = ParamEdit{params, {}, {}};
+        result->params.push_back({name, PinType::Float});
+    }
+    ImGui::PopID();
+    return result;
+}
+
+// Renames parameter pins: side(node) = 1 if the parameters are outputs of the node, 2 if inputs.
+void RenamePins(ScriptGraph& g, const std::function<int(const ScriptNode&)>& side, const std::string& from, const std::string& to)
+{
+    for (ScriptLink& l : g.links) {
+        const ScriptNode* a = g.FindNode(l.fromNode);
+        const ScriptNode* b = g.FindNode(l.toNode);
+        if (a && side(*a) == 1 && l.fromPin == from)
+            l.fromPin = to;
+        if (b && side(*b) == 2 && l.toPin == from)
+            l.toPin = to;
+    }
+    for (ScriptNode& n : g.nodes)
+        if (side(n) == 2)
+            if (const auto it = n.defaults.find(from); it != n.defaults.end()) {
+                ScriptValue v = it->second;
+                n.defaults.erase(it);
+                n.defaults[to] = std::move(v);
+            }
+}
+
 struct ScriptGraphEditor::Document {
     std::filesystem::path path;
     ScriptGraph           graph;
@@ -490,6 +571,7 @@ struct ScriptGraphEditor::Document {
     glm::vec2                     viewSize{800.0f, 500.0f}; // canvas size last frame (framing)
     std::string                   scope;  // the function shown on the canvas; empty: the event graph
     std::vector<std::uint32_t>    syncedBreakpoints;        // last sent to the script system
+    std::map<std::uint32_t, ScriptBreakpointOptions> syncedOptions;
     Entity                        watchEntity = NullEntity; // instance whose values the debugger shows
     bool                          showMinimap = true;
 };
@@ -762,7 +844,7 @@ void ScriptGraphEditor::DeleteSelection()
     const std::uint32_t              comment = doc->selectedComment;
     Edit("Delete", [&](ScriptGraph& g) {
         for (std::uint32_t id : nodes)
-            if (const ScriptNode* n = g.FindNode(id); n && n->type != "Function.Entry") // the function's start stays
+            if (const ScriptNode* n = g.FindNode(id); n && n->type != "Function.Entry" && n->type != "Macro.Inputs") // starts stay
                 g.RemoveNode(id);
         if (comment)
             g.RemoveComment(comment);
@@ -858,6 +940,8 @@ void ScriptGraphEditor::CommentSelection()
     });
     doc->selectedComment = id;
 }
+
+bool ScriptGraphEditor::EditType(const char* id, PinType& type, float width) { return TypeCombo(id, type, width); }
 
 bool ScriptGraphEditor::EditValue(const char* id, ScriptValue& value, PinType type, float width)
 {
@@ -958,17 +1042,25 @@ void ScriptGraphEditor::SyncDebugger(ScriptSystem* debug)
     DragState& drag = *m_Drag;
     if (!debug || !debug->Running()) {
         // Play compiles the graphs with their saved breakpoints.
-        for (auto& d : m_Docs)
+        for (auto& d : m_Docs) {
             d->syncedBreakpoints = d->graph.breakpoints;
+            d->syncedOptions     = d->graph.breakpointOptions;
+        }
         drag.pausedNode   = 0;
         drag.pausedEntity = NullEntity;
         m_Watch.reset();
         return;
     }
-    for (auto& d : m_Docs) // toggled while playing
-        if (d->syncedBreakpoints != d->graph.breakpoints) {
-            debug->SetBreakpoints(d->path, d->graph.breakpoints);
+    for (auto& d : m_Docs) // toggled / changed while playing
+        if (d->syncedBreakpoints != d->graph.breakpoints || d->syncedOptions != d->graph.breakpointOptions) {
+            std::vector<ScriptBreakpoint> list;
+            for (std::uint32_t node : d->graph.breakpoints) {
+                const auto o = d->graph.breakpointOptions.find(node);
+                list.push_back({node, o != d->graph.breakpointOptions.end() ? o->second : ScriptBreakpointOptions{}});
+            }
+            debug->SetBreakpointList(d->path, list);
             d->syncedBreakpoints = d->graph.breakpoints;
+            d->syncedOptions     = d->graph.breakpointOptions;
         }
     const std::optional<ScriptDebugFrame> at = debug->PausedAt();
     if (!at) {
@@ -1004,6 +1096,7 @@ void ScriptGraphEditor::Draw(bool* open, ScriptSystem* debug, Scene* scene)
 {
     m_Scene = scene;
     SyncDebugger(debug);
+    DrawSearch(); // its own window, also without open graphs
     if (m_FocusRequested) {
         ImGui::SetNextWindowFocus();
         m_FocusRequested = false;
@@ -1071,6 +1164,7 @@ void ScriptGraphEditor::Draw(bool* open, ScriptSystem* debug, Scene* scene)
 
     if (ImGui::BeginChild("sidebar", ImVec2(260.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX)) {
         DrawFunctions(doc);
+        DrawMembers(doc);
         DrawSidebar(doc);
         DrawDetails(doc);
         DrawWatch(doc, debug);
@@ -1082,6 +1176,7 @@ void ScriptGraphEditor::Draw(bool* open, ScriptSystem* debug, Scene* scene)
         DrawResults(doc, debug);
     }
     ImGui::EndChild();
+    DrawTimeline(doc);
 
     if (m_Focused)
         HandleKeys(doc, debug, scene);
@@ -1192,8 +1287,14 @@ void ScriptGraphEditor::DrawToolbar(ScriptSystem* debug, Scene* scene)
             if (ImGui::Button("Continue (F5)") && scene)
                 debug->DebugContinue(*scene);
             ImGui::SameLine();
-            if (ImGui::Button("Step (F10)") && scene)
+            if (ImGui::Button("Over (F10)") && scene)
+                debug->DebugStepOver(*scene);
+            ImGui::SameLine();
+            if (ImGui::Button("Into (F11)") && scene)
                 debug->DebugStep(*scene);
+            ImGui::SameLine();
+            if (ImGui::Button("Out (Shift+F11)") && scene)
+                debug->DebugStepOut(*scene);
             ImGui::EndDisabled();
         } else {
             ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  Playing - execution highlighted, F9 = breakpoint");
@@ -1220,8 +1321,10 @@ void ScriptGraphEditor::DrawDialog()
 void ScriptGraphEditor::DrawFunctions(Document& doc)
 {
     ScriptGraph& g = doc.graph;
-    ImGui::SeparatorText("Graphs");
-    if (ImGui::Selectable("Event Graph", doc.scope.empty()))
+    ImGui::SeparatorText(g.library ? "Library" : "Graphs");
+    if (g.library)
+        ImGui::TextDisabled("Functions and macros for every blueprint\n(<file name>.<name>); no event graph.");
+    else if (ImGui::Selectable("Event Graph", doc.scope.empty()))
         OpenScope({});
     std::optional<std::string> removeFunction;
     for (const ScriptFunction& f : g.functions) {
@@ -1234,6 +1337,8 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
         if (ImGui::BeginPopupContextItem()) {
             if (ImGui::MenuItem("Open"))
                 OpenScope(f.name);
+            if (ImGui::MenuItem("Find references"))
+                OpenSearch(f.name, true);
             if (ImGui::MenuItem("Delete function"))
                 removeFunction = f.name;
             ImGui::EndPopup();
@@ -1251,6 +1356,40 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
         const std::string name = UniqueName(g, {}, "NewFunction", true);
         Edit("Add function", [&](ScriptGraph& graph) { graph.AddFunction(name, {0.0f, 0.0f}); });
         OpenScope(name);
+    }
+    // Macros: copied into the graph wherever used (latent nodes and several exec pins allowed).
+    std::optional<std::string> removeMacro;
+    for (const ScriptMacro& m : g.macros) {
+        ImGui::PushID(("macro:" + m.name).c_str());
+        if (ImGui::Selectable(("[M] " + m.name).c_str(), doc.scope == m.name))
+            OpenScope(m.name);
+        if (ImGui::IsItemHovered() && !m.description.empty())
+            ImGui::SetTooltip("%s", m.description.c_str());
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Find references"))
+                OpenSearch(m.name, true);
+            if (ImGui::MenuItem("Delete macro"))
+                removeMacro = m.name;
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    }
+    if (removeMacro) {
+        const std::string name = *removeMacro;
+        if (doc.scope == name)
+            OpenScope({});
+        Edit("Remove macro", [&](ScriptGraph& graph) { graph.RemoveMacro(name); });
+        std::erase_if(doc.selected, [&](std::uint32_t id) { return !doc.graph.FindNode(id); });
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Macro")) {
+        const std::string name = UniqueName(g, {}, "NewMacro", true);
+        Edit("Add macro", [&](ScriptGraph& graph) { graph.AddMacro(name, {0.0f, 0.0f}); });
+        OpenScope(name);
+    }
+    if (ScriptMacro* m = doc.scope.empty() ? nullptr : g.FindMacro(doc.scope)) {
+        DrawMacro(doc, *m);
+        return;
     }
 
     ScriptFunction* f = doc.scope.empty() ? nullptr : g.FindFunction(doc.scope);
@@ -1550,6 +1689,18 @@ void ScriptGraphEditor::DrawWatch(Document& doc, const ScriptSystem* debug)
         }
         ImGui::EndTable();
     };
+    if (const auto at = debug->PausedAt(); at && at->entity == m_Watch->entity) {
+        ImGui::TextDisabled("Call stack");
+        std::vector<ScriptDebugFrame> frames = at->callers;
+        frames.push_back(*at);
+        for (std::size_t i = frames.size(); i-- > 0;) { // innermost first
+            const ScriptDebugFrame& f = frames[i];
+            const std::string label = std::format("{} {}##frame{}", f.function.empty() ? "Event Graph" : f.function,
+                                                  i + 1 == frames.size() ? "(paused)" : "(call)", i);
+            if (ImGui::Selectable(label.c_str()))
+                ShowHit({std::filesystem::path(f.file), f.function, f.node, {}});
+        }
+    }
     table("vars", m_Watch->variables);
     if (!m_Watch->locals.empty()) {
         ImGui::TextDisabled("Locals of %s", m_Watch->function.c_str());
@@ -1597,6 +1748,27 @@ void ScriptGraphEditor::DrawDetails(Document& doc)
         ImGui::TextWrapped("%s", desc->tooltip.c_str());
     if (!desc)
         return;
+    if (g.HasBreakpoint(node->id)) { // condition / hit count
+        ScriptBreakpointOptions options = g.breakpointOptions.contains(node->id) ? g.breakpointOptions[node->id] : ScriptBreakpointOptions{};
+        bool changed = false;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        changed |= ImGui::InputTextWithHint("##condition", "Break condition, e.g. health < 10", &options.condition);
+        if (const std::string error = options.condition.empty() ? std::string() : CheckScriptCondition(options.condition); !error.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", error.c_str());
+        int hits = static_cast<int>(options.hitCount);
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputInt("Break from hit", &hits)) {
+            options.hitCount = static_cast<std::uint32_t>(std::max(hits, 0));
+            changed          = true;
+        }
+        if (changed) {
+            if (options == ScriptBreakpointOptions{})
+                g.breakpointOptions.erase(node->id);
+            else
+                g.breakpointOptions[node->id] = options;
+            m_WidgetTouched = true;
+        }
+    }
     if (desc->kind == NodeKind::Impure) {
         bool breakpoint = g.HasBreakpoint(node->id);
         if (ImGui::Checkbox("Breakpoint (F9)", &breakpoint)) {
@@ -2461,6 +2633,14 @@ void ScriptGraphEditor::DrawCreateMenu(Document& doc)
             CommentSelection();
         if (ImGui::MenuItem("Toggle breakpoint", "F9"))
             ToggleBreakpoints();
+        if (ImGui::MenuItem("Collapse to function"))
+            m_LastError = CollapseSelection(false);
+        if (ImGui::MenuItem("Collapse to macro"))
+            m_LastError = CollapseSelection(true);
+        if (doc.selected.size() == 1)
+            if (const ScriptNode* n = doc.graph.FindNode(doc.selected.front()); n && !n->param.empty() &&
+                ImGui::MenuItem(("Find references to '" + n->param + "'").c_str()))
+                OpenSearch(n->param, true);
         if (ImGui::BeginMenu("Align", doc.selected.size() >= 2)) {
             if (ImGui::MenuItem("Left", "Shift+A"))
                 AlignSelection(Align::Left);
@@ -2499,11 +2679,14 @@ void ScriptGraphEditor::DrawCreateMenu(Document& doc)
     };
     std::vector<Entry>    entries;
     const ScriptFunction* scopeFunction = g.FindFunction(doc.scope);
+    const bool            inMacro       = g.FindMacro(doc.scope) != nullptr;
     for (const NodeDesc& d : ScriptNodeTypes()) {
         if (d.hidden)
             continue; // Entry / Return / calls are offered per function below
         if (scopeFunction && (d.kind == NodeKind::Event || d.latent))
             continue; // functions run synchronously, without events
+        if (inMacro && d.kind == NodeKind::Event)
+            continue;
         if (d.paramKind == ParamKind::Variable) { // one entry per variable (locals of the scope first)
             const auto offer = [&](const ScriptVariable& v) {
                 if (!d.arrayVariable || IsArray(v.type))
@@ -2522,6 +2705,32 @@ void ScriptGraphEditor::DrawCreateMenu(Document& doc)
     for (const ScriptFunction& f : g.functions)
         if (f.name != doc.scope) // no recursion
             entries.push_back({"Call " + f.name, "Functions", f.pure ? "Function.CallPure" : "Function.Call", f.name});
+    for (const ScriptMacro& m : g.macros)
+        if (m.name != doc.scope)
+            entries.push_back({"Macro " + m.name, "Macros", "Macro.Use", m.name});
+    for (const std::string& lib : ScriptRegistry::LibraryNames()) {
+        const ScriptLibrary* l = ScriptRegistry::FindLibrary(lib);
+        for (const ScriptFunction& f : l->graph.functions)
+            entries.push_back({lib + "." + f.name, "Libraries|" + lib, f.pure ? "Library.CallPure" : "Library.Call", lib + "." + f.name});
+        for (const ScriptMacro& m : l->graph.macros)
+            entries.push_back({lib + "." + m.name + " (macro)", "Libraries|" + lib, "Macro.Use", lib + "." + m.name});
+    }
+    for (const std::string& i : ScriptRegistry::InterfaceNames())
+        for (const ScriptInterfaceFunction& f : ScriptRegistry::FindInterface(i)->functions)
+            entries.push_back({f.name + " (Message: " + i + ")", "Interfaces", "Interface.Call", i + "." + f.name});
+    for (const ScriptEventDecl& d : g.dispatchers) {
+        entries.push_back({"Call " + d.name, "Dispatchers", "Dispatcher.Call", d.name});
+        entries.push_back({"Bind to " + d.name, "Dispatchers", "Dispatcher.Bind", d.name});
+        entries.push_back({"Unbind from " + d.name, "Dispatchers", "Dispatcher.Unbind", d.name});
+    }
+    for (const ScriptEventDecl& e : g.events) {
+        if (!scopeFunction && !inMacro)
+            entries.push_back({"Event " + e.name, "Events|Custom", "Event.Custom", e.name});
+        entries.push_back({"Call " + e.name, "Events|Custom", "Flow.CallEvent", e.name});
+    }
+    if (!scopeFunction)
+        for (const ScriptTimeline& t : g.timelines)
+            entries.push_back({"Timeline " + t.name, "Timeline", "Timeline.Play", t.name});
     // Context: only nodes with a pin that fits the dragged one.
     const auto fits = [&](const Entry& e) -> std::optional<std::string> {
         if (!drag.pending)
@@ -2646,7 +2855,13 @@ void ScriptGraphEditor::HandleKeys(Document& doc, ScriptSystem* debug, Scene* sc
         if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
             debug->DebugContinue(*scene);
         if (ImGui::IsKeyPressed(ImGuiKey_F10, false))
-            debug->DebugStep(*scene);
+            debug->DebugStepOver(*scene);
+        if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
+            if (io.KeyShift)
+                debug->DebugStepOut(*scene);
+            else
+                debug->DebugStep(*scene);
+        }
     }
     if (io.KeyShift && !io.KeyCtrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
@@ -2678,6 +2893,8 @@ void ScriptGraphEditor::HandleKeys(Document& doc, ScriptSystem* debug, Scene* sc
             DuplicateSelection();
         if (ImGui::IsKeyPressed(ImGuiKey_S, false))
             Save();
+        if (ImGui::IsKeyPressed(ImGuiKey_F, false))
+            OpenSearch(m_SearchQuery);
         return;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
@@ -2712,6 +2929,633 @@ void ScriptGraphEditor::FrameNodes(Document& doc, bool selectionOnly)
     const glm::vec2 extent = hi - lo + glm::vec2(80.0f);
     doc.zoom               = std::clamp(std::min(view.x / extent.x, view.y / extent.y), kMinZoom, 1.0f);
     doc.scroll             = view / (2.0f * doc.zoom) - (lo + hi) * 0.5f;
+}
+
+
+// --- Phase 20: macros, members, timelines, search, collapse ----------------------------------------
+
+void ScriptGraphEditor::DrawMacro(Document& doc, ScriptMacro& m)
+{
+    ImGui::SeparatorText("Macro");
+    std::string name = m.name;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("##mname", &name);
+    if (ImGui::IsItemDeactivatedAfterEdit() && name != m.name) {
+        if (!IsValidScriptName(name) || doc.graph.HasScope(name)) {
+            m_LastError = "Macro names must be unique (letters, digits, '_', ' ')";
+        } else {
+            const std::string from = m.name;
+            Edit("Rename macro", [&](ScriptGraph& graph) { graph.RenameMacro(from, name); });
+            doc.scope = name;
+        }
+        return;
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    m_WidgetTouched |= ImGui::InputTextWithHint("##mdesc", "Description (tooltip)", &m.description);
+    ImGui::TextDisabled("Pins: tick = exec. Latent nodes are fine here.");
+    for (const bool outputs : {false, true}) {
+        ImGui::SeparatorText(outputs ? "Outputs" : "Inputs");
+        const auto edit = ParamListWidget(outputs ? m.outputs : m.inputs, true, outputs ? "+ Output" : "+ Input", outputs ? 2000 : 1000);
+        if (!edit)
+            continue;
+        const std::string macro = m.name;
+        Edit("Macro pins", [&](ScriptGraph& graph) {
+            ScriptMacro* target                         = graph.FindMacro(macro);
+            (outputs ? target->outputs : target->inputs) = edit->params;
+            if (!edit->from.empty())
+                RenamePins(graph, [&](const ScriptNode& n) {
+                    if (n.type == "Macro.Use" && n.param == macro)
+                        return outputs ? 1 : 2;
+                    if (n.function == macro && n.type == (outputs ? "Macro.Outputs" : "Macro.Inputs"))
+                        return outputs ? 2 : 1;
+                    return 0;
+                }, edit->from, edit->to);
+            graph.RemoveDanglingLinks();
+        });
+        return;
+    }
+}
+
+void ScriptGraphEditor::DrawMembers(Document& doc)
+{
+    ScriptGraph&    g      = doc.graph;
+    const glm::vec2 center = -doc.scroll + glm::vec2(80.0f, 80.0f);
+    const std::string scope = doc.scope;
+    const auto addNode = [&](const char* type, const std::string& param) {
+        Edit("Add node", [&](ScriptGraph& graph) { doc.selected = {graph.AddNode(type, center, param, scope)}; });
+    };
+    if (g.library)
+        return; // functions and macros only
+
+    // Custom events with parameters and event dispatchers: same editor.
+    for (const bool dispatchers : {false, true}) {
+        std::vector<ScriptEventDecl>& list = dispatchers ? g.dispatchers : g.events;
+        if (!ImGui::CollapsingHeader(dispatchers ? "Event Dispatchers" : "Custom Events"))
+            continue;
+        std::optional<std::size_t> remove;
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i) + (dispatchers ? 7000 : 6000));
+            std::string name = list[i].name;
+            ImGui::SetNextItemWidth(-130.0f);
+            ImGui::InputText("##ename", &name);
+            if (ImGui::IsItemDeactivatedAfterEdit() && name != list[i].name && IsValidScriptName(name) &&
+                std::ranges::none_of(list, [&](const ScriptEventDecl& e) { return e.name == name; })) {
+                const std::string from = list[i].name;
+                Edit(dispatchers ? "Rename dispatcher" : "Rename event", [&](ScriptGraph& graph) {
+                    for (ScriptEventDecl& e : dispatchers ? graph.dispatchers : graph.events)
+                        if (e.name == from)
+                            e.name = name;
+                    for (ScriptNode& n : graph.nodes) {
+                        const bool user = dispatchers ? n.type.starts_with("Dispatcher.") : n.type == "Event.Custom" || n.type == "Flow.CallEvent";
+                        if (user && n.param == from)
+                            n.param = name;
+                    }
+                });
+                ImGui::PopID();
+                return;
+            }
+            ImGui::SameLine();
+            if (dispatchers) {
+                if (ImGui::SmallButton("Call"))
+                    addNode("Dispatcher.Call", list[i].name);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Bind"))
+                    addNode("Dispatcher.Bind", list[i].name);
+            } else {
+                if (ImGui::SmallButton("Event") && scope.empty())
+                    addNode("Event.Custom", list[i].name);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Call"))
+                    addNode("Flow.CallEvent", list[i].name);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove = i;
+            ImGui::Indent();
+            if (const auto edit = ParamListWidget(list[i].params, false, "+ Parameter", 100 * static_cast<int>(i) + (dispatchers ? 20000 : 10000))) {
+                const std::string which = list[i].name;
+                Edit("Parameters", [&](ScriptGraph& graph) {
+                    for (ScriptEventDecl& e : dispatchers ? graph.dispatchers : graph.events)
+                        if (e.name == which)
+                            e.params = edit->params;
+                    if (!edit->from.empty())
+                        RenamePins(graph, [&](const ScriptNode& n) {
+                            if (n.param != which)
+                                return 0;
+                            if (dispatchers)
+                                return n.type == "Dispatcher.Call" ? 2 : 0;
+                            return n.type == "Event.Custom" ? 1 : n.type == "Flow.CallEvent" ? 2 : 0;
+                        }, edit->from, edit->to);
+                    graph.RemoveDanglingLinks();
+                });
+                ImGui::Unindent();
+                ImGui::PopID();
+                return;
+            }
+            ImGui::Unindent();
+            ImGui::PopID();
+        }
+        if (remove) {
+            const std::string name = list[*remove].name;
+            Edit("Remove", [&](ScriptGraph& graph) {
+                std::erase_if(dispatchers ? graph.dispatchers : graph.events, [&](const ScriptEventDecl& e) { return e.name == name; });
+                graph.RemoveDanglingLinks();
+            });
+            return;
+        }
+        if (ImGui::SmallButton(dispatchers ? "+ Dispatcher" : "+ Event")) {
+            std::string name = dispatchers ? "OnChanged" : "MyEvent";
+            for (int n = 1; std::ranges::any_of(list, [&](const ScriptEventDecl& e) { return e.name == name; }); ++n)
+                name = (dispatchers ? "OnChanged" : "MyEvent") + std::to_string(n);
+            Edit("Add", [&](ScriptGraph& graph) { (dispatchers ? graph.dispatchers : graph.events).push_back({name, {}}); });
+            return;
+        }
+    }
+
+    // Interfaces: adding one creates its missing functions.
+    if (ImGui::CollapsingHeader("Interfaces")) {
+        std::optional<std::string> remove;
+        for (const std::string& name : g.interfaces) {
+            ImGui::PushID(name.c_str());
+            ImGui::BulletText("%s%s", name.c_str(), ScriptRegistry::FindInterface(name) ? "" : " (missing)");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove = name;
+            ImGui::PopID();
+        }
+        if (remove) {
+            const std::string name = *remove;
+            Edit("Remove interface", [&](ScriptGraph& graph) { std::erase(graph.interfaces, name); });
+            return;
+        }
+        if (ImGui::BeginCombo("##addinterface", "Implement interface...")) {
+            for (const std::string& name : ScriptRegistry::InterfaceNames())
+                if (std::ranges::find(g.interfaces, name) == g.interfaces.end() && ImGui::Selectable(name.c_str())) {
+                    const ScriptInterface iface = *ScriptRegistry::FindInterface(name);
+                    Edit("Implement interface", [&](ScriptGraph& graph) {
+                        graph.interfaces.push_back(name);
+                        float y = 0.0f;
+                        for (const ScriptInterfaceFunction& f : iface.functions) {
+                            if (graph.FindFunction(f.name))
+                                continue; // an existing function of that name must match by hand
+                            graph.AddFunction(f.name, {0.0f, y += 200.0f});
+                            ScriptFunction* fn = graph.FindFunction(f.name);
+                            fn->inputs         = f.inputs;
+                            fn->outputs        = f.outputs;
+                            fn->description    = "Implements " + name;
+                            graph.FunctionSignatureChanged(f.name);
+                        }
+                    });
+                }
+            ImGui::EndCombo();
+        }
+    }
+
+    // Timelines.
+    if (ImGui::CollapsingHeader("Timelines")) {
+        std::optional<std::string> remove;
+        for (const ScriptTimeline& t : g.timelines) {
+            ImGui::PushID(("tl:" + t.name).c_str());
+            if (ImGui::Selectable(std::format("{} ({:.2f} s{})", t.name, t.length, t.loop ? ", loop" : "").c_str(), m_Timeline == t.name,
+                                  ImGuiSelectableFlags_AllowDoubleClick, ImVec2(-80.0f, 0.0f)))
+                OpenTimeline(t.name);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Node") && scope.empty())
+                addNode("Timeline.Play", t.name);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove = t.name;
+            ImGui::PopID();
+        }
+        if (remove) {
+            const std::string name = *remove;
+            Edit("Remove timeline", [&](ScriptGraph& graph) {
+                std::erase_if(graph.timelines, [&](const ScriptTimeline& t) { return t.name == name; });
+                std::vector<std::uint32_t> users;
+                for (const ScriptNode& n : graph.nodes)
+                    if (n.type == "Timeline.Play" && n.param == name)
+                        users.push_back(n.id);
+                for (std::uint32_t id : users)
+                    graph.RemoveNode(id);
+            });
+            std::erase_if(doc.selected, [&](std::uint32_t id) { return !doc.graph.FindNode(id); });
+            return;
+        }
+        if (ImGui::SmallButton("+ Timeline")) {
+            std::string name = "Timeline";
+            for (int n = 1; g.FindTimeline(name); ++n)
+                name = "Timeline" + std::to_string(n);
+            Edit("Add timeline", [&](ScriptGraph& graph) {
+                ScriptTimeline t{name, 1.0f, false, false, {}};
+                t.tracks.push_back({"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {1.0f, glm::vec3(1.0f)}}});
+                graph.timelines.push_back(std::move(t));
+            });
+            OpenTimeline(name);
+        }
+    }
+}
+
+void ScriptGraphEditor::OpenTimeline(const std::string& name)
+{
+    m_Timeline      = name;
+    m_TimelineTrack = 0;
+    m_TimelineKey   = -1;
+}
+
+void ScriptGraphEditor::DrawTimeline(Document& doc)
+{
+    if (m_Timeline.empty())
+        return;
+    ScriptTimeline* t = doc.graph.FindTimeline(m_Timeline);
+    if (!t) {
+        m_Timeline.clear();
+        return;
+    }
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(640.0f, 460.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(("Timeline: " + t->name + "###TimelineEditor").c_str(), &open)) {
+        ImGui::End();
+        if (!open)
+            m_Timeline.clear();
+        return;
+    }
+    // Name (renaming updates the nodes), length, loop, auto play.
+    std::string name = t->name;
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputText("##tlname", &name);
+    if (ImGui::IsItemDeactivatedAfterEdit() && name != t->name && IsValidScriptName(name) && !doc.graph.FindTimeline(name)) {
+        const std::string from = t->name;
+        Edit("Rename timeline", [&](ScriptGraph& graph) {
+            graph.FindTimeline(from)->name = name;
+            for (ScriptNode& n : graph.nodes)
+                if (n.type == "Timeline.Play" && n.param == from)
+                    n.param = name;
+        });
+        m_Timeline = name;
+        ImGui::End();
+        return;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    m_WidgetTouched |= ImGui::DragFloat("Length", &t->length, 0.05f, 0.01f, 3600.0f, "%.2f s");
+    t->length = std::max(t->length, 0.01f);
+    ImGui::SameLine();
+    m_WidgetTouched |= ImGui::Checkbox("Loop", &t->loop);
+    ImGui::SameLine();
+    m_WidgetTouched |= ImGui::Checkbox("Auto play", &t->autoPlay);
+
+    // Tracks.
+    std::optional<std::size_t> removeTrack;
+    for (std::size_t i = 0; i < t->tracks.size(); ++i) {
+        ScriptTimelineTrack& track = t->tracks[i];
+        ImGui::PushID(static_cast<int>(i));
+        static constexpr const char* kKinds[] = {"float", "vector", "event"};
+        if (ImGui::RadioButton("##sel", m_TimelineTrack == static_cast<int>(i))) {
+            m_TimelineTrack = static_cast<int>(i);
+            m_TimelineKey   = -1;
+        }
+        ImGui::SameLine();
+        std::string tname = track.name;
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::InputText("##trname", &tname);
+        if (ImGui::IsItemDeactivatedAfterEdit() && tname != track.name && IsValidScriptName(tname) &&
+            std::ranges::none_of(t->tracks, [&](const ScriptTimelineTrack& x) { return x.name == tname; })) {
+            const std::string timeline = t->name, from = track.name;
+            Edit("Rename track", [&](ScriptGraph& graph) {
+                for (ScriptTimelineTrack& x : graph.FindTimeline(timeline)->tracks)
+                    if (x.name == from)
+                        x.name = tname;
+                RenamePins(graph, [&](const ScriptNode& n) { return n.type == "Timeline.Play" && n.param == timeline ? 1 : 0; }, from,
+                           tname);
+            });
+            ImGui::PopID();
+            ImGui::End();
+            return;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s, %zu keys", kKinds[static_cast<int>(track.kind)], track.keys.size());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x"))
+            removeTrack = i;
+        ImGui::PopID();
+    }
+    const auto addTrack = [&](const char* base, ScriptTrackKind kind) {
+        std::string tname = base;
+        for (int n = 1; std::ranges::any_of(t->tracks, [&](const ScriptTimelineTrack& x) { return x.name == tname; }); ++n)
+            tname = base + std::to_string(n);
+        const std::string timeline = t->name;
+        Edit("Add track", [&](ScriptGraph& graph) {
+            ScriptTimelineTrack track{tname, kind, {}};
+            if (kind != ScriptTrackKind::Event)
+                track.keys = {{0.0f, glm::vec3(0.0f)}, {graph.FindTimeline(timeline)->length, glm::vec3(1.0f)}};
+            graph.FindTimeline(timeline)->tracks.push_back(std::move(track));
+        });
+        m_TimelineTrack = static_cast<int>(t->tracks.size()) - 1;
+    };
+    if (removeTrack) {
+        const std::string timeline = t->name, track = t->tracks[*removeTrack].name;
+        Edit("Remove track", [&](ScriptGraph& graph) {
+            std::erase_if(graph.FindTimeline(timeline)->tracks, [&](const ScriptTimelineTrack& x) { return x.name == track; });
+            graph.RemoveDanglingLinks();
+        });
+        m_TimelineTrack = 0;
+        ImGui::End();
+        return;
+    }
+    if (ImGui::SmallButton("+ Float track"))
+        addTrack("Value", ScriptTrackKind::Float);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Vector track"))
+        addTrack("Vector", ScriptTrackKind::Vector);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Event track"))
+        addTrack("Event", ScriptTrackKind::Event);
+    t = doc.graph.FindTimeline(m_Timeline); // Edit may have replaced the graph
+    if (!t || t->tracks.empty()) {
+        ImGui::End();
+        if (!open)
+            m_Timeline.clear();
+        return;
+    }
+    m_TimelineTrack             = std::clamp(m_TimelineTrack, 0, static_cast<int>(t->tracks.size()) - 1);
+    ScriptTimelineTrack& track  = t->tracks[static_cast<std::size_t>(m_TimelineTrack)];
+    const bool           events = track.kind == ScriptTrackKind::Event;
+    if (track.kind == ScriptTrackKind::Vector) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60.0f);
+        ImGui::Combo("Drag", &m_TimelineComponent, "X\0Y\0Z\0");
+    }
+
+    // Curve view: time to the right, value up. Double-click adds a key, drag moves one.
+    const ImVec2 size(ImGui::GetContentRegionAvail().x, std::max(ImGui::GetContentRegionAvail().y * 0.55f, 120.0f));
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##curve", size);
+    const bool  hovered = ImGui::IsItemHovered();
+    ImDrawList* dl      = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), IM_COL32(28, 28, 32, 255));
+    float lo = 0.0f, hi = 1.0f;
+    for (const ScriptTimelineKey& k : track.keys)
+        for (int c = 0; c < (track.kind == ScriptTrackKind::Vector ? 3 : 1); ++c) {
+            lo = std::min(lo, k.value[c]);
+            hi = std::max(hi, k.value[c]);
+        }
+    const float pad = (hi - lo) * 0.1f + 1e-3f;
+    lo -= pad;
+    hi += pad;
+    const float length = std::max(t->length, 0.01f);
+    const auto  toScreen = [&](float time, float value) {
+        return ImVec2(p0.x + time / length * size.x, p0.y + (1.0f - (value - lo) / (hi - lo)) * size.y);
+    };
+    const auto fromScreen = [&](ImVec2 p) {
+        return glm::vec2(std::clamp((p.x - p0.x) / size.x, 0.0f, 1.0f) * length, lo + (1.0f - (p.y - p0.y) / size.y) * (hi - lo));
+    };
+    for (int sec = 0; sec <= static_cast<int>(length); ++sec) // second marks
+        dl->AddLine(toScreen(static_cast<float>(sec), lo), toScreen(static_cast<float>(sec), hi), IM_COL32(60, 60, 68, 255));
+    if (lo < 0.0f && hi > 0.0f)
+        dl->AddLine(toScreen(0.0f, 0.0f), toScreen(length, 0.0f), IM_COL32(80, 80, 90, 255));
+    static constexpr ImU32 kColors[] = {IM_COL32(240, 90, 80, 255), IM_COL32(110, 220, 100, 255), IM_COL32(90, 150, 250, 255)};
+    if (!events)
+        for (int c = 0; c < (track.kind == ScriptTrackKind::Vector ? 3 : 1); ++c) {
+            ImVec2 prev = toScreen(0.0f, EvaluateTrack(track, 0.0f)[c]);
+            for (int i = 1; i <= 96; ++i) {
+                const float  time = length * static_cast<float>(i) / 96.0f;
+                const ImVec2 cur  = toScreen(time, EvaluateTrack(track, time)[c]);
+                dl->AddLine(prev, cur, track.kind == ScriptTrackKind::Vector ? kColors[c] : IM_COL32(240, 200, 80, 255), 2.0f);
+                prev = cur;
+            }
+        }
+    const int component = track.kind == ScriptTrackKind::Vector ? m_TimelineComponent : 0;
+    int       hoveredKey = -1;
+    for (std::size_t i = 0; i < track.keys.size(); ++i) {
+        const ScriptTimelineKey& k = track.keys[i];
+        const ImVec2 at = events ? ImVec2(toScreen(k.time, 0.0f).x, p0.y + size.y * 0.5f) : toScreen(k.time, k.value[component]);
+        if (events)
+            dl->AddLine(ImVec2(at.x, p0.y), ImVec2(at.x, p0.y + size.y), IM_COL32(230, 160, 60, 255), 2.0f);
+        const bool near = hovered && std::abs(ImGui::GetMousePos().x - at.x) < 6.0f && std::abs(ImGui::GetMousePos().y - at.y) < 6.0f;
+        if (near)
+            hoveredKey = static_cast<int>(i);
+        dl->AddCircleFilled(at, static_cast<int>(i) == m_TimelineKey ? 6.0f : 4.5f,
+                            near || static_cast<int>(i) == m_TimelineKey ? IM_COL32(255, 255, 255, 255) : IM_COL32(200, 200, 200, 255));
+    }
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        m_TimelineKey      = hoveredKey;
+        m_TimelineDragging = hoveredKey >= 0;
+    }
+    if (hovered && hoveredKey < 0 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const glm::vec2   at   = fromScreen(ImGui::GetMousePos());
+        ScriptTimelineKey key{at.x, EvaluateTrack(track, at.x), ScriptInterp::Linear};
+        if (!events)
+            key.value[component] = at.y;
+        track.keys.push_back(key);
+        m_WidgetTouched = true;
+    }
+    if (m_TimelineDragging && m_TimelineKey >= 0 && m_TimelineKey < static_cast<int>(track.keys.size())) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const glm::vec2 at = fromScreen(ImGui::GetMousePos());
+            ScriptTimelineKey& k = track.keys[static_cast<std::size_t>(m_TimelineKey)];
+            k.time               = at.x;
+            if (!events)
+                k.value[component] = at.y;
+            m_WidgetTouched = true;
+        } else {
+            m_TimelineDragging = false;
+        }
+    }
+
+    // Keys as a table.
+    std::optional<std::size_t> removeKey;
+    if (ImGui::BeginTable("##keys", events ? 2 : 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        for (std::size_t i = 0; i < track.keys.size(); ++i) {
+            ScriptTimelineKey& k = track.keys[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            m_WidgetTouched |= ImGui::DragFloat("##t", &k.time, 0.01f, 0.0f, t->length, "%.3f s");
+            if (ImGui::IsItemActivated())
+                m_TimelineKey = static_cast<int>(i);
+            if (!events) {
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                m_WidgetTouched |= track.kind == ScriptTrackKind::Vector ? ImGui::DragFloat3("##v", &k.value.x, 0.01f)
+                                                                         : ImGui::DragFloat("##v", &k.value.x, 0.01f);
+            }
+            ImGui::TableNextColumn();
+            if (!events) {
+                int interp = static_cast<int>(k.interp);
+                ImGui::SetNextItemWidth(90.0f);
+                if (ImGui::Combo("##i", &interp, "Linear\0Constant\0Smooth\0")) {
+                    k.interp        = static_cast<ScriptInterp>(interp);
+                    m_WidgetTouched = true;
+                }
+                ImGui::SameLine();
+            }
+            if (ImGui::SmallButton("x"))
+                removeKey = i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (removeKey) {
+        track.keys.erase(track.keys.begin() + static_cast<std::ptrdiff_t>(*removeKey));
+        m_TimelineKey   = -1;
+        m_WidgetTouched = true;
+    }
+    // Keys stay sorted (the selected one is followed).
+    if (!std::ranges::is_sorted(track.keys, {}, &ScriptTimelineKey::time)) {
+        const std::optional<ScriptTimelineKey> selected =
+            m_TimelineKey >= 0 && m_TimelineKey < static_cast<int>(track.keys.size()) ? std::optional(track.keys[static_cast<std::size_t>(m_TimelineKey)])
+                                                                                      : std::nullopt;
+        std::ranges::stable_sort(track.keys, {}, &ScriptTimelineKey::time);
+        if (selected)
+            for (std::size_t i = 0; i < track.keys.size(); ++i)
+                if (track.keys[i].time == selected->time && track.keys[i].value == selected->value)
+                    m_TimelineKey = static_cast<int>(i);
+    }
+    for (ScriptTimelineKey& k : track.keys)
+        k.time = std::clamp(k.time, 0.0f, t->length);
+    ImGui::TextDisabled("Double-click adds a key, drag moves it. Event tracks fire their output at each key.");
+    ImGui::End();
+    if (!open)
+        m_Timeline.clear();
+}
+
+std::string ScriptGraphEditor::CollapseSelection(bool macro)
+{
+    Document* doc = ActiveDoc();
+    if (!doc || doc->selected.empty())
+        return "Nothing selected";
+    const std::string name = UniqueName(doc->graph, {}, macro ? "NewMacro" : "NewFunction", true);
+    glm::vec2         center(0.0f);
+    for (std::uint32_t id : doc->selected)
+        if (const ScriptNode* n = doc->graph.FindNode(id))
+            center += n->position / static_cast<float>(doc->selected.size());
+    ScriptGraph       probe = doc->graph; // the graph stays untouched (and without an undo step) on errors
+    const std::string error = probe.Collapse(doc->selected, name, macro, center);
+    if (!error.empty())
+        return error;
+    const std::vector<std::uint32_t> nodes = doc->selected;
+    Edit(macro ? "Collapse to macro" : "Collapse to function",
+         [&](ScriptGraph& graph) { (void)graph.Collapse(nodes, name, macro, center); });
+    doc->selected.clear();
+    for (const ScriptNode& n : doc->graph.nodes)
+        if (n.param == name && n.function == doc->scope && (n.type == "Macro.Use" || n.type.starts_with("Function.Call")))
+            doc->selected = {n.id};
+    return {};
+}
+
+std::vector<ScriptGraphEditor::SearchHit> ScriptGraphEditor::Search(const std::string& query, bool references) const
+{
+    std::vector<SearchHit> hits;
+    if (query.empty())
+        return hits;
+    std::vector<std::pair<std::filesystem::path, const ScriptGraph*>> graphs;
+    std::deque<ScriptGraph>                                            loaded; // stable addresses
+    std::unordered_set<std::string>                                    seen;
+    for (const auto& d : m_Docs) {
+        graphs.emplace_back(d->path, &d->graph);
+        seen.insert(ScriptSystem::Key(d->path));
+    }
+    std::error_code ec;
+    if (!m_SearchRoot.empty())
+        for (std::filesystem::recursive_directory_iterator it(m_SearchRoot, std::filesystem::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (it->path().extension() != ".ugraph" || seen.contains(ScriptSystem::Key(it->path())))
+                continue;
+            try {
+                loaded.push_back(LoadScriptGraph(it->path()));
+                graphs.emplace_back(it->path(), &loaded.back());
+            } catch (const std::exception&) { // broken files are not searched
+            }
+        }
+    const std::string lower = Lower(query);
+    for (const auto& [path, graph] : graphs)
+        for (const ScriptNode& n : graph->nodes) {
+            const NodeDesc*   desc  = FindScriptNodeType(n.type);
+            const std::string label = NodeTitle(desc, n);
+            bool              match = false;
+            if (references) {
+                const std::string_view param = n.param;
+                match = param == query || (param.size() > query.size() && param.ends_with(query) && param[param.size() - query.size() - 1] == '.') ||
+                        std::ranges::any_of(n.defaults, [&](const auto& kv) {
+                            const auto* text = std::get_if<std::string>(&kv.second);
+                            return text && *text == query;
+                        });
+            } else {
+                match = Lower(label + " " + n.param + " " + n.type).find(lower) != std::string::npos;
+            }
+            if (match)
+                hits.push_back({path, n.function, n.id, label});
+        }
+    return hits;
+}
+
+void ScriptGraphEditor::OpenSearch(std::string query, bool references)
+{
+    m_SearchQuery      = std::move(query);
+    m_SearchReferences = references;
+    m_SearchOpen       = true;
+    m_SearchFocus      = true;
+    m_SearchHits       = Search(m_SearchQuery, m_SearchReferences);
+}
+
+void ScriptGraphEditor::ShowHit(const SearchHit& hit)
+{
+    if (!Open(hit.file))
+        return;
+    Document& doc = *ActiveDoc();
+    OpenScope(hit.scope);
+    if (doc.graph.FindNode(hit.node)) {
+        doc.selected = {hit.node};
+        FrameNodes(doc, true);
+        doc.framed = true;
+    }
+    m_FocusRequested = true;
+}
+
+void ScriptGraphEditor::DrawSearch()
+{
+    if (!m_SearchOpen)
+        return;
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 360.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Find in Blueprints", &m_SearchOpen)) {
+        ImGui::End();
+        return;
+    }
+    if (std::exchange(m_SearchFocus, false))
+        ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(-200.0f);
+    const bool enter = ImGui::InputTextWithHint("##query", "Search node titles / names...", &m_SearchQuery,
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    bool changed = ImGui::Checkbox("References", &m_SearchReferences);
+    ImGui::SameLine();
+    if (ImGui::Button("Search") || enter || changed)
+        m_SearchHits = Search(m_SearchQuery, m_SearchReferences);
+    ImGui::TextDisabled("%zu result(s)%s", m_SearchHits.size(),
+                        m_SearchRoot.empty() ? " in the open graphs" : " in the open graphs and the project");
+    std::optional<SearchHit> show;
+    if (ImGui::BeginTable("##hits", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Node");
+        ImGui::TableSetupColumn("Graph");
+        ImGui::TableSetupColumn("File");
+        ImGui::TableHeadersRow();
+        for (std::size_t i = 0; i < m_SearchHits.size(); ++i) {
+            const SearchHit& h = m_SearchHits[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (ImGui::Selectable(std::format("{}##hit{}", h.label, i).c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
+                show = h;
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(h.scope.empty() ? "Event Graph" : h.scope.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(h.file.filename().string().c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::End();
+    if (show)
+        ShowHit(*show);
 }
 
 } // namespace Engine

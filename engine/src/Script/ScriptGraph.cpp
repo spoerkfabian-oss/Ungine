@@ -411,6 +411,164 @@ void ScriptGraph::FunctionSignatureChanged(const std::string& name)
     RemoveDanglingLinks();
 }
 
+std::string ScriptGraph::Collapse(const std::vector<std::uint32_t>& ids, const std::string& name, bool macro, glm::vec2 position)
+{
+    if (ids.empty())
+        return "Nothing selected";
+    if (!IsValidScriptName(name) || HasScope(name))
+        return "The name must be a new unique name (letters, digits, '_', ' ')";
+    const std::unordered_set<std::uint32_t> sel(ids.begin(), ids.end());
+    const std::string                       scope = FindNode(ids.front()) ? FindNode(ids.front())->function : std::string();
+    bool                                    impure = false;
+    for (std::uint32_t id : ids) {
+        const ScriptNode* n    = FindNode(id);
+        const NodeDesc*   desc = n ? FindScriptNodeType(n->type) : nullptr;
+        if (!n || !desc)
+            return "Unknown node in the selection";
+        if (n->function != scope)
+            return "The nodes must belong to the same graph / function";
+        if (desc->kind == NodeKind::Event || n->type == "Function.Return" || n->type == "Macro.Outputs")
+            return "Events, function entries / returns and macro tunnels cannot be collapsed";
+        if (!macro && desc->latent)
+            return desc->title + " is latent: collapse to a macro instead";
+        impure |= desc->kind == NodeKind::Impure;
+    }
+
+    // Boundary links, grouped: inside targets of outside exec, outside data sources, inside data
+    // sources used outside, inside exec outputs leading out.
+    using PinKey = std::pair<std::uint32_t, std::string>;
+    struct Boundary {
+        PinKey             key;
+        PinType            type;
+        std::string        name;
+        std::vector<PinKey> other; // the pins on the other side
+    };
+    std::vector<Boundary> execIn, dataIn, execOut, dataOut;
+    const auto group = [](std::vector<Boundary>& list, PinKey key, PinType type, PinKey other) {
+        auto it = std::ranges::find(list, key, &Boundary::key);
+        if (it == list.end()) {
+            list.push_back({key, type, {}, {}});
+            it = list.end() - 1;
+        }
+        it->other.push_back(std::move(other));
+    };
+    for (const ScriptLink& l : links) {
+        const bool from = sel.contains(l.fromNode), to = sel.contains(l.toNode);
+        if (from == to)
+            continue;
+        const ScriptNode* source = FindNode(l.fromNode);
+        const auto        pin    = source ? FindPin(*this, *source, l.fromPin, true) : std::nullopt;
+        if (!pin)
+            continue;
+        const bool exec = pin->type == PinType::Exec;
+        if (to)
+            group(exec ? execIn : dataIn, exec ? PinKey{l.toNode, l.toPin} : PinKey{l.fromNode, l.fromPin}, pin->type,
+                  exec ? PinKey{l.fromNode, l.fromPin} : PinKey{l.toNode, l.toPin});
+        else
+            group(exec ? execOut : dataOut, {l.fromNode, l.fromPin}, pin->type, {l.toNode, l.toPin});
+    }
+    if (!macro && (execIn.size() > 1 || execOut.size() > 1))
+        return "A function has one exec entry and exit: collapse to a macro instead";
+
+    // Parameter names: unique per side, never the call's own exec pins.
+    std::unordered_set<std::string> inNames{"In"}, outNames{"Then"};
+    const auto unique = [](std::unordered_set<std::string>& used, std::string base) {
+        std::string candidate = base;
+        for (int i = 2; !IsValidScriptName(candidate) || used.contains(candidate); ++i)
+            candidate = (IsValidScriptName(base) ? base : std::string("Value")) + " " + std::to_string(i);
+        used.insert(candidate);
+        return candidate;
+    };
+    if (macro) {
+        inNames.clear();
+        outNames.clear();
+        for (std::size_t i = 0; i < execIn.size(); ++i)
+            execIn[i].name = unique(inNames, "In");
+        for (std::size_t i = 0; i < execOut.size(); ++i)
+            execOut[i].name = unique(outNames, "Out");
+    }
+    for (Boundary& b : dataIn)
+        b.name = unique(inNames, b.other.front().second); // named after the first inside input
+    for (Boundary& b : dataOut)
+        b.name = unique(outNames, b.key.second);
+
+    // Build the scope.
+    glm::vec2 lo(1e30f);
+    for (std::uint32_t id : ids)
+        lo = glm::min(lo, FindNode(id)->position);
+    std::uint32_t inputsNode = 0, outputsNode = 0;
+    if (macro) {
+        AddMacro(name, lo - glm::vec2(320.0f, 0.0f));
+        ScriptMacro* m = FindMacro(name);
+        m->inputs.clear();
+        m->outputs.clear();
+        for (const auto* list : {&execIn, &dataIn})
+            for (const Boundary& b : *list)
+                m->inputs.push_back({b.name, b.type});
+        for (const auto* list : {&execOut, &dataOut})
+            for (const Boundary& b : *list)
+                m->outputs.push_back({b.name, b.type});
+        for (const ScriptNode& n : nodes) {
+            if (n.function == name && n.type == "Macro.Inputs")
+                inputsNode = n.id;
+            if (n.function == name && n.type == "Macro.Outputs")
+                outputsNode = n.id;
+        }
+    } else {
+        AddFunction(name, lo - glm::vec2(320.0f, 0.0f));
+        ScriptFunction* f = FindFunction(name);
+        for (const Boundary& b : dataIn)
+            f->inputs.push_back({b.name, b.type});
+        for (const Boundary& b : dataOut)
+            f->outputs.push_back({b.name, b.type});
+        f->pure = execIn.empty() && execOut.empty() && !impure;
+        for (const ScriptNode& n : nodes) {
+            if (n.function == name && n.type == "Function.Entry")
+                inputsNode = n.id;
+            if (n.function == name && n.type == "Function.Return")
+                outputsNode = n.id;
+        }
+        if (FindNode(outputsNode))
+            FindNode(outputsNode)->position = glm::vec2(lo.x + 900.0f, lo.y);
+    }
+    // The default In -> Out / Entry -> Return link stays only for pure functions (their body).
+    const bool keepFrameLink = !macro && execIn.empty() && execOut.empty() && !impure;
+    if (!keepFrameLink)
+        std::erase_if(links, [&](const ScriptLink& l) { return l.fromNode == inputsNode && l.toNode == outputsNode; });
+    for (std::uint32_t id : ids)
+        FindNode(id)->function = name;
+    std::erase_if(links, [&](const ScriptLink& l) { return sel.contains(l.fromNode) != sel.contains(l.toNode); });
+
+    // The call / Macro node outside.
+    const std::uint32_t call = AddNode(macro ? "Macro.Use" : (FindFunction(name)->pure ? "Function.CallPure" : "Function.Call"),
+                                       position, name, scope);
+    const auto link = [&](std::uint32_t a, const std::string& ap, std::uint32_t b, const std::string& bp) {
+        links.push_back({a, ap, b, bp});
+    };
+    for (const Boundary& b : execIn) { // outside exec -> call; tunnel -> inside target
+        const std::string in = macro ? b.name : "In", tunnel = macro ? b.name : "Then";
+        for (const PinKey& src : b.other)
+            link(src.first, src.second, call, in);
+        link(inputsNode, tunnel, b.key.first, b.key.second);
+    }
+    for (const Boundary& b : dataIn) { // outside source -> call; tunnel -> inside inputs
+        link(b.key.first, b.key.second, call, b.name);
+        for (const PinKey& target : b.other)
+            link(inputsNode, b.name, target.first, target.second);
+    }
+    for (const Boundary& b : execOut) { // inside exec -> tunnel; call -> outside target
+        link(b.key.first, b.key.second, outputsNode, macro ? b.name : "In");
+        for (const PinKey& target : b.other)
+            link(call, macro ? b.name : "Then", target.first, target.second);
+    }
+    for (const Boundary& b : dataOut) {
+        link(b.key.first, b.key.second, outputsNode, b.name);
+        for (const PinKey& target : b.other)
+            link(call, b.name, target.first, target.second);
+    }
+    return {};
+}
+
 bool ScriptGraph::HasBreakpoint(std::uint32_t node) const { return std::ranges::find(breakpoints, node) != breakpoints.end(); }
 
 void ScriptGraph::SetBreakpoint(std::uint32_t node, bool enabled)

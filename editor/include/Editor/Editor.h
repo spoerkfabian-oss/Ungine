@@ -201,6 +201,8 @@ private:
     [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
     void DrawContentBrowser();
     void DrawProjectSettings();
+    void DrawBlueprintTypes();
+    void OpenTypeFile(const std::filesystem::path& file);
     void RefreshContent();
     void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
     void HandleHotkeys();
@@ -288,6 +290,7 @@ private:
     std::string m_PlaySnapshot; // whole scene before Play
     std::vector<ModelHandle> m_PlayModels; // of levels opened by scripts while playing (released at Stop)
     std::uint64_t            m_ConstructedRevision = ~std::uint64_t{0}; // History revision construction scripts ran for
+    std::uint64_t            m_ConstructedGraphs   = 0; // graph editor revision they ran for
     bool        m_StepRequested = false;
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
@@ -305,6 +308,9 @@ private:
     bool m_ShowHierarchy = true, m_ShowInspector = true, m_ShowRenderer = true, m_ShowStats = true;
     bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
     bool m_ShowProjectSettings = false;
+    bool m_ShowTypes           = false; // Blueprint Types window
+    struct TypeEdit;                    // the enum / struct / interface edited there
+    std::shared_ptr<TypeEdit> m_TypeEdit;
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
     bool m_AskQuit = false, m_QuitConfirmed = false;
 
@@ -312,7 +318,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;

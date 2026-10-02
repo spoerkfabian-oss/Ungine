@@ -64,11 +64,14 @@ Editor::Editor(const EditorContext& context)
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
     ReloadScriptRegistry();
+    if (m_Ctx.project)
+        m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
 }
 
 void Editor::RunConstructionScripts()
 {
     m_ConstructedRevision = m_History->Revision();
+    m_ConstructedGraphs   = m_Graphs->Revision();
     if (!m_Ctx.scripts || m_PlayState != PlayState::Edit)
         return;
     m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits count
@@ -158,6 +161,8 @@ void Editor::Update(float dt)
         DrawAssets();
     if (m_ShowProjectSettings)
         DrawProjectSettings();
+    if (m_ShowTypes)
+        DrawBlueprintTypes();
     if (m_ShowStats)
         DrawStats();
     if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
@@ -203,7 +208,8 @@ void Editor::Update(float dt)
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
     }
     // Edit mode: construction scripts follow every edit (History change, New / Open, Stop).
-    if (m_PlayState == PlayState::Edit && m_Ctx.scripts && m_History->Revision() != m_ConstructedRevision)
+    if (m_PlayState == PlayState::Edit && m_Ctx.scripts &&
+        (m_History->Revision() != m_ConstructedRevision || m_Graphs->Revision() != m_ConstructedGraphs))
         RunConstructionScripts();
     // Edit mode: bodies follow the scene (collider overlay, queries); Play steps in FixedUpdate.
     if (m_Ctx.physics && m_PlayState == PlayState::Edit)
@@ -372,6 +378,11 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("Content browser", nullptr, &m_ShowContent);
         if (ImGui::MenuItem("Blueprint", nullptr, &m_ShowBlueprint) && m_ShowBlueprint)
             m_Graphs->Focus();
+        ImGui::MenuItem("Blueprint types", nullptr, &m_ShowTypes);
+        if (ImGui::MenuItem("Find in Blueprints", "Ctrl+F (Blueprint)")) {
+            m_ShowBlueprint = true;
+            m_Graphs->OpenSearch({});
+        }
         ImGui::Separator();
         ImGui::MenuItem("ImGui demo", nullptr, &m_ShowDemo);
         ImGui::EndMenu();

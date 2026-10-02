@@ -21,6 +21,7 @@
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Scene/SpatialIndex.h"
+#include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
@@ -2081,6 +2082,183 @@ TEST_CASE(Editor_BlueprintFunctionsDebuggerAndPrefabs)
 
     editor.NewScene();
     bp.Close(0);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+// Phase 20 editor tools: macro / timeline / types / search windows, collapse, construction
+// scripts following edits, debugger stepping with a conditional breakpoint.
+TEST_CASE(Editor_Blueprint3ToolsAndConstruction)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_p20_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    ScriptRegistry::SaveEnumFile(dir / "Mood.uenum", {"Mood", {"Calm", "Angry"}, {}});
+    ScriptRegistry::SaveInterfaceFile(dir / "Usable.uinterface", {"Usable", {{"Use", {{"Power", PinType::Float}}, {}}}, {}});
+    CHECK(ScriptRegistry::LoadDirectory(dir).empty() && ScriptRegistry::FindEnum("Mood") && ScriptRegistry::FindInterface("Usable"));
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    ScriptSystem scripts(F().events, nullptr, &physics, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .scripts       = &scripts});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+
+    // A blueprint with a construction script (Count posts), a macro, a timeline, events.
+    const fs::path     file = dir / "Fence.ugraph";
+    ScriptGraphEditor& bp   = editor.Blueprints();
+    CHECK(bp.New(file) && bp.Graph());
+    if (!bp.Graph())
+        return;
+    std::uint32_t print = 0, begin = 0;
+    for (const ScriptNode& n : bp.Graph()->nodes) {
+        if (n.type == "Debug.Print")
+            print = n.id;
+        if (n.type == "Event.BeginPlay")
+            begin = n.id;
+    }
+    std::uint32_t spawn = 0, use = 0, add = 0, get = 0;
+    bp.Edit("Build", [&](ScriptGraph& g) {
+        g.variables.push_back({"Count", PinType::Int, std::int32_t{2}, true});
+        g.variables.push_back({"Mood", PinType::Enum("Mood"), std::int32_t{1}, false});
+        const std::uint32_t cons = g.AddNode("Event.Construction", {0.0f, 400.0f});
+        const std::uint32_t loop = g.AddNode("Flow.ForLoop", {200.0f, 400.0f});
+        const std::uint32_t last = g.AddNode("Math.SubtractInt", {0.0f, 520.0f});
+        g.FindNode(last)->defaults["B"] = std::int32_t{1};
+        get                             = g.AddNode("Variable.Get", {-150.0f, 520.0f}, "Count");
+        spawn                           = g.AddNode("Entity.SpawnEmpty", {450.0f, 400.0f});
+        const std::uint32_t self        = g.AddNode("Entity.Self", {300.0f, 520.0f});
+        CHECK(g.Connect(cons, "Out", loop, "In").empty() && g.Connect(get, "Value", last, "A").empty() &&
+              g.Connect(last, "Result", loop, "Last Index").empty() && g.Connect(loop, "Loop Body", spawn, "In").empty() &&
+              g.Connect(self, "Self", spawn, "Parent").empty());
+        // Macro AddOne(In, X) -> (Out, Y = X + 1), used between BeginPlay and Print.
+        CHECK(g.AddMacro("AddOne", {0.0f, 0.0f}));
+        g.FindMacro("AddOne")->inputs.push_back({"X", PinType::Int});
+        g.FindMacro("AddOne")->outputs.push_back({"Y", PinType::Int});
+        std::uint32_t in = 0, out = 0;
+        for (const ScriptNode& n : g.nodes) {
+            if (n.type == "Macro.Inputs")
+                in = n.id;
+            if (n.type == "Macro.Outputs")
+                out = n.id;
+        }
+        add = g.AddNode("Math.AddInt", {200.0f, 100.0f}, {}, "AddOne");
+        g.FindNode(add)->defaults["B"] = std::int32_t{1};
+        CHECK(g.Connect(in, "X", add, "A").empty() && g.Connect(add, "Result", out, "Y").empty());
+        use = g.AddNode("Macro.Use", {150.0f, 0.0f}, "AddOne");
+        std::erase_if(g.links, [&](const ScriptLink& l) { return l.fromNode == begin; });
+        CHECK(g.Connect(begin, "Out", use, "In").empty() && g.Connect(use, "Out", print, "In").empty() &&
+              g.Connect(use, "Y", print, "Text").empty());
+        g.FindNode(use)->defaults["X"] = std::int32_t{41};
+        // Timeline + custom event with a parameter + dispatcher + interface.
+        ScriptTimeline t{"Fade", 1.0f, false, false, {}};
+        t.tracks.push_back({"Alpha", ScriptTrackKind::Float, {{0.0f, glm::vec3(0.0f)}, {1.0f, glm::vec3(1.0f)}}});
+        t.tracks.push_back({"Ping", ScriptTrackKind::Event, {{0.5f, glm::vec3(0.0f)}}});
+        g.timelines.push_back(t);
+        g.AddNode("Timeline.Play", {0.0f, 700.0f}, "Fade");
+        g.events.push_back({"Hit", {{"Damage", PinType::Float}}});
+        g.dispatchers.push_back({"OnHit", {{"Damage", PinType::Float}}});
+        g.AddNode("Event.Custom", {0.0f, 900.0f}, "Hit");
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    // Implementing the interface needs its function: Compile reports it.
+    bp.Edit("Interface", [&](ScriptGraph& g) { g.interfaces.push_back("Usable"); });
+    CHECK(std::ranges::any_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    bp.Edit("Implement", [&](ScriptGraph& g) {
+        g.AddFunction("Use", {0.0f, 1200.0f});
+        g.FindFunction("Use")->inputs = {{"Power", PinType::Float}};
+        g.FunctionSignatureChanged("Use");
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    CHECK(bp.Save());
+
+    // The windows: macro scope, timeline editor, search, types.
+    bp.OpenScope("AddOne");
+    bp.OpenTimeline("Fade");
+    bp.OpenSearch("Print");
+    editor.OpenAsset(dir / "Mood.uenum");
+    runFrames(4);
+    CHECK(!bp.Search("Print", false).empty() && bp.Search("Count", true).size() >= 1 && bp.Search("AddOne", true).size() == 3); // Macro node + its Inputs / Outputs
+    bp.OpenScope({});
+
+    // Construction script: follows edits of the graph and of the exposed variable.
+    const Entity fence = scene.CreateEntity("Fence");
+    r.Emplace<ScriptComponent>(fence, ScriptComponent{PathToUtf8(file)});
+    editor.RunConstructionScripts();
+    runFrames(2);
+    const auto posts = [&] {
+        int n = 0;
+        r.ViewOf<ConstructionOwned>().Each([&](Entity, ConstructionOwned&) { ++n; });
+        return n;
+    };
+    CHECK(posts() == 2);
+    r.Get<ScriptComponent>(fence).variables["Count"] = {std::int32_t{4}, 0};
+    bp.Edit("Default", [](ScriptGraph& g) { g.variables[0].value = std::int32_t{3}; }); // any graph edit runs them again
+    runFrames(2);
+    CHECK(posts() == 4);
+    const fs::path sceneFile = dir / "Fence.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    {
+        Scene loaded;
+        (void)LoadSceneFile(sceneFile, loaded, nullptr);
+        int count = 0;
+        loaded.GetRegistry().ViewOf<Uuid>().Each([&](Entity, Uuid&) { ++count; });
+        CHECK(count == 1); // posts are not saved
+    }
+
+    // Collapse: the Print node into a function (undoable).
+    bp.Select({print});
+    CHECK(bp.CollapseSelection(false).empty() && bp.Graph()->FindFunction("NewFunction"));
+    CHECK(std::ranges::none_of(bp.Diagnostics(), [](const ScriptDiagnostic& d) { return d.error; }));
+    CHECK(bp.Undo() && !bp.Graph()->FindFunction("NewFunction"));
+
+    // Debugger: conditional breakpoint inside the macro's copy, step over, call stack drawn.
+    bp.Edit("Breakpoint", [&](ScriptGraph& g) {
+        g.SetBreakpoint(print, true);
+        g.breakpointOptions[print] = {"Count == 4", 0};
+    });
+    editor.Play();
+    runFrames(2);
+    CHECK(scripts.DebugPaused() && scripts.PausedAt() && scripts.PausedAt()->node == print);
+    CHECK(posts() == 4); // rebuilt before BeginPlay
+    scripts.DebugStepOver(scene);
+    runFrames(2);
+    CHECK(!scripts.DebugPaused());
+    CHECK(std::ranges::any_of(scripts.Messages(), [](const ScriptMessage& m) { return m.text == "42"; }));
+    editor.Stop();
+    runFrames(2);
+    CHECK(posts() == 4);
+
+    editor.NewScene();
+    runFrames(1);
+    bp.Close(0);
+    ScriptRegistry::Clear();
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
