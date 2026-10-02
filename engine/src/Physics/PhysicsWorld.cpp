@@ -302,6 +302,10 @@ bool Finite(const glm::vec3& v)
 {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
+bool Finite(const glm::vec4& v)
+{
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) && std::isfinite(v.w);
+}
 bool Finite(const glm::quat& q)
 {
     return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
@@ -412,6 +416,7 @@ struct PhysicsWorld::Impl {
         pairs.clear();
         meshShapes.clear();
         removedBodies.clear();
+        invalidScale.clear();
         contacts.Take();
         pendingEvents.clear();
     }
@@ -560,6 +565,20 @@ struct PhysicsWorld::Impl {
     {
         const Registry& registry = scene.GetRegistry();
         const Pose      pose     = Decompose(registry.Get<WorldTransform>(e).matrix);
+
+        // Degenerate scales (near-zero, NaN/Inf) would poison Jolt with non-finite shape data:
+        // drop the body until the scale is valid again (retried every Sync, like pending meshes).
+        if (!ValidPhysicsScale(pose.scale)) {
+            if (auto it = bodies.find(Key(e)); it != bodies.end()) {
+                RemoveBody(it->second);
+                bodies.erase(it);
+                ++stats.removed;
+            }
+            if (invalidScale.insert(Key(e)).second)
+                ENGINE_WARN("Physics: refusing body for entity {} with invalid scale", static_cast<std::uint64_t>(e));
+            return;
+        }
+        invalidScale.erase(Key(e));
 
         const MeshRenderer* renderer = collider.shape == ColliderShape::Mesh ? registry.TryGet<MeshRenderer>(e) : nullptr;
         const Model*        model    = renderer && assets ? assets->Get(renderer->model) : nullptr;
@@ -870,8 +889,8 @@ struct PhysicsWorld::Impl {
             const Entity     parent = parentOf(w.entity);
             const glm::mat4 parentWorld = parent != NullEntity ? worldOf(parent) : glm::mat4(1.0f);
             if (!Finite(w.position) || (w.rotation && !Finite(*w.rotation)) ||
-                !Finite(glm::vec3(parentWorld[0])) || !Finite(glm::vec3(parentWorld[1])) ||
-                !Finite(glm::vec3(parentWorld[2])) || !Finite(glm::vec3(parentWorld[3]))) {
+                !Finite(parentWorld[0]) || !Finite(parentWorld[1]) || !Finite(parentWorld[2]) ||
+                !Finite(parentWorld[3])) {
                 ENGINE_WARN("Physics: refusing invalid pose write for entity {}", static_cast<std::uint64_t>(w.entity));
                 continue;
             }
@@ -924,6 +943,7 @@ struct PhysicsWorld::Impl {
     using MeshKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>; // model index, generation, mesh, revision
     std::map<MeshKey, JPH::RefConst<JPH::Shape>> meshShapes; // unscaled
     std::unordered_set<JPH::uint32>              removedBodies; // since the last EndRemovedPairs
+    std::unordered_set<std::uint64_t>            invalidScale; // entities refused for a degenerate scale (warned once)
     std::vector<CollisionEvent>                  pendingEvents;
     PhysicsStats                                 stats;
     std::uint32_t                                visit = 0;
