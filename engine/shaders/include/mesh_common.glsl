@@ -29,6 +29,23 @@ layout(push_constant) uniform MeshPush {
     uint          flags;   // MESH_TINT_LATE
 } pc;
 
+mat4 SkinMatrix(GpuInstance instance, Vertex vertex)
+{
+    if (instance.jointCount == 0u || instance.jointOffset == 0xFFFFFFFFu)
+        return mat4(1.0);
+    mat4 result = mat4(0.0);
+    float total = 0.0;
+    for (uint i = 0u; i < 4u; ++i) {
+        const float weight = vertex.weights[i];
+        const uint joint = vertex.joints[i];
+        if (weight > 0.0 && joint < instance.jointCount) {
+            result += pc.frame.jointMatrices.m[instance.jointOffset + joint] * weight;
+            total += weight;
+        }
+    }
+    return total > 1.0e-6 ? result / total : mat4(1.0);
+}
+
 #ifdef ENGINE_BINDLESS_GLSL
 // Material textures go through the texture table: a reload swaps the entry, not the material.
 vec4 SampleMaterial(uint entry, uint samplerIndex, vec2 uv)

@@ -10,7 +10,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - GPU-Skinning für sichtbare Meshes; Bounds und Schatten-Culling berücksichtigen animierte Pose.
 - Blueprint-Knoten zum Abspielen/Stoppen/Blenden und Abfragen des Animationszustands.
 - Editor-Inspektion und eine mitgelieferte animierte Beispielszene.
-- Fortschritt: Model-Asset-Strukturen, Import von Skin-Joints/inversen Bind-Matrizen, glTF-TRS-Tracks (STEP/LINEAR/CUBICSPLINE), JOINTS_0/WEIGHTS_0, CPU-Pose-Sampler und Laufzeit-Wiedergabe (Clip-Auswahl, Loop/Once, Geschwindigkeit; Start des ersten Clips bei Instanziierung) sind umgesetzt. Import- und Sampler-Tests sind ergänzt. Noch offen: GPU-Skinning in allen Render-Pässen, animierte Bounds, Blend/Root-Motion, Blueprint-Steuerung, Editor-Inspektion und Demo.
+- Fortschritt: Model-Asset-Strukturen, Import von Skin-Joints/inversen Bind-Matrizen, glTF-TRS-Tracks (STEP/LINEAR/CUBICSPLINE), JOINTS_0/WEIGHTS_0, CPU-Pose-Sampler, Laufzeit-Wiedergabe (Clip-Auswahl, Loop/Once, Geschwindigkeit; erster Clip startet automatisch) und GPU-Skinning in Mesh-, Tiefen- und Schatten-Pässen sind umgesetzt. Skinned Meshes umgehen bis zu konservativen animierten Bounds das statische Frustum-/Occlusion-/LOD-Culling. Import- und Sampler-Tests sind ergänzt, konnten mangels lokaler Build-Werkzeuge noch nicht ausgeführt werden. Noch offen: Pose-Bounds/Culling, Blend/Root-Motion, Blueprint-Steuerung, Editor-Inspektion, animierte Demo und vollständige GPU-/CI-Verifikation.
 
 ### Phase 22 – In-Game-UI
 - Laufzeit-UI mit Canvas, Widget-Baum, Layout/Anchors, Skalierung und Z-Reihenfolge.

@@ -25,7 +25,13 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 
     GeometryPool& pool = renderer.Geometry();
     out.name     = data.name;
-    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{data.vertices}, ticket);
+    std::vector<Vertex> vertices = data.vertices;
+    if (!data.skinInfluences.empty())
+        for (std::size_t i = 0; i < vertices.size(); ++i) {
+            vertices[i].joints = glm::uvec4(data.skinInfluences[i].joints);
+            vertices[i].weights = data.skinInfluences[i].weights;
+        }
+    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{vertices}, ticket);
     out.indices  = pool.Upload(GeometryKind::Indices, std::span{data.indices}, ticket);
 
     out.meshes = data.meshes;

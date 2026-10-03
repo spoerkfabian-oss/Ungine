@@ -7,8 +7,10 @@
 #include "Engine/Scene/SpatialIndex.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <type_traits>
+#include <unordered_map>
 
 namespace Engine {
 
@@ -74,7 +76,7 @@ void GpuScene::RebuildPipelines()
 GpuScene::~GpuScene()
 {
     m_Renderer.DeferRelease(std::move(m_Scatter));
-    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility})
+    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices})
         if (*b)
             m_Renderer.DeferRelease(std::move(*b));
 }
@@ -144,6 +146,7 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
                 RemoveInstance(i);
         for (const SpatialIndex::MeshProxy& proxy : spatial.Meshes())
             Upsert(scene, assets, proxy.entity);
+        UpdateJointPalettes(scene, assets);
         return;
     }
     for (const Entity e : spatial.MeshUpdates()) {
@@ -151,6 +154,94 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
             Upsert(scene, assets, e);
         else
             Remove(e);
+    }
+    UpdateJointPalettes(scene, assets);
+}
+
+void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& assets)
+{
+    const Registry& registry = scene.GetRegistry();
+    std::unordered_map<Entity, std::vector<Entity>> nodeEntitiesByRoot;
+    registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, const ModelNodeRef& reference) {
+        if (reference.instanceRoot == NullEntity)
+            return;
+        auto& nodes = nodeEntitiesByRoot[reference.instanceRoot];
+        if (nodes.size() <= reference.node)
+            nodes.resize(static_cast<std::size_t>(reference.node) + 1, NullEntity);
+        nodes[reference.node] = entity;
+    });
+
+    m_JointMatrixData.clear();
+    for (std::uint32_t i = 0; i < m_Instances.size(); ++i) {
+        const Entity entity = m_Instances[i].entity;
+        GpuInstance& gpu = m_InstanceData[i];
+        const std::uint32_t oldFlags = gpu.flags;
+        const std::uint32_t oldOffset = gpu.jointOffset;
+        const std::uint32_t oldCount = gpu.jointCount;
+        const auto markIfChanged = [&] {
+            if (gpu.flags != oldFlags || gpu.jointOffset != oldOffset || gpu.jointCount != oldCount)
+                MarkInstance(i);
+        };
+        gpu.jointOffset = ~0u;
+        gpu.jointCount = 0;
+        gpu.flags &= ~kInstanceSkinned;
+        if (entity == NullEntity || !registry.Valid(entity)) {
+            markIfChanged();
+            continue;
+        }
+        const MeshRenderer* meshRenderer = registry.TryGet<MeshRenderer>(entity);
+        const ModelNodeRef* nodeRef = registry.TryGet<ModelNodeRef>(entity);
+        if (!meshRenderer || !nodeRef) {
+            markIfChanged();
+            continue;
+        }
+        const Model* model = assets.Get(meshRenderer->model);
+        if (!model || nodeRef->node >= model->nodes.size()) {
+            markIfChanged();
+            continue;
+        }
+        const std::int32_t skinIndex = model->nodes[nodeRef->node].skin;
+        if (skinIndex < 0 || static_cast<std::size_t>(skinIndex) >= model->skins.size()) {
+            markIfChanged();
+            continue;
+        }
+        const Skin& skin = model->skins[static_cast<std::size_t>(skinIndex)];
+        const auto rootIt = nodeEntitiesByRoot.find(nodeRef->instanceRoot);
+        if (skin.joints.empty() || rootIt == nodeEntitiesByRoot.end()) {
+            markIfChanged();
+            continue;
+        }
+        const glm::mat4& meshWorld = registry.Get<WorldTransform>(entity).matrix;
+        const float determinant = glm::determinant(meshWorld);
+        if (!std::isfinite(determinant) || std::abs(determinant) < 1.0e-8f) {
+            markIfChanged();
+            continue;
+        }
+        const glm::mat4 inverseMesh = glm::inverse(meshWorld);
+        const std::uint32_t offset = static_cast<std::uint32_t>(m_JointMatrixData.size());
+        bool valid = true;
+        for (const SkinJoint& joint : skin.joints) {
+            if (joint.node < 0 || static_cast<std::size_t>(joint.node) >= rootIt->second.size()) {
+                valid = false;
+                break;
+            }
+            const Entity jointEntity = rootIt->second[static_cast<std::size_t>(joint.node)];
+            if (jointEntity == NullEntity || !registry.Valid(jointEntity)) {
+                valid = false;
+                break;
+            }
+            const glm::mat4 matrix = inverseMesh * registry.Get<WorldTransform>(jointEntity).matrix * joint.inverseBindMatrix;
+            m_JointMatrixData.push_back(matrix);
+        }
+        if (!valid) {
+            m_JointMatrixData.resize(offset);
+            markIfChanged();
+            continue;
+        }
+        gpu.jointOffset = offset;
+        gpu.jointCount = static_cast<std::uint32_t>(skin.joints.size());
+        gpu.flags |= kInstanceSkinned;
+        markIfChanged();
     }
 }
 
@@ -439,12 +530,13 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     const bool newDraws     = Ensure(m_Renderer, m_DrawBuffer, m_Draws.size(), sizeof(GpuDraw), "GpuDraws");
     const bool newBatches   = Ensure(m_Renderer, m_BatchBuffer, m_Batches.size(), sizeof(GpuBatch), "GpuBatches");
     const bool newVisible   = Ensure(m_Renderer, m_Visibility, m_Draws.size(), sizeof(std::uint32_t), "GpuDrawVisibility");
+    const bool newJoints    = Ensure(m_Renderer, m_JointMatrices, m_JointMatrixData.size(), sizeof(glm::mat4), "GpuJointMatrices");
     m_BatchesDirty |= newBatches;
 
     const bool fullInstances = newInstances && !m_InstanceData.empty();
     const bool fullDraws     = newDraws && !m_Draws.empty();
     const bool work = newVisible || fullInstances || fullDraws || !m_DirtyInstances.empty() || !m_DirtyDraws.empty() ||
-                      (m_BatchesDirty && !m_Batches.empty());
+                      (m_BatchesDirty && !m_Batches.empty()) || newJoints || !m_JointMatrixData.empty();
     if (!work)
         return;
 
@@ -493,6 +585,9 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     if (m_BatchesDirty && !m_Batches.empty())
         Scatter(cmd, m_BatchBuffer.Address(), m_Batches.data(), sizeof(GpuBatch), {},
                 static_cast<std::uint32_t>(m_Batches.size()));
+    if (!m_JointMatrixData.empty())
+        Scatter(cmd, m_JointMatrices.Address(), m_JointMatrixData.data(), sizeof(glm::mat4), {},
+                static_cast<std::uint32_t>(m_JointMatrixData.size()));
     m_BatchesDirty = false;
 
     Barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,

@@ -24,15 +24,17 @@ namespace Engine {
 class Renderer;
 class Scene;
 
-// 48 bytes, std430-compatible (uv split into the vec3 padding slots). Mirrors mesh_common.glsl.
+// 80 bytes, std430-compatible (uv split into the vec3 padding slots). Mirrors scene_common.glsl.
 struct Vertex {
     glm::vec3 position{0.0f};
     float     uvX = 0.0f;
     glm::vec3 normal{0.0f, 0.0f, 1.0f};
     float     uvY = 0.0f;
     glm::vec4 tangent{0.0f}; // w = bitangent sign; w == 0: none, the shader derives a frame
+    glm::uvec4 joints{0};
+    glm::vec4  weights{0.0f};
 };
-static_assert(sizeof(Vertex) == 48);
+static_assert(sizeof(Vertex) == 80);
 
 struct VertexSkinInfluence {
     glm::u16vec4 joints{0};

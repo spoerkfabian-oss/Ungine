@@ -20,11 +20,13 @@ void main()
     const GpuDraw     draw  = frame.draws.d[entry & VISIBLE_RECORD_MASK];
     const GpuInstance inst  = frame.instances.i[draw.instance];
     const Vertex      v     = frame.vertices.v[gl_VertexIndex]; // vertexOffset (pool) applied by the draw
-    const vec4        world = inst.model * vec4(v.position, 1.0);
+    const mat4        skin  = SkinMatrix(inst, v);
+    const vec4        local = skin * vec4(v.position, 1.0);
+    const vec4        world = inst.model * local;
 
     outWorldPos = world.xyz;
-    outNormal   = NormalMatrix(inst) * v.normal;
-    outTangent  = vec4(mat3(inst.model) * v.tangent.xyz, v.tangent.w); // w == 0 passes through
+    outNormal   = NormalMatrix(inst) * mat3(skin) * v.normal;
+    outTangent  = vec4(mat3(inst.model) * mat3(skin) * v.tangent.xyz, v.tangent.w); // w == 0 passes through
     outUV       = vec2(v.uvX, v.uvY);
     outMaterial = frame.submeshes.s[draw.submesh].material;
     outEntity   = inst.entityId;

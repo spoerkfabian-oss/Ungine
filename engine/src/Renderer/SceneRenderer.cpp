@@ -54,6 +54,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress materials;
     VkDeviceAddress submeshes;
     VkDeviceAddress instances; // GPU scene
+    VkDeviceAddress jointMatrices;
     VkDeviceAddress draws;
     VkDeviceAddress hiz;
     VkDeviceAddress textureTable; // material texture entry -> bindless slot
@@ -568,12 +569,14 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
         return glm::dot(closest - glm::vec3(sphere), closest - glm::vec3(sphere)) <= sphere.w * sphere.w;
     };
     std::vector<std::pair<float, std::uint32_t>> sorted; // transparent: (distance, entry)
-    m_Spatial.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& proxy) {
-        if (range && !near(proxy.bounds))
+    const auto gather = [&](const SpatialIndex::MeshProxy& proxy, bool animated) {
+        if (!animated && range && !near(proxy.bounds))
             return;
         const GpuInstance* inst = m_GpuScene->FindInstance(proxy.entity);
         if (!inst)
             return; // model released meanwhile
+        if (((inst->flags & kInstanceSkinned) != 0) != animated)
+            return;
         // Whole meshes were culled by the BVH; multi-part meshes (and light ranges) also per submesh.
         const bool perSubmesh = inst->drawCount > 1 || range;
         for (std::uint32_t d = inst->firstDraw; d < inst->firstDraw + inst->drawCount; ++d) {
@@ -582,9 +585,9 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
             if ((mode == Gather::Camera && blend) || (mode == Gather::Transparent && !blend))
                 continue;
             const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, inst->model);
-            if (perSubmesh && (!frustum.Intersects(box) || (range && !near(box))))
+            if (!animated && perSubmesh && (!frustum.Intersects(box) || (range && !near(box))))
                 continue;
-            const LodChoice lod   = SelectLod(sm, inst->model, m_LodCamera, m_LodForced);
+            const LodChoice lod   = animated ? LodChoice{} : SelectLod(sm, inst->model, m_LodCamera, m_LodForced);
             const std::uint32_t e = d | (lod.lod << kVisibleLodShift);
             if (mode == Gather::Transparent) {
                 sorted.emplace_back(glm::distance(glm::vec3(m_LodCamera), (box.min + box.max) * 0.5f), e); // xyz: camera
@@ -595,7 +598,14 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
                 out.draws.push_back(e);
             }
         }
-    });
+    };
+    m_Spatial.QueryMeshes(frustum, [&](const SpatialIndex::MeshProxy& proxy) { gather(proxy, false); });
+    // Animated bounds can exceed the imported bind-pose bounds, so keep skinned instances out of
+    // the static BVH/frustum/range tests until conservative pose bounds are available.
+    for (const SpatialIndex::MeshProxy& proxy : m_Spatial.Meshes())
+        if (const GpuInstance* instance = m_GpuScene->FindInstance(proxy.entity);
+            instance && (instance->flags & kInstanceSkinned) != 0)
+            gather(proxy, true);
     if (mode == Gather::Transparent) { // far to near: blending needs back to front
         std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
         for (const auto& [distance, entry] : sorted)
@@ -900,6 +910,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .materials       = m_Renderer.Geometry().Address(GeometryKind::Materials),
           .submeshes       = m_Renderer.Geometry().Address(GeometryKind::Submeshes),
           .instances       = m_GpuScene->InstanceAddress(),
+          .jointMatrices   = m_GpuScene->JointMatrixAddress(),
           .draws           = m_GpuScene->DrawAddress(),
           .hiz             = m_GpuCulling->HiZAddress(),
           .textureTable    = m_Renderer.TextureTableAddress()};
