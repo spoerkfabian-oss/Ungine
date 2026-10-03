@@ -1061,9 +1061,9 @@ TEST_CASE(Blueprint2_ConditionsSteppingAndConstruction)
             templ.GetRegistry().Emplace<ScriptComponent>(root, ScriptComponent{"fence.ugraph"});
             CreatePrefab(dir / "Fence.uprefab", templ, nullptr, root);
             Graph spawner;
-            const std::uint32_t begin = spawner.Node("Event.BeginPlay"), sp = spawner.Node("Entity.SpawnPrefab");
+            const std::uint32_t spawnBegin = spawner.Node("Event.BeginPlay"), sp = spawner.Node("Entity.SpawnPrefab");
             spawner.Set(sp, "Prefab", PathToUtf8(dir / "Fence.uprefab"));
-            spawner.Link(begin, "Out", sp, "In");
+            spawner.Link(spawnBegin, "Out", sp, "In");
             CHECK(spawner.Valid());
             Runner rs;
             rs.scripts.Provide("fence.ugraph", c.g);
