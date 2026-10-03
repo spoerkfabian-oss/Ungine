@@ -35,7 +35,11 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    `Saved/` (Caches, Layout – nicht Teil des Spiels).
 3. **Content**-Browser: Doppelklick öffnet Szenen/Blueprints bzw. platziert Modelle; Dateien lassen
    sich in den Viewport ziehen (Modelle) oder auf die Auswahl (Blueprints). *+ New* legt Ordner,
-   Blueprints und Szenen an.
+   Blueprints und Szenen an. *Import file...* kopiert Modelle (.glb/.gltf samt lokalen Dateien),
+   Texturen und Sounds in den aktuellen Content-Ordner. Auswahl zeigt Textur-, Modell-/Material- oder
+   Audiovorschau; Rechtsklick bietet *Move to folder...*, *Rename...* und die bestätigungspflichtige
+   Löschung. Referenzen in unterstützten Szenen-, Blueprint-, Prefab- und glTF-Dateien werden bei
+   Verschieben/Umbenennen angepasst.
 4. **Blueprint**-Tab: Knoten per Rechtsklick suchen, Pins ziehen zum Verbinden, Variablen links,
    Details/Parameter darunter. Script einer Entity zuweisen: Inspector → *Add component* →
    *Script (Blueprint)*.

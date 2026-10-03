@@ -211,6 +211,7 @@ struct Model {
     PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
     std::vector<GpuSubmesh>    gpuSubmeshes; // CPU copy of those records (index: firstGpuSubmesh - submeshes.offset)
     std::vector<TextureHandle> textures;  // per ModelData texture; owned (released) by the AssetManager
+    std::vector<MaterialData>  previewMaterials; // CPU-side material preview data
     std::vector<std::uint32_t> materialFlags; // CPU copy for pipeline selection
     std::vector<Mesh>          meshes;
     std::vector<ModelNode>     nodes;

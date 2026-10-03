@@ -1,5 +1,6 @@
 #pragma once
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
@@ -11,15 +12,18 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -210,6 +214,11 @@ private:
     void PushSubtreesChange(std::string label, const std::vector<std::uint64_t>& uuids, std::string before);
     [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
     void DrawContentBrowser();
+    void SelectContentFile(const std::filesystem::path& file);
+    void ReleaseContentPreview();
+    void ImportContentFile(const std::filesystem::path& source);
+    void UpdateContentImport();
+    bool RelocateContentAsset(const std::filesystem::path& source, const std::filesystem::path& target);
     void DrawProjectSettings();
     void DrawBlueprintTypes();
     void OpenTypeFile(const std::filesystem::path& file);
@@ -338,6 +347,22 @@ private:
     double                                            m_ContentScanTime = -1.0; // ImGui time of the last scan
     std::string                                       m_ContentFilter;
     std::filesystem::path                             m_ContentSelected;
+    std::filesystem::path                             m_ImportTargetDir;
+    std::filesystem::path                             m_MoveTarget;
+    std::jthread                                      m_ImportWorker;
+    std::atomic<std::uint64_t>                        m_ImportBytes{0}, m_ImportTotal{0};
+    std::atomic<bool>                                 m_ImportDone{false};
+    std::mutex                                        m_ImportMutex;
+    std::string                                       m_ImportResult;
+    bool                                              m_ImportSuccess = false;
+    TextureHandle                                     m_ContentPreviewHandle;
+    ModelHandle                                       m_ContentPreviewModel;
+    SoundHandle                                       m_ContentPreviewSound;
+    std::vector<float>                                m_ContentPreviewWaveform;
+    bool                                              m_ContentPreviewWaveformReady = false;
+    TextureKind                                       m_TextureImportKind = TextureKind::Color;
+    std::uint64_t                                     m_ContentPreviewTexture = 0;
+    std::uint32_t                                     m_ContentPreviewRevision = 0;
     std::filesystem::path                             m_RenameTarget, m_DeleteTarget;
     std::string                                       m_RenameText;
     std::vector<std::pair<ModelHandle, glm::vec3>>    m_PendingInstances; // loading, then placed
@@ -352,7 +377,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills

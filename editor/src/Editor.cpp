@@ -124,7 +124,12 @@ std::vector<std::string> Editor::ReloadScriptRegistry()
 
 Editor::~Editor()
 {
+    if (m_ImportWorker.joinable()) {
+        m_ImportWorker.request_stop();
+        m_ImportWorker.join();
+    }
     Stop(); // leaving the editor while playing returns to the edit scene
+    ReleaseContentPreview();
     m_Ctx.camera.moveRequiresLook = false;
     m_Ctx.sceneRenderer.overlay   = {};
 

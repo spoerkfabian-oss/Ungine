@@ -62,6 +62,7 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> materials,
                          std::span<const std::uint32_t> textureEntries, Model& out, UploadTicket& ticket)
 {
+    out.previewMaterials.assign(materials.begin(), materials.end());
     if (materials.empty())
         throw std::runtime_error("BuildModel: '" + out.name + "' has no materials");
 

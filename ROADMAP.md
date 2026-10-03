@@ -23,6 +23,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Importdialog mit Quellpfad, Ziel, Importoptionen, Fortschritt und verständlichen Fehlern.
 - Thumbnails für Modelle, Texturen, Materialien und Audio; asynchron und gecacht.
 - Referenzen bei Verschieben/Umbenennen aktualisieren; sichere Bestätigung bei nicht rückgängigem Löschen.
+- Fortschritt: Asynchroner Import mit Datei-/Zielwahl, Fortschritt und Fehlerstatus; GLB, glTF samt lokalen URI-Abhängigkeiten, PNG/JPEG/KTX2 und WAV/OGG/MP3/FLAC. AssetManager-Cache liefert asynchrone Textur-, Modell/Material- und Audio-Wellenform-Vorschau (Wireframe max. 600 Dreiecke; gestreamtes Audio ohne PCM-Wellenform). Umbenennen und Ordnerdialog-Verschieben aktualisieren erkannte gespeicherte Referenzen sowie aktive Szenen-/Projektpfade und die aktuelle Szene; Löschen bestätigt vor der nicht rückgängig machbaren Entfernung. Noch nicht lokal kompiliert oder zur Laufzeit geprüft (C++/CMake/Vulkan-Werkzeuge fehlen); offene Referenz- und Formatgrenzen in MEMORY.md §20.
 
 ### Phase 24 – Level- und Bereichs-Streaming
 - Asynchrones Laden/Entladen von Szenen und Teilbereichen ohne Blockieren des Hauptthreads.
