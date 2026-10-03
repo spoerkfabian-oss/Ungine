@@ -41,7 +41,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install packages
         run: |
@@ -51,7 +51,7 @@ jobs:
             mesa-vulkan-drivers vulkan-validationlayers xvfb
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps
           key: deps-linux-${{ matrix.compiler }}-${{ hashFiles('cmake/Dependencies.cmake') }}
@@ -84,7 +84,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Only glslc is needed (volk loads Vulkan at run time). LunarG renamed its installers, so
       # the current version is looked up and both file name schemes are tried.
@@ -99,7 +99,7 @@ jobs:
 
       - name: Cache Vulkan SDK
         id: vulkan-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: C:\VulkanSDK
           key: vulkan-sdk-${{ steps.vulkan.outputs.version }}
@@ -131,7 +131,7 @@ jobs:
           "C:\VulkanSDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps
           key: deps-windows-${{ hashFiles('cmake/Dependencies.cmake') }}
