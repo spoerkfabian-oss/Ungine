@@ -24,15 +24,22 @@ namespace Engine {
 class Renderer;
 class Scene;
 
-// 48 bytes, std430-compatible (uv split into the vec3 padding slots). Mirrors mesh_common.glsl.
+// 80 bytes, std430-compatible (uv split into the vec3 padding slots). Mirrors scene_common.glsl.
 struct Vertex {
     glm::vec3 position{0.0f};
     float     uvX = 0.0f;
     glm::vec3 normal{0.0f, 0.0f, 1.0f};
     float     uvY = 0.0f;
     glm::vec4 tangent{0.0f}; // w = bitangent sign; w == 0: none, the shader derives a frame
+    glm::uvec4 joints{0};
+    glm::vec4  weights{0.0f};
 };
-static_assert(sizeof(Vertex) == 48);
+static_assert(sizeof(Vertex) == 80);
+
+struct VertexSkinInfluence {
+    glm::u16vec4 joints{0};
+    glm::vec4    weights{0.0f};
+};
 
 inline constexpr std::uint32_t kMaxLods = 4;
 
@@ -67,7 +74,40 @@ struct ModelNode {
     Transform            local;
     std::int32_t         mesh   = -1;
     std::int32_t         parent = -1;
+    std::int32_t         skin   = -1;
     std::optional<Light> light; // KHR_lights_punctual (point / spot)
+};
+
+struct SkinJoint {
+    std::int32_t node = -1; // index into Model::nodes
+    glm::mat4    inverseBindMatrix{1.0f};
+};
+
+struct Skin {
+    std::string          name;
+    std::int32_t         skeletonRoot = -1; // index into Model::nodes, when present
+    std::vector<SkinJoint> joints;
+};
+
+enum class AnimationPath : std::uint8_t { Translation, Rotation, Scale };
+enum class AnimationInterpolation : std::uint8_t { Linear, Step, CubicSpline };
+
+struct AnimationTrack {
+    std::uint32_t          node = 0; // index into Model::nodes
+    AnimationPath          path = AnimationPath::Translation;
+    AnimationInterpolation interpolation = AnimationInterpolation::Linear;
+    std::vector<float>     times;
+    // Values use vec4 for a common representation: translation/scale use xyz, rotation uses xyzw.
+    // Cubic spline tracks keep the per-key tangents in separate arrays.
+    std::vector<glm::vec4> values;
+    std::vector<glm::vec4> inTangents;
+    std::vector<glm::vec4> outTangents;
+};
+
+struct AnimationClip {
+    std::string               name;
+    float                     duration = 0.0f;
+    std::vector<AnimationTrack> tracks;
 };
 
 inline constexpr std::int32_t kNoTexture    = -1; // the slot's default texture
@@ -111,6 +151,9 @@ struct ModelData {
     std::vector<MaterialData>  materials;
     std::vector<Mesh>          meshes;
     std::vector<ModelNode>     nodes;
+    std::vector<VertexSkinInfluence> skinInfluences;
+    std::vector<Skin>          skins;
+    std::vector<AnimationClip> animations;
     glm::vec3                  boundsMin{0.0f}; // world space of the default scene
     glm::vec3                  boundsMax{0.0f};
     // Files read besides the source itself (external buffers): hot reload watches them too.
@@ -168,9 +211,13 @@ struct Model {
     PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
     std::vector<GpuSubmesh>    gpuSubmeshes; // CPU copy of those records (index: firstGpuSubmesh - submeshes.offset)
     std::vector<TextureHandle> textures;  // per ModelData texture; owned (released) by the AssetManager
+    std::vector<MaterialData>  previewMaterials; // CPU-side material preview data
     std::vector<std::uint32_t> materialFlags; // CPU copy for pipeline selection
     std::vector<Mesh>          meshes;
     std::vector<ModelNode>     nodes;
+    std::vector<VertexSkinInfluence> skinInfluences; // parallel to GPU model vertices; empty means unskinned
+    std::vector<Skin>          skins;
+    std::vector<AnimationClip> animations;
     glm::vec3                  boundsMin{0.0f};
     glm::vec3                  boundsMax{0.0f};
     // CPU copy of the geometry for mesh colliders (submesh ranges as on the GPU).

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 
 namespace Engine {
@@ -22,6 +23,18 @@ inline constexpr int Left = 0, Right = 1, Middle = 2;
 inline constexpr int Last = 7;
 } // namespace MouseButton
 
+namespace GamepadButton {
+inline constexpr int South = 0, East = 1, West = 2, North = 3;
+inline constexpr int LeftBumper = 4, RightBumper = 5, Back = 6, Start = 7;
+inline constexpr int DpadUp = 11, DpadRight = 12, DpadDown = 13, DpadLeft = 14;
+inline constexpr int Last = 14;
+} // namespace GamepadButton
+
+namespace GamepadAxis {
+inline constexpr int LeftX = 0, LeftY = 1, RightX = 2, RightY = 3, LeftTrigger = 4, RightTrigger = 5;
+inline constexpr int Last = 5;
+} // namespace GamepadAxis
+
 // --- Window ---
 struct WindowCloseEvent {};
 struct WindowFocusEvent       { bool focused; };
@@ -33,6 +46,11 @@ struct CharEvent        { std::uint32_t codepoint; };
 struct MouseButtonEvent { int button; InputAction action; int mods; };
 struct MouseMoveEvent   { double x, y; };
 struct MouseScrollEvent { double dx, dy; };
+struct GamepadStateEvent {
+    bool connected = false;
+    std::array<std::uint8_t, GamepadButton::Last + 1> buttons{};
+    std::array<float, GamepadAxis::Last + 1> axes{};
+};
 
 // Custom engine/game events: any plain struct works, no registration needed.
 

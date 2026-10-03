@@ -11,6 +11,7 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Prefab.h"
@@ -18,6 +19,7 @@
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Assets/Animation.h"
 
 #include <ImGuizmo.h>
 #include <imgui.h>
@@ -59,6 +61,7 @@ bool SetWorldMatrix(Scene& scene, Entity entity, const glm::mat4& world)
 Editor::Editor(const EditorContext& context)
     : m_Ctx(context),
       m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer, PathToUtf8(context.layoutFile))),
+      m_UiOverlay(std::make_unique<TextOverlay>(context.renderer)),
       m_History(std::make_unique<History>()),
       m_FileDialog(std::make_unique<FileDialog>()),
       m_Graphs(std::make_unique<ScriptGraphEditor>())
@@ -121,7 +124,12 @@ std::vector<std::string> Editor::ReloadScriptRegistry()
 
 Editor::~Editor()
 {
+    if (m_ImportWorker.joinable()) {
+        m_ImportWorker.request_stop();
+        m_ImportWorker.join();
+    }
     Stop(); // leaving the editor while playing returns to the edit scene
+    ReleaseContentPreview();
     m_Ctx.camera.moveRequiresLook = false;
     m_Ctx.sceneRenderer.overlay   = {};
 
@@ -227,6 +235,9 @@ void Editor::Update(float dt)
         }
     }
 
+    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
+        UpdateAnimations(m_Ctx.scene, m_Ctx.assets, static_cast<float>(dt));
+
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
     // Audio follows the scene (while playing) and the editor camera (previews, no listener entity).
@@ -274,6 +285,12 @@ void Editor::Render(const FrameContext& frame, float physicsAlpha)
                                     .view   = m_ViewportImage.View(),
                                     .format = kViewportFormat,
                                     .extent = m_ViewportImage.Extent2D()});
+        m_UiSystem.PrepareLayout(m_Ctx.scene,
+                                 {static_cast<float>(m_ViewportImage.Extent().width),
+                                  static_cast<float>(m_ViewportImage.Extent().height)});
+        m_UiSystem.SyncAssets(m_Ctx.scene, m_Ctx.assets);
+        m_UiSystem.Draw(m_Ctx.scene, *m_UiOverlay);
+        m_UiOverlay->Render(frame, m_ViewportImage.View(), kViewportFormat, m_ViewportImage.Extent2D());
         CmdImageBarrier(cmd, {.image     = m_ViewportImage.Handle(),
                               .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                               .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

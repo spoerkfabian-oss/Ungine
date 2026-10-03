@@ -1,4 +1,5 @@
 add_executable(EngineTests CoreTests.cpp ScriptTests.cpp ProjectTests.cpp AudioTests.cpp BlueprintTests.cpp Blueprint2Tests.cpp BlueprintTestUtil.h Test.h)
+target_compile_definitions(EngineTests PRIVATE ENGINE_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(EngineTests PRIVATE Engine stb nlohmann_json::nlohmann_json)
 target_compile_definitions(EngineTests PRIVATE ENGINE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 engine_set_warnings(EngineTests)

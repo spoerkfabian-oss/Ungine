@@ -8,6 +8,7 @@
 #include "Engine/Script/ScriptGraph.h"
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/UI/UiLayout.h"
 
 #include <algorithm>
 #include <cmath>
@@ -245,6 +246,80 @@ TEST_CASE(Script_DelayTransformAndLoopGuard)
     const glm::vec3 world = f.scene.GetRegistry().Get<WorldTransform>(f.actor).matrix[3];
     CHECK(std::abs(world.x - 2.0f) < 0.05f && std::abs(world.z - 10.0f) < 1e-3f); // world +X under a rotated parent
     CHECK(f.scene.CountStaleTransforms() == 0);
+    f.scripts.End(f.scene);
+}
+
+TEST_CASE(Script_UiClickDispatchesCustomEvent)
+{
+    ScriptFixture f;
+    const std::uint32_t clicked = f.Node("Event.UIClicked");
+    const std::uint32_t print = f.Print("button clicked");
+    f.Link(clicked, "Out", print, "In");
+    const std::uint32_t changed = f.Node("Event.UIValueChanged");
+    const std::uint32_t printValue = f.Print("");
+    f.Link(changed, "Out", printValue, "In");
+    f.Link(changed, "Value", printValue, "Text");
+    const std::uint32_t checked = f.Node("Event.UICheckedChanged");
+    const std::uint32_t branch = f.Node("Flow.Branch");
+    f.Link(checked, "Out", branch, "In");
+    f.Link(checked, "Checked", branch, "Condition");
+    f.Link(branch, "True", f.Print("checked"), "In");
+    f.Link(branch, "False", f.Print("unchecked"), "In");
+    f.Start("ui.ugraph");
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::Clicked});
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::ValueChanged, .value = 0.75f});
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::CheckedChanged, .checked = true});
+    CHECK(f.Printed("button clicked") == 1);
+    CHECK(f.Printed("0.75") == 1);
+    CHECK(f.Printed("checked") == 1 && f.Printed("unchecked") == 0);
+    CHECK(!f.Errors());
+}
+
+TEST_CASE(Script_AnimationControls)
+{
+    ScriptFixture f;
+    f.scene.GetRegistry().Emplace<Animator>(f.actor);
+    f.scene.GetRegistry().Emplace<ModelInstance>(f.actor);
+
+    const std::uint32_t begin = f.Node("Event.BeginPlay");
+    const std::uint32_t clip = f.Node("Animation.SetClip");
+    const std::uint32_t speed = f.Node("Animation.SetSpeed");
+    const std::uint32_t looping = f.Node("Animation.SetLooping");
+    const std::uint32_t blend = f.Node("Animation.BlendTo");
+    const std::uint32_t rootMotion = f.Node("Animation.SetRootMotion");
+    const std::uint32_t play = f.Node("Animation.Play");
+    const std::uint32_t branch = f.Node("Flow.Branch");
+    const std::uint32_t playing = f.Node("Animation.IsPlaying");
+    const std::uint32_t print = f.Print("animation started");
+    const std::uint32_t stop = f.Node("Animation.Stop");
+    f.Set(clip, "Clip", std::int32_t{2});
+    f.Set(speed, "Speed", 1.5f);
+    f.Set(looping, "Loop", false);
+    f.Set(blend, "Clip", std::int32_t{4});
+    f.Set(blend, "Weight", 0.25f);
+    f.Set(rootMotion, "Enabled", true);
+    f.Link(begin, "Out", clip, "In");
+    f.Link(clip, "Then", speed, "In");
+    f.Link(speed, "Then", looping, "In");
+    f.Link(looping, "Then", blend, "In");
+    f.Link(blend, "Then", rootMotion, "In");
+    f.Link(rootMotion, "Then", play, "In");
+    f.Link(play, "Then", branch, "In");
+    f.Link(playing, "Playing", branch, "Condition");
+    f.Link(branch, "True", print, "In");
+    f.Link(print, "Then", stop, "In");
+
+    f.Start("animation.ugraph");
+    const Animator& animator = f.scene.GetRegistry().Get<Animator>(f.actor);
+    CHECK(animator.clipIndex == 2);
+    CHECK(animator.speed == 1.5f);
+    CHECK(!animator.looping);
+    CHECK(animator.blendClipIndex == 4);
+    CHECK(animator.blendWeight == 0.25f);
+    CHECK(animator.applyRootMotion);
+    CHECK(!animator.playing); // the IsPlaying pure pin saw Play=true; Stop then ran
+    CHECK(f.Printed("animation started") == 1);
+    CHECK(!f.Errors());
     f.scripts.End(f.scene);
 }
 

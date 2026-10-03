@@ -10,6 +10,8 @@ struct Vertex {
     vec3  normal;
     float uvY;
     vec4  tangent; // w = bitangent sign; w == 0: no tangent, derive the frame in the shader
+    uvec4 joints;
+    vec4  weights;
 };
 
 struct Material {
@@ -63,8 +65,16 @@ struct GpuInstance {
     uint flags;     // INSTANCE_MIRRORED
     uint firstDraw;
     uint drawCount;
+    uint jointOffset;
+    uint jointCount;
+    uint pad0;
+    uint pad1;
+    vec4 skinnedBoundsMin;
+    vec4 skinnedBoundsMax;
 };
 #define INSTANCE_MIRRORED 1u
+#define INSTANCE_SKINNED  2u
+#define INSTANCE_SKIN_BOUNDS_VALID 4u
 
 // Instance x submesh: the unit of culling. instance == ~0u: free slot.
 struct GpuDraw {
@@ -92,6 +102,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Ve
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MaterialBuffer { Material    m[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer SubmeshBuffer  { GpuSubmesh  s[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer InstanceBuffer { GpuInstance i[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer JointMatrixBuffer { mat4 m[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DrawBuffer     { GpuDraw     d[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BatchBuffer    { GpuBatch    b[]; };
 // Draw record per drawn instance (indexed by gl_InstanceIndex: firstInstance selects the slice).

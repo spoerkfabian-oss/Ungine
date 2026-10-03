@@ -15,6 +15,7 @@ namespace Engine {
 
 class AssetManager;
 class AudioSystem;
+struct UiEvent;
 class EventBus;
 class Input;
 class PhysicsWorld;
@@ -104,6 +105,8 @@ public:
     void Begin(Scene& scene);
     // acceptInput: key events / Is Key Down see the keyboard (false while the editor UI has it).
     void Update(Scene& scene, float dt, bool acceptInput = true);
+    // Dispatches a named Custom Event on the entity owning an interactive UI widget.
+    void DispatchUiEvent(Scene& scene, const UiEvent& event);
     void End(Scene& scene);
     [[nodiscard]] bool Running() const;
 

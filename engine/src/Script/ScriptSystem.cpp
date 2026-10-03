@@ -1,4 +1,5 @@
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/UI/UiLayout.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Core/Log.h"
@@ -1621,6 +1622,29 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     for (const auto& [key, inst] : w.instances)
         w.stats.ticking += static_cast<std::uint32_t>(inst->ticking.size());
     scene.UpdateTransforms();
+}
+
+void ScriptSystem::DispatchUiEvent(Scene& scene, const UiEvent& event)
+{
+    Impl& w = *m_Impl;
+    if (!w.running || !scene.GetRegistry().Valid(event.entity))
+        return;
+    const auto instance = w.instances.find(static_cast<std::uint64_t>(event.entity));
+    if (instance == w.instances.end())
+        return;
+    switch (event.type) {
+    case UiEventType::Clicked:
+        w.Fire(scene, *instance->second, "Event.UIClicked", nullptr, {});
+        break;
+    case UiEventType::ValueChanged:
+        w.Fire(scene, *instance->second, "Event.UIValueChanged", nullptr,
+               [&](const CompiledNode&, std::vector<ScriptValue>& out) { out[1] = event.value; });
+        break;
+    case UiEventType::CheckedChanged:
+        w.Fire(scene, *instance->second, "Event.UICheckedChanged", nullptr,
+               [&](const CompiledNode&, std::vector<ScriptValue>& out) { out[1] = event.checked; });
+        break;
+    }
 }
 
 void ScriptSystem::End(Scene& scene)

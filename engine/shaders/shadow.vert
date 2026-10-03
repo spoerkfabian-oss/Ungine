@@ -15,7 +15,8 @@ void main()
     const Vertex      v        = frame.vertices.v[gl_VertexIndex];
     const mat4        viewProj = pc.cascade < 4u ? frame.cascadeViewProj[pc.cascade]
                                                  : frame.shadowViews.v[pc.cascade - 4u].viewProj;
+    const mat4        skin     = SkinMatrix(inst, v);
     outUV       = vec2(v.uvX, v.uvY);
     outMaterial = frame.submeshes.s[draw.submesh].material;
-    gl_Position = viewProj * (inst.model * vec4(v.position, 1.0));
+    gl_Position = viewProj * (inst.model * skin * vec4(v.position, 1.0));
 }

@@ -752,7 +752,6 @@ Rendering:
 - deferred renderer is not the primary path
 
 glTF:
-- no skins/animation
 - no morph targets
 - limited color/UV support
 - selected extensions unsupported
@@ -772,9 +771,12 @@ Blueprint:
 - documented construction-script semantics
 
 Editor:
+- in-game UI is rendered in the editor viewport but interaction is currently available only in the player; pause-menu options are session-only and input remapping is not implemented
 - some interaction testing is manual
-- limited import workflow
-- no full automatic reference repair
+- Content import supports GLB, glTF with local URI dependencies, PNG/JPEG/KTX2 and WAV/OGG/MP3/FLAC; other formats and remote glTF dependencies are unsupported
+- asset previews are asynchronous and cached through AssetManager; model geometry is shown as a bounded wireframe, materials as base-color/metallic/roughness swatches, and streamed audio has no decoded waveform
+- move/rename repairs recognized references in saved scenes, legacy Scenes JSON, prefabs, Blueprints and glTF plus the active scene/project start scene; arbitrary user-defined path strings, unsaved open Blueprint documents and references in unrecognized formats are not repaired
+- deleting remains non-undoable and does not enumerate or repair dependent references
 
 Audio:
 - no HRTF

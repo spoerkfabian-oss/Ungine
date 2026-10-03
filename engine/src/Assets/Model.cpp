@@ -20,10 +20,18 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 {
     if (data.vertices.empty() || data.indices.empty())
         throw std::runtime_error("BuildModel: '" + data.name + "' contains no geometry");
+    if (!data.skinInfluences.empty() && data.skinInfluences.size() != data.vertices.size())
+        throw std::runtime_error("BuildModel: '" + data.name + "' has mismatched skin influences");
 
     GeometryPool& pool = renderer.Geometry();
     out.name     = data.name;
-    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{data.vertices}, ticket);
+    std::vector<Vertex> vertices = data.vertices;
+    if (!data.skinInfluences.empty())
+        for (std::size_t i = 0; i < vertices.size(); ++i) {
+            vertices[i].joints = glm::uvec4(data.skinInfluences[i].joints);
+            vertices[i].weights = data.skinInfluences[i].weights;
+        }
+    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{vertices}, ticket);
     out.indices  = pool.Upload(GeometryKind::Indices, std::span{data.indices}, ticket);
 
     out.meshes = data.meshes;
@@ -38,7 +46,10 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
                 if (std::uint64_t{sm.lods[l].firstIndex} + sm.lods[l].indexCount > data.indices.size())
                     throw std::runtime_error("BuildModel: '" + data.name + "' has an index range out of bounds");
         }
-    out.nodes     = data.nodes;
+    out.nodes      = data.nodes;
+    out.skinInfluences = data.skinInfluences;
+    out.skins      = data.skins;
+    out.animations = data.animations;
     out.boundsMin = data.boundsMin;
     out.boundsMax = data.boundsMax;
 
@@ -51,6 +62,7 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> materials,
                          std::span<const std::uint32_t> textureEntries, Model& out, UploadTicket& ticket)
 {
+    out.previewMaterials.assign(materials.begin(), materials.end());
     if (materials.empty())
         throw std::runtime_error("BuildModel: '" + out.name + "' has no materials");
 
@@ -156,10 +168,20 @@ std::uint64_t ModelCpuBytes(const Model& model)
 {
     std::uint64_t bytes = model.collisionPositions.size() * sizeof(glm::vec3) +
                           model.collisionIndices.size() * sizeof(std::uint32_t) +
+                          model.skinInfluences.size() * sizeof(VertexSkinInfluence) +
                           model.nodes.size() * sizeof(ModelNode) + model.materialFlags.size() * sizeof(std::uint32_t) +
                           model.gpuSubmeshes.size() * sizeof(GpuSubmesh);
     for (const Mesh& mesh : model.meshes)
         bytes += sizeof(Mesh) + mesh.submeshes.size() * sizeof(Submesh);
+    for (const Skin& skin : model.skins)
+        bytes += skin.name.capacity() + skin.joints.capacity() * sizeof(SkinJoint);
+    for (const AnimationClip& clip : model.animations) {
+        bytes += clip.name.capacity() + clip.tracks.capacity() * sizeof(AnimationTrack);
+        for (const AnimationTrack& track : clip.tracks)
+            bytes += track.times.capacity() * sizeof(float) +
+                     (track.values.capacity() + track.inTangents.capacity() + track.outTangents.capacity()) *
+                         sizeof(glm::vec4);
+    }
     return bytes;
 }
 
@@ -169,13 +191,15 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
     const Entity        root     = scene.CreateEntity(model.name, parent);
     std::vector<Entity> entities(model.nodes.size(), NullEntity);
     registry.Emplace<ModelInstance>(root, ModelInstance{.model = handle});
+    if (!model.animations.empty())
+        registry.Emplace<Animator>(root);
 
     for (std::size_t i = 0; i < model.nodes.size(); ++i) {
         const ModelNode& node       = model.nodes[i];
         const Entity     nodeParent = node.parent >= 0 ? entities[static_cast<std::size_t>(node.parent)] : root;
         const Entity     e          = scene.CreateEntity(node.name, nodeParent);
         scene.SetTransform(e, node.local);
-        registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
+        registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i), .instanceRoot = root});
         if (node.mesh >= 0)
             registry.Emplace<MeshRenderer>(e, handle, static_cast<std::uint32_t>(node.mesh));
         if (node.light)
@@ -195,6 +219,12 @@ std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model&
     });
 
     for (const Entity root : roots) {
+        if (!model.animations.empty()) {
+            if (!registry.Has<Animator>(root))
+                registry.Emplace<Animator>(root);
+        } else {
+            registry.Remove<Animator>(root);
+        }
         // This instance's node entities (nested instances are left alone).
         std::vector<Entity> existing;
         std::vector<Entity> stack(registry.Get<Hierarchy>(root).children);
@@ -230,11 +260,12 @@ std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model&
             Entity&          e      = byNode[i];
             if (e == NullEntity) {
                 e = scene.CreateEntity(node.name, parent);
-                registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
+                registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i), .instanceRoot = root});
             } else {
                 if (registry.Get<Hierarchy>(e).parent != parent)
                     scene.SetParent(e, parent);
                 registry.Get<ModelNodeRef>(e).node = static_cast<std::uint32_t>(i);
+                registry.Get<ModelNodeRef>(e).instanceRoot = root;
             }
             scene.SetTransform(e, node.local);
             if (node.mesh >= 0)

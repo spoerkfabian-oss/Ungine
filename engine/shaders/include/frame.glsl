@@ -45,6 +45,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     MaterialBuffer   materials; // geometry pool
     SubmeshBuffer    submeshes; // geometry pool
     InstanceBuffer   instances; // GPU scene
+    JointMatrixBuffer jointMatrices; // per-instance skin palette
     DrawBuffer       draws;     // GPU scene
     HiZBuffer        hiz;
     TextureTable     textureTable; // material texture entry -> bindless slot

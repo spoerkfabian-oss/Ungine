@@ -28,9 +28,17 @@ struct GpuInstance {
     std::uint32_t flags     = 0; // kInstanceMirrored
     std::uint32_t firstDraw = 0;
     std::uint32_t drawCount = 0;
+    std::uint32_t jointOffset = ~0u;
+    std::uint32_t jointCount = 0;
+    std::uint32_t pad0 = 0;
+    std::uint32_t pad1 = 0;
+    glm::vec4 skinnedBoundsMin{0.0f};
+    glm::vec4 skinnedBoundsMax{0.0f};
 };
-static_assert(sizeof(GpuInstance) == 128);
+static_assert(sizeof(GpuInstance) == 176);
 inline constexpr std::uint32_t kInstanceMirrored = 1;
+inline constexpr std::uint32_t kInstanceSkinned = 2;
+inline constexpr std::uint32_t kInstanceSkinBoundsValid = 4;
 
 // Mirrors GpuDraw: one submesh of one instance, the unit of culling.
 struct GpuDraw {
@@ -115,12 +123,14 @@ public:
 
     // GPU buffers (valid after Upload).
     [[nodiscard]] VkDeviceAddress InstanceAddress() const { return m_InstanceBuffer.Address(); }
+    [[nodiscard]] VkDeviceAddress JointMatrixAddress() const { return m_JointMatrices.Address(); }
     [[nodiscard]] VkDeviceAddress DrawAddress() const { return m_DrawBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress BatchAddress() const { return m_BatchBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress VisibilityAddress() const { return m_Visibility.Address(); }
 
 private:
     void Upsert(const Scene& scene, const AssetManager& assets, Entity entity);
+    void UpdateJointPalettes(const Scene& scene, const AssetManager& assets);
     void UseModel(const AssetManager& assets, ModelHandle model);
     void UnuseModel(ModelHandle model);
     void Remove(Entity entity);
@@ -172,7 +182,8 @@ private:
     bool                       m_BatchesDirty = false;
 
     // GPU buffers (capacity in elements)
-    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility;
+    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility, m_JointMatrices;
+    std::vector<glm::mat4> m_JointMatrixData;
 };
 
 } // namespace Engine

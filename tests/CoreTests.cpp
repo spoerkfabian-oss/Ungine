@@ -1,6 +1,7 @@
 #include "Test.h"
 
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Assets/MeshOptimizer.h"
 #include "Engine/Assets/Model.h"
@@ -19,16 +20,21 @@
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/UI/UiLayout.h"
+#include "Engine/UI/UiSystem.h"
 
 #include <glm/gtc/epsilon.hpp>
+#include <glm/gtc/constants.hpp>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -38,6 +44,7 @@
 #include <random>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace Engine;
@@ -255,6 +262,231 @@ TEST_CASE(Cascades_StableUnderCameraMotion)
         const glm::vec2 tb = glm::vec2(moved[c].viewProj * point) * (0.5f * settings.resolution);
         const glm::vec2 d  = ta - tb;
         CHECK(std::abs(d.x - std::round(d.x)) < 1e-2f && std::abs(d.y - std::round(d.y)) < 1e-2f);
+    }
+}
+
+TEST_CASE(Animation_EvaluateLinearStepCubicAndLoop)
+{
+    Model model;
+    model.nodes.resize(3);
+    model.nodes[2].local.position = {7.0f, 8.0f, 9.0f};
+
+    AnimationClip clip;
+    clip.duration = 1.0f;
+    AnimationTrack translation{.node = 0,
+                               .path = AnimationPath::Translation,
+                               .interpolation = AnimationInterpolation::Linear,
+                               .times = {0.0f, 1.0f},
+                               .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 4.0f, 6.0f, 0.0f}}};
+    AnimationTrack rotation{.node = 1,
+                            .path = AnimationPath::Rotation,
+                            .interpolation = AnimationInterpolation::Linear,
+                            .times = {0.0f, 1.0f},
+                            .values = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 0.0f}}};
+    AnimationTrack scale{.node = 2,
+                         .path = AnimationPath::Scale,
+                         .interpolation = AnimationInterpolation::Step,
+                         .times = {0.0f, 1.0f},
+                         .values = {{1.0f, 1.0f, 1.0f, 0.0f}, {3.0f, 3.0f, 3.0f, 0.0f}}};
+    clip.tracks = {translation, rotation, scale};
+
+    std::vector<Transform> pose(model.nodes.size());
+    EvaluateAnimation(model, clip, 0.5f, AnimationPlayback::Once, pose);
+    CHECK(glm::length(pose[0].position - glm::vec3{1.0f, 2.0f, 3.0f}) < 1.0e-5f);
+    CHECK(std::abs(pose[1].rotation.y - std::sqrt(0.5f)) < 1.0e-4f);
+    CHECK(std::abs(pose[1].rotation.w - std::sqrt(0.5f)) < 1.0e-4f);
+    CHECK(glm::length(pose[2].scale - glm::vec3{1.0f}) < 1.0e-5f);
+    CHECK(glm::length(pose[2].position - model.nodes[2].local.position) < 1.0e-5f); // untracked channels retain the bind pose
+
+    AnimationTrack cubic{.node = 0,
+                         .path = AnimationPath::Translation,
+                         .interpolation = AnimationInterpolation::CubicSpline,
+                         .times = {0.0f, 1.0f},
+                         .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f, 0.0f}},
+                         .inTangents = {glm::vec4{0.0f}, glm::vec4{0.0f}},
+                         .outTangents = {glm::vec4{0.0f}, glm::vec4{0.0f}}};
+    clip.tracks = {cubic};
+    EvaluateAnimation(model, clip, 0.5f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(pose[0].position.x - 1.0f) < 1.0e-5f);
+
+    clip.tracks = {translation};
+    EvaluateAnimation(model, clip, 1.5f, AnimationPlayback::Loop, pose);
+    CHECK(std::abs(pose[0].position.x - 1.0f) < 1.0e-5f);
+    EvaluateAnimation(model, clip, 1.5f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(pose[0].position.x - 2.0f) < 1.0e-5f);
+}
+
+TEST_CASE(Animation_BlendAndUnwrappedRootMotion)
+{
+    std::vector<Transform> from(1), to(1);
+    to[0].position = {2.0f, 0.0f, 0.0f};
+    to[0].rotation = glm::angleAxis(glm::pi<float>(), glm::vec3{0.0f, 1.0f, 0.0f});
+    to[0].scale = {3.0f, 3.0f, 3.0f};
+    BlendAnimationPoses(from, to, 0.25f);
+    CHECK(std::abs(from[0].position.x - 0.5f) < 1.0e-5f);
+    CHECK(std::abs(from[0].scale.x - 1.5f) < 1.0e-5f);
+    const glm::quat halfTurn = glm::angleAxis(glm::pi<float>() * 0.25f, glm::vec3{0.0f, 1.0f, 0.0f});
+    CHECK(std::abs(glm::dot(from[0].rotation, halfTurn)) > 0.999f);
+
+    AnimationClip clip;
+    clip.duration = 1.0f;
+    clip.tracks.push_back({.node = 0,
+                           .path = AnimationPath::Translation,
+                           .interpolation = AnimationInterpolation::Linear,
+                           .times = {0.0f, 1.0f},
+                           .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f, 0.0f}}});
+    CHECK(std::abs(SampleRootMotion(clip, 0, 0.25f, true).x - 0.5f) < 1.0e-5f);
+    CHECK(std::abs(SampleRootMotion(clip, 0, 1.25f, true).x - 2.5f) < 1.0e-5f);
+    CHECK(std::abs(SampleRootMotion(clip, 0, 1.25f, false).x - 2.0f) < 1.0e-5f);
+}
+
+TEST_CASE(Animation_SkinnedBoundsFollowThePose)
+{
+    Model model;
+    model.collisionPositions = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    model.collisionIndices = {0, 1, 2};
+    model.skinInfluences.resize(3);
+    for (VertexSkinInfluence& influence : model.skinInfluences) {
+        influence.joints = glm::u16vec4{0};
+        influence.weights = {1.0f, 0.0f, 0.0f, 0.0f};
+    }
+    model.meshes.resize(1);
+    model.meshes[0].submeshes.push_back({.firstIndex = 0, .indexCount = 3, .vertexOffset = 0});
+    model.skins.resize(1);
+    model.skins[0].joints.push_back({.node = 0});
+    const std::array<glm::mat4, 1> palette{glm::translate(glm::mat4{1.0f}, glm::vec3{2.0f, 0.0f, 0.0f})};
+    const auto bounds = ComputeSkinnedBounds(model, 0, 0, palette);
+    CHECK(bounds.has_value());
+    if (bounds) {
+        CHECK(glm::length(bounds->first - glm::vec3{2.0f, 0.0f, 0.0f}) < 1.0e-5f);
+        CHECK(glm::length(bounds->second - glm::vec3{3.0f, 1.0f, 0.0f}) < 1.0e-5f);
+    }
+}
+
+TEST_CASE(Gltf_SkinAndAnimationImport)
+{
+    const auto directory = fs::temp_directory_path() /
+        std::format("ungine_animation_{}", std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::create_directories(directory);
+    const auto gltfPath = directory / "fixture.gltf";
+    const auto binPath = directory / "fixture.bin";
+
+    std::vector<std::byte> bytes;
+    const auto append = [&bytes](const auto& data) {
+        while (bytes.size() % 4 != 0)
+            bytes.push_back(std::byte{0});
+        const std::size_t offset = bytes.size();
+        const auto* first = reinterpret_cast<const std::byte*>(data.data());
+        bytes.insert(bytes.end(), first, first + data.size() * sizeof(data[0]));
+        return std::pair{offset, bytes.size() - offset};
+    };
+    const std::array<float, 9> positions{0, 0, 0, 1, 0, 0, 0, 1, 0};
+    const std::array<std::uint16_t, 3> indices{0, 1, 2};
+    const std::array<std::uint8_t, 12> joints{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, 12> weights{1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    const std::array<float, 16> inverseBind{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const std::array<float, 2> times{0, 1};
+    const std::array<float, 6> translations{0, 0, 0, 1, 0, 0};
+    const auto positionView = append(positions);
+    const auto indexView = append(indices);
+    const auto jointView = append(joints);
+    const auto weightView = append(weights);
+    const auto inverseBindView = append(inverseBind);
+    const auto timeView = append(times);
+    const auto translationView = append(translations);
+    {
+        std::ofstream file(binPath, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    {
+        std::ofstream file(gltfPath);
+        file << std::format(R"({{
+  "asset": {{"version": "2.0"}},
+  "scene": 0,
+  "scenes": [{{"nodes": [0]}}],
+  "nodes": [{{"name": "Root", "children": [1, 2]}}, {{"name": "Bone"}},
+            {{"name": "Mesh", "mesh": 0, "skin": 0}}],
+  "skins": [{{"name": "Rig", "skeleton": 1, "joints": [1], "inverseBindMatrices": 4}}],
+  "animations": [{{"name": "Move", "samplers": [{{"input": 5, "output": 6}}],
+                  "channels": [{{"sampler": 0, "target": {{"node": 1, "path": "translation"}}}}]}}],
+  "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3}}, "indices": 1}}]}}],
+  "buffers": [{{"uri": "fixture.bin", "byteLength": {}}}],
+  "bufferViews": [
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}}
+  ],
+  "accessors": [
+    {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+    {{"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+    {{"bufferView": 2, "componentType": 5121, "count": 3, "type": "VEC4"}},
+    {{"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4"}},
+    {{"bufferView": 4, "componentType": 5126, "count": 1, "type": "MAT4"}},
+    {{"bufferView": 5, "componentType": 5126, "count": 2, "type": "SCALAR"}},
+    {{"bufferView": 6, "componentType": 5126, "count": 2, "type": "VEC3"}}
+  ]
+}})", bytes.size(), positionView.first, positionView.second, indexView.first, indexView.second,
+                         jointView.first, jointView.second, weightView.first, weightView.second,
+                         inverseBindView.first, inverseBindView.second, timeView.first, timeView.second,
+                         translationView.first, translationView.second);
+    }
+
+    const ModelData data = LoadGltf(gltfPath);
+    fs::remove_all(directory);
+    CHECK(data.skins.size() == 1);
+    CHECK(data.animations.size() == 1);
+    CHECK(data.nodes.size() == 3);
+    CHECK(data.skinInfluences.size() == 3);
+    if (data.skins.size() == 1 && data.animations.size() == 1 && data.nodes.size() == 3 &&
+        data.skinInfluences.size() == 3) {
+        CHECK(data.skins[0].joints.size() == 1 && data.skins[0].joints[0].node == 1);
+        CHECK(data.nodes[2].skin == 0);
+        CHECK(data.animations[0].tracks.size() == 1 && data.animations[0].tracks[0].node == 1);
+        CHECK(data.animations[0].duration == 1.0f);
+        CHECK(data.skinInfluences[0].joints.x == 0);
+        CHECK(data.skinInfluences[0].weights.x == 1.0f);
+        const glm::mat4& bind = data.skins[0].joints[0].inverseBindMatrix;
+        CHECK(bind[0][0] == 1.0f && bind[1][1] == 1.0f && bind[2][2] == 1.0f && bind[3][3] == 1.0f);
+    }
+}
+
+TEST_CASE(Gltf_BasicTemplateAnimatedBanner)
+{
+    const fs::path source = fs::path(ENGINE_TEST_SOURCE_DIR) / "templates/Basic/Content";
+    const ModelData model = LoadGltf(source / "Models/AnimatedBanner.gltf");
+    CHECK(model.nodes.size() == 4);
+    CHECK(model.skins.size() == 1 && model.skins[0].joints.size() == 2);
+    CHECK(model.animations.size() == 1 && model.animations[0].tracks.size() == 1);
+    CHECK(model.skinInfluences.size() == 8);
+    if (model.nodes.size() == 4 && model.animations.size() == 1 && !model.animations[0].tracks.empty() &&
+        model.skinInfluences.size() == 8) {
+        CHECK(model.nodes[3].skin == 0);
+        CHECK(model.animations[0].duration == 2.0f);
+        CHECK(model.animations[0].tracks[0].node == 2);
+        CHECK(model.animations[0].tracks[0].path == AnimationPath::Rotation);
+        CHECK(model.skinInfluences[0].joints.x == 0 && model.skinInfluences[4].joints.x == 1);
+    }
+
+    Scene scene;
+    const auto handles = LoadSceneFile(source / "Scenes/Main.scene.json", scene,
+                                       static_cast<AssetManager*>(nullptr));
+    CHECK(handles.empty());
+    const Entity root = scene.FindByUuid(1007);
+    CHECK(root != NullEntity && scene.GetRegistry().Has<Animator>(root));
+    CHECK(scene.GetRegistry().Get<Animator>(root).playing);
+    Entity mesh = NullEntity;
+    scene.GetRegistry().ViewOf<Name>().Each([&](Entity entity, const Name& name) {
+        if (name.value == "Banner Mesh")
+            mesh = entity;
+    });
+    CHECK(mesh != NullEntity);
+    if (mesh != NullEntity) {
+        CHECK(scene.GetRegistry().Has<ModelNodeRef>(mesh));
+        CHECK(scene.GetRegistry().Get<ModelNodeRef>(mesh).instanceRoot == root);
     }
 }
 
@@ -479,11 +711,123 @@ TEST_CASE(Scene_UuidsAndSiblingOrder)
     CHECK(r.AliveCount() == 0);
 }
 
+TEST_CASE(UiLayout_AnchorsScalingHierarchyAndVisibility)
+{
+    Scene scene;
+    Registry& registry = scene.GetRegistry();
+    const Entity canvas = scene.CreateEntity("Canvas");
+    registry.Emplace<UiCanvas>(canvas, UiCanvas{});
+    const Entity panel = scene.CreateEntity("Panel", canvas);
+    registry.Emplace<UiWidget>(panel, UiWidget{.type = UiWidgetType::Panel,
+                                               .offsetMax = {960.0f, 540.0f}});
+    const Entity button = scene.CreateEntity("Play", panel);
+    registry.Emplace<UiWidget>(button, UiWidget{.type = UiWidgetType::Button,
+                                                .anchorMin = {0.5f, 0.5f},
+                                                .anchorMax = {0.5f, 0.5f},
+                                                .offsetMax = {160.0f, 48.0f},
+                                                .pivot = {0.5f, 0.5f}});
+
+    const auto layout = BuildUiLayout(scene, canvas, {1280.0f, 720.0f});
+    CHECK(layout.size() == 2);
+    if (layout.size() != 2)
+        return;
+    CHECK(layout[0].entity == panel);
+    CHECK(layout[0].rect.position == glm::vec2{0.0f});
+    CHECK(glm::length(layout[0].rect.size - glm::vec2{640.0f, 360.0f}) < 1.0e-4f);
+    CHECK(layout[1].entity == button);
+    CHECK(glm::length(layout[1].rect.position - glm::vec2{266.6667f, 156.0f}) < 1.0e-3f);
+    CHECK(glm::length(layout[1].rect.size - glm::vec2{106.6667f, 32.0f}) < 1.0e-3f);
+    CHECK(layout[1].rect.Contains({300.0f, 170.0f}));
+    CHECK(!layout[1].rect.Contains({400.0f, 170.0f}));
+
+    registry.Get<UiCanvas>(canvas).visible = false;
+    CHECK(BuildUiLayout(scene, canvas, {1280.0f, 720.0f}).empty());
+    registry.Get<UiCanvas>(canvas).visible = true;
+    registry.Get<UiWidget>(panel).visible = false;
+    CHECK(BuildUiLayout(scene, canvas, {1280.0f, 720.0f}).empty());
+}
+
+TEST_CASE(UiSystem_MouseKeyboardAndSliderEvents)
+{
+    EventBus events;
+    Input input(events);
+    Scene scene;
+    Registry& registry = scene.GetRegistry();
+    const Entity canvas = scene.CreateEntity("Canvas");
+    registry.Emplace<UiCanvas>(canvas, UiCanvas{.designSize = {640.0f, 480.0f}, .scaleWithViewport = false});
+    const Entity button = scene.CreateEntity("Play", canvas);
+    registry.Emplace<UiWidget>(button, UiWidget{.type = UiWidgetType::Button,
+                                                .offsetMax = {200.0f, 60.0f}, .text = "Play"});
+    const Entity slider = scene.CreateEntity("Volume", canvas);
+    registry.Emplace<UiWidget>(slider, UiWidget{.type = UiWidgetType::Slider,
+                                                .offsetMin = {0.0f, 100.0f}, .offsetMax = {240.0f, 140.0f}});
+
+    UiSystem ui;
+    input.NewFrame();
+    events.Publish(MouseMoveEvent{50.0, 25.0});
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Hovered() == button && ui.Focused() == button);
+    input.NewFrame();
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Release, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].entity == button && ui.Events()[0].type == UiEventType::Clicked);
+
+    input.NewFrame();
+    events.Publish(KeyEvent{Key::Space, 0, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].entity == button && ui.Events()[0].type == UiEventType::Clicked);
+
+    input.NewFrame();
+    events.Publish(MouseMoveEvent{120.0, 120.0});
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Hovered() == slider && ui.Focused() == slider);
+    CHECK(std::abs(registry.Get<UiWidget>(slider).value - 0.5f) < 1.0e-5f);
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].type == UiEventType::ValueChanged);
+}
+
+TEST_CASE(Input_GamepadEdgesAndDisconnect)
+{
+    EventBus events;
+    Input input(events);
+    input.NewFrame();
+    GamepadStateEvent connected;
+    connected.connected = true;
+    connected.buttons[GamepadButton::South] = 1;
+    connected.axes[GamepadAxis::LeftX] = 0.5f;
+    events.Publish(connected);
+    CHECK(input.WasGamepadButtonPressed(GamepadButton::South));
+    CHECK(input.IsGamepadButtonDown(GamepadButton::South));
+    CHECK(input.GamepadAxisValue(GamepadAxis::LeftX) == 0.5f);
+
+    input.NewFrame();
+    events.Publish(connected);
+    CHECK(!input.WasGamepadButtonPressed(GamepadButton::South));
+    CHECK(input.IsGamepadButtonDown(GamepadButton::South));
+    GamepadStateEvent disconnected;
+    events.Publish(disconnected);
+    CHECK(input.WasGamepadButtonReleased(GamepadButton::South));
+    CHECK(!input.IsGamepadButtonDown(GamepadButton::South));
+    CHECK(input.GamepadAxisValue(GamepadAxis::LeftX) == 0.0f);
+}
+
 TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
 {
     Scene        scene;
     Registry&    r      = scene.GetRegistry();
     const Entity parent = scene.CreateEntity("Parent");
+    r.Emplace<ModelInstance>(parent, ModelInstance{.model = ModelHandle{7, 3}});
+    r.Emplace<UiCanvas>(parent, UiCanvas{.designSize = {1600.0f, 900.0f}, .sortOrder = 3});
     scene.CreateEntity("First", parent);
     const Entity node = scene.CreateEntity("Node", parent);
     const Entity child = scene.CreateEntity("Child", node);
@@ -491,6 +835,26 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     scene.EditTransform(node).rotation = glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f));
     r.Emplace<Light>(child, Light{.type = LightType::Spot, .intensity = 7.0f, .castShadows = false});
     r.Emplace<MeshRenderer>(node, MeshRenderer{.model = ModelHandle{3, 9}, .meshIndex = 2});
+    r.Emplace<ModelNodeRef>(node, ModelNodeRef{.node = 0, .instanceRoot = parent});
+    Animator animator;
+    animator.clipIndex = 2;
+    animator.blendClipIndex = 1;
+    animator.blendWeight = 0.35f;
+    animator.speed = 1.75f;
+    animator.looping = false;
+    animator.playing = false;
+    animator.rootMotionNode = 4;
+    animator.applyRootMotion = true;
+    r.Emplace<Animator>(node, animator);
+    r.Emplace<UiWidget>(node, UiWidget{.type = UiWidgetType::Slider,
+                                       .anchorMin = {0.0f, 1.0f},
+                                       .anchorMax = {1.0f, 1.0f},
+                                       .offsetMin = {12.0f, -44.0f},
+                                       .offsetMax = {-12.0f, 0.0f},
+                                       .text = "Volume",
+                                       .value = 0.4f,
+                                       .minimum = -1.0f,
+                                       .maximum = 1.0f});
     const std::uint64_t nodeUuid  = r.Get<Uuid>(node).value;
     const std::uint64_t childUuid = r.Get<Uuid>(child).value;
 
@@ -512,6 +876,24 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
                             glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f))) - 1.0f) < 1e-5f);
     CHECK(r.Has<MeshRenderer>(node2) && r.Get<MeshRenderer>(node2).model == (ModelHandle{3, 9}) &&
           r.Get<MeshRenderer>(node2).meshIndex == 2);
+    CHECK(r.Has<ModelNodeRef>(node2) && r.Get<ModelNodeRef>(node2).node == 0 &&
+          r.Get<ModelNodeRef>(node2).instanceRoot == parent);
+    CHECK(r.Has<UiWidget>(node2));
+    if (const UiWidget* widget = r.TryGet<UiWidget>(node2)) {
+        CHECK(widget->type == UiWidgetType::Slider && widget->text == "Volume");
+        CHECK(widget->anchorMin == glm::vec2{0.0f, 1.0f});
+        CHECK(widget->value == 0.4f && widget->minimum == -1.0f && widget->maximum == 1.0f);
+    }
+    CHECK(r.Has<UiCanvas>(parent) && r.Get<UiCanvas>(parent).designSize == (glm::vec2{1600.0f, 900.0f}) &&
+          r.Get<UiCanvas>(parent).sortOrder == 3);
+    CHECK(r.Has<Animator>(node2));
+    if (const Animator* restoredAnimator = r.TryGet<Animator>(node2)) {
+        CHECK(restoredAnimator->clipIndex == 2 && restoredAnimator->blendClipIndex == 1);
+        CHECK(restoredAnimator->blendWeight == 0.35f && restoredAnimator->speed == 1.75f);
+        CHECK(!restoredAnimator->looping && !restoredAnimator->playing);
+        CHECK(restoredAnimator->rootMotionNode == 4 && restoredAnimator->applyRootMotion);
+        CHECK(restoredAnimator->timeSeconds == 0.0f && restoredAnimator->blendTimeSeconds == 0.0f);
+    }
     CHECK(r.Has<Light>(child2) && r.Get<Light>(child2).type == LightType::Spot &&
           r.Get<Light>(child2).intensity == 7.0f && !r.Get<Light>(child2).castShadows);
 
@@ -527,10 +909,14 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     scene.EditTransform(node2).scale = glm::vec3(5.0f);
     r.Get<Name>(node2).value      = "Renamed";
     r.Remove<MeshRenderer>(node2);
+    r.Get<Animator>(node2).blendWeight = 0.9f;
+    r.Get<UiWidget>(node2).value = 0.9f;
     r.Emplace<Light>(node2);
     ApplyEntityState(scene, node2, state);
     CHECK(r.Get<Transform>(node2).scale == glm::vec3(1.0f) && r.Get<Name>(node2).value == "Node");
     CHECK(r.Has<MeshRenderer>(node2) && !r.Has<Light>(node2));
+    CHECK(r.Get<Animator>(node2).blendWeight == 0.35f);
+    CHECK(r.Get<UiWidget>(node2).value == 0.4f);
 }
 
 TEST_CASE(Scene_DirtyTransformsAndChanges)

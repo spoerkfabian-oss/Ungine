@@ -125,6 +125,18 @@ std::optional<Entity> Target(ScriptContext& c, int pin)
     return e;
 }
 
+std::optional<Entity> AnimatorTarget(ScriptContext& c, int pin)
+{
+    const std::optional<Entity> entity = Target(c, pin);
+    if (!entity)
+        return std::nullopt;
+    if (!c.GetScene().GetRegistry().Has<Animator>(*entity)) {
+        c.Error("Target has no Animator");
+        return std::nullopt;
+    }
+    return entity;
+}
+
 glm::mat4 World(ScriptContext& c, Entity e)
 {
     c.GetScene().UpdateTransforms(); // cheap when nothing is dirty
@@ -444,6 +456,11 @@ std::vector<NodeDesc> BuildRegistry()
               "This entity starts touching another body (physics)"));
     add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
               "This entity stops touching another body"));
+    add(Event("Event.UIClicked", "On UI Clicked", {}, "An interactive UI button was clicked"));
+    add(Event("Event.UIValueChanged", "On UI Value Changed", {Out("Value", P::Float)},
+              "A UI slider value changed"));
+    add(Event("Event.UICheckedChanged", "On UI Checked Changed", {Out("Checked", P::Bool)},
+              "A UI checkbox changed state"));
     add(WithParam(Event("Event.KeyPressed", "On Key Pressed", {}, "The key went down this frame"), ParamKind::Key,
                   "Key", "Space"));
     add(WithParam(Event("Event.KeyReleased", "On Key Released", {}, "The key went up this frame"), ParamKind::Key,
@@ -780,6 +797,74 @@ std::vector<NodeDesc> BuildRegistry()
              }));
     add(Pure("Entity.IsValid", "Is Valid", "Entity", {In("Entity", P::Entity), Out("Valid", P::Bool)},
              [](ScriptContext& c) { c.Out(1, Alive(c, c.InEntity(0))); }));
+
+    add(Action("Animation.Play", "Play Animation", "Animation", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        if (const auto entity = AnimatorTarget(c, 2))
+            c.GetScene().GetRegistry().Get<Animator>(*entity).playing = true;
+    }));
+    add(Action("Animation.Stop", "Stop Animation", "Animation", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        if (const auto entity = AnimatorTarget(c, 2))
+            c.GetScene().GetRegistry().Get<Animator>(*entity).playing = false;
+    }));
+    add(Action("Animation.SetClip", "Set Animation Clip", "Animation",
+               {In("Target", P::Entity), In("Clip", P::Int)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const std::int32_t clip = c.InInt(3);
+                       if (clip < 0) {
+                           c.Error("Animation clip index cannot be negative");
+                           return;
+                       }
+                       Animator& animator = c.GetScene().GetRegistry().Get<Animator>(*entity);
+                       animator.clipIndex = static_cast<std::uint32_t>(clip);
+                       animator.sampledClip = ~std::uint32_t{0};
+                       animator.timeSeconds = 0.0f;
+                   }
+               }));
+    add(Action("Animation.SetSpeed", "Set Animation Speed", "Animation",
+               {In("Target", P::Entity), In("Speed", P::Float)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const float speed = c.InFloat(3);
+                       if (!std::isfinite(speed) || speed < 0.0f) {
+                           c.Error("Animation speed must be finite and non-negative");
+                           return;
+                       }
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).speed = speed;
+                   }
+               }));
+    add(Action("Animation.SetLooping", "Set Animation Looping", "Animation",
+               {In("Target", P::Entity), In("Loop", P::Bool)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2))
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).looping = c.InBool(3);
+               }));
+    add(Action("Animation.BlendTo", "Blend To Animation", "Animation",
+               {In("Target", P::Entity), In("Clip", P::Int), In("Weight", P::Float)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const std::int32_t clip = c.InInt(3);
+                       const float weight = c.InFloat(4);
+                       if (clip < 0 || !std::isfinite(weight)) {
+                           c.Error("Blend clip index must be non-negative and weight finite");
+                           return;
+                       }
+                       Animator& animator = c.GetScene().GetRegistry().Get<Animator>(*entity);
+                       if (animator.blendClipIndex != static_cast<std::uint32_t>(clip)) {
+                           animator.blendClipIndex = static_cast<std::uint32_t>(clip);
+                           animator.sampledBlendClip = ~std::uint32_t{0};
+                       }
+                       animator.blendWeight = std::clamp(weight, 0.0f, 1.0f);
+                   }
+               }));
+    add(Action("Animation.SetRootMotion", "Set Root Motion", "Animation",
+               {In("Target", P::Entity), In("Enabled", P::Bool)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2))
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).applyRootMotion = c.InBool(3);
+               }));
+    add(Pure("Animation.IsPlaying", "Is Animation Playing", "Animation",
+             {In("Target", P::Entity), Out("Playing", P::Bool)}, [](ScriptContext& c) {
+                 const Entity entity = c.InEntity(0);
+                 const Registry& registry = c.GetScene().GetRegistry();
+                 c.Out(1, Alive(c, entity) && registry.Has<Animator>(entity) && registry.Get<Animator>(entity).playing);
+             }));
+
     add(Pure("Entity.GetPosition", "Get World Position", "Transform", {In("Target", P::Entity), Out("Position", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))

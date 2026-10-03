@@ -67,6 +67,7 @@ private:
     GLFWwindow* m_Handle = nullptr;
     EventBus*   m_Events = nullptr;
     int         m_WindowedX = 100, m_WindowedY = 100, m_WindowedW = 1600, m_WindowedH = 900;
+    mutable bool m_GamepadConnected = false;
 };
 
 } // namespace Engine

@@ -35,7 +35,11 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    `Saved/` (Caches, Layout – nicht Teil des Spiels).
 3. **Content**-Browser: Doppelklick öffnet Szenen/Blueprints bzw. platziert Modelle; Dateien lassen
    sich in den Viewport ziehen (Modelle) oder auf die Auswahl (Blueprints). *+ New* legt Ordner,
-   Blueprints und Szenen an.
+   Blueprints und Szenen an. *Import file...* kopiert Modelle (.glb/.gltf samt lokalen Dateien),
+   Texturen und Sounds in den aktuellen Content-Ordner. Auswahl zeigt Textur-, Modell-/Material- oder
+   Audiovorschau; Rechtsklick bietet *Move to folder...*, *Rename...* und die bestätigungspflichtige
+   Löschung. Referenzen in unterstützten Szenen-, Blueprint-, Prefab- und glTF-Dateien werden bei
+   Verschieben/Umbenennen angepasst.
 4. **Blueprint**-Tab: Knoten per Rechtsklick suchen, Pins ziehen zum Verbinden, Variablen links,
    Details/Parameter darunter. Script einer Entity zuweisen: Inspector → *Add component* →
    *Script (Blueprint)*.
@@ -76,10 +80,24 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    *Input*). **Construction Script** (*Construction Script*-Event): läuft im Editor nach jeder
    Änderung und vor BeginPlay; was es erzeugt, wird nicht gespeichert (grau in der Hierarchy).
    Strg+F sucht in allen Blueprints, Rechtsklick → *Collapse to function / macro* fasst Knoten
-   zusammen.
+    zusammen.
+12. **Skeletal animation**: The *Basic Scene* template includes a waving glTF banner. Imported
+    animated models play their first clip automatically. Select the model instance to change its
+    clip, speed, looping, blend target and root-motion settings in the **Animator** inspector.
+    Blueprints can play, stop, select and blend clips, change speed/looping/root motion and query
+    playback. Supported glTF interpolation modes are STEP, LINEAR and CUBICSPLINE.
+13. **In-game UI**: Add a *UI Canvas* and child *UI Widget* components in the Inspector. Widgets
+    use parent-relative anchors and offsets, with a design resolution that scales into the game
+    viewport. Text, images, panels, buttons, checkboxes, sliders and progress bars are supported.
+    Buttons and values can raise Blueprint events (On UI Clicked, On UI Value Changed,
+    On UI Checked Changed). The standalone player opens its pause menu with Escape and supports
+    keyboard, mouse and mapped gamepad navigation; Options currently control music volume and
+    fullscreen for the current session.
+
 
 ## Entwicklung
 
 `Sandbox` ist die Test-/Demo-Anwendung der Engine (siehe `CLAUDE.md` für Architektur, Optionen
 und den Stand der Entwicklung). Tests: `EngineTests` (CPU), `EngineGpuTests` und Smoke-Tests per
-CTest mit `-DENGINE_GPU_TESTS=ON`.
+CTest mit `-DENGINE_GPU_TESTS=ON`. Geplante Engine-Erweiterungen und ihre Reihenfolge stehen in
+[ROADMAP.md](ROADMAP.md).

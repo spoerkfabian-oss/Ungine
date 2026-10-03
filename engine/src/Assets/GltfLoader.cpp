@@ -7,6 +7,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -77,6 +78,10 @@ public:
         ParseMaterials();
         ParseMeshes();
         ParseNodes();
+        ParseSkins();
+        ParseAnimations();
+        if (!m_Out->skins.empty() || !m_Out->animations.empty())
+            ENGINE_WARN("glTF: skeletal data loaded, but runtime animation is not implemented yet - bind pose used");
     }
 
 private:
@@ -205,6 +210,7 @@ private:
                 }
 
                 const cgltf_accessor *pos = nullptr, *nrm = nullptr, *uv = nullptr, *tan = nullptr;
+                const cgltf_accessor *joints = nullptr, *weights = nullptr;
                 for (cgltf_size ai = 0; ai < prim.attributes_count; ++ai) {
                     const cgltf_attribute& a = prim.attributes[ai];
                     switch (a.type) {
@@ -212,6 +218,8 @@ private:
                     case cgltf_attribute_type_normal:   nrm = a.data; break;
                     case cgltf_attribute_type_tangent:  tan = a.data; break;
                     case cgltf_attribute_type_texcoord: if (a.index == 0) uv = a.data; break;
+                    case cgltf_attribute_type_joints:   if (a.index == 0) joints = a.data; break;
+                    case cgltf_attribute_type_weights:  if (a.index == 0) weights = a.data; break;
                     default: break;
                     }
                 }
@@ -260,6 +268,46 @@ private:
                     ++m_MissingTangents;
                 }
 
+                if ((joints == nullptr) != (weights == nullptr)) {
+                    ENGINE_WARN("glTF: '{}' primitive {} has only one of JOINTS_0 / WEIGHTS_0 - skinning ignored",
+                                mesh.name, pi);
+                } else if (joints && (joints->count != count || weights->count != count ||
+                                      cgltf_num_components(joints->type) != 4 ||
+                                      cgltf_num_components(weights->type) != 4)) {
+                    if (!m_Out->skinInfluences.empty())
+                        m_Out->skinInfluences.resize(base + count);
+                    ENGINE_WARN("glTF: '{}' primitive {} has invalid JOINTS_0 / WEIGHTS_0 - skinning ignored",
+                                mesh.name, pi);
+                } else if (joints && weights) {
+                    m_Out->skinInfluences.resize(base + count);
+                    std::vector<float> jointValues(count * 4);
+                    Unpack(*joints, 4);
+                    jointValues = m_Scratch;
+                    Unpack(*weights, 4);
+                    for (std::size_t i = 0; i < count; ++i) {
+                        VertexSkinInfluence influence;
+                        for (std::size_t c = 0; c < 4; ++c) {
+                            const float joint = jointValues[i * 4 + c];
+                            if (std::isfinite(joint) && joint >= 0.0f &&
+                                joint <= static_cast<float>(std::numeric_limits<std::uint16_t>::max()))
+                                influence.joints[static_cast<glm::length_t>(c)] = static_cast<std::uint16_t>(joint);
+                            float weight = m_Scratch[i * 4 + c];
+                            influence.weights[static_cast<glm::length_t>(c)] =
+                                std::isfinite(weight) ? std::max(weight, 0.0f) : 0.0f;
+                        }
+                        const float sum = influence.weights.x + influence.weights.y + influence.weights.z + influence.weights.w;
+                        if (sum > 1.0e-6f)
+                            influence.weights /= sum;
+                        else {
+                            influence.joints = glm::u16vec4{0};
+                            influence.weights = glm::vec4{1.0f, 0.0f, 0.0f, 0.0f};
+                        }
+                        m_Out->skinInfluences[base + i] = influence;
+                    }
+                } else if (!m_Out->skinInfluences.empty()) {
+                    m_Out->skinInfluences.resize(base + count);
+                }
+
                 auto& indices = m_Out->indices;
                 sm.firstIndex = static_cast<std::uint32_t>(indices.size());
                 if (prim.indices) {
@@ -294,6 +342,7 @@ private:
         };
         std::vector<Item>      stack;
         std::vector<glm::mat4> world;
+        m_NodeIndices.assign(m_Data.nodes_count, -1);
 
         const cgltf_scene* scene = m_Data.scene ? m_Data.scene : (m_Data.scenes_count ? &m_Data.scenes[0] : nullptr);
         if (scene) {
@@ -317,6 +366,7 @@ private:
             mn.local  = NodeTransform(*node);
             mn.parent = parent;
             mn.mesh   = IndexIn(m_Data.meshes, node->mesh);
+            mn.skin   = IndexIn(m_Data.skins, node->skin);
 
             const glm::mat4 w = (parent >= 0 ? world[static_cast<std::size_t>(parent)] : glm::mat4{1.0f}) *
                                 mn.local.LocalMatrix();
@@ -335,12 +385,13 @@ private:
                     }
                 }
             }
-            if (node->skin)
-                m_HasSkins = true;
             if (node->light)
                 mn.light = ConvertLight(*node->light);
 
             const auto index = static_cast<std::int32_t>(m_Out->nodes.size());
+            const auto sourceIndex = IndexIn(m_Data.nodes, node);
+            if (sourceIndex >= 0)
+                m_NodeIndices[static_cast<std::size_t>(sourceIndex)] = index;
             m_Out->nodes.push_back(std::move(mn));
             for (cgltf_size c = node->children_count; c-- > 0;)
                 stack.push_back({node->children[c], index}); // parents always precede children
@@ -350,10 +401,142 @@ private:
             m_Out->boundsMin = bmin;
             m_Out->boundsMax = bmax;
         }
-        if (m_HasSkins || m_Data.animations_count)
-            ENGINE_WARN("glTF: skins/animations are not supported yet - rendering bind pose");
         if (m_IgnoredDirectional)
             ENGINE_WARN("glTF: directional lights ignored (the sky's sun is the only directional light)");
+    }
+
+    std::int32_t OutputNode(const cgltf_node* node) const
+    {
+        const std::int32_t sourceIndex = IndexIn(m_Data.nodes, node);
+        if (sourceIndex < 0 || static_cast<std::size_t>(sourceIndex) >= m_NodeIndices.size())
+            return -1;
+        return m_NodeIndices[static_cast<std::size_t>(sourceIndex)];
+    }
+
+    void ParseSkins()
+    {
+        for (cgltf_size si = 0; si < m_Data.skins_count; ++si) {
+            const cgltf_skin& source = m_Data.skins[si];
+            Skin skin;
+            skin.name = source.name ? source.name : std::format("Skin{}", si);
+            skin.skeletonRoot = OutputNode(source.skeleton);
+            if (source.skeleton && skin.skeletonRoot < 0)
+                ENGINE_WARN("glTF: skin '{}' skeleton root is outside the active scene", skin.name);
+
+            const bool validMatrices = source.inverse_bind_matrices &&
+                source.inverse_bind_matrices->type == cgltf_type_mat4 &&
+                source.inverse_bind_matrices->count >= source.joints_count;
+            if (source.inverse_bind_matrices && !validMatrices)
+                ENGINE_WARN("glTF: skin '{}' has invalid inverse bind matrices; identity matrices used", skin.name);
+            if (validMatrices)
+                Unpack(*source.inverse_bind_matrices, 16);
+
+            skin.joints.reserve(source.joints_count);
+            for (cgltf_size ji = 0; ji < source.joints_count; ++ji) {
+                SkinJoint joint;
+                joint.node = OutputNode(source.joints[ji]);
+                if (joint.node < 0)
+                    ENGINE_WARN("glTF: skin '{}' joint {} is outside the active scene", skin.name, ji);
+                if (validMatrices)
+                    joint.inverseBindMatrix = glm::make_mat4(&m_Scratch[ji * 16]);
+                skin.joints.push_back(joint);
+            }
+            m_Out->skins.push_back(std::move(skin));
+        }
+    }
+
+    void ParseAnimations()
+    {
+        for (cgltf_size ai = 0; ai < m_Data.animations_count; ++ai) {
+            const cgltf_animation& source = m_Data.animations[ai];
+            AnimationClip clip;
+            clip.name = source.name ? source.name : std::format("Animation{}", ai);
+
+            for (cgltf_size ci = 0; ci < source.channels_count; ++ci) {
+                const cgltf_animation_channel& channel = source.channels[ci];
+                if (!channel.sampler || !channel.sampler->input || !channel.sampler->output || !channel.target_node) {
+                    ENGINE_WARN("glTF: animation '{}' channel {} is incomplete - skipped", clip.name, ci);
+                    continue;
+                }
+                const std::int32_t node = OutputNode(channel.target_node);
+                if (node < 0) {
+                    ENGINE_WARN("glTF: animation '{}' targets a node outside the active scene - skipped", clip.name);
+                    continue;
+                }
+
+                AnimationPath path;
+                std::size_t components = 3;
+                switch (channel.target_path) {
+                case cgltf_animation_path_type_translation: path = AnimationPath::Translation; break;
+                case cgltf_animation_path_type_rotation: path = AnimationPath::Rotation; components = 4; break;
+                case cgltf_animation_path_type_scale: path = AnimationPath::Scale; break;
+                case cgltf_animation_path_type_weights:
+                    ENGINE_WARN("glTF: animation '{}' morph-weight channel is not supported yet - skipped", clip.name);
+                    continue;
+                default:
+                    ENGINE_WARN("glTF: animation '{}' has an unknown target path - skipped", clip.name);
+                    continue;
+                }
+
+                const cgltf_animation_sampler& sampler = *channel.sampler;
+                const bool cubic = sampler.interpolation == cgltf_interpolation_type_cubic_spline;
+                const cgltf_size keyCount = sampler.input->count;
+                const cgltf_size expectedValues = keyCount * (cubic ? 3 : 1);
+                if (sampler.input->type != cgltf_type_scalar || sampler.output->count != expectedValues ||
+                    cgltf_num_components(sampler.output->type) != components) {
+                    ENGINE_WARN("glTF: animation '{}' channel {} has unsupported or mismatched accessors - skipped",
+                                clip.name, ci);
+                    continue;
+                }
+
+                AnimationTrack track;
+                track.node = static_cast<std::uint32_t>(node);
+                track.path = path;
+                switch (sampler.interpolation) {
+                case cgltf_interpolation_type_step: track.interpolation = AnimationInterpolation::Step; break;
+                case cgltf_interpolation_type_cubic_spline: track.interpolation = AnimationInterpolation::CubicSpline; break;
+                default: track.interpolation = AnimationInterpolation::Linear; break;
+                }
+
+                Unpack(*sampler.input, 1);
+                track.times = m_Scratch;
+                const bool invalidTimes = track.times.empty() ||
+                    std::any_of(track.times.begin(), track.times.end(),
+                                [](float time) { return !std::isfinite(time); }) ||
+                    std::adjacent_find(track.times.begin(), track.times.end(), [](float a, float b) {
+                        return a >= b;
+                    }) != track.times.end();
+                if (invalidTimes) {
+                    ENGINE_WARN("glTF: animation '{}' channel {} has empty, non-finite, or unordered key times - skipped",
+                                clip.name, ci);
+                    continue;
+                }
+                clip.duration = std::max(clip.duration, track.times.back());
+
+                Unpack(*sampler.output, components);
+                const auto valueAt = [&](cgltf_size index) {
+                    glm::vec4 value{0.0f};
+                    for (std::size_t c = 0; c < components; ++c)
+                        value[static_cast<glm::length_t>(c)] = m_Scratch[index * components + c];
+                    return value;
+                };
+                track.values.reserve(keyCount);
+                if (cubic) {
+                    track.inTangents.reserve(keyCount);
+                    track.outTangents.reserve(keyCount);
+                    for (cgltf_size key = 0; key < keyCount; ++key) {
+                        track.inTangents.push_back(valueAt(key * 3));
+                        track.values.push_back(valueAt(key * 3 + 1));
+                        track.outTangents.push_back(valueAt(key * 3 + 2));
+                    }
+                } else {
+                    for (cgltf_size key = 0; key < keyCount; ++key)
+                        track.values.push_back(valueAt(key));
+                }
+                clip.tracks.push_back(std::move(track));
+            }
+            m_Out->animations.push_back(std::move(clip));
+        }
     }
 
     // KHR_lights_punctual: same conventions (candela, local -Z, cone half-angles, range 0 = unbounded).
@@ -381,10 +564,10 @@ private:
     ModelData*                                m_Out = nullptr;
     std::unordered_map<std::uint64_t, std::int32_t> m_TextureCache;
     std::vector<float>                        m_Scratch;
+    std::vector<std::int32_t>                 m_NodeIndices;
     std::int32_t                              m_DefaultMaterial = -1;
     std::size_t                               m_MissingNormals  = 0;
     std::size_t                               m_MissingTangents = 0;
-    bool                                      m_HasSkins        = false;
     bool                                      m_IgnoredDirectional = false;
 };
 

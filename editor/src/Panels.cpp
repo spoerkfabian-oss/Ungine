@@ -463,6 +463,148 @@ void Editor::DrawInspector()
             registry.Remove<MeshRenderer>(e);
     }
 
+    if (ModelInstance* instance = registry.TryGet<ModelInstance>(e);
+        instance && registry.Has<Animator>(e) && ImGui::CollapsingHeader("Animator", ImGuiTreeNodeFlags_DefaultOpen)) {
+        Animator& animator = registry.Get<Animator>(e);
+        if (const Model* model = m_Ctx.assets.Get(instance->model); model && !model->animations.empty()) {
+            const std::string& current = model->animations[std::min<std::size_t>(animator.clipIndex, model->animations.size() - 1)].name;
+            if (ImGui::BeginCombo("Clip", current.empty() ? "(unnamed)" : current.c_str())) {
+                for (std::size_t i = 0; i < model->animations.size(); ++i) {
+                    const AnimationClip& clip = model->animations[i];
+                    const std::string label = clip.name.empty() ? "Clip " + std::to_string(i) : clip.name;
+                    const bool selected = animator.clipIndex == i;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        animator.clipIndex = static_cast<std::uint32_t>(i);
+                        animator.timeSeconds = 0.0f;
+                        animator.playing = true;
+                    }
+                    if (selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            const AnimationClip& clip = model->animations[std::min<std::size_t>(animator.clipIndex, model->animations.size() - 1)];
+            ImGui::Checkbox("Playing", &animator.playing);
+            ImGui::SameLine();
+            ImGui::Checkbox("Loop", &animator.looping);
+            ImGui::DragFloat("Speed", &animator.speed, 0.01f, 0.0f, 5.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderFloat("Time", &animator.timeSeconds, 0.0f, std::max(clip.duration, 0.001f), "%.3f s");
+            ImGui::SeparatorText("Blend");
+            const bool blendValid = animator.blendClipIndex < model->animations.size();
+            const char* blendPreview = blendValid ? model->animations[animator.blendClipIndex].name.c_str() : "(none)";
+            if (ImGui::BeginCombo("Second clip", blendPreview)) {
+                if (ImGui::Selectable("(none)", !blendValid)) {
+                    animator.blendClipIndex = ~std::uint32_t{0};
+                    animator.blendWeight = 0.0f;
+                    animator.sampledBlendClip = ~std::uint32_t{0};
+                }
+                for (std::size_t i = 0; i < model->animations.size(); ++i) {
+                    const AnimationClip& candidate = model->animations[i];
+                    const std::string label = candidate.name.empty() ? "Clip " + std::to_string(i) : candidate.name;
+                    const bool selected = animator.blendClipIndex == i;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        animator.blendClipIndex = static_cast<std::uint32_t>(i);
+                        animator.sampledBlendClip = ~std::uint32_t{0};
+                        animator.blendTimeSeconds = 0.0f;
+                    }
+                    if (selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SliderFloat("Blend weight", &animator.blendWeight, 0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("Apply root motion", &animator.applyRootMotion);
+            if (!model->nodes.empty()) {
+                animator.rootMotionNode = std::min<std::uint32_t>(animator.rootMotionNode,
+                    static_cast<std::uint32_t>(model->nodes.size() - 1));
+                const ModelNode& rootNode = model->nodes[animator.rootMotionNode];
+                if (ImGui::BeginCombo("Root node", rootNode.name.empty() ? "(unnamed)" : rootNode.name.c_str())) {
+                    for (std::size_t i = 0; i < model->nodes.size(); ++i) {
+                        const ModelNode& candidate = model->nodes[i];
+                        const std::string label = candidate.name.empty() ? "Node " + std::to_string(i) : candidate.name;
+                        const bool selected = animator.rootMotionNode == i;
+                        if (ImGui::Selectable(label.c_str(), selected))
+                            animator.rootMotionNode = static_cast<std::uint32_t>(i);
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            if (ImGui::Button("Restart")) {
+                animator.timeSeconds = 0.0f;
+                animator.playing = true;
+            }
+        } else {
+            ImGui::TextDisabled("Animation data is not ready");
+        }
+    }
+
+    if (UiCanvas* canvas = registry.TryGet<UiCanvas>(e);
+        canvas && ImGui::CollapsingHeader("UI Canvas", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("ui-canvas")) {
+        PropertyRow("Design size");
+        ImGui::DragFloat2("##v", &canvas->designSize.x, 1.0f, 1.0f, 16384.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::PopID();
+        PropertyRow("Sort order");
+        ImGui::DragInt("##v", &canvas->sortOrder, 1.0f, -100000, 100000);
+        ImGui::PopID();
+        CheckboxRow("Scale with viewport", &canvas->scaleWithViewport);
+        CheckboxRow("Visible", &canvas->visible);
+        ImGui::EndTable();
+        if (ImGui::Button("Remove canvas"))
+            registry.Remove<UiCanvas>(e);
+    }
+
+    if (UiWidget* widget = registry.TryGet<UiWidget>(e);
+        widget && ImGui::CollapsingHeader("UI Widget", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("ui-widget")) {
+        static constexpr const char* kUiWidgetNames[] = {"Text", "Image", "Panel", "Button", "Checkbox", "Slider", "Progress bar"};
+        ComboRow("Type", &widget->type, kUiWidgetNames);
+        const auto vec2Row = [](const char* label, glm::vec2& value, float speed, float minimum, float maximum) {
+            PropertyRow(label);
+            ImGui::DragFloat2("##v", &value.x, speed, minimum, maximum, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopID();
+        };
+        vec2Row("Anchor min", widget->anchorMin, 0.005f, 0.0f, 1.0f);
+        vec2Row("Anchor max", widget->anchorMax, 0.005f, 0.0f, 1.0f);
+        vec2Row("Offset min", widget->offsetMin, 1.0f, -16384.0f, 16384.0f);
+        vec2Row("Offset max", widget->offsetMax, 1.0f, -16384.0f, 16384.0f);
+        vec2Row("Pivot", widget->pivot, 0.005f, 0.0f, 1.0f);
+        PropertyRow("Color");
+        ImGui::ColorEdit4("##color", &widget->color.x, ImGuiColorEditFlags_NoInputs);
+        ImGui::PopID();
+        if (widget->type == UiWidgetType::Panel || widget->type == UiWidgetType::Button ||
+            widget->type == UiWidgetType::Checkbox || widget->type == UiWidgetType::Slider ||
+            widget->type == UiWidgetType::ProgressBar || widget->type == UiWidgetType::Image) {
+            PropertyRow("Background");
+            ImGui::ColorEdit4("##background", &widget->background.x, ImGuiColorEditFlags_NoInputs);
+            ImGui::PopID();
+        }
+        if (widget->type != UiWidgetType::Image) {
+            PropertyRow("Text");
+            ImGui::InputText("##text", &widget->text);
+            ImGui::PopID();
+        } else {
+            PropertyRow("Image path");
+            ImGui::InputText("##image", &widget->image);
+            ImGui::PopID();
+        }
+        DragFloatRow("Font size", &widget->fontSize, 0.5f, 4.0f, 256.0f);
+        if (widget->type == UiWidgetType::Checkbox)
+            CheckboxRow("Checked", &widget->checked);
+        if (widget->type == UiWidgetType::Slider || widget->type == UiWidgetType::ProgressBar) {
+            DragFloatRow("Minimum", &widget->minimum, 0.01f, -1e6f, 1e6f);
+            DragFloatRow("Maximum", &widget->maximum, 0.01f, -1e6f, 1e6f);
+            widget->maximum = std::max(widget->maximum, widget->minimum + 0.001f);
+            DragFloatRow("Value", &widget->value, 0.01f, widget->minimum, widget->maximum);
+        }
+        CheckboxRow("Visible", &widget->visible);
+        CheckboxRow("Enabled", &widget->enabled);
+        CheckboxRow("Interactable", &widget->interactable);
+        ImGui::EndTable();
+        if (ImGui::Button("Remove UI widget"))
+            registry.Remove<UiWidget>(e);
+    }
+
     if (Light* light = registry.TryGet<Light>(e);
         light && ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("light")) {
         PropertyRow("Type");
@@ -789,6 +931,25 @@ void Editor::DrawInspector()
             registry.Emplace<ScriptComponent>(e);
         if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
             registry.Emplace<CameraComponent>(e);
+        if (ImGui::MenuItem("UI Canvas", nullptr, false, !registry.Has<UiCanvas>(e)))
+            registry.Emplace<UiCanvas>(e);
+        if (ImGui::BeginMenu("UI Widget", !registry.Has<UiWidget>(e))) {
+            if (ImGui::MenuItem("Text"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Text});
+            if (ImGui::MenuItem("Image"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Image});
+            if (ImGui::MenuItem("Panel"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Panel});
+            if (ImGui::MenuItem("Button"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Button});
+            if (ImGui::MenuItem("Checkbox"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Checkbox});
+            if (ImGui::MenuItem("Slider"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Slider});
+            if (ImGui::MenuItem("Progress bar"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::ProgressBar});
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Tags", nullptr, false, !registry.Has<Tags>(e)))
             registry.Emplace<Tags>(e);
         ImGui::Separator();

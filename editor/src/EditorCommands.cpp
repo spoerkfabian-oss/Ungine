@@ -29,6 +29,8 @@
 
 namespace Engine {
 
+namespace fs = std::filesystem;
+
 std::uint64_t Editor::UuidOf(Entity entity) const
 {
     return m_Ctx.scene.GetRegistry().Get<Uuid>(entity).value;
@@ -471,8 +473,50 @@ void Editor::DrawDialogs()
             m_Ctx.modelRefs.push_back(m_Ctx.assets.LoadModel(*path));
             break;
         }
+        case DialogPurpose::ImportContent: ImportContentFile(*path); break;
+        case DialogPurpose::MoveContent: {
+            if (!m_MoveTarget.empty()) {
+                std::error_code ec;
+                const fs::path root = fs::weakly_canonical(ContentRoot(), ec);
+                if (ec) {
+                    m_Status = "Cannot resolve the project's Content folder: " + ec.message();
+                    m_MoveTarget.clear();
+                    break;
+                }
+                const fs::path destination = fs::weakly_canonical(*path, ec);
+                if (ec) {
+                    m_Status = "Cannot resolve move destination: " + ec.message();
+                    m_MoveTarget.clear();
+                    break;
+                }
+                const fs::path relative = destination.lexically_relative(root);
+                const bool insideContent = !ec && !relative.empty() && !relative.is_absolute() &&
+                                           (relative == "." || *relative.begin() != "..");
+                const bool isDirectory = fs::is_directory(m_MoveTarget, ec);
+                if (ec) {
+                    m_Status = "Cannot inspect move source: " + ec.message();
+                    m_MoveTarget.clear();
+                    break;
+                }
+                const fs::path nested = destination.lexically_relative(fs::absolute(m_MoveTarget, ec).lexically_normal());
+                if (!insideContent || ec)
+                    m_Status = "Move destination must be inside the project's Content folder";
+                else if (isDirectory && !nested.empty() && !nested.is_absolute() && *nested.begin() != "..")
+                    m_Status = "A folder cannot be moved into itself";
+                else if (destination == m_MoveTarget.parent_path())
+                    m_Status = "Item is already in that folder";
+                else
+                    (void)RelocateContentAsset(m_MoveTarget, destination / m_MoveTarget.filename());
+                m_MoveTarget.clear();
+            }
+            break;
+        }
         case DialogPurpose::None: break;
         }
+    } else if (!m_FileDialog->IsOpen()) {
+        if (m_DialogPurpose == DialogPurpose::MoveContent)
+            m_MoveTarget.clear();
+        m_DialogPurpose = DialogPurpose::None;
     }
 
     if (std::exchange(m_AskQuit, false))
