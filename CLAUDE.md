@@ -237,6 +237,6 @@ asset_cache/ (Sandbox: Texturen, pipelines.bin; gitignored)   Projekte: <Root>/S
 
 ## Nächste Schritte (Vorschlag)
 - Zuerst: main wieder grün (Fix-PR mergen, CI-Lauf abwarten – inkl. GPU-Suite), `actions/checkout`/`cache` auf v5 heben (Node-20-Deprecation ist aktiv, Runner erzwingen Node 24), Branch-Schutz mit erforderlichen CI-Checks einrichten.
-- **Phase 21 (laufend):** Animation. glTF-Skin-/Clip-Metadaten inklusive JOINTS_0/WEIGHTS_0 werden in Model-Assets übernommen. Als Nächstes: Pose-Animator, GPU-Skinning für alle Render-Pässe, Bounds, Blueprint-Steuerung und animierte Demo.
+- **Phase 21 (laufend):** Animation. glTF-Skin-/Clip-Metadaten inklusive JOINTS_0/WEIGHTS_0 werden in Model-Assets übernommen; `EvaluateAnimation` wertet STEP/LINEAR/CUBICSPLINE-Tracks in einen wiederverwendbaren CPU-Posepuffer aus. Als Nächstes: Laufzeit-Einbindung, GPU-Skinning für alle Render-Pässe, Bounds, Blueprint-Steuerung und animierte Demo.
 - **Danach gemäß [ROADMAP.md](ROADMAP.md):** In-Game-UI, Content-Import/Vorschauen, Level-Streaming, gekochte Builds + Savegame-Versionierung, Physik/Character-Werkzeuge und Audio-Ausbau.
 - Weitere spätere Render-/Scripting-Ideen: Meshlets/Cluster-Culling, Hi-Z für Schatten-Views, Deferred-Variante, Mip-Streaming und Blueprint-Vererbung.
