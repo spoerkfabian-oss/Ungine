@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -32,6 +33,22 @@ using SceneJson::UuidOf;
 namespace {
 
 constexpr int kSceneVersion = 1;
+
+void BindModelNodeRefsToInstances(Scene& scene)
+{
+    Registry& registry = scene.GetRegistry();
+    registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, ModelNodeRef& reference) {
+        Entity ancestor = registry.Get<Hierarchy>(entity).parent;
+        reference.instanceRoot = NullEntity;
+        while (ancestor != NullEntity && registry.Valid(ancestor)) {
+            if (registry.Has<ModelInstance>(ancestor)) {
+                reference.instanceRoot = ancestor;
+                break;
+            }
+            ancestor = registry.Get<Hierarchy>(ancestor).parent;
+        }
+    });
+}
 
 // --- Values -----------------------------------------------------------------------------------
 
@@ -428,6 +445,16 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         if (!model.is_null())
             j["modelInstance"] = {{"model", std::move(model)}};
     }
+    if (const auto* animator = r.TryGet<Animator>(e)) {
+        j["animator"] = {{"clipIndex", animator->clipIndex},
+                          {"blendClipIndex", animator->blendClipIndex},
+                          {"blendWeight", animator->blendWeight},
+                          {"speed", animator->speed},
+                          {"looping", animator->looping},
+                          {"playing", animator->playing},
+                          {"rootMotionNode", animator->rootMotionNode},
+                          {"applyRootMotion", animator->applyRootMotion}};
+    }
     if (const auto* node = r.TryGet<ModelNodeRef>(e))
         j["modelNode"] = node->node;
     if (const auto* body = r.TryGet<RigidBody>(e))
@@ -506,6 +533,27 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         r.EmplaceOrReplace<ModelInstance>(e, ModelInstance{.model = models.Read(it->at("model"))});
     else
         r.Remove<ModelInstance>(e);
+    ApplyOptional<Animator>(r, e, j, "animator", [](const json& data) {
+        Animator animator;
+        Read(data, "clipIndex", animator.clipIndex);
+        Read(data, "blendClipIndex", animator.blendClipIndex);
+        Read(data, "blendWeight", animator.blendWeight);
+        Read(data, "speed", animator.speed);
+        Read(data, "looping", animator.looping);
+        Read(data, "playing", animator.playing);
+        Read(data, "rootMotionNode", animator.rootMotionNode);
+        Read(data, "applyRootMotion", animator.applyRootMotion);
+        if (!std::isfinite(animator.blendWeight))
+            animator.blendWeight = 0.0f;
+        animator.blendWeight = std::clamp(animator.blendWeight, 0.0f, 1.0f);
+        if (!std::isfinite(animator.speed) || animator.speed < 0.0f)
+            animator.speed = 1.0f;
+        animator.timeSeconds = 0.0f;
+        animator.blendTimeSeconds = 0.0f;
+        animator.sampledClip = ~std::uint32_t{0};
+        animator.sampledBlendClip = ~std::uint32_t{0};
+        return animator;
+    });
     if (const auto it = j.find("modelNode"); it != j.end())
         r.EmplaceOrReplace<ModelNodeRef>(e, ModelNodeRef{.node = it->get<std::uint32_t>()});
     else
@@ -864,6 +912,7 @@ std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene&
         if (options.physics)
             if (const auto it = root.find("physics"); it != root.end())
                 PhysicsSettingsFromJson(*it, *options.physics);
+        BindModelNodeRefsToInstances(scene);
     } catch (const std::exception& e) {
         for (auto it = created.rbegin(); it != created.rend(); ++it)
             scene.DestroyEntity(*it);
@@ -948,6 +997,7 @@ std::vector<Entity> RestoreEntities(Scene& scene, const std::string& snapshot, R
             }
         }
     }
+    BindModelNodeRefsToInstances(scene);
     return roots;
 }
 
@@ -961,6 +1011,7 @@ void ApplyEntityState(Scene& scene, Entity entity, const std::string& state)
 {
     ModelRefs models;
     SceneJson::ApplyComponents(scene, entity, json::parse(state), models);
+    BindModelNodeRefsToInstances(scene);
 }
 
 namespace {
@@ -1004,6 +1055,7 @@ bool ApplyEntityStateDiff(Scene& scene, Entity target, const std::string& before
     if (state == original)
         return false;
     SceneJson::ApplyComponents(scene, target, state, models);
+    BindModelNodeRefsToInstances(scene);
     return true;
 }
 

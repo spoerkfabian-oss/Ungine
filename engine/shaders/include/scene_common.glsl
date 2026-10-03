@@ -69,9 +69,12 @@ struct GpuInstance {
     uint jointCount;
     uint pad0;
     uint pad1;
+    vec4 skinnedBoundsMin;
+    vec4 skinnedBoundsMax;
 };
 #define INSTANCE_MIRRORED 1u
 #define INSTANCE_SKINNED  2u
+#define INSTANCE_SKIN_BOUNDS_VALID 4u
 
 // Instance x submesh: the unit of culling. instance == ~0u: free slot.
 struct GpuDraw {

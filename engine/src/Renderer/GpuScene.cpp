@@ -1,4 +1,5 @@
 #include "GpuScene.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Renderer/Renderer.h"
@@ -178,13 +179,17 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
         const std::uint32_t oldFlags = gpu.flags;
         const std::uint32_t oldOffset = gpu.jointOffset;
         const std::uint32_t oldCount = gpu.jointCount;
+        const glm::vec3 oldBoundsMin = glm::vec3(gpu.skinnedBoundsMin);
+        const glm::vec3 oldBoundsMax = glm::vec3(gpu.skinnedBoundsMax);
         const auto markIfChanged = [&] {
-            if (gpu.flags != oldFlags || gpu.jointOffset != oldOffset || gpu.jointCount != oldCount)
+            if (gpu.flags != oldFlags || gpu.jointOffset != oldOffset || gpu.jointCount != oldCount ||
+                glm::length(glm::vec3(gpu.skinnedBoundsMin) - oldBoundsMin) > 1.0e-5f ||
+                glm::length(glm::vec3(gpu.skinnedBoundsMax) - oldBoundsMax) > 1.0e-5f)
                 MarkInstance(i);
         };
         gpu.jointOffset = ~0u;
         gpu.jointCount = 0;
-        gpu.flags &= ~kInstanceSkinned;
+        gpu.flags &= ~(kInstanceSkinned | kInstanceSkinBoundsValid);
         if (entity == NullEntity || !registry.Valid(entity)) {
             markIfChanged();
             continue;
@@ -241,6 +246,15 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
         gpu.jointOffset = offset;
         gpu.jointCount = static_cast<std::uint32_t>(skin.joints.size());
         gpu.flags |= kInstanceSkinned;
+
+        if (const auto bounds = ComputeSkinnedBounds(*model, meshRenderer->meshIndex,
+                                                     static_cast<std::uint32_t>(skinIndex),
+                                                     std::span<const glm::mat4>{m_JointMatrixData.data() + offset,
+                                                                                skin.joints.size()})) {
+            gpu.skinnedBoundsMin = glm::vec4(bounds->first, 0.0f);
+            gpu.skinnedBoundsMax = glm::vec4(bounds->second, 0.0f);
+            gpu.flags |= kInstanceSkinBoundsValid;
+        }
         markIfChanged();
     }
 }

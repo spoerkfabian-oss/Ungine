@@ -222,17 +222,20 @@ void main()
         if (draw.instance != DRAW_FREE && (early || late)) {
             const GpuInstance inst = data.instances.i[draw.instance];
             const GpuSubmesh  sm   = data.submeshes.s[draw.submesh];
-            const vec3 c      = (sm.boundsMin + sm.boundsMax) * 0.5;
-            const vec3 e      = (sm.boundsMax - sm.boundsMin) * 0.5;
+            const bool skinned = (inst.flags & INSTANCE_SKINNED) != 0u;
+            const bool skinBoundsValid = (inst.flags & INSTANCE_SKIN_BOUNDS_VALID) != 0u;
+            const vec3 boundsMin = skinned && skinBoundsValid ? inst.skinnedBoundsMin.xyz : sm.boundsMin;
+            const vec3 boundsMax = skinned && skinBoundsValid ? inst.skinnedBoundsMax.xyz : sm.boundsMax;
+            const vec3 c      = (boundsMin + boundsMax) * 0.5;
+            const vec3 e      = (boundsMax - boundsMin) * 0.5;
             const vec3 center = (inst.model * vec4(c, 1.0)).xyz;
             const vec3 extent = mat3(abs(inst.model[0].xyz), abs(inst.model[1].xyz), abs(inst.model[2].xyz)) * e;
-            const bool skinned = (inst.flags & INSTANCE_SKINNED) != 0u;
-            const bool inside = skinned || InFrustum(view, center, extent);
-            const bool occlusion = !skinned && (view.flags & VIEW_OCCLUSION) != 0u;
+            const bool inside = (skinned && !skinBoundsValid) || InFrustum(view, center, extent);
+            const bool occlusion = (!skinned || skinBoundsValid) && (view.flags & VIEW_OCCLUSION) != 0u;
             const float scale = max(max(length(inst.model[0].xyz), length(inst.model[1].xyz)), length(inst.model[2].xyz));
             const uvec2 lod   = skinned ? uvec2(0u) : SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
 
-            if (late && shadowOcclusion && skinned) {
+            if (late && shadowOcclusion && skinned && !skinBoundsValid) {
                 Emit(view, draw, index, uvec2(0u));
                 atomicAdd(sStats[STAT_SHADOW], 1u);
             } else if (late && shadowOcclusion) {
@@ -253,7 +256,7 @@ void main()
             } else if (late) {
                 if (!inside) {
                     data.visibility.u[index] = 0u;
-                } else if (!skinned && Occluded(view, inst.model, sm.boundsMin, sm.boundsMax)) {
+                } else if ((!skinned || skinBoundsValid) && Occluded(view, inst.model, boundsMin, boundsMax)) {
                     data.visibility.u[index] = 0u;
                     atomicAdd(sStats[STAT_OCCLUDED], 1u);
                 } else {

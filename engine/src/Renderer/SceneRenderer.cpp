@@ -584,8 +584,13 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
             const bool        blend = (sm.flags & kMaterialAlphaBlend) != 0;
             if ((mode == Gather::Camera && blend) || (mode == Gather::Transparent && !blend))
                 continue;
-            const Aabb box = TransformAabb({sm.boundsMin, sm.boundsMax}, inst->model);
-            if (!animated && perSubmesh && (!frustum.Intersects(box) || (range && !near(box))))
+            const bool skinBoundsValid = (inst->flags & kInstanceSkinBoundsValid) != 0;
+            const Aabb localBounds = animated && skinBoundsValid
+                                         ? Aabb{glm::vec3(inst->skinnedBoundsMin), glm::vec3(inst->skinnedBoundsMax)}
+                                         : Aabb{sm.boundsMin, sm.boundsMax};
+            const Aabb box = TransformAabb(localBounds, inst->model);
+            if (((!animated && perSubmesh) || (animated && skinBoundsValid)) &&
+                (!frustum.Intersects(box) || (range && !near(box))))
                 continue;
             const LodChoice lod   = animated ? LodChoice{} : SelectLod(sm, inst->model, m_LodCamera, m_LodForced);
             const std::uint32_t e = d | (lod.lod << kVisibleLodShift);

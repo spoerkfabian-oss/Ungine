@@ -66,10 +66,16 @@ struct ModelInstance {
 struct Animator {
     std::uint32_t clipIndex = 0;
     std::uint32_t sampledClip = ~std::uint32_t{0};
+    std::uint32_t blendClipIndex = ~std::uint32_t{0};
+    std::uint32_t sampledBlendClip = ~std::uint32_t{0};
+    std::uint32_t rootMotionNode = 0;
     float         timeSeconds = 0.0f;
+    float         blendTimeSeconds = 0.0f;
+    float         blendWeight = 0.0f;
     float         speed = 1.0f;
     bool          looping = true;
     bool          playing = true;
+    bool          applyRootMotion = false;
 };
 
 struct ModelNodeRef {

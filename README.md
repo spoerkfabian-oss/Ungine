@@ -76,7 +76,12 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    *Input*). **Construction Script** (*Construction Script*-Event): läuft im Editor nach jeder
    Änderung und vor BeginPlay; was es erzeugt, wird nicht gespeichert (grau in der Hierarchy).
    Strg+F sucht in allen Blueprints, Rechtsklick → *Collapse to function / macro* fasst Knoten
-   zusammen.
+    zusammen.
+12. **Skeletal animation**: The *Basic Scene* template includes a waving glTF banner. Imported
+    animated models play their first clip automatically. Select the model instance to change its
+    clip, speed, looping, blend target and root-motion settings in the **Animator** inspector.
+    Blueprints can play, stop, select and blend clips, change speed/looping/root motion and query
+    playback. Supported glTF interpolation modes are STEP, LINEAR and CUBICSPLINE.
 
 ## Entwicklung
 

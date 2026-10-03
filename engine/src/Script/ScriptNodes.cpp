@@ -826,6 +826,33 @@ std::vector<NodeDesc> BuildRegistry()
                        c.GetScene().GetRegistry().Get<Animator>(*entity).speed = speed;
                    }
                }));
+    add(Action("Animation.SetLooping", "Set Animation Looping", "Animation",
+               {In("Target", P::Entity), In("Loop", P::Bool)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2))
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).looping = c.InBool(3);
+               }));
+    add(Action("Animation.BlendTo", "Blend To Animation", "Animation",
+               {In("Target", P::Entity), In("Clip", P::Int), In("Weight", P::Float)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const std::int32_t clip = c.InInt(3);
+                       const float weight = c.InFloat(4);
+                       if (clip < 0 || !std::isfinite(weight)) {
+                           c.Error("Blend clip index must be non-negative and weight finite");
+                           return;
+                       }
+                       Animator& animator = c.GetScene().GetRegistry().Get<Animator>(*entity);
+                       if (animator.blendClipIndex != static_cast<std::uint32_t>(clip)) {
+                           animator.blendClipIndex = static_cast<std::uint32_t>(clip);
+                           animator.sampledBlendClip = ~std::uint32_t{0};
+                       }
+                       animator.blendWeight = std::clamp(weight, 0.0f, 1.0f);
+                   }
+               }));
+    add(Action("Animation.SetRootMotion", "Set Root Motion", "Animation",
+               {In("Target", P::Entity), In("Enabled", P::Bool)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2))
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).applyRootMotion = c.InBool(3);
+               }));
     add(Pure("Animation.IsPlaying", "Is Animation Playing", "Animation",
              {In("Target", P::Entity), Out("Playing", P::Bool)}, [](ScriptContext& c) {
                  const Entity entity = c.InEntity(0);

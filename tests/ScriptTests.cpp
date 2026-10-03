@@ -257,6 +257,9 @@ TEST_CASE(Script_AnimationControls)
     const std::uint32_t begin = f.Node("Event.BeginPlay");
     const std::uint32_t clip = f.Node("Animation.SetClip");
     const std::uint32_t speed = f.Node("Animation.SetSpeed");
+    const std::uint32_t looping = f.Node("Animation.SetLooping");
+    const std::uint32_t blend = f.Node("Animation.BlendTo");
+    const std::uint32_t rootMotion = f.Node("Animation.SetRootMotion");
     const std::uint32_t play = f.Node("Animation.Play");
     const std::uint32_t branch = f.Node("Flow.Branch");
     const std::uint32_t playing = f.Node("Animation.IsPlaying");
@@ -264,9 +267,16 @@ TEST_CASE(Script_AnimationControls)
     const std::uint32_t stop = f.Node("Animation.Stop");
     f.Set(clip, "Clip", std::int32_t{2});
     f.Set(speed, "Speed", 1.5f);
+    f.Set(looping, "Loop", false);
+    f.Set(blend, "Clip", std::int32_t{4});
+    f.Set(blend, "Weight", 0.25f);
+    f.Set(rootMotion, "Enabled", true);
     f.Link(begin, "Out", clip, "In");
     f.Link(clip, "Then", speed, "In");
-    f.Link(speed, "Then", play, "In");
+    f.Link(speed, "Then", looping, "In");
+    f.Link(looping, "Then", blend, "In");
+    f.Link(blend, "Then", rootMotion, "In");
+    f.Link(rootMotion, "Then", play, "In");
     f.Link(play, "Then", branch, "In");
     f.Link(playing, "Playing", branch, "Condition");
     f.Link(branch, "True", print, "In");
@@ -276,6 +286,10 @@ TEST_CASE(Script_AnimationControls)
     const Animator& animator = f.scene.GetRegistry().Get<Animator>(f.actor);
     CHECK(animator.clipIndex == 2);
     CHECK(animator.speed == 1.5f);
+    CHECK(!animator.looping);
+    CHECK(animator.blendClipIndex == 4);
+    CHECK(animator.blendWeight == 0.25f);
+    CHECK(animator.applyRootMotion);
     CHECK(!animator.playing); // the IsPlaying pure pin saw Play=true; Stop then ran
     CHECK(f.Printed("animation started") == 1);
     CHECK(!f.Errors());

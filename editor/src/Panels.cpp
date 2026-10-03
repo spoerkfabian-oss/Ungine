@@ -489,6 +489,48 @@ void Editor::DrawInspector()
             ImGui::Checkbox("Loop", &animator.looping);
             ImGui::DragFloat("Speed", &animator.speed, 0.01f, 0.0f, 5.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
             ImGui::SliderFloat("Time", &animator.timeSeconds, 0.0f, std::max(clip.duration, 0.001f), "%.3f s");
+            ImGui::SeparatorText("Blend");
+            const bool blendValid = animator.blendClipIndex < model->animations.size();
+            const char* blendPreview = blendValid ? model->animations[animator.blendClipIndex].name.c_str() : "(none)";
+            if (ImGui::BeginCombo("Second clip", blendPreview)) {
+                if (ImGui::Selectable("(none)", !blendValid)) {
+                    animator.blendClipIndex = ~std::uint32_t{0};
+                    animator.blendWeight = 0.0f;
+                    animator.sampledBlendClip = ~std::uint32_t{0};
+                }
+                for (std::size_t i = 0; i < model->animations.size(); ++i) {
+                    const AnimationClip& candidate = model->animations[i];
+                    const std::string label = candidate.name.empty() ? "Clip " + std::to_string(i) : candidate.name;
+                    const bool selected = animator.blendClipIndex == i;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        animator.blendClipIndex = static_cast<std::uint32_t>(i);
+                        animator.sampledBlendClip = ~std::uint32_t{0};
+                        animator.blendTimeSeconds = 0.0f;
+                    }
+                    if (selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SliderFloat("Blend weight", &animator.blendWeight, 0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("Apply root motion", &animator.applyRootMotion);
+            if (!model->nodes.empty()) {
+                animator.rootMotionNode = std::min<std::uint32_t>(animator.rootMotionNode,
+                    static_cast<std::uint32_t>(model->nodes.size() - 1));
+                const ModelNode& rootNode = model->nodes[animator.rootMotionNode];
+                if (ImGui::BeginCombo("Root node", rootNode.name.empty() ? "(unnamed)" : rootNode.name.c_str())) {
+                    for (std::size_t i = 0; i < model->nodes.size(); ++i) {
+                        const ModelNode& candidate = model->nodes[i];
+                        const std::string label = candidate.name.empty() ? "Node " + std::to_string(i) : candidate.name;
+                        const bool selected = animator.rootMotionNode == i;
+                        if (ImGui::Selectable(label.c_str(), selected))
+                            animator.rootMotionNode = static_cast<std::uint32_t>(i);
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
             if (ImGui::Button("Restart")) {
                 animator.timeSeconds = 0.0f;
                 animator.playing = true;

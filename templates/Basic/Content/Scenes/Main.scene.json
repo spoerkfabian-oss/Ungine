@@ -269,6 +269,58 @@
         "outerCone": 0.785398,
         "castShadows": true
       }
+    },
+    {
+      "uuid": 1007,
+      "parent": 0,
+      "name": "Animated Banner",
+      "transform": {
+        "position": [-1.8, 0.05, 0],
+        "rotation": [0, 0, 0, 1],
+        "scale": [1, 1, 1]
+      },
+      "modelInstance": {
+        "model": {"file": "../Models/AnimatedBanner.gltf"}
+      },
+      "animator": {
+        "clipIndex": 0,
+        "blendClipIndex": 4294967295,
+        "blendWeight": 0,
+        "speed": 1,
+        "looping": true,
+        "playing": true,
+        "rootMotionNode": 2,
+        "applyRootMotion": false
+      }
+    },
+    {
+      "uuid": 1008,
+      "parent": 1007,
+      "name": "Banner Root",
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "modelNode": 0
+    },
+    {
+      "uuid": 1009,
+      "parent": 1008,
+      "name": "Pole",
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "modelNode": 1
+    },
+    {
+      "uuid": 1010,
+      "parent": 1009,
+      "name": "Banner Pivot",
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "modelNode": 2
+    },
+    {
+      "uuid": 1011,
+      "parent": 1008,
+      "name": "Banner Mesh",
+      "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "modelNode": 3,
+      "mesh": {"model": {"file": "../Models/AnimatedBanner.gltf"}, "index": 0}
     }
   ],
   "camera": {

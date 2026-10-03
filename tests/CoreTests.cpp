@@ -22,6 +22,7 @@
 #include "Engine/Scene/SceneSerializer.h"
 
 #include <glm/gtc/epsilon.hpp>
+#include <glm/gtc/constants.hpp>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -313,6 +314,53 @@ TEST_CASE(Animation_EvaluateLinearStepCubicAndLoop)
     CHECK(std::abs(pose[0].position.x - 2.0f) < 1.0e-5f);
 }
 
+TEST_CASE(Animation_BlendAndUnwrappedRootMotion)
+{
+    std::vector<Transform> from(1), to(1);
+    to[0].position = {2.0f, 0.0f, 0.0f};
+    to[0].rotation = glm::angleAxis(glm::pi<float>(), glm::vec3{0.0f, 1.0f, 0.0f});
+    to[0].scale = {3.0f, 3.0f, 3.0f};
+    BlendAnimationPoses(from, to, 0.25f);
+    CHECK(std::abs(from[0].position.x - 0.5f) < 1.0e-5f);
+    CHECK(std::abs(from[0].scale.x - 1.5f) < 1.0e-5f);
+    const glm::quat halfTurn = glm::angleAxis(glm::pi<float>() * 0.25f, glm::vec3{0.0f, 1.0f, 0.0f});
+    CHECK(std::abs(glm::dot(from[0].rotation, halfTurn)) > 0.999f);
+
+    AnimationClip clip;
+    clip.duration = 1.0f;
+    clip.tracks.push_back({.node = 0,
+                           .path = AnimationPath::Translation,
+                           .interpolation = AnimationInterpolation::Linear,
+                           .times = {0.0f, 1.0f},
+                           .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f, 0.0f}}});
+    CHECK(std::abs(SampleRootMotion(clip, 0, 0.25f, true).x - 0.5f) < 1.0e-5f);
+    CHECK(std::abs(SampleRootMotion(clip, 0, 1.25f, true).x - 2.5f) < 1.0e-5f);
+    CHECK(std::abs(SampleRootMotion(clip, 0, 1.25f, false).x - 2.0f) < 1.0e-5f);
+}
+
+TEST_CASE(Animation_SkinnedBoundsFollowThePose)
+{
+    Model model;
+    model.collisionPositions = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    model.collisionIndices = {0, 1, 2};
+    model.skinInfluences.resize(3);
+    for (VertexSkinInfluence& influence : model.skinInfluences) {
+        influence.joints = glm::u16vec4{0};
+        influence.weights = {1.0f, 0.0f, 0.0f, 0.0f};
+    }
+    model.meshes.resize(1);
+    model.meshes[0].submeshes.push_back({.firstIndex = 0, .indexCount = 3, .vertexOffset = 0});
+    model.skins.resize(1);
+    model.skins[0].joints.push_back({.node = 0});
+    const std::array<glm::mat4, 1> palette{glm::translate(glm::mat4{1.0f}, glm::vec3{2.0f, 0.0f, 0.0f})};
+    const auto bounds = ComputeSkinnedBounds(model, 0, 0, palette);
+    CHECK(bounds.has_value());
+    if (bounds) {
+        CHECK(glm::length(bounds->first - glm::vec3{2.0f, 0.0f, 0.0f}) < 1.0e-5f);
+        CHECK(glm::length(bounds->second - glm::vec3{3.0f, 1.0f, 0.0f}) < 1.0e-5f);
+    }
+}
+
 TEST_CASE(Gltf_SkinAndAnimationImport)
 {
     const auto directory = fs::temp_directory_path() /
@@ -401,6 +449,42 @@ TEST_CASE(Gltf_SkinAndAnimationImport)
         CHECK(data.skinInfluences[0].weights.x == 1.0f);
         const glm::mat4& bind = data.skins[0].joints[0].inverseBindMatrix;
         CHECK(bind[0][0] == 1.0f && bind[1][1] == 1.0f && bind[2][2] == 1.0f && bind[3][3] == 1.0f);
+    }
+}
+
+TEST_CASE(Gltf_BasicTemplateAnimatedBanner)
+{
+    const fs::path source = fs::path(ENGINE_TEST_SOURCE_DIR) / "templates/Basic/Content";
+    const ModelData model = LoadGltf(source / "Models/AnimatedBanner.gltf");
+    CHECK(model.nodes.size() == 4);
+    CHECK(model.skins.size() == 1 && model.skins[0].joints.size() == 2);
+    CHECK(model.animations.size() == 1 && model.animations[0].tracks.size() == 1);
+    CHECK(model.skinInfluences.size() == 8);
+    if (model.nodes.size() == 4 && model.animations.size() == 1 && !model.animations[0].tracks.empty() &&
+        model.skinInfluences.size() == 8) {
+        CHECK(model.nodes[3].skin == 0);
+        CHECK(model.animations[0].duration == 2.0f);
+        CHECK(model.animations[0].tracks[0].node == 2);
+        CHECK(model.animations[0].tracks[0].path == AnimationPath::Rotation);
+        CHECK(model.skinInfluences[0].joints.x == 0 && model.skinInfluences[4].joints.x == 1);
+    }
+
+    Scene scene;
+    const auto handles = LoadSceneFile(source / "Scenes/Main.scene.json", scene,
+                                       static_cast<AssetManager*>(nullptr));
+    CHECK(handles.empty());
+    const Entity root = scene.FindByUuid(1007);
+    CHECK(root != NullEntity && scene.GetRegistry().Has<Animator>(root));
+    CHECK(scene.GetRegistry().Get<Animator>(root).playing);
+    Entity mesh = NullEntity;
+    scene.GetRegistry().ViewOf<Name>().Each([&](Entity entity, const Name& name) {
+        if (name.value == "Banner Mesh")
+            mesh = entity;
+    });
+    CHECK(mesh != NullEntity);
+    if (mesh != NullEntity) {
+        CHECK(scene.GetRegistry().Has<ModelNodeRef>(mesh));
+        CHECK(scene.GetRegistry().Get<ModelNodeRef>(mesh).instanceRoot == root);
     }
 }
 
@@ -630,6 +714,7 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     Scene        scene;
     Registry&    r      = scene.GetRegistry();
     const Entity parent = scene.CreateEntity("Parent");
+    r.Emplace<ModelInstance>(parent, ModelInstance{.model = ModelHandle{7, 3}});
     scene.CreateEntity("First", parent);
     const Entity node = scene.CreateEntity("Node", parent);
     const Entity child = scene.CreateEntity("Child", node);
@@ -637,6 +722,17 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     scene.EditTransform(node).rotation = glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f));
     r.Emplace<Light>(child, Light{.type = LightType::Spot, .intensity = 7.0f, .castShadows = false});
     r.Emplace<MeshRenderer>(node, MeshRenderer{.model = ModelHandle{3, 9}, .meshIndex = 2});
+    r.Emplace<ModelNodeRef>(node, ModelNodeRef{.node = 0, .instanceRoot = parent});
+    Animator animator;
+    animator.clipIndex = 2;
+    animator.blendClipIndex = 1;
+    animator.blendWeight = 0.35f;
+    animator.speed = 1.75f;
+    animator.looping = false;
+    animator.playing = false;
+    animator.rootMotionNode = 4;
+    animator.applyRootMotion = true;
+    r.Emplace<Animator>(node, animator);
     const std::uint64_t nodeUuid  = r.Get<Uuid>(node).value;
     const std::uint64_t childUuid = r.Get<Uuid>(child).value;
 
@@ -658,6 +754,16 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
                             glm::angleAxis(0.5f, glm::vec3(0.0f, 1.0f, 0.0f))) - 1.0f) < 1e-5f);
     CHECK(r.Has<MeshRenderer>(node2) && r.Get<MeshRenderer>(node2).model == (ModelHandle{3, 9}) &&
           r.Get<MeshRenderer>(node2).meshIndex == 2);
+    CHECK(r.Has<ModelNodeRef>(node2) && r.Get<ModelNodeRef>(node2).node == 0 &&
+          r.Get<ModelNodeRef>(node2).instanceRoot == parent);
+    CHECK(r.Has<Animator>(node2));
+    if (const Animator* restoredAnimator = r.TryGet<Animator>(node2)) {
+        CHECK(restoredAnimator->clipIndex == 2 && restoredAnimator->blendClipIndex == 1);
+        CHECK(restoredAnimator->blendWeight == 0.35f && restoredAnimator->speed == 1.75f);
+        CHECK(!restoredAnimator->looping && !restoredAnimator->playing);
+        CHECK(restoredAnimator->rootMotionNode == 4 && restoredAnimator->applyRootMotion);
+        CHECK(restoredAnimator->timeSeconds == 0.0f && restoredAnimator->blendTimeSeconds == 0.0f);
+    }
     CHECK(r.Has<Light>(child2) && r.Get<Light>(child2).type == LightType::Spot &&
           r.Get<Light>(child2).intensity == 7.0f && !r.Get<Light>(child2).castShadows);
 
@@ -673,10 +779,12 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     scene.EditTransform(node2).scale = glm::vec3(5.0f);
     r.Get<Name>(node2).value      = "Renamed";
     r.Remove<MeshRenderer>(node2);
+    r.Get<Animator>(node2).blendWeight = 0.9f;
     r.Emplace<Light>(node2);
     ApplyEntityState(scene, node2, state);
     CHECK(r.Get<Transform>(node2).scale == glm::vec3(1.0f) && r.Get<Name>(node2).value == "Node");
     CHECK(r.Has<MeshRenderer>(node2) && !r.Has<Light>(node2));
+    CHECK(r.Get<Animator>(node2).blendWeight == 0.35f);
 }
 
 TEST_CASE(Scene_DirtyTransformsAndChanges)

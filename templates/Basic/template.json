@@ -1,5 +1,5 @@
 {
   "name": "Basic Scene",
-  "description": "Floor, a rotating, humming cube (Blueprint, 3D sound), a falling sphere, a light, a camera and background music.",
+  "description": "Floor, a rotating, humming cube, a waving skeletal banner, falling sphere, lights, a camera and music.",
   "startScene": "Content/Scenes/Main.scene.json"
 }

@@ -32,10 +32,13 @@ struct GpuInstance {
     std::uint32_t jointCount = 0;
     std::uint32_t pad0 = 0;
     std::uint32_t pad1 = 0;
+    glm::vec4 skinnedBoundsMin{0.0f};
+    glm::vec4 skinnedBoundsMax{0.0f};
 };
-static_assert(sizeof(GpuInstance) == 144);
+static_assert(sizeof(GpuInstance) == 176);
 inline constexpr std::uint32_t kInstanceMirrored = 1;
 inline constexpr std::uint32_t kInstanceSkinned = 2;
+inline constexpr std::uint32_t kInstanceSkinBoundsValid = 4;
 
 // Mirrors GpuDraw: one submesh of one instance, the unit of culling.
 struct GpuDraw {
