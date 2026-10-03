@@ -20,6 +20,8 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 {
     if (data.vertices.empty() || data.indices.empty())
         throw std::runtime_error("BuildModel: '" + data.name + "' contains no geometry");
+    if (!data.skinInfluences.empty() && data.skinInfluences.size() != data.vertices.size())
+        throw std::runtime_error("BuildModel: '" + data.name + "' has mismatched skin influences");
 
     GeometryPool& pool = renderer.Geometry();
     out.name     = data.name;
@@ -38,7 +40,10 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
                 if (std::uint64_t{sm.lods[l].firstIndex} + sm.lods[l].indexCount > data.indices.size())
                     throw std::runtime_error("BuildModel: '" + data.name + "' has an index range out of bounds");
         }
-    out.nodes     = data.nodes;
+    out.nodes      = data.nodes;
+    out.skinInfluences = data.skinInfluences;
+    out.skins      = data.skins;
+    out.animations = data.animations;
     out.boundsMin = data.boundsMin;
     out.boundsMax = data.boundsMax;
 
@@ -156,10 +161,20 @@ std::uint64_t ModelCpuBytes(const Model& model)
 {
     std::uint64_t bytes = model.collisionPositions.size() * sizeof(glm::vec3) +
                           model.collisionIndices.size() * sizeof(std::uint32_t) +
+                          model.skinInfluences.size() * sizeof(VertexSkinInfluence) +
                           model.nodes.size() * sizeof(ModelNode) + model.materialFlags.size() * sizeof(std::uint32_t) +
                           model.gpuSubmeshes.size() * sizeof(GpuSubmesh);
     for (const Mesh& mesh : model.meshes)
         bytes += sizeof(Mesh) + mesh.submeshes.size() * sizeof(Submesh);
+    for (const Skin& skin : model.skins)
+        bytes += skin.name.capacity() + skin.joints.capacity() * sizeof(SkinJoint);
+    for (const AnimationClip& clip : model.animations) {
+        bytes += clip.name.capacity() + clip.tracks.capacity() * sizeof(AnimationTrack);
+        for (const AnimationTrack& track : clip.tracks)
+            bytes += track.times.capacity() * sizeof(float) +
+                     (track.values.capacity() + track.inTangents.capacity() + track.outTangents.capacity()) *
+                         sizeof(glm::vec4);
+    }
     return bytes;
 }
 

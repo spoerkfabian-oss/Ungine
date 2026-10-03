@@ -10,6 +10,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - GPU-Skinning für sichtbare Meshes; Bounds und Schatten-Culling berücksichtigen animierte Pose.
 - Blueprint-Knoten zum Abspielen/Stoppen/Blenden und Abfragen des Animationszustands.
 - Editor-Inspektion und eine mitgelieferte animierte Beispielszene.
+- Fortschritt: Model-Asset-Strukturen, Import von Skin-Joints/inversen Bind-Matrizen, glTF-TRS-Tracks (STEP/LINEAR/CUBICSPLINE) sowie JOINTS_0/WEIGHTS_0 sind lokal umgesetzt. Noch offen: Laufzeit-Pose, GPU-Skinning, Bounds, Blueprint und Demo.
 
 ### Phase 22 – In-Game-UI
 - Laufzeit-UI mit Canvas, Widget-Baum, Layout/Anchors, Skalierung und Z-Reihenfolge.

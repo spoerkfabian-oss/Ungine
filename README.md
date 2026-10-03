@@ -82,4 +82,5 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
 
 `Sandbox` ist die Test-/Demo-Anwendung der Engine (siehe `CLAUDE.md` für Architektur, Optionen
 und den Stand der Entwicklung). Tests: `EngineTests` (CPU), `EngineGpuTests` und Smoke-Tests per
-CTest mit `-DENGINE_GPU_TESTS=ON`.
+CTest mit `-DENGINE_GPU_TESTS=ON`. Geplante Engine-Erweiterungen und ihre Reihenfolge stehen in
+[ROADMAP.md](ROADMAP.md).
