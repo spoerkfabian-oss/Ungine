@@ -78,6 +78,40 @@ struct Animator {
     bool          applyRootMotion = false;
 };
 
+// Screen-space UI canvas. Canvases are independent of the 3D scene camera and are ordered by
+// sortOrder; scaleWithViewport preserves a design resolution while adapting to the game window.
+struct UiCanvas {
+    glm::vec2 designSize{1920.0f, 1080.0f};
+    std::int32_t sortOrder = 0;
+    bool scaleWithViewport = true;
+    bool visible = true;
+};
+
+enum class UiWidgetType : std::uint8_t { Text, Image, Panel, Button, Checkbox, Slider, ProgressBar };
+
+// Anchors and offsets are relative to the parent widget's content rectangle (or the canvas).
+// A zero-size anchor range is positioned by pivot; a stretched range uses both offset edges.
+struct UiWidget {
+    UiWidgetType type = UiWidgetType::Panel;
+    glm::vec2 anchorMin{0.0f};
+    glm::vec2 anchorMax{0.0f};
+    glm::vec2 offsetMin{0.0f};
+    glm::vec2 offsetMax{160.0f, 48.0f};
+    glm::vec2 pivot{0.0f};
+    glm::vec4 color{1.0f};
+    glm::vec4 background{0.12f, 0.14f, 0.18f, 0.95f};
+    std::string text;
+    std::string image;
+    float value = 0.0f;
+    float minimum = 0.0f;
+    float maximum = 1.0f;
+    float fontSize = 24.0f;
+    bool checked = false;
+    bool visible = true;
+    bool enabled = true;
+    bool interactable = true;
+};
+
 struct ModelNodeRef {
     std::uint32_t node = 0; // index into Model::nodes
     Entity        instanceRoot = NullEntity;

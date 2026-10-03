@@ -456,6 +456,11 @@ std::vector<NodeDesc> BuildRegistry()
               "This entity starts touching another body (physics)"));
     add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
               "This entity stops touching another body"));
+    add(Event("Event.UIClicked", "On UI Clicked", {}, "An interactive UI button was clicked"));
+    add(Event("Event.UIValueChanged", "On UI Value Changed", {Out("Value", P::Float)},
+              "A UI slider value changed"));
+    add(Event("Event.UICheckedChanged", "On UI Checked Changed", {Out("Checked", P::Bool)},
+              "A UI checkbox changed state"));
     add(WithParam(Event("Event.KeyPressed", "On Key Pressed", {}, "The key went down this frame"), ParamKind::Key,
                   "Key", "Space"));
     add(WithParam(Event("Event.KeyReleased", "On Key Released", {}, "The key went up this frame"), ParamKind::Key,

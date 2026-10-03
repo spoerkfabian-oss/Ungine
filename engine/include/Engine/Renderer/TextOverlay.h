@@ -5,7 +5,10 @@
 
 #include <string>
 #include <string_view>
+#include <cstdint>
+#include <array>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace Engine {
@@ -26,6 +29,11 @@ public:
     // position: top-left corner in pixels (y down); color in sRGB; scale 1 = 7 px glyphs.
     // Each line gets a dark shadow for readability.
     void Add(std::string_view text, glm::vec2 position, glm::vec4 color = glm::vec4(1.0f), float scale = 2.0f);
+    // Filled screen-space rectangle in pixels; shares draw order with queued text.
+    void AddRect(glm::vec2 position, glm::vec2 size, glm::vec4 color);
+    // Textured screen-space image; textureEntry is an AssetManager texture-table entry.
+    void AddImage(std::uint32_t textureEntry, glm::vec2 position, glm::vec2 size,
+                  glm::vec4 tint = glm::vec4(1.0f));
     // Size in pixels (lines separated by '\n').
     [[nodiscard]] static glm::vec2 Measure(std::string_view text, float scale = 2.0f);
     [[nodiscard]] bool             Empty() const { return m_Items.empty(); }
@@ -42,10 +50,21 @@ private:
         glm::vec4   color;
         float       scale;
     };
+    struct Rect {
+        glm::vec2 position;
+        glm::vec2 size;
+        glm::vec4 color;
+    };
+    struct ImageItem {
+        std::uint32_t textureEntry;
+        glm::vec2 position;
+        glm::vec2 size;
+        glm::vec4 tint;
+    };
     const Pipeline& PipelineFor(VkFormat format);
 
     Renderer&                                  m_Renderer;
-    std::vector<Item>                          m_Items;
+    std::vector<std::variant<Item, Rect, ImageItem>> m_Items;
     std::vector<std::pair<VkFormat, Pipeline>> m_Pipelines;
     std::uint64_t                              m_ShaderGeneration = 0;
 };

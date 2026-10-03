@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 
 #include <bitset>
+#include <array>
 
 namespace Engine {
 
@@ -22,6 +23,10 @@ public:
     [[nodiscard]] bool IsMouseDown(int button) const;
     [[nodiscard]] bool WasMousePressed(int button) const;
     [[nodiscard]] bool WasMouseReleased(int button) const;
+    [[nodiscard]] bool IsGamepadButtonDown(int button) const;
+    [[nodiscard]] bool WasGamepadButtonPressed(int button) const;
+    [[nodiscard]] bool WasGamepadButtonReleased(int button) const;
+    [[nodiscard]] float GamepadAxisValue(int axis) const;
 
     [[nodiscard]] glm::vec2 MousePosition() const { return m_MousePos; }
     [[nodiscard]] glm::vec2 MouseDelta()    const { return m_MouseDelta; }
@@ -30,11 +35,14 @@ public:
 private:
     std::bitset<Key::Last + 1>         m_Keys, m_KeysPressed, m_KeysReleased;
     std::bitset<MouseButton::Last + 1> m_Buttons, m_ButtonsPressed, m_ButtonsReleased;
+    std::bitset<GamepadButton::Last + 1> m_GamepadButtons, m_GamepadPressed, m_GamepadReleased;
+    std::array<float, GamepadAxis::Last + 1> m_GamepadAxes{};
     glm::vec2 m_MousePos{0.0f}, m_MouseDelta{0.0f};
     float     m_Scroll    = 0.0f;
     bool      m_FirstMove = true;
 
     Subscription m_KeySub, m_ButtonSub, m_MoveSub, m_ScrollSub, m_FocusSub;
+    Subscription m_GamepadSub;
 };
 
 } // namespace Engine

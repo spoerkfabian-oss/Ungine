@@ -44,6 +44,8 @@ add_library(Engine STATIC
     src/Scene/SceneSerializer.cpp
     src/Scene/Prefab.cpp
     src/Scene/SpatialIndex.cpp
+    src/UI/UiLayout.cpp
+    src/UI/UiSystem.cpp
     src/Physics/PhysicsWorld.cpp
     src/Script/ScriptGraph.cpp
     src/Script/ScriptNodes.cpp

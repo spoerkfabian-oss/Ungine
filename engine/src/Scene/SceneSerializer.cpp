@@ -52,9 +52,35 @@ void BindModelNodeRefsToInstances(Scene& scene)
 
 // --- Values -----------------------------------------------------------------------------------
 
+json ToJson(const glm::vec2& v) { return json::array({v.x, v.y}); }
 json ToJson(const glm::vec3& v) { return json::array({v.x, v.y, v.z}); }
 json ToJson(const glm::vec4& v) { return json::array({v.x, v.y, v.z, v.w}); }
 json ToJson(const glm::quat& q) { return json::array({q.x, q.y, q.z, q.w}); }
+
+const char* UiWidgetTypeName(UiWidgetType type)
+{
+    switch (type) {
+    case UiWidgetType::Text: return "text";
+    case UiWidgetType::Image: return "image";
+    case UiWidgetType::Panel: return "panel";
+    case UiWidgetType::Button: return "button";
+    case UiWidgetType::Checkbox: return "checkbox";
+    case UiWidgetType::Slider: return "slider";
+    case UiWidgetType::ProgressBar: return "progressBar";
+    }
+    return "panel";
+}
+
+UiWidgetType UiWidgetTypeFromName(const std::string& name)
+{
+    if (name == "text") return UiWidgetType::Text;
+    if (name == "image") return UiWidgetType::Image;
+    if (name == "button") return UiWidgetType::Button;
+    if (name == "checkbox") return UiWidgetType::Checkbox;
+    if (name == "slider") return UiWidgetType::Slider;
+    if (name == "progressBar") return UiWidgetType::ProgressBar;
+    return UiWidgetType::Panel;
+}
 
 // Missing or mistyped fields keep their current value (older or hand-edited files).
 template <class T>
@@ -62,6 +88,11 @@ void Read(const json& j, const char* key, T& value)
 {
     if (const auto it = j.find(key); it != j.end() && !it->is_null())
         value = it->get<T>();
+}
+void Read(const json& j, const char* key, glm::vec2& v)
+{
+    if (const auto it = j.find(key); it != j.end() && it->is_array() && it->size() == 2)
+        v = {(*it)[0].get<float>(), (*it)[1].get<float>()};
 }
 void Read(const json& j, const char* key, glm::vec3& v)
 {
@@ -455,6 +486,30 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
                           {"rootMotionNode", animator->rootMotionNode},
                           {"applyRootMotion", animator->applyRootMotion}};
     }
+    if (const auto* canvas = r.TryGet<UiCanvas>(e))
+        j["uiCanvas"] = {{"designSize", ToJson(canvas->designSize)},
+                          {"sortOrder", canvas->sortOrder},
+                          {"scaleWithViewport", canvas->scaleWithViewport},
+                          {"visible", canvas->visible}};
+    if (const auto* widget = r.TryGet<UiWidget>(e))
+        j["uiWidget"] = {{"type", UiWidgetTypeName(widget->type)},
+                         {"anchorMin", ToJson(widget->anchorMin)},
+                         {"anchorMax", ToJson(widget->anchorMax)},
+                         {"offsetMin", ToJson(widget->offsetMin)},
+                         {"offsetMax", ToJson(widget->offsetMax)},
+                         {"pivot", ToJson(widget->pivot)},
+                         {"color", ToJson(widget->color)},
+                         {"background", ToJson(widget->background)},
+                         {"text", widget->text},
+                         {"image", models.WritePath(widget->image)},
+                         {"value", widget->value},
+                         {"minimum", widget->minimum},
+                         {"maximum", widget->maximum},
+                         {"fontSize", widget->fontSize},
+                         {"checked", widget->checked},
+                         {"visible", widget->visible},
+                         {"enabled", widget->enabled},
+                         {"interactable", widget->interactable}};
     if (const auto* node = r.TryGet<ModelNodeRef>(e))
         j["modelNode"] = node->node;
     if (const auto* body = r.TryGet<RigidBody>(e))
@@ -553,6 +608,47 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         animator.sampledClip = ~std::uint32_t{0};
         animator.sampledBlendClip = ~std::uint32_t{0};
         return animator;
+    });
+    ApplyOptional<UiCanvas>(r, e, j, "uiCanvas", [](const json& data) {
+        UiCanvas canvas;
+        Read(data, "designSize", canvas.designSize);
+        Read(data, "sortOrder", canvas.sortOrder);
+        Read(data, "scaleWithViewport", canvas.scaleWithViewport);
+        Read(data, "visible", canvas.visible);
+        if (!std::isfinite(canvas.designSize.x) || canvas.designSize.x <= 0.0f)
+            canvas.designSize.x = 1920.0f;
+        if (!std::isfinite(canvas.designSize.y) || canvas.designSize.y <= 0.0f)
+            canvas.designSize.y = 1080.0f;
+        return canvas;
+    });
+    ApplyOptional<UiWidget>(r, e, j, "uiWidget", [](const json& data) {
+        UiWidget widget;
+        std::string type;
+        Read(data, "type", type);
+        widget.type = UiWidgetTypeFromName(type);
+        Read(data, "anchorMin", widget.anchorMin);
+        Read(data, "anchorMax", widget.anchorMax);
+        Read(data, "offsetMin", widget.offsetMin);
+        Read(data, "offsetMax", widget.offsetMax);
+        Read(data, "pivot", widget.pivot);
+        Read(data, "color", widget.color);
+        Read(data, "background", widget.background);
+        Read(data, "text", widget.text);
+        Read(data, "image", widget.image);
+        widget.image = models.ReadPath(widget.image);
+        Read(data, "value", widget.value);
+        Read(data, "minimum", widget.minimum);
+        Read(data, "maximum", widget.maximum);
+        Read(data, "fontSize", widget.fontSize);
+        Read(data, "checked", widget.checked);
+        Read(data, "visible", widget.visible);
+        Read(data, "enabled", widget.enabled);
+        Read(data, "interactable", widget.interactable);
+        if (!std::isfinite(widget.value)) widget.value = 0.0f;
+        if (!std::isfinite(widget.minimum)) widget.minimum = 0.0f;
+        if (!std::isfinite(widget.maximum)) widget.maximum = 1.0f;
+        if (!std::isfinite(widget.fontSize) || widget.fontSize <= 0.0f) widget.fontSize = 24.0f;
+        return widget;
     });
     if (const auto it = j.find("modelNode"); it != j.end())
         r.EmplaceOrReplace<ModelNodeRef>(e, ModelNodeRef{.node = it->get<std::uint32_t>()});
@@ -1058,5 +1154,4 @@ bool ApplyEntityStateDiff(Scene& scene, Entity target, const std::string& before
     BindModelNodeRefsToInstances(scene);
     return true;
 }
-
 } // namespace Engine

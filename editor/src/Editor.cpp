@@ -11,6 +11,7 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
+#include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Prefab.h"
@@ -60,6 +61,7 @@ bool SetWorldMatrix(Scene& scene, Entity entity, const glm::mat4& world)
 Editor::Editor(const EditorContext& context)
     : m_Ctx(context),
       m_ImGui(std::make_unique<ImGuiLayer>(context.window, context.renderer, PathToUtf8(context.layoutFile))),
+      m_UiOverlay(std::make_unique<TextOverlay>(context.renderer)),
       m_History(std::make_unique<History>()),
       m_FileDialog(std::make_unique<FileDialog>()),
       m_Graphs(std::make_unique<ScriptGraphEditor>())
@@ -278,6 +280,12 @@ void Editor::Render(const FrameContext& frame, float physicsAlpha)
                                     .view   = m_ViewportImage.View(),
                                     .format = kViewportFormat,
                                     .extent = m_ViewportImage.Extent2D()});
+        m_UiSystem.PrepareLayout(m_Ctx.scene,
+                                 {static_cast<float>(m_ViewportImage.Extent().width),
+                                  static_cast<float>(m_ViewportImage.Extent().height)});
+        m_UiSystem.SyncAssets(m_Ctx.scene, m_Ctx.assets);
+        m_UiSystem.Draw(m_Ctx.scene, *m_UiOverlay);
+        m_UiOverlay->Render(frame, m_ViewportImage.View(), kViewportFormat, m_ViewportImage.Extent2D());
         CmdImageBarrier(cmd, {.image     = m_ViewportImage.Handle(),
                               .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                               .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

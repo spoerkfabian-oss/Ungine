@@ -1,7 +1,7 @@
 // UnginePlayer: runs a project's start scene as the game (physics, visual scripts, audio, the
 // scene's primary Camera component). Started by the editor (Build & Run) with the project file, or as a
 // packaged game that finds the .ungineproj next to the executable.
-// Keys: Esc quits, F11 toggles fullscreen.
+// Keys: Esc opens/closes the pause menu, F11 toggles fullscreen.
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
@@ -19,7 +19,10 @@
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
 #include "Engine/Assets/Animation.h"
+#include "Engine/UI/UiSystem.h"
 
+#include <array>
+#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -43,9 +46,7 @@ public:
         m_KeySub = GetEvents().Subscribe<KeyEvent>([this](const KeyEvent& e) {
             if (e.action != InputAction::Press)
                 return;
-            if (e.key == Key::Escape)
-                GetWindow().RequestClose();
-            else if (e.key == 300) // F11
+            if (e.key == 300) // F11
                 GetWindow().SetFullscreen(!GetWindow().IsFullscreen());
         });
     }
@@ -88,6 +89,7 @@ protected:
         m_Audio->Begin(m_Scene);
         m_Scripts->SetCurrentLevel(m_Project.Relative(scene));
         m_Scripts->Begin(m_Scene);
+        CreatePauseMenu();
         ENGINE_INFO("Playing '{}' ({})", m_Project.settings.name, PathToUtf8(scene));
         return true;
     }
@@ -123,7 +125,7 @@ protected:
 
     void OnFixedUpdate(double dt) override
     {
-        if (!m_Failed)
+        if (!m_Failed && !m_Paused)
             m_Physics->Step(m_Scene, static_cast<float>(dt));
     }
 
@@ -133,12 +135,27 @@ protected:
             return;
         // Mouse / camera nodes work in window coordinates of the whole window.
         m_Scripts->SetViewport({.origin = glm::vec2(0.0f), .size = GetWindow().WindowSize()});
-        m_Scripts->Update(m_Scene, static_cast<float>(dt));
-        if (const auto request = m_Scripts->TakeLevelRequest()) {
-            if (request->quit)
-                GetWindow().RequestClose();
-            else
-                ChangeLevel(request->scene);
+        if (GetInput().WasKeyPressed(Key::Escape))
+            SetPaused(!m_Paused);
+        if (!m_Paused)
+            m_Scripts->Update(m_Scene, static_cast<float>(dt));
+        if (!m_Paused) {
+            if (const auto request = m_Scripts->TakeLevelRequest()) {
+                if (request->quit)
+                    GetWindow().RequestClose();
+                else
+                    ChangeLevel(request->scene);
+            }
+        }
+        const VkExtent2D framebuffer = GetWindow().FramebufferExtent();
+        m_Ui.Update(m_Scene, GetInput(), GetWindow().WindowSize(),
+                    {static_cast<float>(framebuffer.width), static_cast<float>(framebuffer.height)});
+        m_Ui.SyncAssets(m_Scene, GetAssets());
+        if (m_MenuFullscreen != NullEntity && m_Scene.GetRegistry().Valid(m_MenuFullscreen))
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuFullscreen).checked = GetWindow().IsFullscreen();
+        for (const UiEvent& event : m_Ui.Events()) {
+            HandleMenuEvent(event);
+            m_Scripts->DispatchUiEvent(m_Scene, event);
         }
         UpdateAnimations(m_Scene, GetAssets(), static_cast<float>(dt));
         m_Scene.UpdateTransforms();
@@ -161,6 +178,7 @@ protected:
             camera = CameraFromWorld(m_Scene.GetRegistry().Get<WorldTransform>(e).matrix, cam.fovY, cam.nearPlane, aspect);
         }
         m_SceneRenderer->Render(frame, m_Scene, camera);
+        m_Ui.Draw(m_Scene, *m_Text);
         DrawPrints(frame);
     }
 
@@ -195,6 +213,108 @@ protected:
     }
 
 private:
+    Entity AddUiEntity(std::string name, Entity parent, const UiWidget& widget)
+    {
+        const Entity entity = m_Scene.CreateEntity(std::move(name), parent);
+        m_Scene.GetRegistry().Emplace<UiWidget>(entity, widget);
+        return entity;
+    }
+
+    void CreatePauseMenu()
+    {
+        Registry& registry = m_Scene.GetRegistry();
+        m_MenuCanvas = m_Scene.CreateEntity("Pause Menu");
+        registry.Emplace<UiCanvas>(m_MenuCanvas, UiCanvas{.designSize = {1280.0f, 720.0f},
+                                                          .sortOrder = 100, .visible = false});
+        const auto panel = [&](const char* name) {
+            return AddUiEntity(name, m_MenuCanvas,
+                               UiWidget{.type = UiWidgetType::Panel,
+                                        .anchorMin = {0.5f, 0.5f}, .anchorMax = {0.5f, 0.5f},
+                                        .offsetMax = {460.0f, 430.0f}, .pivot = {0.5f, 0.5f},
+                                        .background = {0.035f, 0.045f, 0.07f, 0.97f}});
+        };
+        m_MenuMainPanel = panel("Pause Panel");
+        m_MenuOptionsPanel = panel("Options Panel");
+        registry.Get<UiWidget>(m_MenuOptionsPanel).visible = false;
+        const auto button = [&](Entity parent, const char* name, const char* text, float top) {
+            return AddUiEntity(name, parent,
+                               UiWidget{.type = UiWidgetType::Button,
+                                        .offsetMin = {30.0f, top}, .offsetMax = {430.0f, top + 58.0f},
+                                        .color = {1.0f, 1.0f, 1.0f, 1.0f},
+                                        .background = {0.14f, 0.2f, 0.3f, 1.0f}, .text = text,
+                                        .fontSize = 24.0f});
+        };
+        AddUiEntity("Paused", m_MenuMainPanel,
+                    UiWidget{.type = UiWidgetType::Text,
+                             .offsetMin = {30.0f, 24.0f}, .offsetMax = {430.0f, 72.0f},
+                             .color = {1.0f, 0.84f, 0.36f, 1.0f}, .text = "PAUSED", .fontSize = 32.0f});
+        m_MenuResume = button(m_MenuMainPanel, "Resume", "Resume", 100.0f);
+        m_MenuOptions = button(m_MenuMainPanel, "Open Options", "Options", 178.0f);
+        m_MenuQuit = button(m_MenuMainPanel, "Quit", "Quit game", 256.0f);
+
+        AddUiEntity("Options", m_MenuOptionsPanel,
+                    UiWidget{.type = UiWidgetType::Text,
+                             .offsetMin = {30.0f, 24.0f}, .offsetMax = {430.0f, 72.0f},
+                             .color = {1.0f, 0.84f, 0.36f, 1.0f}, .text = "OPTIONS", .fontSize = 32.0f});
+        const float musicVolume = m_Audio->Engine().BusVolume(AudioBus::Music);
+        m_MenuMusic = AddUiEntity("Music volume", m_MenuOptionsPanel,
+                                  UiWidget{.type = UiWidgetType::Slider,
+                                           .offsetMin = {30.0f, 110.0f}, .offsetMax = {430.0f, 166.0f},
+                                           .color = {0.25f, 0.75f, 1.0f, 1.0f}, .text = "Music volume",
+                                           .value = musicVolume, .fontSize = 20.0f});
+        m_MenuFullscreen = AddUiEntity("Fullscreen", m_MenuOptionsPanel,
+                                       UiWidget{.type = UiWidgetType::Checkbox,
+                                                .offsetMin = {30.0f, 194.0f}, .offsetMax = {430.0f, 246.0f},
+                                                .color = {1.0f, 1.0f, 1.0f, 1.0f}, .text = "Fullscreen",
+                                                .checked = GetWindow().IsFullscreen(), .fontSize = 20.0f});
+        m_MenuBack = button(m_MenuOptionsPanel, "Back", "Back", 310.0f);
+    }
+
+    void SetPaused(bool paused)
+    {
+        if (m_Paused == paused)
+            return;
+        m_Paused = paused;
+        if (m_MenuCanvas != NullEntity && m_Scene.GetRegistry().Valid(m_MenuCanvas))
+            m_Scene.GetRegistry().Get<UiCanvas>(m_MenuCanvas).visible = paused;
+        if (m_MenuMainPanel != NullEntity && m_Scene.GetRegistry().Valid(m_MenuMainPanel))
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = true;
+        if (m_MenuOptionsPanel != NullEntity && m_Scene.GetRegistry().Valid(m_MenuOptionsPanel))
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = false;
+        if (paused) {
+            constexpr std::array buses{AudioBus::World, AudioBus::Music, AudioBus::Ambient};
+            for (std::size_t i = 0; i < buses.size(); ++i) {
+                m_PrePauseMuted[i] = m_Audio->Engine().BusMuted(buses[i]);
+                m_Audio->Engine().SetBusMuted(buses[i], true);
+            }
+        } else {
+            constexpr std::array buses{AudioBus::World, AudioBus::Music, AudioBus::Ambient};
+            for (std::size_t i = 0; i < buses.size(); ++i)
+                m_Audio->Engine().SetBusMuted(buses[i], m_PrePauseMuted[i]);
+        }
+    }
+
+    void HandleMenuEvent(const UiEvent& event)
+    {
+        if (!m_Paused)
+            return;
+        if (event.entity == m_MenuResume)
+            SetPaused(false);
+        else if (event.entity == m_MenuOptions) {
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = false;
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = true;
+        } else if (event.entity == m_MenuBack) {
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = false;
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = true;
+        } else if (event.entity == m_MenuQuit)
+            GetWindow().RequestClose();
+        else if (event.entity == m_MenuMusic && event.type == UiEventType::ValueChanged) {
+            m_Audio->Engine().SetBusVolume(AudioBus::Music, event.value);
+            m_Project.settings.audio.volume[static_cast<std::size_t>(AudioBus::Music)] = event.value;
+        } else if (event.entity == m_MenuFullscreen && event.type == UiEventType::CheckedChanged)
+            GetWindow().SetFullscreen(event.checked);
+    }
+
     Project                        m_Project;
     fs::path                       m_SaveDirectory;
     std::uint32_t                  m_ExitAfterFrames = 0;
@@ -206,6 +326,18 @@ private:
     std::vector<ModelHandle>       m_Models;
     std::unique_ptr<SceneRenderer> m_SceneRenderer;
     std::unique_ptr<TextOverlay>   m_Text;
+    UiSystem                      m_Ui;
+    Entity                        m_MenuCanvas = NullEntity;
+    Entity                        m_MenuMainPanel = NullEntity;
+    Entity                        m_MenuOptionsPanel = NullEntity;
+    Entity                        m_MenuResume = NullEntity;
+    Entity                        m_MenuOptions = NullEntity;
+    Entity                        m_MenuQuit = NullEntity;
+    Entity                        m_MenuBack = NullEntity;
+    Entity                        m_MenuMusic = NullEntity;
+    Entity                        m_MenuFullscreen = NullEntity;
+    std::array<bool, 3>           m_PrePauseMuted{};
+    bool                          m_Paused = false;
     std::unique_ptr<PhysicsWorld>  m_Physics;
     std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;

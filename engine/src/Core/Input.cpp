@@ -46,6 +46,17 @@ Input::Input(EventBus& events)
             m_Buttons.reset();
         }
     });
+    m_GamepadSub = events.Subscribe<GamepadStateEvent>([this](const GamepadStateEvent& e) {
+        for (std::size_t i = 0; i <= GamepadButton::Last; ++i) {
+            const bool down = e.connected && e.buttons[i] != 0;
+            if (down && !m_GamepadButtons.test(i))
+                m_GamepadPressed.set(i);
+            else if (!down && m_GamepadButtons.test(i))
+                m_GamepadReleased.set(i);
+            m_GamepadButtons.set(i, down);
+        }
+        m_GamepadAxes = e.connected ? e.axes : std::array<float, GamepadAxis::Last + 1>{};
+    });
 }
 
 void Input::NewFrame()
@@ -54,6 +65,8 @@ void Input::NewFrame()
     m_KeysReleased.reset();
     m_ButtonsPressed.reset();
     m_ButtonsReleased.reset();
+    m_GamepadPressed.reset();
+    m_GamepadReleased.reset();
     m_MouseDelta = glm::vec2{0.0f};
     m_Scroll     = 0.0f;
 }
@@ -78,6 +91,22 @@ bool Input::WasMousePressed(int b) const
 bool Input::WasMouseReleased(int b) const
 {
     return InRange(b, MouseButton::Last) && m_ButtonsReleased.test(static_cast<std::size_t>(b));
+}
+bool Input::IsGamepadButtonDown(int button) const
+{
+    return InRange(button, GamepadButton::Last) && m_GamepadButtons.test(static_cast<std::size_t>(button));
+}
+bool Input::WasGamepadButtonPressed(int button) const
+{
+    return InRange(button, GamepadButton::Last) && m_GamepadPressed.test(static_cast<std::size_t>(button));
+}
+bool Input::WasGamepadButtonReleased(int button) const
+{
+    return InRange(button, GamepadButton::Last) && m_GamepadReleased.test(static_cast<std::size_t>(button));
+}
+float Input::GamepadAxisValue(int axis) const
+{
+    return InRange(axis, GamepadAxis::Last) ? m_GamepadAxes[static_cast<std::size_t>(axis)] : 0.0f;
 }
 
 } // namespace Engine

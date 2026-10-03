@@ -8,6 +8,7 @@
 #include "Engine/Script/ScriptGraph.h"
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/UI/UiLayout.h"
 
 #include <algorithm>
 #include <cmath>
@@ -246,6 +247,32 @@ TEST_CASE(Script_DelayTransformAndLoopGuard)
     CHECK(std::abs(world.x - 2.0f) < 0.05f && std::abs(world.z - 10.0f) < 1e-3f); // world +X under a rotated parent
     CHECK(f.scene.CountStaleTransforms() == 0);
     f.scripts.End(f.scene);
+}
+
+TEST_CASE(Script_UiClickDispatchesCustomEvent)
+{
+    ScriptFixture f;
+    const std::uint32_t clicked = f.Node("Event.UIClicked");
+    const std::uint32_t print = f.Print("button clicked");
+    f.Link(clicked, "Out", print, "In");
+    const std::uint32_t changed = f.Node("Event.UIValueChanged");
+    const std::uint32_t printValue = f.Print("");
+    f.Link(changed, "Out", printValue, "In");
+    f.Link(changed, "Value", printValue, "Text");
+    const std::uint32_t checked = f.Node("Event.UICheckedChanged");
+    const std::uint32_t branch = f.Node("Flow.Branch");
+    f.Link(checked, "Out", branch, "In");
+    f.Link(checked, "Checked", branch, "Condition");
+    f.Link(branch, "True", f.Print("checked"), "In");
+    f.Link(branch, "False", f.Print("unchecked"), "In");
+    f.Start("ui.ugraph");
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::Clicked});
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::ValueChanged, .value = 0.75f});
+    f.scripts.DispatchUiEvent(f.scene, UiEvent{.entity = f.actor, .type = UiEventType::CheckedChanged, .checked = true});
+    CHECK(f.Printed("button clicked") == 1);
+    CHECK(f.Printed("0.75") == 1);
+    CHECK(f.Printed("checked") == 1 && f.Printed("unchecked") == 0);
+    CHECK(!f.Errors());
 }
 
 TEST_CASE(Script_AnimationControls)

@@ -752,7 +752,6 @@ Rendering:
 - deferred renderer is not the primary path
 
 glTF:
-- no skins/animation
 - no morph targets
 - limited color/UV support
 - selected extensions unsupported
@@ -772,6 +771,7 @@ Blueprint:
 - documented construction-script semantics
 
 Editor:
+- in-game UI is rendered in the editor viewport but interaction is currently available only in the player; pause-menu options are session-only and input remapping is not implemented
 - some interaction testing is manual
 - limited import workflow
 - no full automatic reference repair

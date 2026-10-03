@@ -170,7 +170,27 @@ void Window::InstallCallbacks()
     });
 }
 
-void Window::PollEvents() const { glfwPollEvents(); }
+void Window::PollEvents() const
+{
+    glfwPollEvents();
+    GamepadStateEvent event{};
+    for (int joystick = GLFW_JOYSTICK_1; joystick <= GLFW_JOYSTICK_LAST; ++joystick) {
+        if (!glfwJoystickPresent(joystick) || !glfwJoystickIsGamepad(joystick))
+            continue;
+        GLFWgamepadstate state{};
+        if (glfwGetGamepadState(joystick, &state) != GLFW_TRUE)
+            continue;
+        event.connected = true;
+        for (std::size_t i = 0; i < event.buttons.size() && i <= GLFW_GAMEPAD_BUTTON_LAST; ++i)
+            event.buttons[i] = state.buttons[i];
+        for (std::size_t i = 0; i < event.axes.size() && i <= GLFW_GAMEPAD_AXIS_LAST; ++i)
+            event.axes[i] = state.axes[i];
+        break; // the first mapped controller is the active UI gamepad
+    }
+    if (event.connected || m_GamepadConnected)
+        m_Events->Publish(event);
+    m_GamepadConnected = event.connected;
+}
 void Window::WaitEvents() const { glfwWaitEvents(); }
 void Window::WaitEvents(double timeoutSeconds) const { glfwWaitEventsTimeout(timeoutSeconds); }
 void Window::RequestClose() const { glfwSetWindowShouldClose(m_Handle, GLFW_TRUE); }

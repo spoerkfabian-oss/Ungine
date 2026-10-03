@@ -20,6 +20,8 @@
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/UI/UiLayout.h"
+#include "Engine/UI/UiSystem.h"
 
 #include <glm/gtc/epsilon.hpp>
 #include <glm/gtc/constants.hpp>
@@ -709,12 +711,123 @@ TEST_CASE(Scene_UuidsAndSiblingOrder)
     CHECK(r.AliveCount() == 0);
 }
 
+TEST_CASE(UiLayout_AnchorsScalingHierarchyAndVisibility)
+{
+    Scene scene;
+    Registry& registry = scene.GetRegistry();
+    const Entity canvas = scene.CreateEntity("Canvas");
+    registry.Emplace<UiCanvas>(canvas, UiCanvas{});
+    const Entity panel = scene.CreateEntity("Panel", canvas);
+    registry.Emplace<UiWidget>(panel, UiWidget{.type = UiWidgetType::Panel,
+                                               .offsetMax = {960.0f, 540.0f}});
+    const Entity button = scene.CreateEntity("Play", panel);
+    registry.Emplace<UiWidget>(button, UiWidget{.type = UiWidgetType::Button,
+                                                .anchorMin = {0.5f, 0.5f},
+                                                .anchorMax = {0.5f, 0.5f},
+                                                .offsetMax = {160.0f, 48.0f},
+                                                .pivot = {0.5f, 0.5f}});
+
+    const auto layout = BuildUiLayout(scene, canvas, {1280.0f, 720.0f});
+    CHECK(layout.size() == 2);
+    if (layout.size() != 2)
+        return;
+    CHECK(layout[0].entity == panel);
+    CHECK(layout[0].rect.position == glm::vec2{0.0f});
+    CHECK(glm::length(layout[0].rect.size - glm::vec2{640.0f, 360.0f}) < 1.0e-4f);
+    CHECK(layout[1].entity == button);
+    CHECK(glm::length(layout[1].rect.position - glm::vec2{266.6667f, 156.0f}) < 1.0e-3f);
+    CHECK(glm::length(layout[1].rect.size - glm::vec2{106.6667f, 32.0f}) < 1.0e-3f);
+    CHECK(layout[1].rect.Contains({300.0f, 170.0f}));
+    CHECK(!layout[1].rect.Contains({400.0f, 170.0f}));
+
+    registry.Get<UiCanvas>(canvas).visible = false;
+    CHECK(BuildUiLayout(scene, canvas, {1280.0f, 720.0f}).empty());
+    registry.Get<UiCanvas>(canvas).visible = true;
+    registry.Get<UiWidget>(panel).visible = false;
+    CHECK(BuildUiLayout(scene, canvas, {1280.0f, 720.0f}).empty());
+}
+
+TEST_CASE(UiSystem_MouseKeyboardAndSliderEvents)
+{
+    EventBus events;
+    Input input(events);
+    Scene scene;
+    Registry& registry = scene.GetRegistry();
+    const Entity canvas = scene.CreateEntity("Canvas");
+    registry.Emplace<UiCanvas>(canvas, UiCanvas{.designSize = {640.0f, 480.0f}, .scaleWithViewport = false});
+    const Entity button = scene.CreateEntity("Play", canvas);
+    registry.Emplace<UiWidget>(button, UiWidget{.type = UiWidgetType::Button,
+                                                .offsetMax = {200.0f, 60.0f}, .text = "Play"});
+    const Entity slider = scene.CreateEntity("Volume", canvas);
+    registry.Emplace<UiWidget>(slider, UiWidget{.type = UiWidgetType::Slider,
+                                                .offsetMin = {0.0f, 100.0f}, .offsetMax = {240.0f, 140.0f}});
+
+    UiSystem ui;
+    input.NewFrame();
+    events.Publish(MouseMoveEvent{50.0, 25.0});
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Hovered() == button && ui.Focused() == button);
+    input.NewFrame();
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Release, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].entity == button && ui.Events()[0].type == UiEventType::Clicked);
+
+    input.NewFrame();
+    events.Publish(KeyEvent{Key::Space, 0, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].entity == button && ui.Events()[0].type == UiEventType::Clicked);
+
+    input.NewFrame();
+    events.Publish(MouseMoveEvent{120.0, 120.0});
+    events.Publish(MouseButtonEvent{MouseButton::Left, InputAction::Press, 0});
+    ui.Update(scene, input, {640.0f, 480.0f}, {640.0f, 480.0f});
+    CHECK(ui.Hovered() == slider && ui.Focused() == slider);
+    CHECK(std::abs(registry.Get<UiWidget>(slider).value - 0.5f) < 1.0e-5f);
+    CHECK(ui.Events().size() == 1);
+    if (ui.Events().size() != 1)
+        return;
+    CHECK(ui.Events()[0].type == UiEventType::ValueChanged);
+}
+
+TEST_CASE(Input_GamepadEdgesAndDisconnect)
+{
+    EventBus events;
+    Input input(events);
+    input.NewFrame();
+    GamepadStateEvent connected;
+    connected.connected = true;
+    connected.buttons[GamepadButton::South] = 1;
+    connected.axes[GamepadAxis::LeftX] = 0.5f;
+    events.Publish(connected);
+    CHECK(input.WasGamepadButtonPressed(GamepadButton::South));
+    CHECK(input.IsGamepadButtonDown(GamepadButton::South));
+    CHECK(input.GamepadAxisValue(GamepadAxis::LeftX) == 0.5f);
+
+    input.NewFrame();
+    events.Publish(connected);
+    CHECK(!input.WasGamepadButtonPressed(GamepadButton::South));
+    CHECK(input.IsGamepadButtonDown(GamepadButton::South));
+    GamepadStateEvent disconnected;
+    events.Publish(disconnected);
+    CHECK(input.WasGamepadButtonReleased(GamepadButton::South));
+    CHECK(!input.IsGamepadButtonDown(GamepadButton::South));
+    CHECK(input.GamepadAxisValue(GamepadAxis::LeftX) == 0.0f);
+}
+
 TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
 {
     Scene        scene;
     Registry&    r      = scene.GetRegistry();
     const Entity parent = scene.CreateEntity("Parent");
     r.Emplace<ModelInstance>(parent, ModelInstance{.model = ModelHandle{7, 3}});
+    r.Emplace<UiCanvas>(parent, UiCanvas{.designSize = {1600.0f, 900.0f}, .sortOrder = 3});
     scene.CreateEntity("First", parent);
     const Entity node = scene.CreateEntity("Node", parent);
     const Entity child = scene.CreateEntity("Child", node);
@@ -733,6 +846,15 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     animator.rootMotionNode = 4;
     animator.applyRootMotion = true;
     r.Emplace<Animator>(node, animator);
+    r.Emplace<UiWidget>(node, UiWidget{.type = UiWidgetType::Slider,
+                                       .anchorMin = {0.0f, 1.0f},
+                                       .anchorMax = {1.0f, 1.0f},
+                                       .offsetMin = {12.0f, -44.0f},
+                                       .offsetMax = {-12.0f, 0.0f},
+                                       .text = "Volume",
+                                       .value = 0.4f,
+                                       .minimum = -1.0f,
+                                       .maximum = 1.0f});
     const std::uint64_t nodeUuid  = r.Get<Uuid>(node).value;
     const std::uint64_t childUuid = r.Get<Uuid>(child).value;
 
@@ -756,6 +878,14 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
           r.Get<MeshRenderer>(node2).meshIndex == 2);
     CHECK(r.Has<ModelNodeRef>(node2) && r.Get<ModelNodeRef>(node2).node == 0 &&
           r.Get<ModelNodeRef>(node2).instanceRoot == parent);
+    CHECK(r.Has<UiWidget>(node2));
+    if (const UiWidget* widget = r.TryGet<UiWidget>(node2)) {
+        CHECK(widget->type == UiWidgetType::Slider && widget->text == "Volume");
+        CHECK(widget->anchorMin == glm::vec2{0.0f, 1.0f});
+        CHECK(widget->value == 0.4f && widget->minimum == -1.0f && widget->maximum == 1.0f);
+    }
+    CHECK(r.Has<UiCanvas>(parent) && r.Get<UiCanvas>(parent).designSize == (glm::vec2{1600.0f, 900.0f}) &&
+          r.Get<UiCanvas>(parent).sortOrder == 3);
     CHECK(r.Has<Animator>(node2));
     if (const Animator* restoredAnimator = r.TryGet<Animator>(node2)) {
         CHECK(restoredAnimator->clipIndex == 2 && restoredAnimator->blendClipIndex == 1);
@@ -780,11 +910,13 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     r.Get<Name>(node2).value      = "Renamed";
     r.Remove<MeshRenderer>(node2);
     r.Get<Animator>(node2).blendWeight = 0.9f;
+    r.Get<UiWidget>(node2).value = 0.9f;
     r.Emplace<Light>(node2);
     ApplyEntityState(scene, node2, state);
     CHECK(r.Get<Transform>(node2).scale == glm::vec3(1.0f) && r.Get<Name>(node2).value == "Node");
     CHECK(r.Has<MeshRenderer>(node2) && !r.Has<Light>(node2));
     CHECK(r.Get<Animator>(node2).blendWeight == 0.35f);
+    CHECK(r.Get<UiWidget>(node2).value == 0.4f);
 }
 
 TEST_CASE(Scene_DirtyTransformsAndChanges)

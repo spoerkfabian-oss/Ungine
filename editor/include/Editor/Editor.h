@@ -5,6 +5,7 @@
 #include "Engine/Renderer/Vulkan/Image.h"
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Script/ScriptGraph.h"
+#include "Engine/UI/UiSystem.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -37,6 +38,7 @@ class Scene;
 class SceneRenderer;
 class ScriptGraphEditor;
 class ScriptSystem;
+class TextOverlay;
 class Window;
 struct ScriptComponent;
 enum class LightType : std::uint8_t;
@@ -245,6 +247,8 @@ private:
 
     EditorContext               m_Ctx;
     std::unique_ptr<ImGuiLayer> m_ImGui;
+    std::unique_ptr<TextOverlay> m_UiOverlay;
+    UiSystem                     m_UiSystem;
     std::unique_ptr<History>    m_History;
     std::unique_ptr<FileDialog> m_FileDialog;
     std::unique_ptr<ScriptGraphEditor> m_Graphs;

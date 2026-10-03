@@ -7,6 +7,7 @@
 #include <stb_easy_font.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace Engine {
@@ -19,12 +20,20 @@ struct TextVertex { // stb_easy_font's layout: position + RGBA8
 };
 static_assert(sizeof(TextVertex) == 16);
 
+struct OverlayVertex { // mirrors the std430 record in text.vert
+    glm::vec4 positionUv;
+    glm::uvec4 data; // packed color, texture-table entry, flags, padding
+};
+static_assert(sizeof(OverlayVertex) == 32);
+
 struct TextPush { // mirrors text.vert
     VkDeviceAddress vertices;
     glm::vec2       screenSize;
     std::uint32_t   srgbTarget;
     std::uint32_t   pad;
+    VkDeviceAddress textureTable;
 };
+static_assert(sizeof(TextPush) == 32);
 
 constexpr std::size_t kMaxQuads = 65536; // per frame
 
@@ -34,7 +43,21 @@ bool IsSrgb(VkFormat format)
            format == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
 }
 
-unsigned char ToByte(float v) { return static_cast<unsigned char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); }
+unsigned char ToByte(float v)
+{
+    if (!std::isfinite(v))
+        return 0;
+    return static_cast<unsigned char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+std::uint32_t PackColor(glm::vec4 color)
+{
+    const std::uint32_t r = ToByte(color.r);
+    const std::uint32_t g = ToByte(color.g);
+    const std::uint32_t b = ToByte(color.b);
+    const std::uint32_t a = ToByte(color.a);
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
 
 } // namespace
 
@@ -47,8 +70,23 @@ TextOverlay::~TextOverlay()
 
 void TextOverlay::Add(std::string_view text, glm::vec2 position, glm::vec4 color, float scale)
 {
-    if (!text.empty())
-        m_Items.push_back({std::string(text), position, color, std::max(scale, 0.25f)});
+    if (!text.empty() && std::isfinite(position.x) && std::isfinite(position.y))
+        m_Items.emplace_back(Item{std::string(text), position, color,
+                                  std::isfinite(scale) ? std::max(scale, 0.25f) : 1.0f});
+}
+
+void TextOverlay::AddRect(glm::vec2 position, glm::vec2 size, glm::vec4 color)
+{
+    if (size.x > 0.0f && size.y > 0.0f && std::isfinite(size.x) && std::isfinite(size.y) &&
+        std::isfinite(position.x) && std::isfinite(position.y))
+        m_Items.emplace_back(Rect{position, size, color});
+}
+
+void TextOverlay::AddImage(std::uint32_t textureEntry, glm::vec2 position, glm::vec2 size, glm::vec4 tint)
+{
+    if (size.x > 0.0f && size.y > 0.0f && std::isfinite(size.x) && std::isfinite(size.y) &&
+        std::isfinite(position.x) && std::isfinite(position.y))
+        m_Items.emplace_back(ImageItem{textureEntry, position, size, tint});
 }
 
 glm::vec2 TextOverlay::Measure(std::string_view text, float scale)
@@ -90,21 +128,50 @@ void TextOverlay::Render(const FrameContext& frame, VkImageView view, VkFormat f
         m_Items.clear();
         return;
     }
-    // Quads per item: stb_easy_font writes ~270 bytes per character at most; shadow + text.
-    std::vector<TextVertex> vertices;
+    // Quads per text item: shadow + foreground; filled rectangles use one quad each.
+    std::vector<OverlayVertex> vertices;
     std::vector<TextVertex> scratch;
-    for (const Item& item : m_Items) {
+    for (const auto& command : m_Items) {
+        if (const auto* rect = std::get_if<Rect>(&command)) {
+            if (vertices.size() / 4 >= kMaxQuads)
+                break;
+            const float x0 = rect->position.x;
+            const float y0 = rect->position.y;
+            const float x1 = x0 + rect->size.x;
+            const float y1 = y0 + rect->size.y;
+            for (const glm::vec2 point : {glm::vec2{x0, y0}, glm::vec2{x1, y0}, glm::vec2{x1, y1}, glm::vec2{x0, y1}}) {
+                vertices.push_back({glm::vec4{point, 0.0f, 0.0f}, {PackColor(rect->color), 0u, 0u, 0u}});
+            }
+            continue;
+        }
+        if (const auto* image = std::get_if<ImageItem>(&command)) {
+            if (vertices.size() / 4 >= kMaxQuads)
+                break;
+            const float x0 = image->position.x;
+            const float y0 = image->position.y;
+            const float x1 = x0 + image->size.x;
+            const float y1 = y0 + image->size.y;
+            const std::array<glm::vec4, 4> points{{{x0, y0, 0.0f, 0.0f}, {x1, y0, 1.0f, 0.0f},
+                                                   {x1, y1, 1.0f, 1.0f}, {x0, y1, 0.0f, 1.0f}}};
+            const std::uint32_t color = PackColor(image->tint);
+            for (const glm::vec4 point : points)
+                vertices.push_back({point, {color, image->textureEntry, 1u, 0u}});
+            continue;
+        }
+        const Item& item = std::get<Item>(command);
         std::string text = item.text;
         scratch.resize(text.size() * 70 + 64); // stb_easy_font: up to ~4 quads (16 vertices) per char
         const auto emit = [&](glm::vec2 offset, glm::vec4 color) {
             unsigned char rgba[4] = {ToByte(color.r), ToByte(color.g), ToByte(color.b), ToByte(color.a)};
             const int     quads   = stb_easy_font_print(0.0f, 0.0f, text.data(), rgba, scratch.data(),
                                                         static_cast<int>(scratch.size() * sizeof(TextVertex)));
-            for (int i = 0; i < quads * 4; ++i) {
-                TextVertex v = scratch[static_cast<std::size_t>(i)];
-                v.x          = item.position.x + offset.x + v.x * item.scale;
-                v.y          = item.position.y + offset.y + v.y * item.scale;
-                vertices.push_back(v);
+            for (int i = 0; i < quads * 4 && vertices.size() / 4 < kMaxQuads; ++i) {
+                const TextVertex v = scratch[static_cast<std::size_t>(i)];
+                vertices.push_back({glm::vec4{item.position.x + offset.x + v.x * item.scale,
+                                               item.position.y + offset.y + v.y * item.scale, 0.0f, 0.0f},
+                                    {PackColor({v.color[0] / 255.0f, v.color[1] / 255.0f,
+                                                v.color[2] / 255.0f, v.color[3] / 255.0f}),
+                                     0u, 0u, 0u}});
             }
         };
         emit(glm::vec2(std::max(1.0f, item.scale * 0.5f)), glm::vec4(0.0f, 0.0f, 0.0f, 0.75f * item.color.a));
@@ -117,8 +184,8 @@ void TextOverlay::Render(const FrameContext& frame, VkImageView view, VkFormat f
     if (quads == 0)
         return;
 
-    const TransientAllocation buffer = m_Renderer.AllocateTransient(quads * 4 * sizeof(TextVertex), 16);
-    std::memcpy(buffer.cpu, vertices.data(), quads * 4 * sizeof(TextVertex));
+    const TransientAllocation buffer = m_Renderer.AllocateTransient(quads * 4 * sizeof(OverlayVertex), 16);
+    std::memcpy(buffer.cpu, vertices.data(), quads * 4 * sizeof(OverlayVertex));
 
     const VkCommandBuffer cmd = frame.cmd;
     VkRenderingAttachmentInfo color{};
@@ -140,7 +207,8 @@ void TextOverlay::Render(const FrameContext& frame, VkImageView view, VkFormat f
     const TextPush push{.vertices   = buffer.gpu,
                         .screenSize = glm::vec2(static_cast<float>(extent.width), static_cast<float>(extent.height)),
                         .srgbTarget = IsSrgb(format) ? 1u : 0u,
-                        .pad        = 0};
+                        .pad        = 0,
+                        .textureTable = m_Renderer.TextureTableAddress()};
     vkCmdPushConstants(cmd, m_Renderer.GetBindless().PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     vkCmdDraw(cmd, static_cast<std::uint32_t>(quads * 6), 1, 0, 0);
     vkCmdEndRendering(cmd);

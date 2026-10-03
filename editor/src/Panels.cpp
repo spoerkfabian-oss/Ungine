@@ -540,6 +540,71 @@ void Editor::DrawInspector()
         }
     }
 
+    if (UiCanvas* canvas = registry.TryGet<UiCanvas>(e);
+        canvas && ImGui::CollapsingHeader("UI Canvas", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("ui-canvas")) {
+        PropertyRow("Design size");
+        ImGui::DragFloat2("##v", &canvas->designSize.x, 1.0f, 1.0f, 16384.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::PopID();
+        PropertyRow("Sort order");
+        ImGui::DragInt("##v", &canvas->sortOrder, 1.0f, -100000, 100000);
+        ImGui::PopID();
+        CheckboxRow("Scale with viewport", &canvas->scaleWithViewport);
+        CheckboxRow("Visible", &canvas->visible);
+        ImGui::EndTable();
+        if (ImGui::Button("Remove canvas"))
+            registry.Remove<UiCanvas>(e);
+    }
+
+    if (UiWidget* widget = registry.TryGet<UiWidget>(e);
+        widget && ImGui::CollapsingHeader("UI Widget", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("ui-widget")) {
+        static constexpr const char* kUiWidgetNames[] = {"Text", "Image", "Panel", "Button", "Checkbox", "Slider", "Progress bar"};
+        ComboRow("Type", &widget->type, kUiWidgetNames);
+        const auto vec2Row = [](const char* label, glm::vec2& value, float speed, float minimum, float maximum) {
+            PropertyRow(label);
+            ImGui::DragFloat2("##v", &value.x, speed, minimum, maximum, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopID();
+        };
+        vec2Row("Anchor min", widget->anchorMin, 0.005f, 0.0f, 1.0f);
+        vec2Row("Anchor max", widget->anchorMax, 0.005f, 0.0f, 1.0f);
+        vec2Row("Offset min", widget->offsetMin, 1.0f, -16384.0f, 16384.0f);
+        vec2Row("Offset max", widget->offsetMax, 1.0f, -16384.0f, 16384.0f);
+        vec2Row("Pivot", widget->pivot, 0.005f, 0.0f, 1.0f);
+        PropertyRow("Color");
+        ImGui::ColorEdit4("##color", &widget->color.x, ImGuiColorEditFlags_NoInputs);
+        ImGui::PopID();
+        if (widget->type == UiWidgetType::Panel || widget->type == UiWidgetType::Button ||
+            widget->type == UiWidgetType::Checkbox || widget->type == UiWidgetType::Slider ||
+            widget->type == UiWidgetType::ProgressBar || widget->type == UiWidgetType::Image) {
+            PropertyRow("Background");
+            ImGui::ColorEdit4("##background", &widget->background.x, ImGuiColorEditFlags_NoInputs);
+            ImGui::PopID();
+        }
+        if (widget->type != UiWidgetType::Image) {
+            PropertyRow("Text");
+            ImGui::InputText("##text", &widget->text);
+            ImGui::PopID();
+        } else {
+            PropertyRow("Image path");
+            ImGui::InputText("##image", &widget->image);
+            ImGui::PopID();
+        }
+        DragFloatRow("Font size", &widget->fontSize, 0.5f, 4.0f, 256.0f);
+        if (widget->type == UiWidgetType::Checkbox)
+            CheckboxRow("Checked", &widget->checked);
+        if (widget->type == UiWidgetType::Slider || widget->type == UiWidgetType::ProgressBar) {
+            DragFloatRow("Minimum", &widget->minimum, 0.01f, -1e6f, 1e6f);
+            DragFloatRow("Maximum", &widget->maximum, 0.01f, -1e6f, 1e6f);
+            widget->maximum = std::max(widget->maximum, widget->minimum + 0.001f);
+            DragFloatRow("Value", &widget->value, 0.01f, widget->minimum, widget->maximum);
+        }
+        CheckboxRow("Visible", &widget->visible);
+        CheckboxRow("Enabled", &widget->enabled);
+        CheckboxRow("Interactable", &widget->interactable);
+        ImGui::EndTable();
+        if (ImGui::Button("Remove UI widget"))
+            registry.Remove<UiWidget>(e);
+    }
+
     if (Light* light = registry.TryGet<Light>(e);
         light && ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("light")) {
         PropertyRow("Type");
@@ -866,6 +931,25 @@ void Editor::DrawInspector()
             registry.Emplace<ScriptComponent>(e);
         if (ImGui::MenuItem("Camera", nullptr, false, !registry.Has<CameraComponent>(e)))
             registry.Emplace<CameraComponent>(e);
+        if (ImGui::MenuItem("UI Canvas", nullptr, false, !registry.Has<UiCanvas>(e)))
+            registry.Emplace<UiCanvas>(e);
+        if (ImGui::BeginMenu("UI Widget", !registry.Has<UiWidget>(e))) {
+            if (ImGui::MenuItem("Text"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Text});
+            if (ImGui::MenuItem("Image"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Image});
+            if (ImGui::MenuItem("Panel"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Panel});
+            if (ImGui::MenuItem("Button"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Button});
+            if (ImGui::MenuItem("Checkbox"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Checkbox});
+            if (ImGui::MenuItem("Slider"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::Slider});
+            if (ImGui::MenuItem("Progress bar"))
+                registry.Emplace<UiWidget>(e, UiWidget{.type = UiWidgetType::ProgressBar});
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Tags", nullptr, false, !registry.Has<Tags>(e)))
             registry.Emplace<Tags>(e);
         ImGui::Separator();

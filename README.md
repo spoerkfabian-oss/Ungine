@@ -82,6 +82,14 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     clip, speed, looping, blend target and root-motion settings in the **Animator** inspector.
     Blueprints can play, stop, select and blend clips, change speed/looping/root motion and query
     playback. Supported glTF interpolation modes are STEP, LINEAR and CUBICSPLINE.
+13. **In-game UI**: Add a *UI Canvas* and child *UI Widget* components in the Inspector. Widgets
+    use parent-relative anchors and offsets, with a design resolution that scales into the game
+    viewport. Text, images, panels, buttons, checkboxes, sliders and progress bars are supported.
+    Buttons and values can raise Blueprint events (On UI Clicked, On UI Value Changed,
+    On UI Checked Changed). The standalone player opens its pause menu with Escape and supports
+    keyboard, mouse and mapped gamepad navigation; Options currently control music volume and
+    fullscreen for the current session.
+
 
 ## Entwicklung
 

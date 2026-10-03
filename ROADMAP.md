@@ -16,6 +16,8 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Laufzeit-UI mit Canvas, Widget-Baum, Layout/Anchors, Skalierung und Z-Reihenfolge.
 - Text, Bild, Panel, Button, Checkbox, Slider und Progressbar; Fokus, Maus/Tastatur/Gamepad-Navigation.
 - Blueprint-bindbare Werte/Ereignisse, HUD- und Menü-Vorlagen sowie Pause-/Optionsmenü im Player.
+- Fortschritt: Canvas-/Widget-Komponenten mit Anchors, Designauflösung, Hierarchie und stabiler Sortierung; Screen-space Rendering für Text, Panels, Buttons, Checkboxen, Slider, Progressbars und Texturen; Maus-, Tastatur- und Gamepad-Steuerung; Blueprint-Events; rückwärtskompatible Szenen-Serialisierung; Editor-Inspector/Add-Component sowie Pause-/Optionsmenü mit Resume, Quit, Music-Lautstärke und Fullscreen im Player. CPU-Tests für Layout, Eingabekanten, Interaktion, Serialisierung und Blueprint-Events ergänzt. Build, Shader-Compile und Laufzeit-GPU-Test sind lokal noch nicht verifiziert (Build-Werkzeuge fehlen).
+
 
 ### Phase 23 – Content-Import und Vorschauen
 - Importdialog mit Quellpfad, Ziel, Importoptionen, Fortschritt und verständlichen Fehlern.
