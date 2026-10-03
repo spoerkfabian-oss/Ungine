@@ -125,6 +125,18 @@ std::optional<Entity> Target(ScriptContext& c, int pin)
     return e;
 }
 
+std::optional<Entity> AnimatorTarget(ScriptContext& c, int pin)
+{
+    const std::optional<Entity> entity = Target(c, pin);
+    if (!entity)
+        return std::nullopt;
+    if (!c.GetScene().GetRegistry().Has<Animator>(*entity)) {
+        c.Error("Target has no Animator");
+        return std::nullopt;
+    }
+    return entity;
+}
+
 glm::mat4 World(ScriptContext& c, Entity e)
 {
     c.GetScene().UpdateTransforms(); // cheap when nothing is dirty
@@ -780,6 +792,47 @@ std::vector<NodeDesc> BuildRegistry()
              }));
     add(Pure("Entity.IsValid", "Is Valid", "Entity", {In("Entity", P::Entity), Out("Valid", P::Bool)},
              [](ScriptContext& c) { c.Out(1, Alive(c, c.InEntity(0))); }));
+
+    add(Action("Animation.Play", "Play Animation", "Animation", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        if (const auto entity = AnimatorTarget(c, 2))
+            c.GetScene().GetRegistry().Get<Animator>(*entity).playing = true;
+    }));
+    add(Action("Animation.Stop", "Stop Animation", "Animation", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        if (const auto entity = AnimatorTarget(c, 2))
+            c.GetScene().GetRegistry().Get<Animator>(*entity).playing = false;
+    }));
+    add(Action("Animation.SetClip", "Set Animation Clip", "Animation",
+               {In("Target", P::Entity), In("Clip", P::Int)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const std::int32_t clip = c.InInt(3);
+                       if (clip < 0) {
+                           c.Error("Animation clip index cannot be negative");
+                           return;
+                       }
+                       Animator& animator = c.GetScene().GetRegistry().Get<Animator>(*entity);
+                       animator.clipIndex = static_cast<std::uint32_t>(clip);
+                       animator.sampledClip = ~std::uint32_t{0};
+                       animator.timeSeconds = 0.0f;
+                   }
+               }));
+    add(Action("Animation.SetSpeed", "Set Animation Speed", "Animation",
+               {In("Target", P::Entity), In("Speed", P::Float)}, [](ScriptContext& c) {
+                   if (const auto entity = AnimatorTarget(c, 2)) {
+                       const float speed = c.InFloat(3);
+                       if (!std::isfinite(speed) || speed < 0.0f) {
+                           c.Error("Animation speed must be finite and non-negative");
+                           return;
+                       }
+                       c.GetScene().GetRegistry().Get<Animator>(*entity).speed = speed;
+                   }
+               }));
+    add(Pure("Animation.IsPlaying", "Is Animation Playing", "Animation",
+             {In("Target", P::Entity), Out("Playing", P::Bool)}, [](ScriptContext& c) {
+                 const Entity entity = c.InEntity(0);
+                 const Registry& registry = c.GetScene().GetRegistry();
+                 c.Out(1, Alive(c, entity) && registry.Has<Animator>(entity) && registry.Get<Animator>(entity).playing);
+             }));
+
     add(Pure("Entity.GetPosition", "Get World Position", "Transform", {In("Target", P::Entity), Out("Position", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))

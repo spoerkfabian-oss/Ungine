@@ -248,6 +248,40 @@ TEST_CASE(Script_DelayTransformAndLoopGuard)
     f.scripts.End(f.scene);
 }
 
+TEST_CASE(Script_AnimationControls)
+{
+    ScriptFixture f;
+    f.scene.GetRegistry().Emplace<Animator>(f.actor);
+    f.scene.GetRegistry().Emplace<ModelInstance>(f.actor);
+
+    const std::uint32_t begin = f.Node("Event.BeginPlay");
+    const std::uint32_t clip = f.Node("Animation.SetClip");
+    const std::uint32_t speed = f.Node("Animation.SetSpeed");
+    const std::uint32_t play = f.Node("Animation.Play");
+    const std::uint32_t branch = f.Node("Flow.Branch");
+    const std::uint32_t playing = f.Node("Animation.IsPlaying");
+    const std::uint32_t print = f.Print("animation started");
+    const std::uint32_t stop = f.Node("Animation.Stop");
+    f.Set(clip, "Clip", std::int32_t{2});
+    f.Set(speed, "Speed", 1.5f);
+    f.Link(begin, "Out", clip, "In");
+    f.Link(clip, "Then", speed, "In");
+    f.Link(speed, "Then", play, "In");
+    f.Link(play, "Then", branch, "In");
+    f.Link(playing, "Playing", branch, "Condition");
+    f.Link(branch, "True", print, "In");
+    f.Link(print, "Then", stop, "In");
+
+    f.Start("animation.ugraph");
+    const Animator& animator = f.scene.GetRegistry().Get<Animator>(f.actor);
+    CHECK(animator.clipIndex == 2);
+    CHECK(animator.speed == 1.5f);
+    CHECK(!animator.playing); // the IsPlaying pure pin saw Play=true; Stop then ran
+    CHECK(f.Printed("animation started") == 1);
+    CHECK(!f.Errors());
+    f.scripts.End(f.scene);
+}
+
 TEST_CASE(Script_CollisionEventsAndImpulse)
 {
     ThreadPool   pool{2};

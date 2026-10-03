@@ -463,6 +463,41 @@ void Editor::DrawInspector()
             registry.Remove<MeshRenderer>(e);
     }
 
+    if (ModelInstance* instance = registry.TryGet<ModelInstance>(e);
+        instance && registry.Has<Animator>(e) && ImGui::CollapsingHeader("Animator", ImGuiTreeNodeFlags_DefaultOpen)) {
+        Animator& animator = registry.Get<Animator>(e);
+        if (const Model* model = m_Ctx.assets.Get(instance->model); model && !model->animations.empty()) {
+            const std::string& current = model->animations[std::min<std::size_t>(animator.clipIndex, model->animations.size() - 1)].name;
+            if (ImGui::BeginCombo("Clip", current.empty() ? "(unnamed)" : current.c_str())) {
+                for (std::size_t i = 0; i < model->animations.size(); ++i) {
+                    const AnimationClip& clip = model->animations[i];
+                    const std::string label = clip.name.empty() ? "Clip " + std::to_string(i) : clip.name;
+                    const bool selected = animator.clipIndex == i;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        animator.clipIndex = static_cast<std::uint32_t>(i);
+                        animator.timeSeconds = 0.0f;
+                        animator.playing = true;
+                    }
+                    if (selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            const AnimationClip& clip = model->animations[std::min<std::size_t>(animator.clipIndex, model->animations.size() - 1)];
+            ImGui::Checkbox("Playing", &animator.playing);
+            ImGui::SameLine();
+            ImGui::Checkbox("Loop", &animator.looping);
+            ImGui::DragFloat("Speed", &animator.speed, 0.01f, 0.0f, 5.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderFloat("Time", &animator.timeSeconds, 0.0f, std::max(clip.duration, 0.001f), "%.3f s");
+            if (ImGui::Button("Restart")) {
+                animator.timeSeconds = 0.0f;
+                animator.playing = true;
+            }
+        } else {
+            ImGui::TextDisabled("Animation data is not ready");
+        }
+    }
+
     if (Light* light = registry.TryGet<Light>(e);
         light && ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("light")) {
         PropertyRow("Type");
