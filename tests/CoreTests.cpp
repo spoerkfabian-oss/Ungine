@@ -1,6 +1,7 @@
 #include "Test.h"
 
 #include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Assets/MeshOptimizer.h"
 #include "Engine/Assets/Model.h"
@@ -26,9 +27,11 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -38,6 +41,7 @@
 #include <random>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace Engine;
@@ -255,6 +259,148 @@ TEST_CASE(Cascades_StableUnderCameraMotion)
         const glm::vec2 tb = glm::vec2(moved[c].viewProj * point) * (0.5f * settings.resolution);
         const glm::vec2 d  = ta - tb;
         CHECK(std::abs(d.x - std::round(d.x)) < 1e-2f && std::abs(d.y - std::round(d.y)) < 1e-2f);
+    }
+}
+
+TEST_CASE(Animation_EvaluateLinearStepCubicAndLoop)
+{
+    Model model;
+    model.nodes.resize(3);
+    model.nodes[2].local.position = {7.0f, 8.0f, 9.0f};
+
+    AnimationClip clip;
+    clip.duration = 1.0f;
+    AnimationTrack translation{.node = 0,
+                               .path = AnimationPath::Translation,
+                               .interpolation = AnimationInterpolation::Linear,
+                               .times = {0.0f, 1.0f},
+                               .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 4.0f, 6.0f, 0.0f}}};
+    AnimationTrack rotation{.node = 1,
+                            .path = AnimationPath::Rotation,
+                            .interpolation = AnimationInterpolation::Linear,
+                            .times = {0.0f, 1.0f},
+                            .values = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 0.0f}}};
+    AnimationTrack scale{.node = 2,
+                         .path = AnimationPath::Scale,
+                         .interpolation = AnimationInterpolation::Step,
+                         .times = {0.0f, 1.0f},
+                         .values = {{1.0f, 1.0f, 1.0f, 0.0f}, {3.0f, 3.0f, 3.0f, 0.0f}}};
+    clip.tracks = {translation, rotation, scale};
+
+    std::vector<Transform> pose(model.nodes.size());
+    EvaluateAnimation(model, clip, 0.5f, AnimationPlayback::Once, pose);
+    CHECK(glm::length(pose[0].position - glm::vec3{1.0f, 2.0f, 3.0f}) < 1.0e-5f);
+    CHECK(std::abs(pose[1].rotation.y - std::sqrt(0.5f)) < 1.0e-4f);
+    CHECK(std::abs(pose[1].rotation.w - std::sqrt(0.5f)) < 1.0e-4f);
+    CHECK(glm::length(pose[2].scale - glm::vec3{1.0f}) < 1.0e-5f);
+    CHECK(glm::length(pose[2].position - model.nodes[2].local.position) < 1.0e-5f); // untracked channels retain the bind pose
+
+    AnimationTrack cubic{.node = 0,
+                         .path = AnimationPath::Translation,
+                         .interpolation = AnimationInterpolation::CubicSpline,
+                         .times = {0.0f, 1.0f},
+                         .values = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f, 0.0f}},
+                         .inTangents = {glm::vec4{0.0f}, glm::vec4{0.0f}},
+                         .outTangents = {glm::vec4{0.0f}, glm::vec4{0.0f}}};
+    clip.tracks = {cubic};
+    EvaluateAnimation(model, clip, 0.5f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(pose[0].position.x - 1.0f) < 1.0e-5f);
+
+    clip.tracks = {translation};
+    EvaluateAnimation(model, clip, 1.5f, AnimationPlayback::Loop, pose);
+    CHECK(std::abs(pose[0].position.x - 1.0f) < 1.0e-5f);
+    EvaluateAnimation(model, clip, 1.5f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(pose[0].position.x - 2.0f) < 1.0e-5f);
+}
+
+TEST_CASE(Gltf_SkinAndAnimationImport)
+{
+    const auto directory = fs::temp_directory_path() /
+        std::format("ungine_animation_{}", std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::create_directories(directory);
+    const auto gltfPath = directory / "fixture.gltf";
+    const auto binPath = directory / "fixture.bin";
+
+    std::vector<std::byte> bytes;
+    const auto append = [&bytes](const auto& data) {
+        while (bytes.size() % 4 != 0)
+            bytes.push_back(std::byte{0});
+        const std::size_t offset = bytes.size();
+        const auto* first = reinterpret_cast<const std::byte*>(data.data());
+        bytes.insert(bytes.end(), first, first + data.size() * sizeof(data[0]));
+        return std::pair{offset, bytes.size() - offset};
+    };
+    const std::array<float, 9> positions{0, 0, 0, 1, 0, 0, 0, 1, 0};
+    const std::array<std::uint16_t, 3> indices{0, 1, 2};
+    const std::array<std::uint8_t, 12> joints{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, 12> weights{1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    const std::array<float, 16> inverseBind{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const std::array<float, 2> times{0, 1};
+    const std::array<float, 6> translations{0, 0, 0, 1, 0, 0};
+    const auto positionView = append(positions);
+    const auto indexView = append(indices);
+    const auto jointView = append(joints);
+    const auto weightView = append(weights);
+    const auto inverseBindView = append(inverseBind);
+    const auto timeView = append(times);
+    const auto translationView = append(translations);
+    {
+        std::ofstream file(binPath, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    {
+        std::ofstream file(gltfPath);
+        file << std::format(R"({{
+  "asset": {{"version": "2.0"}},
+  "scene": 0,
+  "scenes": [{{"nodes": [0]}}],
+  "nodes": [{{"name": "Root", "children": [1, 2]}}, {{"name": "Bone"}},
+            {{"name": "Mesh", "mesh": 0, "skin": 0}}],
+  "skins": [{{"name": "Rig", "skeleton": 1, "joints": [1], "inverseBindMatrices": 4}}],
+  "animations": [{{"name": "Move", "samplers": [{{"input": 5, "output": 6}}],
+                  "channels": [{{"sampler": 0, "target": {{"node": 1, "path": "translation"}}}}]}}],
+  "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3}}, "indices": 1}}]}}],
+  "buffers": [{{"uri": "fixture.bin", "byteLength": {}}}],
+  "bufferViews": [
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+    {{"buffer": 0, "byteOffset": {}, "byteLength": {}}}
+  ],
+  "accessors": [
+    {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+    {{"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+    {{"bufferView": 2, "componentType": 5121, "count": 3, "type": "VEC4"}},
+    {{"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4"}},
+    {{"bufferView": 4, "componentType": 5126, "count": 1, "type": "MAT4"}},
+    {{"bufferView": 5, "componentType": 5126, "count": 2, "type": "SCALAR"}},
+    {{"bufferView": 6, "componentType": 5126, "count": 2, "type": "VEC3"}}
+  ]
+}})", bytes.size(), positionView.first, positionView.second, indexView.first, indexView.second,
+                         jointView.first, jointView.second, weightView.first, weightView.second,
+                         inverseBindView.first, inverseBindView.second, timeView.first, timeView.second,
+                         translationView.first, translationView.second);
+    }
+
+    const ModelData data = LoadGltf(gltfPath);
+    fs::remove_all(directory);
+    CHECK(data.skins.size() == 1);
+    CHECK(data.animations.size() == 1);
+    CHECK(data.nodes.size() == 3);
+    CHECK(data.skinInfluences.size() == 3);
+    if (data.skins.size() == 1 && data.animations.size() == 1 && data.nodes.size() == 3 &&
+        data.skinInfluences.size() == 3) {
+        CHECK(data.skins[0].joints.size() == 1 && data.skins[0].joints[0].node == 1);
+        CHECK(data.nodes[2].skin == 0);
+        CHECK(data.animations[0].tracks.size() == 1 && data.animations[0].tracks[0].node == 1);
+        CHECK(data.animations[0].duration == 1.0f);
+        CHECK(data.skinInfluences[0].joints.x == 0);
+        CHECK(data.skinInfluences[0].weights.x == 1.0f);
+        const glm::mat4& bind = data.skins[0].joints[0].inverseBindMatrix;
+        CHECK(bind[0][0] == 1.0f && bind[1][1] == 1.0f && bind[2][2] == 1.0f && bind[3][3] == 1.0f);
     }
 }
 

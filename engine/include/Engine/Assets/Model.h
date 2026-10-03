@@ -144,7 +144,6 @@ struct TextureData {
 struct ModelData {
     std::string                name;
     std::vector<Vertex>        vertices;
-    std::vector<VertexSkinInfluence> skinInfluences; // parallel to vertices; empty means unskinned
     std::vector<std::uint32_t> indices;
     std::vector<TextureData>   textures;
     std::vector<MaterialData>  materials;
@@ -213,6 +212,7 @@ struct Model {
     std::vector<std::uint32_t> materialFlags; // CPU copy for pipeline selection
     std::vector<Mesh>          meshes;
     std::vector<ModelNode>     nodes;
+    std::vector<VertexSkinInfluence> skinInfluences; // parallel to GPU model vertices; empty means unskinned
     std::vector<Skin>          skins;
     std::vector<AnimationClip> animations;
     glm::vec3                  boundsMin{0.0f};

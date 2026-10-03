@@ -18,6 +18,7 @@
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Assets/Animation.h"
 
 #include <cstdlib>
 #include <exception>
@@ -139,6 +140,7 @@ protected:
             else
                 ChangeLevel(request->scene);
         }
+        UpdateAnimations(m_Scene, GetAssets(), static_cast<float>(dt));
         m_Scene.UpdateTransforms();
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
         const CameraData view = m_FallbackCamera.GetData(1.0f);

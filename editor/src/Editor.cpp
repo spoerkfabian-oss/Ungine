@@ -18,6 +18,7 @@
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Assets/Animation.h"
 
 #include <ImGuizmo.h>
 #include <imgui.h>
@@ -226,6 +227,9 @@ void Editor::Update(float dt)
                 (void)PlayLevel(PathFromUtf8(request->scene));
         }
     }
+
+    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
+        UpdateAnimations(m_Ctx.scene, m_Ctx.assets, static_cast<float>(dt));
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();

@@ -184,13 +184,15 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
     const Entity        root     = scene.CreateEntity(model.name, parent);
     std::vector<Entity> entities(model.nodes.size(), NullEntity);
     registry.Emplace<ModelInstance>(root, ModelInstance{.model = handle});
+    if (!model.animations.empty())
+        registry.Emplace<Animator>(root);
 
     for (std::size_t i = 0; i < model.nodes.size(); ++i) {
         const ModelNode& node       = model.nodes[i];
         const Entity     nodeParent = node.parent >= 0 ? entities[static_cast<std::size_t>(node.parent)] : root;
         const Entity     e          = scene.CreateEntity(node.name, nodeParent);
         scene.SetTransform(e, node.local);
-        registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
+        registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i), .instanceRoot = root});
         if (node.mesh >= 0)
             registry.Emplace<MeshRenderer>(e, handle, static_cast<std::uint32_t>(node.mesh));
         if (node.light)
@@ -210,6 +212,12 @@ std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model&
     });
 
     for (const Entity root : roots) {
+        if (!model.animations.empty()) {
+            if (!registry.Has<Animator>(root))
+                registry.Emplace<Animator>(root);
+        } else {
+            registry.Remove<Animator>(root);
+        }
         // This instance's node entities (nested instances are left alone).
         std::vector<Entity> existing;
         std::vector<Entity> stack(registry.Get<Hierarchy>(root).children);
@@ -245,11 +253,12 @@ std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model&
             Entity&          e      = byNode[i];
             if (e == NullEntity) {
                 e = scene.CreateEntity(node.name, parent);
-                registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i)});
+                registry.Emplace<ModelNodeRef>(e, ModelNodeRef{.node = static_cast<std::uint32_t>(i), .instanceRoot = root});
             } else {
                 if (registry.Get<Hierarchy>(e).parent != parent)
                     scene.SetParent(e, parent);
                 registry.Get<ModelNodeRef>(e).node = static_cast<std::uint32_t>(i);
+                registry.Get<ModelNodeRef>(e).instanceRoot = root;
             }
             scene.SetTransform(e, node.local);
             if (node.mesh >= 0)

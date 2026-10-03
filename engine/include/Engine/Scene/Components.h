@@ -61,8 +61,20 @@ struct ModelInstance {
     ModelHandle model;
 };
 
+// Playback state attached to an instantiated model root. Newly instantiated animated models play
+// their first clip by default; editor controls can change these fields at runtime.
+struct Animator {
+    std::uint32_t clipIndex = 0;
+    std::uint32_t sampledClip = ~std::uint32_t{0};
+    float         timeSeconds = 0.0f;
+    float         speed = 1.0f;
+    bool          looping = true;
+    bool          playing = true;
+};
+
 struct ModelNodeRef {
     std::uint32_t node = 0; // index into Model::nodes
+    Entity        instanceRoot = NullEntity;
 };
 
 enum class LightType : std::uint8_t { Point, Spot };

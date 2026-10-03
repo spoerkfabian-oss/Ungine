@@ -1,10 +1,13 @@
 #include "Engine/Assets/Animation.h"
+#include "Engine/Assets/AssetManager.h"
+#include "Engine/Scene/Scene.h"
 
 #include <glm/gtx/quaternion.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace Engine {
 
@@ -91,6 +94,62 @@ void EvaluateAnimation(const Model& model, const AnimationClip& clip, float time
         }
         }
     }
+}
+
+void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
+{
+    Registry& registry = scene.GetRegistry();
+    const float dt = std::isfinite(deltaSeconds) ? std::max(deltaSeconds, 0.0f) : 0.0f;
+    std::unordered_map<Entity, std::vector<Entity>> nodeEntitiesByRoot;
+    registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, ModelNodeRef& reference) {
+        if (reference.instanceRoot == NullEntity)
+            return;
+        auto& nodes = nodeEntitiesByRoot[reference.instanceRoot];
+        if (nodes.size() <= reference.node)
+            nodes.resize(static_cast<std::size_t>(reference.node) + 1, NullEntity);
+        nodes[reference.node] = entity;
+    });
+
+    registry.ViewOf<Animator, ModelInstance>().Each([&](Entity root, Animator& animator, ModelInstance& instance) {
+        const Model* model = assets.Get(instance.model);
+        if (!model || model->animations.empty())
+            return;
+        if (animator.clipIndex >= model->animations.size()) {
+            animator.playing = false;
+            return;
+        }
+        if (animator.sampledClip != animator.clipIndex) {
+            animator.timeSeconds = 0.0f;
+            animator.sampledClip = animator.clipIndex;
+        }
+
+        const AnimationClip& clip = model->animations[animator.clipIndex];
+        if (animator.playing) {
+            const float speed = std::isfinite(animator.speed) ? std::max(animator.speed, 0.0f) : 0.0f;
+            animator.timeSeconds += dt * speed;
+            if (!animator.looping && animator.timeSeconds >= clip.duration) {
+                animator.timeSeconds = clip.duration;
+                animator.playing = false;
+            }
+        }
+        if (!std::isfinite(animator.timeSeconds))
+            animator.timeSeconds = 0.0f;
+
+        auto& nodeEntities = nodeEntitiesByRoot[root];
+        if (nodeEntities.size() < model->nodes.size())
+            nodeEntities.resize(model->nodes.size(), NullEntity);
+
+        std::vector<Transform> pose(model->nodes.size());
+        EvaluateAnimation(*model, clip, animator.timeSeconds,
+                          animator.looping ? AnimationPlayback::Loop : AnimationPlayback::Once, pose);
+        std::vector<std::uint8_t> animated(model->nodes.size(), 0);
+        for (const AnimationTrack& track : clip.tracks)
+            if (track.node < animated.size())
+                animated[track.node] = 1;
+        for (std::size_t i = 0; i < animated.size(); ++i)
+            if (animated[i] && nodeEntities[i] != NullEntity && registry.Valid(nodeEntities[i]))
+                scene.SetTransform(nodeEntities[i], pose[i]);
+    });
 }
 
 } // namespace Engine
