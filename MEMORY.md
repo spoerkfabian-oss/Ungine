@@ -739,8 +739,8 @@ Purpose:
 Node 24-compatible GitHub Actions.
 
 ### Phase 21-23 build repair
-Commit:
-32ea260 (on `branch`)
+Commits:
+32ea260 and 5e62aec (on `branch`)
 
 Problem:
 Phases 21-23 (animation, runtime UI, content import) were merged to main without ever being compiled; every CI job failed in the Build step.
@@ -754,13 +754,14 @@ Fix:
 - player designated initializers in declaration order
 - Editor links nlohmann_json, includes ImGuiLayer.h, uses the ImGui 1.92.8 AddPolyline argument order
 - tests: missing Input/Events includes, a macro comma
+- 5e62aec (MSVC only): ContentBrowser `RelocateReference` takes the reference as UTF-8 `std::string` (`fs::path` has no implicit conversion to `std::string` on Windows); two C4456 shadowing renames (ScriptGraphEditor `frameLabel`, Blueprint2Tests `begin`)
 - two wrong test expectations corrected: blending towards a half turn is ambiguous (angleAxis(pi) has w = -0, so shortest-path slerp goes the other way) -> quarter turn; the UI layout test expected the pivot offset unscaled in y (164 is correct)
 
 Verification (local, 2026-10-05):
 - GCC 13 and Clang with Werror: clean
 - EngineTests: all passed
 - EngineGpuTests 30/30 plus 13 CTest smokes (lavapipe, synchronization validation): passed, 0 validation errors; the Basic-template player smoke exercises the animated banner (GPU skinning)
-- MSVC: pending CI
+- CI run for 5e62aec (push to `branch`): Windows MSVC (VS 2022 Debug, /W4 /WX) build + EngineTests, Linux GCC and Linux Clang (Werror) build + EngineTests all green. The lavapipe GPU job runs only on PR/main/manual dispatch and was not part of this run.
 
 ## 19. Important CI lesson
 
@@ -917,6 +918,6 @@ If an audit finds no concrete defect:
 ## 24. Roadmap status at handoff
 
 - Phases 21 (skeletal animation), 22 (runtime UI and pause menu) and 23 (content import and previews) are on main via PR #11 (merge 43b639d, Phase 23 = 4c73c55).
-- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; the MSVC build is verified only by CI.
+- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. main stays red until `branch` is merged via a PR (user decision; merge only after the PR's full CI incl. GPU suite is green).
 - Dedicated GPU tests for skinning, runtime UI interaction and import previews do not exist yet; skinning is exercised only through the Basic-template player smoke.
 - Phase 24 (level/area streaming) remains unimplemented; see the limitation above. Do not report it as complete until async preparation, safe main-thread activation/unload, reference behavior and user-visible loading state are implemented and verified.
