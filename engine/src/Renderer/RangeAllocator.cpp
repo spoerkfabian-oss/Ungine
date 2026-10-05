@@ -19,18 +19,24 @@ std::optional<std::uint32_t> RangeAllocator::Allocate(std::uint32_t count)
 {
     if (count == 0)
         return std::nullopt;
-    for (auto it = m_Free.begin(); it != m_Free.end(); ++it) {
-        if (it->second < count)
-            continue;
-        const std::uint32_t offset = it->first;
-        const std::uint32_t rest   = it->second - count;
-        m_Free.erase(it);
-        if (rest > 0)
-            m_Free.emplace(offset + count, rest);
-        m_Used += count;
-        return offset;
-    }
-    return std::nullopt;
+    // Best fit (lowest offset among equals): small ranges fill small holes instead of splitting the
+    // large ones a big model (or its reload next to the old copy) needs.
+    auto best = m_Free.end();
+    for (auto it = m_Free.begin(); it != m_Free.end(); ++it)
+        if (it->second >= count && (best == m_Free.end() || it->second < best->second)) {
+            best = it;
+            if (it->second == count)
+                break;
+        }
+    if (best == m_Free.end())
+        return std::nullopt;
+    const std::uint32_t offset = best->first;
+    const std::uint32_t rest   = best->second - count;
+    m_Free.erase(best);
+    if (rest > 0)
+        m_Free.emplace(offset + count, rest);
+    m_Used += count;
+    return offset;
 }
 
 void RangeAllocator::Free(std::uint32_t offset, std::uint32_t count)

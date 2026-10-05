@@ -793,6 +793,17 @@ void Editor::ImportContentFile(const fs::path& source)
     });
 }
 
+bool Editor::ImportContent(const fs::path& source, const fs::path& directory)
+{
+    if (m_ImportWorker.joinable() && !m_ImportDone.load(std::memory_order_acquire)) {
+        m_Status = "An import is already in progress";
+        return false;
+    }
+    m_ImportTargetDir = directory;
+    ImportContentFile(source);
+    return m_ImportWorker.joinable();
+}
+
 void Editor::UpdateContentImport()
 {
     if (!m_ImportWorker.joinable() || !m_ImportDone.load(std::memory_order_acquire))
@@ -808,6 +819,11 @@ void Editor::UpdateContentImport()
 
 bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target)
 {
+    // Play-mode scene edits are dropped by Stop: the restored scene would keep the old paths.
+    if (m_PlayState != PlayState::Edit) {
+        m_Status = "Stop playing to move or rename content";
+        return false;
+    }
     std::error_code ec;
     if (!fs::exists(source, ec) || ec || fs::exists(target, ec)) {
         m_Status = ec ? "Cannot inspect relocation paths: " + ec.message() : "Relocation target already exists or source is missing";
@@ -906,6 +922,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (audioPath) audio->sound = PathToUtf8(*audioPath);
         if (imagePath) widget->image = PathToUtf8(*imagePath);
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
+        m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
     if (!edits.empty())
@@ -921,7 +938,6 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
 
 void Editor::DrawContentBrowser()
 {
-    UpdateContentImport();
     if (!ImGui::Begin("Content", &m_ShowContent)) {
         ImGui::End();
         return;

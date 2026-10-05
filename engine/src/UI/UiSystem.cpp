@@ -108,7 +108,31 @@ void UiSystem::SyncAssets(const Scene& scene, AssetManager& assets)
     }
 }
 
+UiInput UiInputFromWindow(const Input& input, glm::vec2 windowSize, glm::vec2 framebufferSize)
+{
+    UiInput ui;
+    if (windowSize.x > 0.0f && windowSize.y > 0.0f)
+        ui.pointer = input.MousePosition() * (framebufferSize / windowSize);
+    ui.pointerPressed  = input.WasMousePressed(MouseButton::Left);
+    ui.pointerDown     = input.IsMouseDown(MouseButton::Left);
+    ui.pointerReleased = input.WasMouseReleased(MouseButton::Left);
+    const bool tab     = input.WasKeyPressed(Key::Tab);
+    const bool shift   = input.IsKeyDown(Key::LeftShift);
+    ui.next     = (tab && !shift) || input.WasKeyPressed(Key::Down) || input.WasGamepadButtonPressed(GamepadButton::DpadDown);
+    ui.previous = (tab && shift) || input.WasKeyPressed(Key::Up) || input.WasGamepadButtonPressed(GamepadButton::DpadUp);
+    ui.left     = input.WasKeyPressed(Key::Left) || input.WasGamepadButtonPressed(GamepadButton::DpadLeft);
+    ui.right    = input.WasKeyPressed(Key::Right) || input.WasGamepadButtonPressed(GamepadButton::DpadRight);
+    ui.submit   = input.WasKeyPressed(Key::Enter) || input.WasKeyPressed(Key::Space) ||
+                input.WasGamepadButtonPressed(GamepadButton::South);
+    return ui;
+}
+
 void UiSystem::Update(Scene& scene, const Input& input, glm::vec2 windowSize, glm::vec2 framebufferSize)
+{
+    Update(scene, UiInputFromWindow(input, windowSize, framebufferSize), framebufferSize);
+}
+
+void UiSystem::Update(Scene& scene, const UiInput& input, glm::vec2 framebufferSize)
 {
     m_Events.clear();
     PrepareLayout(scene, framebufferSize);
@@ -128,9 +152,7 @@ void UiSystem::Update(Scene& scene, const Input& input, glm::vec2 windowSize, gl
             m_Active = NullEntity;
     }
 
-    glm::vec2 pointer{0.0f};
-    if (windowSize.x > 0.0f && windowSize.y > 0.0f)
-        pointer = input.MousePosition() * (framebufferSize / windowSize);
+    const glm::vec2 pointer = input.pointer;
     m_Hovered = NullEntity;
     for (auto it = m_Layout.rbegin(); it != m_Layout.rend(); ++it) {
         if (!registry.Valid(it->entity))
@@ -161,15 +183,9 @@ void UiSystem::Update(Scene& scene, const Input& input, glm::vec2 windowSize, gl
         return m_Focused != NullEntity && registry.Valid(m_Focused) &&
                registry.Get<UiWidget>(m_Focused).type == UiWidgetType::Slider;
     };
-    if (input.WasKeyPressed(Key::Tab))
-        moveFocus(input.IsKeyDown(Key::LeftShift) ? -1 : 1);
-    else if (input.WasKeyPressed(Key::Down) || input.WasGamepadButtonPressed(GamepadButton::DpadDown) ||
-             (input.WasKeyPressed(Key::Right) && !focusedIsSlider()) ||
-             (input.WasGamepadButtonPressed(GamepadButton::DpadRight) && !focusedIsSlider()))
+    if (input.next || (input.right && !focusedIsSlider()))
         moveFocus(1);
-    else if (input.WasKeyPressed(Key::Up) || input.WasGamepadButtonPressed(GamepadButton::DpadUp) ||
-             (input.WasKeyPressed(Key::Left) && !focusedIsSlider()) ||
-             (input.WasGamepadButtonPressed(GamepadButton::DpadLeft) && !focusedIsSlider()))
+    else if (input.previous || (input.left && !focusedIsSlider()))
         moveFocus(-1);
 
     const auto activate = [&](Entity entity) {
@@ -201,22 +217,20 @@ void UiSystem::Update(Scene& scene, const Input& input, glm::vec2 windowSize, gl
         }
     };
 
-    if (input.WasMousePressed(MouseButton::Left)) {
+    if (input.pointerPressed) {
         m_Focused = m_Hovered;
         m_Active = m_Hovered;
         setSliderFromPointer(m_Active);
     }
-    if (m_Active != NullEntity && input.IsMouseDown(MouseButton::Left))
+    if (m_Active != NullEntity && input.pointerDown)
         setSliderFromPointer(m_Active);
-    if (input.WasMouseReleased(MouseButton::Left)) {
+    if (input.pointerReleased) {
         if (m_Active != NullEntity && m_Active == m_Hovered)
             activate(m_Active);
         m_Active = NullEntity;
     }
 
-    if (m_Focused != NullEntity &&
-        (input.WasKeyPressed(Key::Enter) || input.WasKeyPressed(Key::Space) ||
-         input.WasGamepadButtonPressed(GamepadButton::South)))
+    if (m_Focused != NullEntity && input.submit)
         activate(m_Focused);
     if (focusedIsSlider()) {
         UiWidget& widget = scene.GetRegistry().Get<UiWidget>(m_Focused);
@@ -224,9 +238,9 @@ void UiSystem::Update(Scene& scene, const Input& input, glm::vec2 windowSize, gl
             const float step = std::max((widget.maximum - widget.minimum) * 0.01f, 0.001f);
             float value = std::isfinite(widget.value) ? std::clamp(widget.value, widget.minimum, widget.maximum)
                                                      : widget.minimum;
-            if (input.WasKeyPressed(Key::Left) || input.WasGamepadButtonPressed(GamepadButton::DpadLeft))
+            if (input.left)
                 value = std::max(value - step, widget.minimum);
-            else if (input.WasKeyPressed(Key::Right) || input.WasGamepadButtonPressed(GamepadButton::DpadRight))
+            else if (input.right)
                 value = std::min(value + step, widget.maximum);
             if (value != widget.value) {
                 widget.value = value;

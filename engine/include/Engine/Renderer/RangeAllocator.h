@@ -5,7 +5,7 @@
 
 namespace Engine {
 
-// First-fit allocator of [offset, offset + count) ranges in a fixed capacity, free neighbors
+// Best-fit allocator of [offset, offset + count) ranges in a fixed capacity, free neighbors
 // merged on Free. Not thread-safe (GeometryPool locks around it).
 class RangeAllocator {
 public:

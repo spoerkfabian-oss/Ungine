@@ -209,6 +209,17 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
     return root;
 }
 
+Entity FindModelInstanceRoot(const Registry& registry, Entity node)
+{
+    if (!registry.Valid(node))
+        return NullEntity;
+    for (Entity e = registry.Get<Hierarchy>(node).parent; e != NullEntity && registry.Valid(e);
+         e = registry.Get<Hierarchy>(e).parent)
+        if (registry.Has<ModelInstance>(e))
+            return e;
+    return NullEntity;
+}
+
 std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model& model)
 {
     Registry&           registry = scene.GetRegistry();

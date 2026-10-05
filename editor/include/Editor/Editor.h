@@ -129,6 +129,8 @@ public:
     void SimulateKey(std::string_view key, bool down);
     void SimulateText(std::string_view utf8);
     void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
+    // The scene image of the viewport in window pixels (x, y, width, height); zero while hidden.
+    [[nodiscard]] glm::vec4 ViewportRect() const { return m_ViewportRect; }
 
     // Project: (re)loads the blueprint types / interfaces / libraries of the content directory
     // (ScriptRegistry); done at start and before play. Returns the problems found.
@@ -154,6 +156,17 @@ public:
     bool ConfirmQuit();
     // Content browser actions (also double-click / drag & drop).
     void OpenAsset(const std::filesystem::path& file); // scene, blueprint or model (instantiated)
+    // Import (copied in the background into `directory`, which must be inside ContentRoot();
+    // a .gltf brings its external files along): false if rejected, see Status().
+    bool ImportContent(const std::filesystem::path& source, const std::filesystem::path& directory);
+    [[nodiscard]] bool ContentImportBusy() const { return m_ImportWorker.joinable(); } // until its result is shown
+    // Move / rename a file or folder; references in stored scenes, prefabs, blueprints and glTF
+    // files, the open scene (undoable) and the start scene follow. False: nothing changed.
+    bool MoveContent(const std::filesystem::path& source, const std::filesystem::path& target)
+    {
+        return RelocateContentAsset(source, target);
+    }
+    [[nodiscard]] const std::string& Status() const { return m_Status; } // last file operation
 
     // Scene files. New/Open replace the scene and release the editor's model refs.
     void NewScene();
@@ -258,6 +271,7 @@ private:
     std::unique_ptr<ImGuiLayer> m_ImGui;
     std::unique_ptr<TextOverlay> m_UiOverlay;
     UiSystem                     m_UiSystem;
+    std::vector<UiEvent>         m_UiEvents; // runtime UI while playing: handed to the scripts in Update
     std::unique_ptr<History>    m_History;
     std::unique_ptr<FileDialog> m_FileDialog;
     std::unique_ptr<ScriptGraphEditor> m_Graphs;
@@ -271,6 +285,7 @@ private:
         bool          used     = false; // drawn this frame
     };
     std::unordered_map<TextureHandle, Preview> m_TexturePreviews; // Assets panel thumbnails
+    glm::vec4     m_ViewportRect{0.0f};
     bool          m_ViewportHovered = false;
     bool          m_ViewportVisible = false; // drawn this frame (else the scene render is skipped)
     int           m_FocusViewport   = 0; // frames until the viewport tab is brought to front (default layout)

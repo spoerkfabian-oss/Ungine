@@ -1593,7 +1593,7 @@ TEST_CASE(SceneSerializer_EntityStateDiff)
     CHECK(!ApplyEntityStateDiff(scene, b, before, after)); // idempotent
 }
 
-TEST_CASE(RangeAllocator_FirstFitMergeGrow)
+TEST_CASE(RangeAllocator_BestFitMergeGrow)
 {
     RangeAllocator ranges(100);
     const auto a = ranges.Allocate(30);
@@ -1602,7 +1602,7 @@ TEST_CASE(RangeAllocator_FirstFitMergeGrow)
     CHECK(a == 0u && b == 30u && c == 60u && ranges.Used() == 90);
     CHECK(!ranges.Allocate(11).has_value() && ranges.LargestFree() == 10);
 
-    // Freeing the middle leaves a hole reused first-fit; freeing the neighbors merges everything.
+    // Freeing the middle leaves a hole that is reused; freeing the neighbors merges everything.
     ranges.Free(*b, 30);
     CHECK(ranges.Allocate(20) == 30u); // [30, 50) from the hole, [50, 60) left
     CHECK(ranges.FreeBlocks() == 2);
@@ -1620,6 +1620,15 @@ TEST_CASE(RangeAllocator_FirstFitMergeGrow)
     ranges.Grow(200);
     CHECK(ranges.FreeBlocks() == 2 && ranges.LargestFree() == 100); // [0, 100) and [150, 200)
     CHECK(!ranges.Allocate(0).has_value());
+
+    // Best fit: a small range goes into the smallest hole, so the large hole stays whole (first
+    // fit would cut it and a later large range would no longer fit).
+    RangeAllocator pool(100);
+    const auto big = pool.Allocate(60), small = pool.Allocate(30);
+    CHECK(big == 0u && small == 60u); // [90, 100) free
+    pool.Free(*big, 60);              // [0, 60) free too
+    CHECK(pool.Allocate(5) == 90u);
+    CHECK(pool.Allocate(60) == 0u);
 }
 
 // --- Texture cooking ---------------------------------------------------------------------------

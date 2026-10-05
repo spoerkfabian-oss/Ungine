@@ -38,15 +38,7 @@ void BindModelNodeRefsToInstances(Scene& scene)
 {
     Registry& registry = scene.GetRegistry();
     registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, ModelNodeRef& reference) {
-        Entity ancestor = registry.Get<Hierarchy>(entity).parent;
-        reference.instanceRoot = NullEntity;
-        while (ancestor != NullEntity && registry.Valid(ancestor)) {
-            if (registry.Has<ModelInstance>(ancestor)) {
-                reference.instanceRoot = ancestor;
-                break;
-            }
-            ancestor = registry.Get<Hierarchy>(ancestor).parent;
-        }
+        reference.instanceRoot = FindModelInstanceRoot(registry, entity);
     });
 }
 
@@ -917,6 +909,7 @@ void SaveSceneFile(const std::filesystem::path& file, const Scene& scene, const 
                      {"prefab", PrefabDetail::InstanceToFileJson(scene, assets, e, models.baseDir)}};
             } else {
                 j = EntityToJson(r, e, models);
+                j.erase("prefabLink"); // not a member (see IsMember): a link left from leaving its instance
             }
             j["parent"] = UuidOf(r, r.Get<Hierarchy>(e).parent);
             entities.push_back(std::move(j));

@@ -1242,6 +1242,8 @@ struct ScriptSystem::Impl {
     // A new chain: queued while the debugger pauses.
     void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
     {
+        if (!scene.GetRegistry().Valid(inst.entity)) // destroyed this frame (its instance goes at the end of Update)
+            return;
         ChainState st;
         st.id        = ++nextChain;
         st.lastUse   = entry < 0 ? inst.program->nodes[static_cast<std::size_t>(node)].use : 0; // resumed inside a macro copy
@@ -1261,7 +1263,8 @@ struct ScriptSystem::Impl {
     {
         const auto resume = [&](SuspendedChain chain, bool skip) {
             const auto it = instances.find(chain.entity);
-            if (it == instances.end() || it->second->serial != chain.serial || !it->second->program)
+            if (it == instances.end() || it->second->serial != chain.serial || !it->second->program ||
+                !scene.GetRegistry().Valid(it->second->entity))
                 return;
             const std::uint64_t chainId = chain.state.id;
             chain.state.skipBreak = skip;
@@ -1287,7 +1290,7 @@ struct ScriptSystem::Impl {
     void Fire(Scene& scene, Instance& inst, const std::string& type, const std::string* param,
               const std::function<void(const CompiledNode&, std::vector<ScriptValue>&)>& outputs)
     {
-        if (!inst.program)
+        if (!inst.program || !scene.GetRegistry().Valid(inst.entity)) // destroyed: no more events
             return;
         const auto it = inst.program->events.find(type);
         if (it == inst.program->events.end())
@@ -1612,6 +1615,8 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     });
 
     std::erase_if(w.messages, [&](const ScriptMessage& m) { return m.time + m.duration < w.time; });
+    // Entities destroyed during this update (their chains have ended; EndPlay needs the entity).
+    std::erase_if(w.instances, [&](const auto& entry) { return !scene.GetRegistry().Valid(entry.second->entity); });
     w.stats.instances = static_cast<std::uint32_t>(w.instances.size());
     w.stats.waiting   = static_cast<std::uint32_t>(w.waiting.size());
     w.stats.timers    = 0;
@@ -1670,7 +1675,8 @@ void ScriptSystem::End(Scene& scene)
             }
         }
     w.Clear();
-    w.running = false;
+    w.running         = false;
+    w.stats.instances = w.stats.waiting = w.stats.timers = w.stats.queued = w.stats.ticking = 0;
     scene.UpdateTransforms();
 }
 
