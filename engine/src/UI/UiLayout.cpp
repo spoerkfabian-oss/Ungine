@@ -34,7 +34,7 @@ std::vector<UiLayoutItem> BuildUiLayout(const Scene& scene, Entity canvasEntity,
         canvas.designSize.x <= 0.0f || canvas.designSize.y <= 0.0f)
         return result;
 
-    UiRect root{{0.0f}, viewportSize};
+    UiRect root{glm::vec2(0.0f), viewportSize};
     float scaleX = 1.0f;
     float scaleY = 1.0f;
     if (canvas.scaleWithViewport) {

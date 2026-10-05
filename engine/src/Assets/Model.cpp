@@ -31,7 +31,7 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
             vertices[i].joints = glm::uvec4(data.skinInfluences[i].joints);
             vertices[i].weights = data.skinInfluences[i].weights;
         }
-    out.vertices = pool.Upload(GeometryKind::Vertices, std::span{vertices}, ticket);
+    out.vertices = pool.Upload(GeometryKind::Vertices, std::span<const Vertex>{vertices}, ticket);
     out.indices  = pool.Upload(GeometryKind::Indices, std::span{data.indices}, ticket);
 
     out.meshes = data.meshes;

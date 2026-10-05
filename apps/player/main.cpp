@@ -266,7 +266,7 @@ private:
                                        UiWidget{.type = UiWidgetType::Checkbox,
                                                 .offsetMin = {30.0f, 194.0f}, .offsetMax = {430.0f, 246.0f},
                                                 .color = {1.0f, 1.0f, 1.0f, 1.0f}, .text = "Fullscreen",
-                                                .checked = GetWindow().IsFullscreen(), .fontSize = 20.0f});
+                                                .fontSize = 20.0f, .checked = GetWindow().IsFullscreen()});
         m_MenuBack = button(m_MenuOptionsPanel, "Back", "Back", 310.0f);
     }
 
