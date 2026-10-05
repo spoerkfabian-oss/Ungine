@@ -8,8 +8,10 @@
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Assets/TextureCooker.h"
 #include "Engine/Core/FlatMap.h"
+#include "Engine/Core/Input.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Events/EventBus.h"
+#include "Engine/Events/Events.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/RangeAllocator.h"
 #include "Engine/Renderer/ShaderReload.h"
@@ -320,13 +322,14 @@ TEST_CASE(Animation_BlendAndUnwrappedRootMotion)
 {
     std::vector<Transform> from(1), to(1);
     to[0].position = {2.0f, 0.0f, 0.0f};
-    to[0].rotation = glm::angleAxis(glm::pi<float>(), glm::vec3{0.0f, 1.0f, 0.0f});
+    // A quarter turn (a half turn has no unique shortest path: its quaternion's w rounds to -0).
+    to[0].rotation = glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0f, 1.0f, 0.0f});
     to[0].scale = {3.0f, 3.0f, 3.0f};
     BlendAnimationPoses(from, to, 0.25f);
     CHECK(std::abs(from[0].position.x - 0.5f) < 1.0e-5f);
     CHECK(std::abs(from[0].scale.x - 1.5f) < 1.0e-5f);
-    const glm::quat halfTurn = glm::angleAxis(glm::pi<float>() * 0.25f, glm::vec3{0.0f, 1.0f, 0.0f});
-    CHECK(std::abs(glm::dot(from[0].rotation, halfTurn)) > 0.999f);
+    const glm::quat expected = glm::angleAxis(glm::half_pi<float>() * 0.25f, glm::vec3{0.0f, 1.0f, 0.0f});
+    CHECK(std::abs(glm::dot(from[0].rotation, expected)) > 0.9999f);
 
     AnimationClip clip;
     clip.duration = 1.0f;
@@ -735,7 +738,7 @@ TEST_CASE(UiLayout_AnchorsScalingHierarchyAndVisibility)
     CHECK(layout[0].rect.position == glm::vec2{0.0f});
     CHECK(glm::length(layout[0].rect.size - glm::vec2{640.0f, 360.0f}) < 1.0e-4f);
     CHECK(layout[1].entity == button);
-    CHECK(glm::length(layout[1].rect.position - glm::vec2{266.6667f, 156.0f}) < 1.0e-3f);
+    CHECK(glm::length(layout[1].rect.position - glm::vec2{266.6667f, 164.0f}) < 1.0e-3f); // centre (320, 180) - pivot * (106.7, 32)
     CHECK(glm::length(layout[1].rect.size - glm::vec2{106.6667f, 32.0f}) < 1.0e-3f);
     CHECK(layout[1].rect.Contains({300.0f, 170.0f}));
     CHECK(!layout[1].rect.Contains({400.0f, 170.0f}));
@@ -881,7 +884,7 @@ TEST_CASE(SceneSerializer_SnapshotRestoreAndState)
     CHECK(r.Has<UiWidget>(node2));
     if (const UiWidget* widget = r.TryGet<UiWidget>(node2)) {
         CHECK(widget->type == UiWidgetType::Slider && widget->text == "Volume");
-        CHECK(widget->anchorMin == glm::vec2{0.0f, 1.0f});
+        CHECK((widget->anchorMin == glm::vec2{0.0f, 1.0f}));
         CHECK(widget->value == 0.4f && widget->minimum == -1.0f && widget->maximum == 1.0f);
     }
     CHECK(r.Has<UiCanvas>(parent) && r.Get<UiCanvas>(parent).designSize == (glm::vec2{1600.0f, 900.0f}) &&

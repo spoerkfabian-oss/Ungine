@@ -100,8 +100,8 @@ struct UiWidget {
     glm::vec2 pivot{0.0f};
     glm::vec4 color{1.0f};
     glm::vec4 background{0.12f, 0.14f, 0.18f, 0.95f};
-    std::string text;
-    std::string image;
+    std::string text{};
+    std::string image{};
     float value = 0.0f;
     float minimum = 0.0f;
     float maximum = 1.0f;

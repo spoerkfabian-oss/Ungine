@@ -175,6 +175,36 @@ private:
     std::tuple<ComponentPool<Ts>*...> m_Pools;
 };
 
+// Read-only View (Registry::ViewOf() const): the callback gets const components and may not
+// change the registry; otherwise like View.
+template <Component... Ts>
+class ConstView {
+public:
+    explicit ConstView(const ComponentPool<Ts>*... pools) : m_Pools{pools...} {}
+
+    template <class F>
+        requires std::invocable<F&, Entity, const Ts&...>
+    void Each(F&& fn) const
+    {
+        if ((!std::get<const ComponentPool<Ts>*>(m_Pools) || ...))
+            return;
+
+        const IComponentPool* driver = nullptr;
+        ((driver = (!driver || std::get<const ComponentPool<Ts>*>(m_Pools)->Size() < driver->Size())
+                       ? static_cast<const IComponentPool*>(std::get<const ComponentPool<Ts>*>(m_Pools))
+                       : driver),
+         ...);
+        for (std::size_t i = 0; i < driver->Size(); ++i) {
+            const Entity e = driver->EntityAt(i);
+            if ((std::get<const ComponentPool<Ts>*>(m_Pools)->Contains(e) && ...))
+                fn(e, std::get<const ComponentPool<Ts>*>(m_Pools)->Get(e)...);
+        }
+    }
+
+private:
+    std::tuple<const ComponentPool<Ts>*...> m_Pools;
+};
+
 class Registry {
 public:
     Registry()                           = default;
@@ -294,6 +324,11 @@ public:
     [[nodiscard]] View<Ts...> ViewOf()
     {
         return View<Ts...>(FindPool<Ts>()...);
+    }
+    template <Component... Ts>
+    [[nodiscard]] ConstView<Ts...> ViewOf() const
+    {
+        return ConstView<Ts...>(FindPool<Ts>()...);
     }
 
     [[nodiscard]] std::size_t AliveCount() const { return m_Alive; }

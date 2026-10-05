@@ -621,7 +621,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
             canvas.designSize.y = 1080.0f;
         return canvas;
     });
-    ApplyOptional<UiWidget>(r, e, j, "uiWidget", [](const json& data) {
+    ApplyOptional<UiWidget>(r, e, j, "uiWidget", [&](const json& data) {
         UiWidget widget;
         std::string type;
         Read(data, "type", type);

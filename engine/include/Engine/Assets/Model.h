@@ -100,8 +100,8 @@ struct AnimationTrack {
     // Values use vec4 for a common representation: translation/scale use xyz, rotation uses xyzw.
     // Cubic spline tracks keep the per-key tangents in separate arrays.
     std::vector<glm::vec4> values;
-    std::vector<glm::vec4> inTangents;
-    std::vector<glm::vec4> outTangents;
+    std::vector<glm::vec4> inTangents{};
+    std::vector<glm::vec4> outTangents{};
 };
 
 struct AnimationClip {

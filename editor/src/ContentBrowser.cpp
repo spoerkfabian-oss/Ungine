@@ -1,6 +1,7 @@
 #include "Editor/Editor.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
+#include "Editor/ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Texture.h"
@@ -132,9 +133,9 @@ std::optional<fs::path> RelocateReference(const fs::path& reference, const fs::p
                                           const fs::path& to, bool directory);
 
 struct StoredReferenceFile {
-    fs::path path;
-    fs::path temporary;
-    fs::path backup;
+    fs::path path{};
+    fs::path temporary{};
+    fs::path backup{};
     bool backedUp = false;
     bool installed = false;
 };
@@ -1157,7 +1158,7 @@ void Editor::DrawContentBrowser()
                                                     screenCenter.y - projectedY * scale);
                         }
                         if (valid)
-                            draw->AddPolyline(points, 3, IM_COL32(115, 190, 245, 180), ImDrawFlags_Closed, 1.0f);
+                            draw->AddPolyline(points, 3, IM_COL32(115, 190, 245, 180), 1.0f, ImDrawFlags_Closed);
                     }
                     ImGui::Dummy(size);
                     ImGui::Text("%zu mesh(es), %zu material(s)", model->meshes.size(), model->previewMaterials.size());
