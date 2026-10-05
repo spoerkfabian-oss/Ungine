@@ -129,7 +129,7 @@ std::string EncodeUriPath(const fs::path& path)
     return encoded;
 }
 
-std::optional<fs::path> RelocateReference(const fs::path& reference, const fs::path& from,
+std::optional<fs::path> RelocateReference(const std::string& reference, const fs::path& from,
                                           const fs::path& to, bool directory);
 
 struct StoredReferenceFile {
@@ -296,7 +296,7 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
     return true;
 }
 
-std::optional<fs::path> RelocateReference(const fs::path& reference, const fs::path& from,
+std::optional<fs::path> RelocateReference(const std::string& reference, const fs::path& from,
                                           const fs::path& to, bool directory)
 {
     if (reference.empty())
@@ -1405,15 +1405,15 @@ void Editor::DrawContentBrowser()
             m_Status = ec ? "Delete failed: " + ec.message() : "Deleted " + PathToUtf8(m_DeleteTarget.filename());
             if (!ec && m_Ctx.project) {
                 const fs::path start = m_Ctx.project->StartScene();
-                const fs::path relative = start.lexically_normal().lexically_relative(deleted.lexically_normal());
-                if (!relative.empty() && !relative.is_absolute() && relative.begin() != relative.end() && *relative.begin() != "..") {
+                const fs::path startRelative = start.lexically_normal().lexically_relative(deleted.lexically_normal());
+                if (!startRelative.empty() && !startRelative.is_absolute() && startRelative.begin() != startRelative.end() && *startRelative.begin() != "..") {
                     m_Ctx.project->settings.startScene.clear();
                     m_ProjectDirty = !m_Ctx.project->Save();
                 }
             }
             if (!ec && !m_ScenePath.empty()) {
-                const fs::path relative = m_ScenePath.lexically_normal().lexically_relative(deleted.lexically_normal());
-                if (relative.empty() || (!relative.is_absolute() && relative.begin() != relative.end() && *relative.begin() != ".."))
+                const fs::path sceneRelative = m_ScenePath.lexically_normal().lexically_relative(deleted.lexically_normal());
+                if (sceneRelative.empty() || (!sceneRelative.is_absolute() && sceneRelative.begin() != sceneRelative.end() && *sceneRelative.begin() != ".."))
                     m_ScenePath.clear();
             }
             m_DeleteTarget.clear();
