@@ -196,8 +196,9 @@ TEST_CASE(Script_FlowControlVariablesAndMath)
     CHECK(!f.Errors());
     const ScriptDebugInfo* debug = f.scripts.Debug("test.ugraph");
     CHECK(debug && debug->nodeTimes.contains(loop) && debug->linkTimes.contains({seq, "Then 1"}));
+    CHECK(f.scripts.Stats().instances == 1);
     f.scripts.End(f.scene);
-    CHECK(!f.scripts.Running() && f.scripts.Stats().instances == 1);
+    CHECK(!f.scripts.Running() && f.scripts.Stats().instances == 0); // End stops every instance
 }
 
 TEST_CASE(Script_DelayTransformAndLoopGuard)

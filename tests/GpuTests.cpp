@@ -6,6 +6,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Platform.h"
@@ -945,7 +946,10 @@ TEST_CASE(Physics_MeshColliderAndEditorPlayStop)
 
 namespace {
 // Renders `frames` frames of `camera` into an offscreen RGBA8 target and returns the last one.
-std::vector<std::uint8_t> RenderImage(SceneRenderer& renderer, Scene& scene, const CameraData& camera, int frames)
+// `overlay` draws on top of the scene (target in COLOR_ATTACHMENT_OPTIMAL).
+using OverlayFn = std::function<void(const FrameContext&, VkImageView, VkFormat, VkExtent2D)>;
+std::vector<std::uint8_t> RenderImage(SceneRenderer& renderer, Scene& scene, const CameraData& camera, int frames,
+                                      const OverlayFn& overlay = {})
 {
     constexpr VkExtent2D kExtent{160, 120};
     constexpr VkFormat   kFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -970,6 +974,8 @@ std::vector<std::uint8_t> RenderImage(SceneRenderer& renderer, Scene& scene, con
                                      .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                      .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
         renderer.Render(*frame, scene, camera, {.image = target.Handle(), .view = target.View(), .format = kFormat, .extent = kExtent});
+        if (overlay)
+            overlay(*frame, target.View(), kFormat, kExtent);
         if (i == frames) {
             CmdImageBarrier(frame->cmd, {.image     = target.Handle(),
                                          .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2398,6 +2404,519 @@ TEST_CASE(Editor_Blueprint3MouseInput)
     bp.Close(0);
     glfwSetWindowSize(F().window->Native(), 320, 240);
     runFrames(2);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+namespace {
+// Pixels whose color differs noticeably between two images of the same size.
+std::size_t DifferentPixels(const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b)
+{
+    std::size_t count = 0;
+    for (std::size_t i = 0; i + 3 < a.size() && i + 3 < b.size(); i += 4)
+        if (std::abs(int{a[i]} - int{b[i]}) + std::abs(int{a[i + 1]} - int{b[i + 1]}) +
+                std::abs(int{a[i + 2]} - int{b[i + 2]}) > 24)
+            ++count;
+    return count;
+}
+} // namespace
+
+TEST_CASE(Render_SkinnedAnimationInstancesAndPrefabs)
+{
+    // The banner's mesh node is not animated - only its pivot joint (0° at t = 0, 30° about Z at
+    // t = 1): its pixels move through GPU skinning alone. Every way of making an instance (model,
+    // duplicate, prefab rebuilt from JSON) must keep the skin bound to its joints.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_skin_{}", std::random_device{}());
+    fs::create_directories(dir);
+    const ModelHandle handle = F().assets->LoadModel(TemplateDirectory() / "Basic" / "Content" / "Models" / "AnimatedBanner.gltf");
+    CHECK(F().Pump([&] { return Settled(handle); }));
+    const Model* model = F().assets->Get(handle);
+    CHECK(model && model->skins.size() == 1 && model->animations.size() == 1);
+    if (!model) {
+        F().assets->Release(handle);
+        return;
+    }
+
+    Scene         scene;
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    const glm::vec3  eye{0.55f, 0.8f, 2.2f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.55f, 0.8f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto pose = [&](Entity root, float time) {
+        Animator& animator   = scene.GetRegistry().Get<Animator>(root);
+        animator.playing     = false;
+        animator.timeSeconds = time;
+        UpdateAnimations(scene, *F().assets, 0.0f);
+        scene.UpdateTransforms();
+        return RenderImage(renderer, scene, camera, 3);
+    };
+    const auto checkSkinned = [&](Entity root, const char* label) {
+        CHECK(root != NullEntity && scene.GetRegistry().Has<Animator>(root));
+        if (root == NullEntity || !scene.GetRegistry().Has<Animator>(root))
+            return;
+        const auto rest    = pose(root, 0.0f);
+        const auto swung   = pose(root, 1.0f);
+        const auto back    = pose(root, 2.0f);
+        const std::size_t moved = DifferentPixels(rest, swung);
+        std::printf("    %s: %zu pixels moved, %zu differ after the cycle\n", label, moved, DifferentPixels(rest, back));
+        CHECK(moved > 150);
+        CHECK(DifferentPixels(rest, back) < 20);
+        // A stopped clip writes no transforms (no BVH / shadow cache churn).
+        UpdateAnimations(scene, *F().assets, 0.5f);
+        scene.UpdateTransforms();
+        CHECK(scene.LastTransformUpdate().updated == 0);
+    };
+
+    Entity root = InstantiateModel(scene, handle, *model);
+    checkSkinned(root, "model instance");
+
+    // Duplicate (as Ctrl+D / undo): new entities, the node references follow the new root.
+    const std::string snapshot = SnapshotEntities(scene, std::span<const Entity>(&root, 1));
+    scene.DestroyEntity(root);
+    const auto copies = RestoreEntities(scene, snapshot, RestoreMode::Duplicate);
+    CHECK(copies.size() == 1);
+    root = copies.empty() ? NullEntity : copies.front();
+    checkSkinned(root, "duplicate");
+
+    // Prefab: members are rebuilt from the prefab's JSON.
+    std::vector<ModelHandle> models;
+    const fs::path           prefab = dir / "Banner.uprefab";
+    CreatePrefab(prefab, scene, F().assets.get(), root);
+    scene.DestroyEntity(root);
+    root = InstantiatePrefab(scene, F().assets.get(), prefab, NullEntity, Transform{}, models);
+    checkSkinned(root, "prefab instance");
+    // Reverting overrides rebuilds the members in place.
+    RevertPrefabOverrides(scene, F().assets.get(), root, {}, models);
+    checkSkinned(root, "reverted prefab instance");
+
+    scene.Clear();
+    for (ModelHandle h : models)
+        F().assets->Release(h);
+    F().assets->Release(handle);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+namespace {
+Entity AddUiWidget(Scene& scene, const char* name, Entity parent, const UiWidget& widget)
+{
+    const Entity e = scene.CreateEntity(name, parent);
+    scene.GetRegistry().Emplace<UiWidget>(e, widget);
+    return e;
+}
+
+glm::ivec3 PixelAt(const std::vector<std::uint8_t>& image, int x, int y)
+{
+    const std::size_t i = (static_cast<std::size_t>(y) * 160 + static_cast<std::size_t>(x)) * 4;
+    return {image[i], image[i + 1], image[i + 2]};
+}
+} // namespace
+
+TEST_CASE(Render_RuntimeUiOverlay)
+{
+    // Panel, image (texture asset from a widget path) and progress bar drawn by the UI system over
+    // the scene, at the layout's positions.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_ui_{}", std::random_device{}());
+    fs::create_directories(dir);
+    WriteFile(dir / "green.png", SolidPng(0, 255, 0));
+
+    Scene        scene;
+    const Entity canvas = scene.CreateEntity("Canvas");
+    scene.GetRegistry().Emplace<UiCanvas>(canvas, UiCanvas{.designSize = {160.0f, 120.0f}});
+    AddUiWidget(scene, "Panel", canvas,
+                {.type = UiWidgetType::Panel, .offsetMin = {10.0f, 10.0f}, .offsetMax = {60.0f, 50.0f},
+                 .background = {1.0f, 0.0f, 0.0f, 1.0f}});
+    AddUiWidget(scene, "Image", canvas,
+                {.type = UiWidgetType::Image, .offsetMin = {100.0f, 10.0f}, .offsetMax = {150.0f, 50.0f},
+                 .background = {0.0f, 0.0f, 0.0f, 1.0f}, .image = PathToUtf8(dir / "green.png")});
+    AddUiWidget(scene, "Progress", canvas,
+                {.type = UiWidgetType::ProgressBar, .offsetMin = {10.0f, 80.0f}, .offsetMax = {150.0f, 100.0f},
+                 .color = {1.0f, 1.0f, 0.0f, 1.0f}, .background = {0.0f, 0.0f, 1.0f, 1.0f}, .value = 0.5f});
+    AddUiWidget(scene, "Hidden", canvas,
+                {.type = UiWidgetType::Panel, .offsetMin = {0.0f, 0.0f}, .offsetMax = {160.0f, 120.0f},
+                 .background = {1.0f, 1.0f, 1.0f, 1.0f}, .visible = false});
+
+    // The UI system acquires the image itself (same cached asset): wait for it to be ready.
+    const TextureHandle texture = F().assets->LoadTexture(dir / "green.png", TextureKind::Color);
+    CHECK(F().Pump([&] { return F().assets->State(texture) == AssetState::Ready; }));
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    UiSystem      ui;
+    TextOverlay   overlay(*F().renderer);
+    const auto image = RenderImage(renderer, scene, FrontCamera(3.0f), 3,
+                                   [&](const FrameContext& frame, VkImageView view, VkFormat format, VkExtent2D extent) {
+                                       ui.PrepareLayout(scene, {static_cast<float>(extent.width), static_cast<float>(extent.height)});
+                                       ui.SyncAssets(scene, *F().assets);
+                                       ui.Draw(scene, overlay);
+                                       overlay.Render(frame, view, format, extent);
+                                   });
+    const glm::ivec3 panel = PixelAt(image, 35, 30), picture = PixelAt(image, 125, 30);
+    const glm::ivec3 filled = PixelAt(image, 40, 90), empty = PixelAt(image, 120, 90);
+    CHECK(panel.r > 200 && panel.g < 60 && panel.b < 60);
+    CHECK(picture.g > 200 && picture.r < 60 && picture.b < 60);
+    CHECK(filled.r > 200 && filled.g > 200 && filled.b < 60);
+    CHECK(empty.b > 200 && empty.r < 60 && empty.g < 60);
+
+    F().context->WaitIdle();
+    F().assets->Release(texture);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_RuntimeUiInPlayMode)
+{
+    // While playing, the viewport is the game's screen: clicks reach button / checkbox / slider
+    // widgets (not picking) and their Blueprint UI events fire.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_ui_play_{}", std::random_device{}());
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    glfwSetWindowSize(F().window->Native(), 1280, 800);
+
+    ScriptGraph graph;
+    const auto  print = [&](const char* text) {
+        const std::uint32_t n = graph.AddNode("Debug.Print", {});
+        graph.FindNode(n)->defaults["Text"] = std::string(text);
+        return n;
+    };
+    const std::uint32_t clicked = graph.AddNode("Event.UIClicked", {});
+    CHECK(graph.Connect(clicked, "Out", print("ui clicked"), "In").empty());
+    const std::uint32_t changed = graph.AddNode("Event.UIValueChanged", {});
+    CHECK(graph.Connect(changed, "Out", print("slider moved"), "In").empty());
+    const std::uint32_t checked = graph.AddNode("Event.UICheckedChanged", {});
+    const std::uint32_t branch  = graph.AddNode("Flow.Branch", {});
+    CHECK(graph.Connect(checked, "Out", branch, "In").empty());
+    CHECK(graph.Connect(checked, "Checked", branch, "Condition").empty());
+    CHECK(graph.Connect(branch, "True", print("box checked"), "In").empty());
+    SaveScriptGraph(dir / "Ui.ugraph", graph);
+
+    Scene        scene;
+    Registry&    r      = scene.GetRegistry();
+    const Entity canvas = scene.CreateEntity("Canvas");
+    r.Emplace<UiCanvas>(canvas, UiCanvas{.designSize = {1280.0f, 720.0f}});
+    const auto widget = [&](const char* name, UiWidgetType type, glm::vec2 anchor, glm::vec2 halfSize) {
+        const Entity e = AddUiWidget(scene, name, canvas,
+                                     {.type = type, .anchorMin = anchor, .anchorMax = anchor, .offsetMin = -halfSize,
+                                      .offsetMax = halfSize, .text = name});
+        r.Emplace<ScriptComponent>(e, PathToUtf8(dir / "Ui.ugraph"));
+        return e;
+    };
+    widget("Button", UiWidgetType::Button, {0.5f, 0.3f}, {160.0f, 50.0f});
+    const std::uint64_t checkbox = r.Get<Uuid>(widget("Checkbox", UiWidgetType::Checkbox, {0.5f, 0.5f}, {160.0f, 40.0f})).value;
+    const std::uint64_t slider   = r.Get<Uuid>(widget("Slider", UiWidgetType::Slider, {0.5f, 0.7f}, {300.0f, 30.0f})).value;
+
+    ScriptSystem  scripts(F().events, nullptr, nullptr, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto printed = [&](std::string_view text) {
+        return std::ranges::count_if(scripts.Messages(), [&](const ScriptMessage& m) { return m.text == text; });
+    };
+    runFrames(4);
+    editor.Play();
+    runFrames(3);
+    CHECK(editor.GetPlayState() == PlayState::Playing);
+
+    // Widget centers in window pixels: the layout of the viewport's image, offset by its rect.
+    const glm::vec4 rect = editor.ViewportRect();
+    CHECK(rect.z > 200.0f && rect.w > 200.0f);
+    const auto layout = BuildUiLayout(scene, canvas, {rect.z, rect.w});
+    const auto at = [&](const char* name, float u) {
+        for (const UiLayoutItem& item : layout)
+            if (r.Get<Name>(item.entity).value == name)
+                return glm::vec2(rect.x, rect.y) + item.rect.position + item.rect.size * glm::vec2(u, 0.5f);
+        return glm::vec2(-1.0f);
+    };
+    const auto press = [&](glm::vec2 position, bool down) {
+        for (int i = 0; i < 2; ++i) { // under Xvfb the warped pointer reaches ImGui a frame later
+            editor.SimulateMouse(position);
+            runFrames(1);
+        }
+        editor.SimulateMouse(position, 0, down);
+        runFrames(2);
+    };
+    press(at("Button", 0.5f), true);
+    press(at("Button", 0.5f), false);
+    CHECK(printed("ui clicked") == 1);
+    CHECK(editor.Selection().empty()); // the click went to the UI, not to picking
+
+    press(at("Checkbox", 0.1f), true);
+    press(at("Checkbox", 0.1f), false);
+    const Entity playCheckbox = scene.FindByUuid(checkbox);
+    CHECK(playCheckbox != NullEntity && r.Get<UiWidget>(playCheckbox).checked);
+    CHECK(printed("box checked") == 1);
+
+    press(at("Slider", 0.25f), true);
+    for (int i = 1; i <= 4; ++i) {
+        editor.SimulateMouse(at("Slider", 0.25f + 0.125f * static_cast<float>(i)));
+        runFrames(1);
+    }
+    press(at("Slider", 0.75f), false);
+    const Entity playSlider = scene.FindByUuid(slider);
+    CHECK(playSlider != NullEntity && std::abs(r.Get<UiWidget>(playSlider).value - 0.75f) < 0.05f);
+    CHECK(printed("slider moved") >= 1);
+
+    editor.Stop(); // widget values come back from the snapshot
+    runFrames(2);
+    CHECK(scene.FindByUuid(checkbox) != NullEntity && !r.Get<UiWidget>(scene.FindByUuid(checkbox)).checked);
+    glfwSetWindowSize(F().window->Native(), 320, 240);
+    runFrames(2);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_ContentImportAndReferenceRepair)
+{
+    // Content browser: background import (unique names, glTF with its external files, target
+    // outside Content refused), then moves that repair stored and open-scene references.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      root = fs::temp_directory_path() / std::format("ungine_import_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(root / "source", ec);
+    const auto templates = ProjectTemplates();
+    const auto blank     = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Blank"; });
+    CHECK(blank != templates.end());
+    if (blank == templates.end())
+        return;
+    std::optional<Project> project = Project::Create(root, "ImportGame", *blank);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    WriteFile(root / "source" / "tex.png", SolidPng(0, 200, 255));
+    WriteFile(root / "source" / "quad.gltf", QuadGltf(0.5f, "tex.png"));
+
+    Scene                    scene;
+    ScriptSystem             scripts(F().events, nullptr, nullptr, F().assets.get()); // Play needs a simulation
+    SceneRenderer            sceneRenderer(*F().renderer, *F().context, *F().assets);
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .scripts       = &scripts,
+                       .project       = &*project,
+                       .layoutFile    = {}});
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                F().assets->Update();
+                editor.Update(1.0f / 60.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        const auto importFile = [&](const fs::path& source, const fs::path& directory) {
+            if (!editor.ImportContent(source, directory))
+                return false;
+            return F().Pump([&] {
+                runFrames(1);
+                return !editor.ContentImportBusy();
+            });
+        };
+        runFrames(3);
+        const fs::path glb = fs::path(ENGINE_ASSET_DIR) / "models" / "BoxTextured.glb";
+        CHECK(importFile(glb, content / "Models") && fs::exists(content / "Models" / "BoxTextured.glb"));
+        CHECK(editor.Status().starts_with("Imported"));
+        CHECK(importFile(glb, content / "Models") && fs::exists(content / "Models" / "BoxTextured1.glb")); // no overwrite
+        CHECK(!editor.ImportContent(glb, root / "source"));                                           // outside Content
+        CHECK(importFile(root / "source" / "quad.gltf", content / "Models"));
+        CHECK(fs::exists(content / "Models" / "quad" / "quad.gltf") && fs::exists(content / "Models" / "quad" / "tex.png"));
+
+        // Two placed models: one stays in the scene file, the other becomes a prefab.
+        const auto meshes = [&] {
+            std::vector<Entity> found;
+            scene.GetRegistry().ViewOf<MeshRenderer>().Each([&](Entity e, const MeshRenderer&) { found.push_back(e); });
+            return found;
+        };
+        for (std::size_t count = 1; count <= 2; ++count) {
+            editor.OpenAsset(content / "Models" / "BoxTextured.glb");
+            CHECK(F().Pump([&] {
+                runFrames(1);
+                return meshes().size() == count;
+            }));
+        }
+        CHECK(meshes().size() == 2);
+        if (meshes().size() != 2)
+            return;
+        Entity              box     = meshes()[0];
+        const std::uint64_t boxUuid = scene.GetRegistry().Get<Uuid>(box).value;
+        fs::create_directories(content / "Prefabs", ec);
+        CHECK(editor.CreatePrefabFrom(FindModelInstanceRoot(scene.GetRegistry(), meshes()[1]), content / "Prefabs" / "Box.uprefab"));
+        CHECK(editor.SaveScene(content / "Scenes" / "Main.scene.json"));
+        const auto fileText = [](const fs::path& file) {
+            std::ifstream in(file, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in), {});
+        };
+
+        // Move the model: stored files, the open scene (and the renderer) follow.
+        fs::create_directories(content / "Models" / "Moved", ec);
+        const fs::path moved = content / "Models" / "Moved" / "Box.glb";
+        CHECK(editor.MoveContent(content / "Models" / "BoxTextured.glb", moved));
+        CHECK(fs::exists(moved) && !fs::exists(content / "Models" / "BoxTextured.glb"));
+        CHECK(fileText(content / "Scenes" / "Main.scene.json").find("Moved/Box.glb") != std::string::npos);
+        CHECK(fileText(content / "Scenes" / "Main.scene.json").find("BoxTextured.glb") == std::string::npos);
+        CHECK(fileText(content / "Prefabs" / "Box.uprefab").find("Moved/Box.glb") != std::string::npos);
+        box = scene.FindByUuid(boxUuid);
+        CHECK(box != NullEntity);
+        if (box != NullEntity) {
+            const ModelHandle model = scene.GetRegistry().Get<MeshRenderer>(box).model;
+            CHECK(fs::equivalent(F().assets->Source(model).file, moved, ec));
+            CHECK(F().Pump([&] {
+                runFrames(1);
+                const auto* proxy = sceneRenderer.Spatial().FindMesh(box);
+                return proxy && proxy->model == model;
+            }));
+            CHECK(editor.CanUndo()); // the reference repair is one undo step
+        }
+
+        // Folder move keeps relative glTF dependencies; moving the .gltf alone rewrites its URIs.
+        CHECK(editor.MoveContent(content / "Models" / "quad", content / "Models" / "QuadFolder"));
+        CHECK(editor.MoveContent(content / "Models" / "QuadFolder" / "quad.gltf", content / "Models" / "quad.gltf"));
+        CHECK(fileText(content / "Models" / "quad.gltf").find("QuadFolder/tex.png") != std::string::npos);
+        const ModelHandle quad = F().assets->LoadModel(content / "Models" / "quad.gltf");
+        CHECK(F().Pump([&] { return Settled(quad); }) && F().assets->State(quad) == AssetState::Ready);
+        const Model* quadModel = F().assets->Get(quad);
+        CHECK(quadModel && !quadModel->textures.empty());
+        if (quadModel)
+            for (TextureHandle t : quadModel->textures)
+                CHECK(F().assets->State(t) == AssetState::Ready); // the dependency was found
+        F().assets->Release(quad);
+
+        // Moves are refused while playing (Stop would restore the old paths).
+        editor.Play();
+        runFrames(2);
+        CHECK(!editor.MoveContent(moved, content / "Models" / "Box.glb") && fs::exists(moved));
+        editor.Stop();
+        runFrames(2);
+        editor.NewScene();
+        runFrames(2);
+    }
+    for (ModelHandle h : modelRefs)
+        F().assets->Release(h);
+    F().context->WaitIdle();
+    fs::remove_all(root, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Asset_LifecycleStress)
+{
+    // Random loads, releases (also while scene entities still use the handle), reloads, retries,
+    // texture rewrites and frames in between: nothing may crash, leak or upset the validation layer,
+    // and once everything is released the asset lists are back where they started.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_asset_stress_{}", std::random_device{}());
+    fs::create_directories(dir);
+    WriteFile(dir / "tex.png", SolidPng(255, 0, 0));
+    WriteFile(dir / "quad.gltf", QuadGltf(0.5f, "tex.png"));
+    const auto modelsBefore = F().assets->Models().size(), texturesBefore = F().assets->Textures().size(),
+               soundsBefore = F().assets->Sounds().size();
+    const std::vector<fs::path> modelFiles{kBox, kSpheres, dir / "quad.gltf", dir / "missing.glb"};
+
+    Scene                      scene;
+    SceneRenderer              renderer(*F().renderer, *F().context, *F().assets);
+    std::vector<ModelHandle>   models;
+    std::vector<TextureHandle> textures;
+    std::vector<SoundHandle>   sounds;
+    std::mt19937               rng(42);
+    const auto                 index = [&](std::size_t size) { return std::uniform_int_distribution<std::size_t>(0, size - 1)(rng); };
+    const auto take = [&](auto& handles) {
+        const std::size_t i = index(handles.size());
+        const auto        h = handles[i];
+        handles.erase(handles.begin() + static_cast<std::ptrdiff_t>(i));
+        return h;
+    };
+    const CameraData camera = FrontCamera(4.0f);
+    for (int step = 0; step < 300; ++step) {
+        const int op = std::uniform_int_distribution<int>(0, 99)(rng);
+        if (op < 25) {
+            const ModelHandle h = F().assets->LoadModel(modelFiles[index(modelFiles.size())]);
+            models.push_back(h);
+            const Entity e = scene.CreateEntity("Mesh");
+            scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = h, .meshIndex = 0});
+            scene.EditTransform(e).position = glm::vec3(static_cast<float>(step % 5) - 2.0f, 0.0f, 0.0f);
+        } else if (op < 35) {
+            models.push_back(F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 0.5f + 0.1f * static_cast<float>(step % 3)}));
+        } else if (op < 55 && !models.empty()) {
+            F().assets->Release(take(models)); // entities may still reference it: they draw nothing
+        } else if (op < 63 && !models.empty()) {
+            (void)F().assets->Reload(models[index(models.size())]); // reload or retry
+        } else if (op < 70) {
+            textures.push_back(F().assets->LoadTexture(dir / "tex.png", TextureKind::Color));
+        } else if (op < 76 && !textures.empty()) {
+            F().assets->Release(take(textures));
+        } else if (op < 80) {
+            WriteFile(dir / "tex.png", SolidPng(static_cast<std::uint8_t>(step), 128, 0), step);
+            if (!textures.empty())
+                (void)F().assets->Reload(textures[index(textures.size())]);
+        } else if (op < 85) {
+            sounds.push_back(F().assets->LoadSound(fs::path(ENGINE_ASSET_DIR) / "sounds" / "chime.wav"));
+        } else if (op < 88 && !sounds.empty()) {
+            F().assets->Release(take(sounds));
+        } else if (op < 92) {
+            std::vector<Entity> meshes;
+            scene.GetRegistry().ViewOf<MeshRenderer>().Each([&](Entity e, const MeshRenderer&) { meshes.push_back(e); });
+            if (!meshes.empty())
+                scene.DestroyEntity(meshes[index(meshes.size())]);
+        }
+        scene.UpdateTransforms();
+        F().window->PollEvents();
+        F().events.Flush();
+        F().assets->Update();
+        if (step % 3 == 0)
+            (void)RenderImage(renderer, scene, camera, 1);
+    }
+    scene.Clear();
+    for (ModelHandle h : models)
+        F().assets->Release(h);
+    for (TextureHandle h : textures)
+        F().assets->Release(h);
+    for (SoundHandle h : sounds)
+        F().assets->Release(h);
+    (void)RenderImage(renderer, scene, camera, 2);
+    CHECK(F().Pump([&] {
+        return F().assets->Models().size() == modelsBefore && F().assets->Textures().size() == texturesBefore &&
+               F().assets->Sounds().size() == soundsBefore;
+    }, 600));
+    std::printf("    models %zu/%zu, textures %zu/%zu, sounds %zu/%zu\n", F().assets->Models().size(), modelsBefore,
+                F().assets->Textures().size(), texturesBefore, F().assets->Sounds().size(), soundsBefore);
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);

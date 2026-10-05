@@ -186,6 +186,7 @@ void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
     const float dt = std::isfinite(deltaSeconds) ? std::max(deltaSeconds, 0.0f) : 0.0f;
     std::unordered_map<Entity, std::vector<Entity>> nodeEntitiesByRoot;
     registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, ModelNodeRef& reference) {
+        reference.instanceRoot = FindModelInstanceRoot(registry, entity); // refresh the hint
         if (reference.instanceRoot == NullEntity)
             return;
         auto& nodes = nodeEntitiesByRoot[reference.instanceRoot];
@@ -291,8 +292,11 @@ void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
             for (const AnimationTrack& track : candidate.tracks)
                 if (track.node < animated.size())
                     animated[track.node] = 1;
+        // Unchanged poses (stopped or paused clips) are not written: a dirty transform costs BVH
+        // updates and invalidates cached local shadows every frame.
         for (std::size_t i = 0; i < animated.size(); ++i)
-            if (animated[i] && nodeEntities[i] != NullEntity && registry.Valid(nodeEntities[i]))
+            if (animated[i] && nodeEntities[i] != NullEntity && registry.Valid(nodeEntities[i]) &&
+                scene.GetTransform(nodeEntities[i]) != pose[i])
                 scene.SetTransform(nodeEntities[i], pose[i]);
     });
 }

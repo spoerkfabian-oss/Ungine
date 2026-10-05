@@ -80,8 +80,6 @@ public:
         ParseNodes();
         ParseSkins();
         ParseAnimations();
-        if (!m_Out->skins.empty() || !m_Out->animations.empty())
-            ENGINE_WARN("glTF: skeletal data loaded, but runtime animation is not implemented yet - bind pose used");
     }
 
 private:

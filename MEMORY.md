@@ -763,6 +763,21 @@ Verification (local, 2026-10-05):
 - EngineGpuTests 30/30 plus 13 CTest smokes (lavapipe, synchronization validation): passed, 0 validation errors; the Basic-template player smoke exercises the animated banner (GPU skinning)
 - CI run for 5e62aec (push to `branch`): Windows MSVC (VS 2022 Debug, /W4 /WX) build + EngineTests, Linux GCC and Linux Clang (Werror) build + EngineTests all green. The lavapipe GPU job runs only on PR/main/manual dispatch and was not part of this run.
 
+### Phase A hardening (GPU tests for phases 21-23 + lifecycle audits, 2026-10-05)
+Branch `branch` (PR pending at the time of writing).
+
+Defects found by the new tests and fixed:
+- Prefab instances (and anything rebuilt from JSON) never animated or skinned: `ModelNodeRef::instanceRoot` stayed null. New `FindModelInstanceRoot` (nearest ancestor with ModelInstance) is used by `UpdateAnimations`, `GpuScene::UpdateJointPalettes` and the serializer; `instanceRoot` is only a refreshed hint now.
+- `UpdateAnimations` wrote every animated node every frame even for stopped clips (dirty transforms, BVH updates, local shadow cache invalidation): unchanged poses are skipped.
+- Editor Play mode: runtime UI was drawn but not interactive and UI events never reached Blueprints. `UiSystem::Update` now takes a `UiInput` (player: `UiInputFromWindow`); the editor feeds viewport mouse/keys while playing, clicks on widgets skip picking, events are dispatched after `ScriptSystem::Update`.
+- Content browser move/rename changed MeshRenderer models without `Scene::MarkChanged` (renderer/BVH/GPU instances kept the old model); now marked. Moves are refused while playing (Stop would restore the old paths). Imports finish even with the content browser closed.
+- Blueprint VM fired Tick/timers/delays/custom events on entities destroyed earlier in the same update; instances of destroyed entities are now skipped and pruned at the end of `Update`; `End` resets the stats counts.
+- Prefab members dragged out of their instance kept a stale `PrefabLink`; after a revert (member recreated) and moving the detached entity back below the instance, one of them was skipped when saving (data loss). Rebuild drops links to the instance from non-members; scene files do not write `prefabLink` for non-members.
+- Geometry pool fragmentation: first fit cut the large holes with small allocations, so a big model's reload failed with two thirds of the pool free. `RangeAllocator` is best fit now.
+- Removed the outdated glTF warning "runtime animation is not implemented yet".
+
+New tests: GPU `Render_SkinnedAnimationInstancesAndPrefabs`, `Render_RuntimeUiOverlay`, `Editor_RuntimeUiInPlayMode`, `Editor_ContentImportAndReferenceRepair`, `Asset_LifecycleStress`; CPU `tests/LifecycleTests.cpp` (scene hierarchy fuzz, prefab instance fuzz, scripts destroying/spawning while running, detached prefab member survives save, destroyed entity gets no more events), RangeAllocator best-fit case. Each fix was checked by running its test without the fix (fails) and with it (passes).
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -825,6 +840,8 @@ Packaging:
 - no full cooked/pak distribution pipeline
 
 ## 21. Open audit priorities
+
+Status 2026-10-05 (Phase A): priorities 1-3 were audited with randomized lifecycle tests (tests/LifecycleTests.cpp, GPU `Asset_LifecycleStress`) plus targeted GPU tests; the defects found are listed in section 18 ("Phase A hardening"). Not yet covered by tests: debugger state after recompilation, level transition in the middle of a chain (Open Level inside ForEach), shutdown with pending asset jobs under ASan for the new tests. Priorities 4-5 still need Windows / real hardware (user).
 
 Priority 1: ECS and Scene lifecycle
 - destruction during script execution
@@ -892,16 +909,13 @@ Priority 5: Real hardware
 
 ## 23. Immediate continuation point
 
-The repository is in a post-Phase-20 hardening state.
+User-approved work plan (2026-10-05, after PR #12 merged the build repair; main green at 181cfc6):
 
-The recommended continuation sequence is:
+1. Phase A (hardening): A1 GPU tests for phases 21-23 (skinning image/bounds, runtime UI interaction, content import + reference maintenance); A2 lifecycle audits (ECS/Scene, Blueprint runtime, asset lifetime; section 21) with regression tests and fixes.
+2. Roadmap phases 24 (level/area streaming), 25 (cooked builds + savegame versioning + options/input remapping), 26 (joints, character rotation, per-triangle materials, contact point/impulse), 27 (sound cues, voice priority, snapshots/ducking, multi-ray occlusion).
+3. Phases 28+ ("C" features, all approved): GPU particles; navmesh via Recast/Detour (zlib, FetchContent, engine-private) + AI Blueprint nodes; animation state machine/blend trees/IK; rendering TAA/decals/SSR/volumetric fog/terrain; editor material assets + material editor, nested prefabs, undo for renderer settings.
 
-ECS / Scene lifecycle
--> Blueprint runtime lifecycle
--> Prefab / Construction Script teardown
--> Asset shutdown/reload lifetime
--> Windows/MSVC runtime paths
--> GTX 1070 Ti + validation/QFOT
+Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
 
 For every concrete issue:
 - patch branch
@@ -918,6 +932,6 @@ If an audit finds no concrete defect:
 ## 24. Roadmap status at handoff
 
 - Phases 21 (skeletal animation), 22 (runtime UI and pause menu) and 23 (content import and previews) are on main via PR #11 (merge 43b639d, Phase 23 = 4c73c55).
-- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. main stays red until `branch` is merged via a PR (user decision; merge only after the PR's full CI incl. GPU suite is green).
-- Dedicated GPU tests for skinning, runtime UI interaction and import previews do not exist yet; skinning is exercised only through the Basic-template player smoke.
+- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. PR #12 merged it on 2026-10-05 (merge 181cfc6); main is green.
+- Phase A added GPU tests for skinning (model, duplicate, prefab instances), runtime UI drawing and editor Play-mode interaction, content import and reference repair; import previews (thumbnails, waveforms) still have no dedicated test.
 - Phase 24 (level/area streaming) remains unimplemented; see the limitation above. Do not report it as complete until async preparation, safe main-thread activation/unload, reference behavior and user-visible loading state are implemented and verified.

@@ -163,10 +163,13 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
 {
     const Registry& registry = scene.GetRegistry();
     std::unordered_map<Entity, std::vector<Entity>> nodeEntitiesByRoot;
+    std::unordered_map<Entity, Entity> rootOf; // node entity -> its model instance
     registry.ViewOf<ModelNodeRef>().Each([&](Entity entity, const ModelNodeRef& reference) {
-        if (reference.instanceRoot == NullEntity)
+        const Entity root = FindModelInstanceRoot(registry, entity);
+        if (root == NullEntity)
             return;
-        auto& nodes = nodeEntitiesByRoot[reference.instanceRoot];
+        rootOf.emplace(entity, root);
+        auto& nodes = nodeEntitiesByRoot[root];
         if (nodes.size() <= reference.node)
             nodes.resize(static_cast<std::size_t>(reference.node) + 1, NullEntity);
         nodes[reference.node] = entity;
@@ -211,7 +214,8 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
             continue;
         }
         const Skin& skin = model->skins[static_cast<std::size_t>(skinIndex)];
-        const auto rootIt = nodeEntitiesByRoot.find(nodeRef->instanceRoot);
+        const auto owner  = rootOf.find(entity);
+        const auto rootIt = owner == rootOf.end() ? nodeEntitiesByRoot.end() : nodeEntitiesByRoot.find(owner->second);
         if (skin.joints.empty() || rootIt == nodeEntitiesByRoot.end()) {
             markIfChanged();
             continue;

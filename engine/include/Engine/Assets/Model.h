@@ -21,6 +21,7 @@
 
 namespace Engine {
 
+class Registry;
 class Renderer;
 class Scene;
 
@@ -254,5 +255,10 @@ Entity InstantiateModel(Scene& scene, ModelHandle handle, const Model& model, En
 // transform, mesh, light) or removed (their other children move to the instance root). The
 // roots keep their own transforms. Returns the number of instances.
 std::size_t RefreshModelInstances(Scene& scene, ModelHandle handle, const Model& model);
+
+// The model instance a node entity belongs to: its nearest ancestor with ModelInstance (NullEntity
+// if there is none). ModelNodeRef::instanceRoot is only a hint - entities rebuilt from JSON (prefab
+// instances, undo, duplicates) or re-parented carry a null or stale handle there.
+[[nodiscard]] Entity FindModelInstanceRoot(const Registry& registry, Entity node);
 
 } // namespace Engine

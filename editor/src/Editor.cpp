@@ -209,6 +209,7 @@ void Editor::Update(float dt)
     HandleHotkeys();
     ApplyPendingEdits();
     UpdatePendingInstances();
+    UpdateContentImport(); // also with the content browser closed
     // Prefab files changed on disk (another editor, version control): instances follow.
     if (m_PlayState == PlayState::Edit && ImGui::GetTime() - m_PrefabPollTime > 1.0) {
         m_PrefabPollTime = ImGui::GetTime();
@@ -227,6 +228,8 @@ void Editor::Update(float dt)
     // Scripts tick with the frame while playing; they see the keyboard when the viewport has it.
     if (m_Ctx.scripts && m_PlayState == PlayState::Playing) {
         m_Ctx.scripts->Update(m_Ctx.scene, dt, (m_ViewportHovered || m_ViewportFocused) && !WantsKeyboard());
+        for (const UiEvent& event : std::exchange(m_UiEvents, {})) // UI Clicked / Value Changed / Checked Changed
+            m_Ctx.scripts->DispatchUiEvent(m_Ctx.scene, event);
         if (const auto request = m_Ctx.scripts->TakeLevelRequest()) { // Open Level / Quit Game
             if (request->quit)
                 Stop();
@@ -234,6 +237,7 @@ void Editor::Update(float dt)
                 (void)PlayLevel(PathFromUtf8(request->scene));
         }
     }
+    m_UiEvents.clear(); // no scripts / not playing: nobody listens
 
     if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
         UpdateAnimations(m_Ctx.scene, m_Ctx.assets, static_cast<float>(dt));
@@ -466,6 +470,7 @@ void Editor::DrawViewport()
     ImGui::PopStyleVar();
     m_ViewportVisible = visible; // hidden tab / collapsed: the scene is not rendered (Render)
     if (!visible) {
+        m_ViewportRect    = glm::vec4(0.0f);
         m_ViewportHovered = false;
         m_ViewportPress = m_BoxSelecting = false;
         ImGui::End();
@@ -478,11 +483,11 @@ void Editor::DrawViewport()
     EnsureViewportTarget(width, height);
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    if (m_Ctx.scripts) { // mouse / camera nodes: the viewport in window coordinates
-        const ImVec2 window = ImGui::GetMainViewport()->Pos;
-        m_Ctx.scripts->SetViewport({.origin = glm::vec2(origin.x - window.x, origin.y - window.y),
-                                    .size   = glm::vec2(static_cast<float>(width), static_cast<float>(height))});
-    }
+    const ImVec2 window = ImGui::GetMainViewport()->Pos;
+    m_ViewportRect = {origin.x - window.x, origin.y - window.y, static_cast<float>(width), static_cast<float>(height)};
+    if (m_Ctx.scripts) // mouse / camera nodes: the viewport in window coordinates
+        m_Ctx.scripts->SetViewport({.origin = glm::vec2(m_ViewportRect.x, m_ViewportRect.y),
+                                    .size   = glm::vec2(m_ViewportRect.z, m_ViewportRect.w)});
     ImGui::Image(ImTextureRef(m_ViewportTexture), ImVec2(static_cast<float>(width), static_cast<float>(height)));
     // Content browser drops: models are placed where the cursor points, blueprints go to the selection.
     if (ImGui::BeginDragDropTarget()) {
@@ -545,7 +550,35 @@ void Editor::DrawViewport()
     }
     m_ViewportHovered  = ImGui::IsItemHovered();
     m_ViewportFocused  = ImGui::IsWindowFocused();
-    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing();
+    // Runtime UI while playing: the viewport is the game's screen (pointer in image pixels); a
+    // click on a widget belongs to the game, not to picking.
+    bool uiPointer = false;
+    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()) && m_ViewportImage) {
+        const ImGuiIO&  uiIo   = ImGui::GetIO();
+        const glm::vec2 extent(static_cast<float>(m_ViewportImage.Extent().width),
+                               static_cast<float>(m_ViewportImage.Extent().height));
+        UiInput ui;
+        if (m_ViewportHovered || m_UiSystem.CapturesPointer())
+            ui.pointer = glm::vec2(uiIo.MousePos.x - origin.x, uiIo.MousePos.y - origin.y) *
+                         (extent / glm::vec2(static_cast<float>(width), static_cast<float>(height)));
+        ui.pointerPressed  = m_ViewportHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        ui.pointerDown     = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        ui.pointerReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+        if (m_ViewportFocused && !WantsKeyboard()) {
+            const bool tab = ImGui::IsKeyPressed(ImGuiKey_Tab, false);
+            ui.next     = (tab && !uiIo.KeyShift) || ImGui::IsKeyPressed(ImGuiKey_DownArrow, false);
+            ui.previous = (tab && uiIo.KeyShift) || ImGui::IsKeyPressed(ImGuiKey_UpArrow, false);
+            ui.left     = ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false);
+            ui.right    = ImGui::IsKeyPressed(ImGuiKey_RightArrow, false);
+            ui.submit   = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Space, false);
+        }
+        m_UiSystem.Update(m_Ctx.scene, ui, extent);
+        const auto events = m_UiSystem.Events();
+        m_UiEvents.insert(m_UiEvents.end(), events.begin(), events.end());
+        uiPointer = m_UiSystem.CapturesPointer();
+    }
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing() &&
+                         !uiPointer;
     bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
     if (m_ShowAudio)
         iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;

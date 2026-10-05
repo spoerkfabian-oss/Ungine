@@ -307,6 +307,22 @@ void Rebuild(Scene& scene, AssetManager* assets, Entity root, std::shared_ptr<co
     const std::uint64_t rootUuid = UuidOf(r, root);
     const auto          existing = Members(scene, root);
 
+    // Links to this instance from entities that are not its members (moved out of the instance,
+    // or a second entity for the same prefab entity) are stale: those are ordinary entities now.
+    // Left in place they would be skipped as members when the scene is saved.
+    {
+        std::unordered_set<std::uint64_t> members;
+        for (const auto& [source, e] : existing)
+            members.insert(static_cast<std::uint64_t>(e));
+        std::vector<Entity> stale;
+        r.ViewOf<PrefabLink>().Each([&](Entity e, const PrefabLink& link) {
+            if (link.instance == rootUuid && !members.contains(static_cast<std::uint64_t>(e)))
+                stale.push_back(e);
+        });
+        for (const Entity e : stale)
+            r.Remove<PrefabLink>(e);
+    }
+
     // Instance UUIDs: recorded, existing, else new.
     SourceMap                         uuids;
     std::unordered_set<std::uint64_t> taken;
