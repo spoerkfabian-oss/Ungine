@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-03
+- Last updated: 2026-10-05
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -10,6 +10,13 @@ Persistent handover memory for continued development of Ungine.
 - Editor: UngineEditor
 - Player: UnginePlayer
 - Developer application: Sandbox
+
+## 0. Collaboration preferences
+
+- Answer in German, short and to the point; work token-efficiently.
+- Before starting a task, ask about real ambiguities (short multiple-choice questions with a recommended option).
+- Use and update memory often: MEMORY.md is the leading handover file (current state, rules, priorities); CLAUDE.md is the detailed technical reference (architecture, data layouts, verification history). Keep both current.
+- Review your own work before delivering: end with a self-review split into "bereits behoben" (already fixed) and "noch offen" (still open).
 
 ## 1. Project purpose
 
@@ -42,6 +49,7 @@ Branch policy:
 - branch is the current user-requested working branch.
 - New work should be committed to branch unless the user explicitly changes the target.
 - claude/friendly-mccarthy-33nhl0 is an old feature branch that was merged and deleted. Do not recreate or use it.
+- Confirmed by the user on 2026-10-05: work on `branch`. Before new work, bring `branch` up to date with main (fast-forward or merge main into it).
 
 Normal workflow:
 1. Inspect current branch and relevant files.
@@ -679,6 +687,8 @@ Documented validation results from the recent audit:
 
 These are historical results. Always verify the current branch and current CI before presenting them as current.
 
+CI incident (2026-10-03/05): PR #11 (Phases 21-23, codex/feature-roadmap-and-phases) was merged although its CI was red (runs #70/#71); main stayed red (run #72: Build failed on Linux GCC, Linux Clang and Windows MSVC). Repaired on `branch` in 32ea260 (see section 18).
+
 ## 18. Recent concrete fixes
 
 ### GLM finite check fix
@@ -728,6 +738,30 @@ Fix:
 Purpose:
 Node 24-compatible GitHub Actions.
 
+### Phase 21-23 build repair
+Commit:
+32ea260 (on `branch`)
+
+Problem:
+Phases 21-23 (animation, runtime UI, content import) were merged to main without ever being compiled; every CI job failed in the Build step.
+
+Fix:
+- Registry gained a read-only ConstView / `ViewOf() const` (GpuScene joint palettes and UiSystem iterate a const Scene)
+- skinned vertices are uploaded as `span<const Vertex>`
+- the uiWidget scene reader captures ModelRefs for its image path
+- explicit `glm::vec2` for the UI root rect
+- default member initializers on UiWidget, AnimationTrack and StoredReferenceFile (designated initializers vs. -Wmissing-field-initializers)
+- player designated initializers in declaration order
+- Editor links nlohmann_json, includes ImGuiLayer.h, uses the ImGui 1.92.8 AddPolyline argument order
+- tests: missing Input/Events includes, a macro comma
+- two wrong test expectations corrected: blending towards a half turn is ambiguous (angleAxis(pi) has w = -0, so shortest-path slerp goes the other way) -> quarter turn; the UI layout test expected the pivot offset unscaled in y (164 is correct)
+
+Verification (local, 2026-10-05):
+- GCC 13 and Clang with Werror: clean
+- EngineTests: all passed
+- EngineGpuTests 30/30 plus 13 CTest smokes (lavapipe, synchronization validation): passed, 0 validation errors; the Basic-template player smoke exercises the animated banner (GPU skinning)
+- MSVC: pending CI
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -739,6 +773,7 @@ Rule:
 - use production warning flags
 - wait for CI before merging
 - do not assume syntax-only success means CI success
+- never merge a pull request whose CI is red or still running (PR #11 was merged red and broke main); require status checks via branch protection
 
 ## 20. Known limitations that should not be mistaken for regressions
 
@@ -767,6 +802,7 @@ Blueprint:
 - no inheritance
 - restricted nested containers
 - synchronous level loading
+- Phase 24 level/area streaming is not implemented: there are no streaming volumes, background scene parsing/activation pipeline, cross-scene entity-reference policy, or loading transitions yet
 - unversioned save slots
 - documented construction-script semantics
 
@@ -877,3 +913,10 @@ If an audit finds no concrete defect:
 - make no speculative change
 - record the inspected area
 - continue with the next audit priority
+
+## 24. Roadmap status at handoff
+
+- Phases 21 (skeletal animation), 22 (runtime UI and pause menu) and 23 (content import and previews) are on main via PR #11 (merge 43b639d, Phase 23 = 4c73c55).
+- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; the MSVC build is verified only by CI.
+- Dedicated GPU tests for skinning, runtime UI interaction and import previews do not exist yet; skinning is exercised only through the Basic-template player smoke.
+- Phase 24 (level/area streaming) remains unimplemented; see the limitation above. Do not report it as complete until async preparation, safe main-thread activation/unload, reference behavior and user-visible loading state are implemented and verified.
