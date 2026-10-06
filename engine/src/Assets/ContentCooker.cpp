@@ -122,7 +122,8 @@ public:
     {
         const std::size_t n = Count(sizeof(T));
         std::vector<T>    values(n);
-        std::memcpy(values.data(), m_In.data() + m_At, n * sizeof(T));
+        if (n > 0) // memcpy from / to null is undefined even for 0 bytes
+            std::memcpy(values.data(), m_In.data() + m_At, n * sizeof(T));
         m_At += n * sizeof(T);
         return values;
     }
