@@ -4,6 +4,7 @@
 #include "Editor/ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Log.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -402,13 +404,68 @@ bool Editor::PackageProject(const fs::path& outputDirectory)
         return false;
     SaveAll();
     std::string error;
-    if (!Engine::PackageProject(*m_Ctx.project, SiblingExecutable("UnginePlayer"), outputDirectory, &error)) {
+    m_PackageReport     = std::make_unique<CookReport>();
+    m_PackageOutput     = outputDirectory;
+    m_ShowPackageReport = true;
+    if (!Engine::PackageProject(*m_Ctx.project, SiblingExecutable("UnginePlayer"), outputDirectory, &error, m_PackageReport.get())) {
         ENGINE_ERROR("Package: {}", error);
-        m_Status = "Packaging failed (see log)";
+        if (std::ranges::find(m_PackageReport->errors, error) == m_PackageReport->errors.end())
+            m_PackageReport->errors.push_back(error);
+        m_Status = "Packaging failed (see Package report)";
         return false;
     }
     m_Status = "Packaged into " + PathToUtf8(outputDirectory);
     return true;
+}
+
+void Editor::DrawPackageReport()
+{
+    if (!m_PackageReport) {
+        m_ShowPackageReport = false;
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 420.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Package report", &m_ShowPackageReport)) {
+        ImGui::End();
+        return;
+    }
+    const CookReport& r = *m_PackageReport;
+    if (r.Ok())
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Packaged into %s", PathToUtf8(m_PackageOutput).c_str());
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Packaging failed");
+    ImGui::Text("%u raw files (%.2f MB), %u replaced by cooked models", r.rawFiles, r.rawBytes / 1048576.0, r.replacedFiles);
+    ImGui::Text("%u models, %u textures cooked (%.2f MB); pak %.2f MB in %.1f s", r.cookedModels, r.cookedTextures,
+                r.cookedBytes / 1048576.0, r.pakBytes / 1048576.0, r.seconds);
+    if (r.Ok() && ImGui::Button("Show folder"))
+        OpenInFileBrowser(m_PackageOutput);
+    const auto list = [](const char* title, const std::vector<std::string>& lines, const ImVec4& color) {
+        if (lines.empty() || !ImGui::CollapsingHeader(std::format("{} ({})", title, lines.size()).c_str(), ImGuiTreeNodeFlags_DefaultOpen))
+            return;
+        for (const std::string& line : lines)
+            ImGui::TextColored(color, "%s", line.c_str());
+    };
+    list("Errors", r.errors, ImVec4(1.0f, 0.4f, 0.3f, 1.0f));
+    list("Warnings", r.warnings, ImVec4(1.0f, 0.8f, 0.3f, 1.0f));
+    if (!r.entries.empty() && ImGui::CollapsingHeader(std::format("Pak entries ({})", r.entries.size()).c_str()) &&
+        ImGui::BeginTable("##pak", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0.0f, 240.0f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Entry");
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("KB", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableHeadersRow();
+        for (const CookReport::Entry& e : r.entries) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.path.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.kind.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f", e.bytes / 1024.0);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::End();
 }
 
 void Editor::OpenAsset(const fs::path& file)
@@ -1522,6 +1579,12 @@ void Editor::DrawProjectSettings()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Shown while Open Level loads: UI canvases of this scene; a progress bar tagged\n"
                           "\"LoadingProgress\" follows the progress");
+    int saveVersion = static_cast<int>(s.saveVersion);
+    if (ImGui::InputInt("Save version", &saveVersion))
+        s.saveVersion = static_cast<std::uint32_t>(std::clamp(saveVersion, 1, 1 << 30));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Written into every save slot. Raise it when the saved data changes: older slots fire\n"
+                          "\"On Migrate Save Game\" when they are read, newer ones are refused");
     int size[2] = {static_cast<int>(s.windowWidth), static_cast<int>(s.windowHeight)};
     if (ImGui::InputInt2("Window size", size)) {
         s.windowWidth  = static_cast<std::uint32_t>(std::clamp(size[0], 320, 16384));

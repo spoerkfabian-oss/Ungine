@@ -5,6 +5,7 @@
 #include "Editor/ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/ContentCooker.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
@@ -14,6 +15,7 @@
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Core/GameOptions.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
@@ -211,6 +213,8 @@ void Editor::Update(float dt)
         DrawAssets();
     if (m_ShowProjectSettings)
         DrawProjectSettings();
+    if (m_ShowPackageReport)
+        DrawPackageReport();
     if (m_ShowTypes)
         DrawBlueprintTypes();
     if (m_ShowLevels && m_Ctx.streaming)

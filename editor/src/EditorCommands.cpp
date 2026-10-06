@@ -14,6 +14,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Core/GameOptions.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
@@ -662,8 +663,14 @@ void Editor::Play()
     if (m_Ctx.scripts) {
         m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
         if (m_Ctx.project) {
-            m_Ctx.scripts->SetInputMap(m_Ctx.project->settings.input);
             m_Ctx.scripts->SetSaveDirectory(m_Ctx.project->SavedDirectory() / "SaveGames");
+            m_Ctx.scripts->SetSaveVersion(m_Ctx.project->settings.saveVersion);
+            // Options nodes work on the same Settings.json as the development player; while
+            // playing in the editor only the key bindings apply (window / graphics stay the editor's).
+            m_PlayOptions = std::make_unique<GameOptions>(m_Ctx.project->settings, m_Ctx.project->SavedDirectory() / "Settings.json");
+            m_PlayOptions->SetApply([scripts = m_Ctx.scripts](const GameOptions& o) { scripts->SetInputMap(o.Input()); });
+            m_PlayOptions->Changed();
+            m_Ctx.scripts->SetGameOptions(m_PlayOptions.get());
         }
         m_Ctx.scripts->SetCurrentLevel(m_ScenePath.empty() ? std::string()
                                        : m_Ctx.project ? m_Ctx.project->Relative(m_ScenePath)
@@ -752,8 +759,10 @@ void Editor::Stop()
         if (m_Ctx.scene.GetRegistry().Valid(e))
             selected.push_back(UuidOf(e));
 
-    if (m_Ctx.scripts)
+    if (m_Ctx.scripts) {
         m_Ctx.scripts->End(m_Ctx.scene); // EndPlay, spawned models released
+        m_Ctx.scripts->SetGameOptions(nullptr);
+    }
     if (m_Ctx.audio) {
         m_Ctx.audio->End(m_Ctx.scene);
         m_Ctx.audio->SetPaused(false);

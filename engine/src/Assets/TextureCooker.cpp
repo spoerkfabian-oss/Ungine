@@ -1,4 +1,5 @@
 #include "Engine/Assets/TextureCooker.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
 
 #include <bc7decomp.h>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -354,6 +356,15 @@ std::uint64_t LevelBytes(VkFormat format, std::uint32_t width, std::uint32_t hei
     return std::uint64_t{(width + 3) / 4} * ((height + 3) / 4) * info.blockBytes;
 }
 
+std::string TextureCookKey(std::span<const std::byte> source, TextureKind kind, const TextureCookSettings& settings)
+{
+    std::uint64_t       hash    = Fnv1a(source);
+    const std::uint32_t salt[4] = {kCookerVersion, static_cast<std::uint32_t>(kind), settings.compress ? 1u : 0u,
+                                   settings.quality};
+    hash = Fnv1a(std::as_bytes(std::span{salt}), hash);
+    return std::format("{:016x}", hash);
+}
+
 CookResult CookTexture(std::span<const std::byte> source, TextureKind kind, const TextureCookSettings& settings)
 {
     if (source.empty())
@@ -361,14 +372,18 @@ CookResult CookTexture(std::span<const std::byte> source, TextureKind kind, cons
     if (IsKtx2(source))
         return {std::make_shared<TextureImage>(FromKtx2(source, kind, settings.compress)), false};
 
-    // Cache: keyed by the source bytes and everything that shapes the output.
+    // Cooked data of a mounted pak, then the cache: keyed by the source bytes and everything that
+    // shapes the output.
+    const std::string key = TextureCookKey(source, kind, settings);
+    try {
+        if (const std::optional<std::vector<std::byte>> cooked = Vfs::ReadCooked("textures/" + key + ".ktx2"))
+            return {std::make_shared<TextureImage>(ReadKtx2(*cooked)), true, true, false};
+    } catch (const std::exception& e) {
+        ENGINE_WARN("Texture: ignoring cooked data {}: {}", key, e.what());
+    }
     std::filesystem::path cacheFile;
     if (!settings.cacheDirectory.empty()) {
-        std::uint64_t hash = Fnv1a(source);
-        const std::uint32_t salt[4] = {kCookerVersion, static_cast<std::uint32_t>(kind), settings.compress ? 1u : 0u,
-                                       settings.quality};
-        hash      = Fnv1a(std::as_bytes(std::span{salt}), hash);
-        cacheFile = settings.cacheDirectory / std::format("{:016x}.ktx2", hash);
+        cacheFile = settings.cacheDirectory / (key + ".ktx2");
         if (const std::vector<std::byte> cached = ReadWholeFile(cacheFile); !cached.empty()) {
             try {
                 auto image = std::make_shared<TextureImage>(ReadKtx2(cached));
@@ -404,7 +419,7 @@ CookResult CookTexture(std::span<const std::byte> source, TextureKind kind, cons
     auto image = std::make_shared<TextureImage>(Pack(std::move(levels), format, kind, settings.quality));
     if (!cacheFile.empty())
         WriteCacheFile(cacheFile, WriteKtx2(*image));
-    return {std::move(image), false};
+    return {std::move(image), false, false, true}; // encoded just now
 }
 
 // --- KTX2 ---------------------------------------------------------------------------------------

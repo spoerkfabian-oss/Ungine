@@ -1,4 +1,6 @@
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/ContentCooker.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/ThreadPool.h"
@@ -40,24 +42,17 @@ std::u8string ToU8(std::string_view ascii)
     return {ascii.begin(), ascii.end()};
 }
 
-std::vector<std::byte> ReadBytes(const std::filesystem::path& path)
+std::vector<std::byte> ReadBytes(const std::filesystem::path& path) // pak entry or disk file
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    std::optional<std::vector<std::byte>> bytes = Vfs::Read(path);
+    if (!bytes)
         throw std::runtime_error(std::format("cannot open '{}'", ToUtf8(path)));
-    std::vector<std::byte> bytes(static_cast<std::size_t>(file.tellg()));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!file)
-        throw std::runtime_error(std::format("cannot read '{}'", ToUtf8(path)));
-    return bytes;
+    return std::move(*bytes);
 }
 
 std::filesystem::file_time_type ModifiedTime(const std::filesystem::path& path)
 {
-    std::error_code ec;
-    const auto      time = std::filesystem::last_write_time(path, ec);
-    return ec ? std::filesystem::file_time_type::min() : time; // missing: appears as a change later
+    return Vfs::ModifiedTime(path); // missing: min(), appears as a change later
 }
 
 // While a texture loads, materials sample the slot's neutral default; after a failure color
@@ -240,8 +235,15 @@ ModelHandle AssetManager::LoadModel(const std::filesystem::path& path)
         ++e.refCount;
         return {it->second, e.generation};
     }
-    const ModelHandle handle =
-        StartModel(normalized, key, [normalized] { return LoadGltf(normalized); }, /*reloadable*/ true, /*watch*/ true);
+    // A mounted pak's cooked model (already optimized) before the glTF itself.
+    const ModelHandle handle = StartModel(
+        normalized, key,
+        [normalized, meshes = m_Desc.meshes] {
+            if (std::optional<ModelData> cooked = LoadCookedModel(normalized, meshes))
+                return std::move(*cooked);
+            return LoadGltf(normalized);
+        },
+        /*reloadable*/ true, /*watch*/ true);
     m_ModelCache.emplace(std::move(key), handle.index);
     return handle;
 }
@@ -603,6 +605,8 @@ void AssetManager::RunTextureJob(TextureHandle handle, const std::function<std::
     } else {
         try {
             const CookResult    cooked = CookTexture(source(), kind, m_Cook);
+            if (cooked.encoded && Vfs::Mounted()) // a packaged game should not need the encoder
+                ENGINE_WARN("Texture '{}' is not cooked into the pak: encoded while loading", name);
             const TextureImage& image  = *cooked.image;
             result.texture             = std::make_unique<Texture>();
             Texture& texture           = *result.texture;

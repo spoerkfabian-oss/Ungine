@@ -1,4 +1,5 @@
 #include "Engine/Script/ScriptRegistry.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Script/ScriptGraph.h"
 #include "ScriptJson.h"
 
@@ -70,11 +71,11 @@ std::string ToUtf8(const std::filesystem::path& p)
 
 json ReadJson(const std::filesystem::path& file)
 {
-    std::ifstream in(file, std::ios::binary);
-    if (!in)
+    const std::optional<std::string> text = Vfs::ReadText(file); // pak entry or disk
+    if (!text)
         throw std::runtime_error("cannot read '" + ToUtf8(file) + "'");
     try {
-        return json::parse(in);
+        return json::parse(*text);
     } catch (const json::exception& e) {
         throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
     }
@@ -371,10 +372,7 @@ std::vector<std::string> LoadDirectory(const std::filesystem::path& root)
 {
     std::vector<std::string>             problems;
     std::vector<std::filesystem::path>   structFiles;
-    std::error_code                      ec;
-    for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
-         !ec && it != end; it.increment(ec)) {
-        const std::filesystem::path& path = it->path();
+    for (const std::filesystem::path& path : Vfs::ListFiles(root, true)) { // pak entries and disk files
         const std::string            ext  = path.extension().string();
         try {
             if (ext == ".uenum") {
@@ -392,8 +390,7 @@ std::vector<std::string> LoadDirectory(const std::filesystem::path& root)
                 else
                     AddInterface(std::move(i));
             } else if (ext == ".ugraph") { // only libraries (cheap check before parsing the whole graph)
-                std::ifstream in(path, std::ios::binary);
-                const std::string text{std::istreambuf_iterator<char>(in), {}};
+                const std::string text = Vfs::ReadText(path).value_or(std::string());
                 if (text.find("\"library\"") != std::string::npos) {
                     ScriptGraph graph = ScriptGraphFromJson(text);
                     if (graph.library) {

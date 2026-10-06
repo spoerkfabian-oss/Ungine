@@ -14,6 +14,7 @@ namespace Engine {
 class AssetManager;
 class AudioSystem;
 class LevelStreamer;
+class GameOptions;
 class Input;
 class PhysicsWorld;
 class Scene;
@@ -103,6 +104,7 @@ public:
     [[nodiscard]] virtual AssetManager* Assets() = 0;     // may be null
     [[nodiscard]] virtual AudioSystem*  Audio() = 0;      // may be null
     [[nodiscard]] virtual LevelStreamer* Streaming() = 0;  // may be null (no level streaming)
+    [[nodiscard]] virtual GameOptions*   Options() = 0;    // may be null (no user options, e.g. tools)
     [[nodiscard]] virtual const Input*  GetInput() = 0;   // null while the game does not have the input
     // A variable of this instance: the running function's locals first, then the graph's. Null:
     // no such variable.
@@ -157,6 +159,9 @@ public:
     virtual bool               SaveDelete(const std::string& slot) = 0;
 
     [[nodiscard]] virtual std::vector<std::string> SaveSlots() = 0; // slots with a file (names, sorted)
+    // Save game versions: the game's current one (project setting) and a slot's (nullopt: no slot).
+    [[nodiscard]] virtual std::uint32_t                SaveVersion() const                      = 0;
+    [[nodiscard]] virtual std::optional<std::uint32_t> SaveSlotVersion(const std::string& slot) = 0;
     // Runs the construction scripts of the entity and its children now (spawned prefabs).
     virtual void Construct(Entity root) = 0;
 

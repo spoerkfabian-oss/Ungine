@@ -42,6 +42,7 @@ public:
     void SetTitle(const std::string& title) const;
     void SetCursorCaptured(bool captured) const; // hidden + raw motion (FPS-style look)
     void SetFullscreen(bool fullscreen);          // primary monitor <-> the last windowed placement
+    void SetSize(int width, int height);          // windowed size (in fullscreen: used when leaving it)
     [[nodiscard]] bool IsFullscreen() const;
     // RGBA8 icons of different sizes (the system picks one). The engine icon is set by default.
     struct Icon {

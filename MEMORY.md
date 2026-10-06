@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-06
+- Last updated: 2026-10-06 (Phase 25 implemented and verified locally; PR pending)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -69,7 +69,8 @@ Current intended structure:
 Ungine/
 - apps/
   - editor/
-  - player/
+  - player/ (main.cpp, OptionsMenu.h)
+  - cook/ (UngineCook: command-line packaging)
   - sandbox/
 - engine/
   - include/Engine/
@@ -125,6 +126,7 @@ Warning policy:
 - Warning regressions are treated as build failures.
 
 Packaging:
+- a game: Build → Package project… in the editor (Package report window) or `UngineCook <project> <out> [--pak-only]` → player, shaders/, project file, Content.upak, BuildReport.txt
 - cpack -C Release
 - Windows can produce NSIS and ZIP packages.
 - Linux produces a tarball and desktop integration script.
@@ -794,6 +796,16 @@ Defects found and fixed while doing it:
 - Activation failure of a streamed level now releases its models.
 - Prefab Apply could write the same prefab UUID twice (unreadable prefab file): an entity created into the prefab keeps its own UUID as prefab UUID; moved below another instance whose member has that UUID as source, the dedup fell back to the entity's own (already used) UUID. Now a fresh UUID is chosen. Found by the capped prefab fuzz in CI (Clang, timing-dependent); deterministic regression test `Lifecycle_ApplyWithForeignMemberKeepsPrefabUuidsUnique` (red before, green after).
 
+### Phase 25 cooked builds, savegame versions, options (2026-10-06)
+Technical details: CLAUDE.md "Gekochte Builds, Savegame-Versionen, Optionen (Phase 25)".
+
+- `Core/FileSystem.h`: pak format v1 (one uncompressed file, index at the end, FNV-1a 64 per entry + index), `PakWriter`/`PakFile`, `Vfs::Mount` (paths below the root come from the pak; ":cooked/" entries for cooked data). Every content reader goes through the VFS (assets, glTF, scenes, prefabs, blueprints, script registry, sounds incl. streaming via miniaudio `ma_vfs`).
+- `Assets/ContentCooker.h`: everything below Content/ into the pak; glTF/GLB cooked as binary `ModelData` after optimization/LODs (raw model files left out), textures as KTX2 BC7/BC5 under their cook key, the rest raw; missing references reported; reproducible. The runtime prefers cooked models/textures; encoding with a mounted pak logs "not cooked into the pak".
+- `PackageProject` now cooks `Content.upak` + `BuildReport.txt` (no Content/ folder); `UngineCook` CLI; editor Package report window; player mounts `<root>/Content.upak`.
+- Savegames: `ProjectSettings::saveVersion`; older slots fire `Event.MigrateSaveGame`, newer slots are refused (not read, not overwritten); nodes Slot Version / Game Version.
+- `Core/GameOptions.h`: per-user `Settings.json` (graphics, bus volumes, remapped bindings); player options menu (Graphics/Audio/Controls with key capture, conflict hint, paging, resets), `Renderer::SetVSync`, `Window::SetSize`; Blueprint Options/Remap nodes; editor Play applies only the remapped input.
+- Tests: CPU `tests/CookTests.cpp` (5 cases), GPU editor package-report check, smokes `SmokePackageSetup` + `UnginePackagedPlayerSmoke` (Basic level-switch project with a textured model, played from the pak).
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -835,11 +847,11 @@ Blueprint:
 - restricted nested containers
 - Open Level in editor Play mode is synchronous (the player loads in the background with a loading screen)
 - level streaming: a level's entities are created in one frame (spike for big levels), box volumes only (no priorities/budgets), sub-level renderer/physics settings ignored, a sub-level's primary camera can take over, a file is loaded at most once, UUID collisions with the main scene get new UUIDs, only script entity variables/overrides resolve late, previews are read-only (edit the level by opening it), no automatic reload of a loaded level, Open Level drops running sub-levels
-- unversioned save slots
+- save slots: migration only through the Blueprint event (no schema), the save version is a manually raised project integer
 - documented construction-script semantics
 
 Editor:
-- in-game UI is rendered in the editor viewport but interaction is currently available only in the player; pause-menu options are session-only and input remapping is not implemented
+- player options: the menu shows/remaps only an action's first key (more via Blueprint), no resolution/monitor choice, no gamepad bindings, axis remap changes keys only (scale kept), graphics options cap the level settings and apply only in the player (editor Play applies only the input bindings)
 - some interaction testing is manual
 - Content import supports GLB, glTF with local URI dependencies, PNG/JPEG/KTX2 and WAV/OGG/MP3/FLAC; other formats and remote glTF dependencies are unsupported
 - asset previews are asynchronous and cached through AssetManager; model geometry is shown as a bounded wireframe, materials as base-color/metallic/roughness swatches, and streamed audio has no decoded waveform
@@ -852,8 +864,12 @@ Audio:
 - simple reverb
 
 Packaging:
-- content is currently packaged relatively raw
-- no full cooked/pak distribution pipeline
+- the pak is uncompressed and unsigned (hashes only detect corruption); entries are read whole into memory (except streamed sounds)
+- source images (PNG/JPEG) also ship raw in the pak (the cook key is the hash of the source bytes); model textures outside Content/ are missing in the game (warning)
+- always everything below Content/ (no exclusion list); shaders ship as a folder
+- models are re-optimized on every cook (only textures are cached); editor packaging is synchronous
+- cooked models need identical MeshOptimizeSettings in cooker and player (otherwise the missing glTF is loaded → load error)
+- reference checks only for scenes/prefabs (not for paths in Blueprint pins); unreferenced images are cooked as color
 
 ## 21. Open audit priorities
 
@@ -933,7 +949,7 @@ User-approved work plan (2026-10-05, after PR #12 merged the build repair; main 
 
 Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
 
-Status 2026-10-06: Phase A merged (PR #13); Phase 24 done on `branch`, PR #14 open. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
+Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 implemented and verified locally (section 18); PR #15 from `branch`, drive CI green, then wait for the user's merge; next Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – ask the user about its open decisions first. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
 
 For every concrete issue:
 - patch branch
@@ -953,4 +969,5 @@ If an audit finds no concrete defect:
 - They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. PR #12 merged it on 2026-10-05 (merge 181cfc6); main is green.
 - Phase A added GPU tests for skinning (model, duplicate, prefab instances), runtime UI drawing and editor Play-mode interaction, content import and reference repair; import previews (thumbnails, waveforms) still have no dedicated test.
 - Phase A merged as PR #13 (2026-10-06).
-- Phase 24 (level/area streaming) implemented and verified locally (section 18); PR #14, CI must be green (incl. GPU suite and MSVC) before the user merges. Next: Phase 25 after that merge.
+- Phase 24 (level/area streaming) merged as PR #14.
+- Phase 25 (cooked builds, savegame versions, options/remapping) implemented and verified locally (section 18); PR #15 open, CI must be green before the user merges.

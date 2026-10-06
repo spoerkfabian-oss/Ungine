@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Engine {
@@ -29,10 +30,19 @@ struct TextureCookSettings {
 
 struct CookResult {
     std::shared_ptr<const TextureImage> image;
-    bool                                cacheHit = false;
+    bool                                cacheHit = false; // from the cache directory or a pak
+    bool                                packed   = false; // cooked data of a mounted pak
+    bool                                encoded  = false; // decoded + mipmapped + compressed just now
 };
 
-// PNG / JPEG / KTX2 bytes -> GPU-ready image with mips (CPU box filter, linear-space for sRGB,
+// Identifies the cooked result of `source` for `kind` and the settings that shape it (not the
+// cache directory): 16 hex digits. Cache files are "<key>.ktx2"; paks hold ":cooked/textures/<key>.ktx2".
+[[nodiscard]] std::string TextureCookKey(std::span<const std::byte> source, TextureKind kind,
+                                         const TextureCookSettings& settings);
+
+// PNG / JPEG / KTX2 bytes -> GPU-ready image with mips. Looks into the mounted paks' cooked
+// textures and the cache directory first.
+// Encoding: CPU box filter, linear-space for sRGB,
 // renormalized for normal maps) in the kind's format. KTX2 input is used as it is (decompressed
 // to RGBA8 when compression is off). Thread-safe; throws std::runtime_error on bad input.
 [[nodiscard]] CookResult CookTexture(std::span<const std::byte> source, TextureKind kind,

@@ -35,6 +35,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Reproduzierbarer Cook-Schritt für Assets, gepackte Laufzeitdaten und selektive Einbeziehung von Content.
 - Player startet aus gepackten Daten ohne Import-Kochen; Build-Bericht und klare Fehler bei fehlenden Assets.
 - Versionierte Savegames mit Migration/Kompatibilitätsprüfung; Optionsspeicherung inklusive Input-Remapping.
+- Fortschritt (2026-10-06): umgesetzt und lokal verifiziert – virtuelles Dateisystem mit einer unkomprimierten Pak-Datei (Index + FNV-Hashes, reproduzierbar), Cooker (Modelle als Binär-Mesh nach Optimierung/LODs, Texturen als KTX2 BC7/BC5, Rest roh, Build-Bericht mit fehlenden Referenzen), `UngineCook` + Editor-Paketierung mit Bericht, Player lädt aus `Content.upak`; Savegames mit Projekt-Save-Version (Migrate-Save-Game-Event, neuere Slots abgelehnt); Optionsmenü (Grafik/Audio/Steuerung mit Remapping) pro Benutzer gespeichert + Blueprint-API. Grenzen in CLAUDE.md, Offene Punkte 19.
 
 ### Phase 26 – Physik- und Character-Werkzeuge
 - Joints/Constraints mit Grenzwerten, Motoren und serialisierbaren Parametern.

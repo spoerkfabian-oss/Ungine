@@ -1,7 +1,9 @@
-# cmake -DTEMPLATE=<templates/X> -DDIR=<out dir> -DNAME=<name> [-DLEVEL_SWITCH=ON] -P MakeProject.cmake
+# cmake -DTEMPLATE=<templates/X> -DDIR=<out dir> -DNAME=<name> [-DLEVEL_SWITCH=ON] [-DMODEL=<file.glb>] -P MakeProject.cmake
 # A project from a template, like Project::Create (for the app smoke tests).
 # LEVEL_SWITCH (Basic template): starts in a small scene whose Blueprint opens the Annex level
 # after a short delay, with a custom loading screen (progress bar tagged "LoadingProgress").
+# MODEL (Basic template): copied to Content/Models and placed in the Annex level (textured content
+# for the packaging smoke test).
 file(REMOVE_RECURSE "${DIR}")
 file(MAKE_DIRECTORY "${DIR}/Saved")
 file(COPY "${TEMPLATE}/Content" DESTINATION "${DIR}")
@@ -50,6 +52,17 @@ if(LEVEL_SWITCH)
   ]
 }
 ]=])
+endif()
+if(MODEL)
+    get_filename_component(model_name "${MODEL}" NAME)
+    file(COPY "${MODEL}" DESTINATION "${DIR}/Content/Models")
+    set(annex "${DIR}/Content/Scenes/Annex.scene.json")
+    file(READ "${annex}" scene)
+    string(JSON count LENGTH "${scene}" entities)
+    string(JSON scene SET "${scene}" entities ${count} "{\"uuid\": 9001, \"parent\": 0, \"name\": \"Packaged Model\",
+        \"transform\": {\"position\": [0, 1, -3], \"rotation\": [0, 0, 0, 1], \"scale\": [1, 1, 1]},
+        \"mesh\": {\"model\": {\"file\": \"../Models/${model_name}\"}, \"index\": 0}}")
+    file(WRITE "${annex}" "${scene}")
 endif()
 file(WRITE "${DIR}/${NAME}.ungineproj" "{
   \"version\": 1,

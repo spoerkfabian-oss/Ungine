@@ -1,5 +1,8 @@
 #include "Engine/Audio/Sound.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Platform.h"
+
+#include "SoundFile.h"
 
 #include <miniaudio.h>
 
@@ -9,6 +12,8 @@
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <optional>
 #include <numbers>
 #include <random>
 #include <stdexcept>
@@ -33,14 +38,95 @@ struct Decoder {
     }
 };
 
+// miniaudio file access through Vfs: a pak entry's byte range or a disk file. The path handed to
+// ma_decoder_init_vfs is UTF-8 (also on Windows).
+struct VfsHandle {
+    std::ifstream file;
+    std::uint64_t offset   = 0;
+    std::uint64_t size     = 0;
+    std::uint64_t position = 0;
+};
+
+ma_result VfsOpen(ma_vfs*, const char* path, ma_uint32 openMode, ma_vfs_file* out)
+{
+    if (!out || (openMode & MA_OPEN_MODE_WRITE) != 0)
+        return MA_INVALID_ARGS;
+    try {
+        const std::optional<Vfs::Location> location = Vfs::Locate(PathFromUtf8(path));
+        if (!location)
+            return MA_DOES_NOT_EXIST;
+        auto handle = std::make_unique<VfsHandle>();
+        handle->file.open(location->file, std::ios::binary);
+        if (!handle->file)
+            return MA_ACCESS_DENIED;
+        handle->offset = location->offset;
+        handle->size   = location->size;
+        *out           = handle.release();
+        return MA_SUCCESS;
+    } catch (...) {
+        return MA_ERROR;
+    }
+}
+
+ma_result VfsOpenW(ma_vfs*, const wchar_t*, ma_uint32, ma_vfs_file*) { return MA_NOT_IMPLEMENTED; }
+
+ma_result VfsClose(ma_vfs*, ma_vfs_file file)
+{
+    delete static_cast<VfsHandle*>(file);
+    return MA_SUCCESS;
+}
+
+ma_result VfsRead(ma_vfs*, ma_vfs_file file, void* dst, size_t bytes, size_t* read)
+{
+    VfsHandle&          h    = *static_cast<VfsHandle*>(file);
+    const std::uint64_t left = h.position < h.size ? h.size - h.position : 0;
+    const std::size_t   want = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, left));
+    std::size_t         got  = 0;
+    if (want > 0) {
+        h.file.clear();
+        h.file.seekg(static_cast<std::streamoff>(h.offset + h.position));
+        h.file.read(static_cast<char*>(dst), static_cast<std::streamsize>(want));
+        got = static_cast<std::size_t>(h.file.gcount());
+        h.position += got;
+    }
+    if (read)
+        *read = got;
+    return got == 0 && bytes > 0 ? MA_AT_END : MA_SUCCESS;
+}
+
+ma_result VfsWrite(ma_vfs*, ma_vfs_file, const void*, size_t, size_t*) { return MA_ACCESS_DENIED; }
+
+ma_result VfsSeek(ma_vfs*, ma_vfs_file file, ma_int64 offset, ma_seek_origin origin)
+{
+    VfsHandle&         h    = *static_cast<VfsHandle*>(file);
+    const std::int64_t base = origin == ma_seek_origin_start ? 0
+                            : origin == ma_seek_origin_end   ? static_cast<std::int64_t>(h.size)
+                                                             : static_cast<std::int64_t>(h.position);
+    const std::int64_t target = base + offset;
+    if (target < 0)
+        return MA_INVALID_ARGS;
+    h.position = static_cast<std::uint64_t>(target);
+    return MA_SUCCESS;
+}
+
+ma_result VfsTell(ma_vfs*, ma_vfs_file file, ma_int64* cursor)
+{
+    *cursor = static_cast<ma_int64>(static_cast<VfsHandle*>(file)->position);
+    return MA_SUCCESS;
+}
+
+ma_result VfsInfo(ma_vfs*, ma_vfs_file file, ma_file_info* info)
+{
+    info->sizeInBytes = static_cast<VfsHandle*>(file)->size;
+    return MA_SUCCESS;
+}
+
+ma_vfs_callbacks g_SoundVfs{VfsOpen, VfsOpenW, VfsClose, VfsRead, VfsWrite, VfsSeek, VfsTell, VfsInfo};
+
 void OpenFile(Decoder& d, const fs::path& file)
 {
     const ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0); // native channels / rate
-#ifdef _WIN32
-    const ma_result result = ma_decoder_init_file_w(file.c_str(), &config, &d.decoder);
-#else
-    const ma_result result = ma_decoder_init_file(file.c_str(), &config, &d.decoder);
-#endif
+    const ma_result         result = InitFileDecoder(file, config, d.decoder);
     if (result != MA_SUCCESS)
         throw std::runtime_error("'" + PathToUtf8(file) + "': cannot decode (" + ResultText(result) + ")");
     d.open = true;
@@ -79,6 +165,11 @@ std::string Lower(std::string s)
 }
 
 } // namespace
+
+ma_result InitFileDecoder(const fs::path& file, const ma_decoder_config& config, ma_decoder& decoder)
+{
+    return ma_decoder_init_vfs(&g_SoundVfs, PathToUtf8(file).c_str(), &config, &decoder);
+}
 
 SoundData LoadSoundFile(const fs::path& file, SoundLoadMode mode)
 {

@@ -4,6 +4,7 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Core/GameOptions.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/LevelStreaming.h"
@@ -462,6 +463,10 @@ std::vector<NodeDesc> BuildRegistry()
               "A streamed level was added to the scene (Level: its file, relative to the project)"));
     add(Event("Event.LevelUnloaded", "On Level Unloaded", {Out("Level", P::String)},
               "A streamed level was removed from the scene"));
+    add(Event("Event.MigrateSaveGame", "On Migrate Save Game",
+              {Out("Slot", P::String), Out("From Version", P::Int), Out("To Version", P::Int)},
+              "A save slot of an older save version (project settings) was just read: convert its values with "
+              "Get / Set Save Value (the slot then counts as current; Save Game to Slot writes the new version)"));
     add(Event("Event.UIClicked", "On UI Clicked", {}, "An interactive UI button was clicked"));
     add(Event("Event.UIValueChanged", "On UI Value Changed", {Out("Value", P::Float)},
               "A UI slider value changed"));
@@ -2200,6 +2205,19 @@ std::vector<NodeDesc> BuildRegistry()
         add(WithDefaults(Pure("SaveGame.Exists", "Does Save Slot Exist", "Save Game", {In("Slot", P::String), Out("Exists", P::Bool)},
                               [](ScriptContext& c) { c.Out(1, c.SaveExists(c.InString(0))); }, "Is there a file for the slot?"),
                          {{"Slot", std::string("Save1")}}));
+        add(WithDefaults(Pure("SaveGame.SlotVersion", "Get Save Slot Version", "Save Game",
+                              {In("Slot", P::String), Out("Version", P::Int), Out("Exists", P::Bool), Out("Compatible", P::Bool)},
+                              [](ScriptContext& c) {
+                                  const std::optional<std::uint32_t> v = c.SaveSlotVersion(c.InString(0));
+                                  c.Out(1, static_cast<std::int32_t>(v.value_or(0)));
+                                  c.Out(2, v.has_value());
+                                  c.Out(3, v.has_value() && *v <= c.SaveVersion());
+                              }, "The save version the slot was written with; Compatible: this game can load it "
+                                 "(older slots are migrated)"),
+                         {{"Slot", std::string("Save1")}}));
+        add(Pure("SaveGame.GameVersion", "Get Save Game Version", "Save Game", {Out("Version", P::Int)},
+                 [](ScriptContext& c) { c.Out(0, static_cast<std::int32_t>(c.SaveVersion())); },
+                 "The game's current save version (project settings)"));
         const auto variables = [&](const char* type, const char* title, bool save, const char* tooltip) {
             add(WithDefaults(Action(type, title, "Save Game", {In("Slot", P::String), In("Prefix", P::String), Out("Success", P::Bool)},
                                     [save](ScriptContext& c) {
@@ -2224,6 +2242,124 @@ std::vector<NodeDesc> BuildRegistry()
                   "Stores all variables of this script (keys Prefix + name; entities by UUID) and writes the slot");
         variables("SaveGame.LoadVariables", "Load Variables", false,
                   "Reads the slot and sets this script's variables stored by Save Variables");
+    }
+
+    // Options: the player's own settings (stored per user; the player's Options menu shows the same).
+    {
+        const auto options = [](ScriptContext& c) -> GameOptions* {
+            GameOptions* o = c.Options();
+            if (!o)
+                c.Error("No game options here (only in the player and while playing in the editor)");
+            return o;
+        };
+        const auto setter = [&](const char* type, const char* title, PinInfo value, auto apply, const char* tooltip) {
+            add(Action(type, title, "Options", {std::move(value)}, [options, apply](ScriptContext& c) {
+                if (GameOptions* o = options(c)) {
+                    apply(c, o->Edit());
+                    o->Changed();
+                }
+            }, tooltip));
+        };
+        setter("Options.SetFullscreen", "Set Fullscreen", In("Fullscreen", P::Bool),
+               [](ScriptContext& c, UserSettings& u) { u.fullscreen = c.InBool(2); }, "Fullscreen or windowed");
+        setter("Options.SetVSync", "Set VSync", In("VSync", P::Bool),
+               [](ScriptContext& c, UserSettings& u) { u.vsync = c.InBool(2); }, "Wait for the display (no tearing)");
+        setter("Options.SetShadowQuality", "Set Shadow Quality", In("Quality", P::Int),
+               [](ScriptContext& c, UserSettings& u) { u.shadowQuality = static_cast<std::uint32_t>(std::clamp(c.InInt(2), 0, 3)); },
+               "0 off, 1 low, 2 medium, 3 high");
+        setter("Options.SetAmbientOcclusion", "Set Ambient Occlusion", In("Enabled", P::Bool),
+               [](ScriptContext& c, UserSettings& u) { u.ambientOcclusion = c.InBool(2); }, "Screen-space ambient occlusion");
+        setter("Options.SetBloom", "Set Bloom", In("Enabled", P::Bool),
+               [](ScriptContext& c, UserSettings& u) { u.bloom = c.InBool(2); }, "Glow around bright areas");
+        add(Pure("Options.GetGraphics", "Get Graphics Options", "Options",
+                 {Out("Fullscreen", P::Bool), Out("VSync", P::Bool), Out("Shadow Quality", P::Int), Out("Ambient Occlusion", P::Bool),
+                  Out("Bloom", P::Bool)},
+                 [options](ScriptContext& c) {
+                     const UserSettings u = options(c) ? c.Options()->Values() : UserSettings{};
+                     c.Out(0, u.fullscreen);
+                     c.Out(1, u.vsync);
+                     c.Out(2, static_cast<std::int32_t>(u.shadowQuality));
+                     c.Out(3, u.ambientOcclusion);
+                     c.Out(4, u.bloom);
+                 }, "The current graphics options"));
+        add(busParam(WithDefaults(Action("Options.SetVolume", "Set Volume Option", "Options", {In("Volume", P::Float)},
+                                         [options, bus](ScriptContext& c) {
+                                             if (GameOptions* o = options(c)) {
+                                                 o->Edit().audio.volume[static_cast<std::size_t>(bus(c, AudioBus::Music))] =
+                                                     std::clamp(c.InFloat(2), 0.0f, 4.0f);
+                                                 o->Changed();
+                                             }
+                                         }, "A mixer bus volume the player chose (kept by Save Options)"),
+                                  {{"Volume", 1.0f}}),
+                     "music"));
+        add(busParam(Pure("Options.GetVolume", "Get Volume Option", "Options", {Out("Volume", P::Float)},
+                          [options, bus](ScriptContext& c) {
+                              c.Out(0, options(c) ? c.Options()->Values().audio.volume[static_cast<std::size_t>(bus(c, AudioBus::Music))]
+                                                  : 1.0f);
+                          }, "A mixer bus volume of the options"),
+                     "music"));
+        add(Action("Options.Save", "Save Options", "Options", {Out("Success", P::Bool)},
+                   [options](ScriptContext& c) { c.Out(2, options(c) && c.Options()->Save()); },
+                   "Writes the options (they are loaded again at the next start)"));
+        add(Action("Options.Reset", "Reset Options", "Options", {}, [options](ScriptContext& c) {
+            if (GameOptions* o = options(c)) {
+                o->ResetToDefaults();
+                o->Changed();
+            }
+        }, "Back to the project's defaults (including key bindings)"));
+
+        // Key remapping (input actions of the project settings).
+        add(WithParam(WithDefaults(Action("Input.RemapAction", "Remap Input Action", "Input",
+                                          {In("Index", P::Int), In("Key", P::String), Out("Success", P::Bool),
+                                           Out("Conflicts", P::StringArray)},
+                                          [options](ScriptContext& c) {
+                                              GameOptions*      o   = options(c);
+                                              const std::string key = c.InString(3);
+                                              const bool known = key.empty() || std::ranges::find(KeyNames(), key) != KeyNames().end();
+                                              if (o && !known)
+                                                  c.Error("Unknown key '" + key + "'");
+                                              const bool ok = o && known && o->RemapAction(c.Param(), static_cast<std::size_t>(std::max(c.InInt(2), 0)), key);
+                                              if (ok)
+                                                  o->Changed();
+                                              std::vector<ScriptValue> conflicts;
+                                              if (ok)
+                                                  for (std::string& n : o->Conflicts(key, c.Param()))
+                                                      conflicts.emplace_back(std::move(n));
+                                              c.Out(4, ok);
+                                              c.Out(5, MakeArray(P::String, std::move(conflicts)));
+                                          }, "Binds key Index of the action (Index = key count: adds one; empty Key: removes it); "
+                                             "Conflicts: other actions / axes using the key"),
+                                   {{"Key", std::string("Space")}}),
+                      ParamKind::InputAction, "Action", "Jump"));
+        add(WithParam(Pure("Input.GetActionKeys", "Get Action Keys", "Input", {Out("Keys", P::StringArray)},
+                           [options](ScriptContext& c) {
+                               std::vector<ScriptValue> keys;
+                               const InputMap map = c.Options() ? c.Options()->Input() : c.Inputs();
+                               if (const InputActionBinding* a = map.FindAction(c.Param()))
+                                   for (const std::string& k : a->keys)
+                                       keys.emplace_back(k);
+                               c.Out(0, MakeArray(P::String, std::move(keys)));
+                               (void)options;
+                           }, "The keys bound to the action (with the player's remapping)"),
+                      ParamKind::InputAction, "Action", "Jump"));
+        add(Action("Input.ResetBindings", "Reset Key Bindings", "Input", {}, [options](ScriptContext& c) {
+            if (GameOptions* o = options(c)) {
+                o->ResetInput();
+                o->Changed();
+            }
+        }, "Back to the project's key bindings"));
+        add(Pure("Input.AnyKeyPressed", "Get Pressed Key", "Input", {Out("Key", P::String), Out("Pressed", P::Bool)},
+                 [](ScriptContext& c) {
+                     std::string key;
+                     if (const Input* in = c.GetInput())
+                         for (const std::string& name : KeyNames())
+                             if (QueryKey(*in, name, KeyQuery::Pressed)) {
+                                 key = name;
+                                 break;
+                             }
+                     c.Out(0, key);
+                     c.Out(1, !key.empty());
+                 }, "A key (or mouse button) that went down this frame: for \"press a key\" remapping screens"));
     }
 
     // Levels.

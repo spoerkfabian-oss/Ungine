@@ -9,6 +9,12 @@ target_link_libraries(UnginePlayer PRIVATE Engine)
 add_executable(Sandbox sandbox/main.cpp)
 target_link_libraries(Sandbox PRIVATE Engine Editor)
 
+# Command-line packaging (cooked Content.upak); a console tool, no window.
+add_executable(UngineCook cook/main.cpp)
+target_link_libraries(UngineCook PRIVATE Engine)
+engine_set_warnings(UngineCook)
+set_target_properties(UngineCook PROPERTIES FOLDER "Apps")
+
 foreach(app UngineEditor UnginePlayer Sandbox)
     engine_set_warnings(${app})
     set_target_properties(${app} PROPERTIES FOLDER "Apps" VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -21,8 +27,8 @@ foreach(app UngineEditor UnginePlayer Sandbox)
 endforeach()
 
 # --- Install layout (relative, so the tools find their data next to the executables) ---
-#   bin/UngineEditor, bin/UnginePlayer, bin/shaders/*.spv, bin/templates/, bin/samples/, bin/resources/
-install(TARGETS UngineEditor UnginePlayer RUNTIME DESTINATION bin)
+#   bin/UngineEditor, bin/UnginePlayer, bin/UngineCook, bin/shaders/*.spv, bin/templates/, bin/samples/, bin/resources/
+install(TARGETS UngineEditor UnginePlayer UngineCook RUNTIME DESTINATION bin)
 install(DIRECTORY "${ENGINE_SHADER_OUTPUT_DIR}/" DESTINATION bin/shaders FILES_MATCHING PATTERN "*.spv")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/templates/" DESTINATION bin/templates)
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/models" "${CMAKE_SOURCE_DIR}/assets/scripts" "${CMAKE_SOURCE_DIR}/assets/sounds"

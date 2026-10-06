@@ -46,7 +46,8 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
 5. **Play** (Strg+P) simuliert Physik und Blueprints im Editor; *Stop* stellt die Szene wieder her.
 6. **Build → Build & Run** (Strg+B) speichert alles und startet das Spiel im **UnginePlayer**;
    **Build → Package project…** erzeugt einen eigenständigen Spielordner (`<Name>.exe`, Shader,
-   Projekt, Content).
+   Projekt, `Content.upak` = gekochter Inhalt, `BuildReport.txt`); das Fenster *Package report*
+   zeigt Warnungen (fehlende Referenzen) und Fehler. Ohne Editor: `UngineCook <projekt> <ziel>`.
 7. Der Player rendert durch die primäre **Camera**-Komponente der Startszene (*File → Project
    settings…*). Im Editor zeigt *Game cam* diese Sicht.
 8. **Audio**: Sounds (WAV/OGG/MP3/FLAC) nach `Content/` kopieren. Doppelklick im Content-Browser
@@ -91,8 +92,7 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     viewport. Text, images, panels, buttons, checkboxes, sliders and progress bars are supported.
     Buttons and values can raise Blueprint events (On UI Clicked, On UI Value Changed,
     On UI Checked Changed). The standalone player opens its pause menu with Escape and supports
-    keyboard, mouse and mapped gamepad navigation; Options currently control music volume and
-    fullscreen for the current session.
+    keyboard, mouse and mapped gamepad navigation.
 14. **Level-Streaming**: Hierarchy → *+ Add* → *Streaming Volume*, im Inspector die Level-Datei
     wählen (*Browse…*). Im Spiel wird das Sub-Level additiv geladen, sobald die Kamera (bzw. eine
     Entity mit *Streaming Source*) in der Box ist, und nach Verlassen der Box plus *Unload margin*
@@ -102,6 +102,12 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     bearbeitet wird ein Level durch Öffnen seiner Datei). *Open Level* lädt im Player im Hintergrund
     hinter einem Ladebildschirm: eigene Gestaltung über *Project Settings → Loading screen* (Szene mit
     UI-Canvas; ein Fortschrittsbalken mit dem Tag `LoadingProgress` zeigt den Fortschritt).
+15. **Optionen & Spielstände**: Das Pause-Menü des Players (Escape) hat *Options* mit Grafik
+    (Vollbild, VSync, Schattenqualität, AO, Bloom), Audio (Bus-Lautstärken) und Steuerung (Tasten
+    neu belegen inkl. Konflikt-Hinweis, Zurücksetzen); gespeichert pro Benutzer (`Settings.json`).
+    Blueprints: Kategorie *Options* und *Input → Remap Action*. *Project Settings → Save version*
+    versioniert Spielstände: ältere Slots lösen beim Laden das Event *Migrate Save Game* aus,
+    Slots einer neueren Spielversion werden abgelehnt (nicht gelesen, nicht überschrieben).
 
 
 ## Entwicklung

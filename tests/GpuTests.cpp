@@ -7,6 +7,7 @@
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Animation.h"
+#include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Platform.h"
@@ -1779,7 +1780,9 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
         CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
         CHECK(!editor.BuildAndRun()); // no UnginePlayer next to the test executable: reported, no crash
-        runFrames(3);                 // content browser, project menus
+        // Packaging without a player fails the same way; the report window shows why.
+        CHECK(!editor.PackageProject(root / "Package") && editor.PackageReport() && !editor.PackageReport()->Ok());
+        runFrames(3); // content browser, project menus, package report
         editor.NewScene();
     }
     for (ModelHandle h : modelRefs)

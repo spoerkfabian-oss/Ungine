@@ -1,4 +1,5 @@
 #include "Engine/Scene/Prefab.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Scene/Components.h"
@@ -91,13 +92,13 @@ json Canonical(const json& source, Scene& scratch)
 std::shared_ptr<const PrefabAsset> ParsePrefab(const std::string& file, std::filesystem::file_time_type mtime,
                                                std::uintmax_t size)
 {
-    const std::filesystem::path path = FromUtf8(file);
-    std::ifstream               in(path, std::ios::binary);
-    if (!in)
+    const std::filesystem::path      path = FromUtf8(file);
+    const std::optional<std::string> text = Vfs::ReadText(path); // pak entry or disk
+    if (!text)
         throw std::runtime_error("cannot read '" + file + "'");
     json root;
     try {
-        root = json::parse(in);
+        root = json::parse(*text);
     } catch (const json::exception& e) {
         throw std::runtime_error("'" + file + "': " + e.what());
     }
@@ -142,14 +143,14 @@ std::shared_ptr<const PrefabAsset> LoadPrefab(const std::string& file, std::stri
 {
     const std::string           key  = NormalizedFile(FromUtf8(file));
     const std::filesystem::path path = FromUtf8(key);
-    std::error_code             ec;
-    const auto                  mtime = std::filesystem::last_write_time(path, ec);
-    const std::uintmax_t        size  = ec ? 0 : std::filesystem::file_size(path, ec);
-    if (ec) {
+    const std::optional<Vfs::Location> location = Vfs::Locate(path); // pak entry or disk file
+    if (!location) {
         if (error)
-            *error = "cannot read '" + key + "': " + ec.message();
+            *error = "cannot read '" + key + "': not found";
         return nullptr;
     }
+    const auto           mtime = Vfs::ModifiedTime(path);
+    const std::uintmax_t size  = location->size;
     PrefabCache&     cache = Cache();
     std::scoped_lock lock(cache.mutex);
     auto&            slot = cache.entries[key];

@@ -1,4 +1,5 @@
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -991,11 +992,11 @@ std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::pat
     prepared->file    = file;
     prepared->baseDir = std::filesystem::absolute(file).parent_path();
     {
-        std::ifstream in(file, std::ios::binary);
-        if (!in)
+        const std::optional<std::string> text = Vfs::ReadText(file); // pak entry or disk
+        if (!text)
             throw std::runtime_error("cannot read '" + ToUtf8(file) + "'");
         try {
-            prepared->root = json::parse(in);
+            prepared->root = json::parse(*text);
         } catch (const json::exception& e) {
             throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
         }
@@ -1046,11 +1047,11 @@ std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::pat
             prefabFile = prepared->baseDir / prefabFile;
         if (!prefabs.insert(ToUtf8(prefabFile.lexically_normal())).second)
             continue;
-        std::ifstream in(prefabFile, std::ios::binary);
-        if (!in)
+        const std::optional<std::string> text = Vfs::ReadText(prefabFile);
+        if (!text)
             continue; // instantiating reports it (or keeps the instance unresolved)
         try {
-            const json prefabJson = json::parse(in);
+            const json prefabJson = json::parse(*text);
             if (const auto list = prefabJson.find("entities"); list != prefabJson.end() && list->is_array())
                 for (const json& member : *list)
                     addEntity(member, prefabFile.parent_path());

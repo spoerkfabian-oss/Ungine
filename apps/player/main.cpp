@@ -6,6 +6,8 @@
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
+#include "Engine/Core/FileSystem.h"
+#include "Engine/Core/GameOptions.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Core/Window.h"
@@ -16,6 +18,8 @@
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/LevelStreaming.h"
+
+#include "OptionsMenu.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptRegistry.h"
@@ -41,15 +45,19 @@ using namespace Engine;
 
 class PlayerApp final : public Application {
 public:
-    PlayerApp(const ApplicationDesc& desc, Project project, fs::path saveDirectory, std::uint32_t exitAfterFrames)
+    PlayerApp(const ApplicationDesc& desc, Project project, fs::path saveDirectory, std::uint32_t exitAfterFrames,
+              GameOptions options)
         : Application(desc), m_Project(std::move(project)), m_SaveDirectory(std::move(saveDirectory)),
-          m_ExitAfterFrames(exitAfterFrames)
+          m_ExitAfterFrames(exitAfterFrames), m_Options(std::move(options))
     {
         m_KeySub = GetEvents().Subscribe<KeyEvent>([this](const KeyEvent& e) {
             if (e.action != InputAction::Press)
                 return;
-            if (e.key == 300) // F11
-                GetWindow().SetFullscreen(!GetWindow().IsFullscreen());
+            if (e.key == 300) { // F11
+                m_Options.Edit().fullscreen = !GetWindow().IsFullscreen();
+                m_Options.Changed();
+                (void)m_Options.Save();
+            }
         });
     }
 
@@ -66,6 +74,11 @@ protected:
         m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
         m_Scripts->SetInputMap(m_Project.settings.input);
         m_Scripts->SetSaveDirectory(m_SaveDirectory);
+        m_Scripts->SetSaveVersion(m_Project.settings.saveVersion);
+        // The player's own options (Settings.json): window, graphics caps, mixer, key bindings.
+        m_Scripts->SetGameOptions(&m_Options);
+        m_Options.SetApply([this](const GameOptions& options) { ApplyOptions(options); });
+        ApplyOptions(m_Options);
         m_Streamer = std::make_unique<LevelStreamer>(GetJobs(), &GetAssets(), &GetEvents());
         m_Streamer->SetUnloadHook([this](Scene& scene, std::span<const Entity> roots) { m_Scripts->EndPlayFor(scene, roots); });
         m_Scripts->SetLevelStreamer(m_Streamer.get());
@@ -97,6 +110,12 @@ protected:
 
     void StartLevel(const fs::path& scene)
     {
+        // The level's renderer settings; the user's graphics options cap them (ApplyGraphics).
+        m_LevelShadows      = m_SceneRenderer->shadows;
+        m_LevelLocalShadows = m_SceneRenderer->localShadows;
+        m_LevelAo           = m_SceneRenderer->ao;
+        m_LevelBloom        = m_SceneRenderer->post.bloom;
+        ApplyGraphics();
         m_Scene.UpdateTransforms();
         m_Physics->Sync(m_Scene);
         m_Audio->Begin(m_Scene);
@@ -226,7 +245,9 @@ protected:
         }
         // Mouse / camera nodes work in window coordinates of the whole window.
         m_Scripts->SetViewport({.origin = glm::vec2(0.0f), .size = GetWindow().WindowSize()});
-        if (GetInput().WasKeyPressed(Key::Escape))
+        if (m_OptionsMenu.Capturing()) // "press a key": Escape cancels the capture, not the pause
+            m_OptionsMenu.Update(m_Scene, m_Options, GetInput());
+        else if (GetInput().WasKeyPressed(Key::Escape))
             SetPaused(!m_Paused);
         if (!m_Paused)
             m_Scripts->Update(m_Scene, static_cast<float>(dt));
@@ -242,8 +263,6 @@ protected:
         m_Ui.Update(m_Scene, GetInput(), GetWindow().WindowSize(),
                     {static_cast<float>(framebuffer.width), static_cast<float>(framebuffer.height)});
         m_Ui.SyncAssets(m_Scene, GetAssets());
-        if (m_MenuFullscreen != NullEntity && m_Scene.GetRegistry().Valid(m_MenuFullscreen))
-            m_Scene.GetRegistry().Get<UiWidget>(m_MenuFullscreen).checked = GetWindow().IsFullscreen();
         for (const UiEvent& event : m_Ui.Events()) {
             HandleMenuEvent(event);
             m_Scripts->DispatchUiEvent(m_Scene, event);
@@ -313,6 +332,47 @@ protected:
     }
 
 private:
+    // Window, renderer, mixer and key bindings from the user's options.
+    void ApplyOptions(const GameOptions& options)
+    {
+        const UserSettings& u = options.Values();
+        if (GetWindow().IsFullscreen() != u.fullscreen)
+            GetWindow().SetFullscreen(u.fullscreen);
+        if (u.windowWidth && u.windowHeight && (u.windowWidth != m_AppliedWidth || u.windowHeight != m_AppliedHeight)) {
+            GetWindow().SetSize(static_cast<int>(u.windowWidth), static_cast<int>(u.windowHeight));
+            m_AppliedWidth  = u.windowWidth;
+            m_AppliedHeight = u.windowHeight;
+        }
+        GetRenderer().SetVSync(u.vsync);
+        ApplyGraphics();
+        for (std::size_t i = 0; i < kAudioBusCount; ++i) {
+            const auto bus    = static_cast<AudioBus>(i);
+            const bool paused = m_Paused && std::ranges::find(kPausedBuses, bus) != kPausedBuses.end();
+            m_Audio->Engine().SetBusVolume(bus, u.audio.volume[i]);
+            m_Audio->Engine().SetBusMuted(bus, paused || u.audio.muted[i]);
+        }
+        m_Scripts->SetInputMap(options.Input());
+    }
+
+    // The level's shadow / AO / bloom settings, capped by the graphics options.
+    void ApplyGraphics()
+    {
+        const UserSettings& u   = m_Options.Values();
+        const std::uint32_t cap = GameOptions::ShadowResolution(u.shadowQuality);
+        ShadowSettings      sun = m_LevelShadows;
+        sun.enabled             = sun.enabled && cap > 0;
+        if (cap > 0)
+            sun.resolution = std::min(sun.resolution, cap);
+        m_SceneRenderer->shadows      = sun;
+        m_SceneRenderer->localShadows = m_LevelLocalShadows;
+        m_SceneRenderer->localShadows.enabled = m_LevelLocalShadows.enabled && cap > 0;
+        if (cap > 0)
+            m_SceneRenderer->localShadows.atlasSize = std::min(m_LevelLocalShadows.atlasSize, cap);
+        m_SceneRenderer->ao         = m_LevelAo;
+        m_SceneRenderer->ao.enabled = m_LevelAo.enabled && u.ambientOcclusion;
+        m_SceneRenderer->post.bloom = m_LevelBloom && u.bloom;
+    }
+
     Entity AddUiEntity(std::string name, Entity parent, const UiWidget& widget)
     {
         const Entity entity = m_Scene.CreateEntity(std::move(name), parent);
@@ -334,8 +394,6 @@ private:
                                         .background = {0.035f, 0.045f, 0.07f, 0.97f}});
         };
         m_MenuMainPanel = panel("Pause Panel");
-        m_MenuOptionsPanel = panel("Options Panel");
-        registry.Get<UiWidget>(m_MenuOptionsPanel).visible = false;
         const auto button = [&](Entity parent, const char* name, const char* text, float top) {
             return AddUiEntity(name, parent,
                                UiWidget{.type = UiWidgetType::Button,
@@ -352,22 +410,8 @@ private:
         m_MenuOptions = button(m_MenuMainPanel, "Open Options", "Options", 178.0f);
         m_MenuQuit = button(m_MenuMainPanel, "Quit", "Quit game", 256.0f);
 
-        AddUiEntity("Options", m_MenuOptionsPanel,
-                    UiWidget{.type = UiWidgetType::Text,
-                             .offsetMin = {30.0f, 24.0f}, .offsetMax = {430.0f, 72.0f},
-                             .color = {1.0f, 0.84f, 0.36f, 1.0f}, .text = "OPTIONS", .fontSize = 32.0f});
-        const float musicVolume = m_Audio->Engine().BusVolume(AudioBus::Music);
-        m_MenuMusic = AddUiEntity("Music volume", m_MenuOptionsPanel,
-                                  UiWidget{.type = UiWidgetType::Slider,
-                                           .offsetMin = {30.0f, 110.0f}, .offsetMax = {430.0f, 166.0f},
-                                           .color = {0.25f, 0.75f, 1.0f, 1.0f}, .text = "Music volume",
-                                           .value = musicVolume, .fontSize = 20.0f});
-        m_MenuFullscreen = AddUiEntity("Fullscreen", m_MenuOptionsPanel,
-                                       UiWidget{.type = UiWidgetType::Checkbox,
-                                                .offsetMin = {30.0f, 194.0f}, .offsetMax = {430.0f, 246.0f},
-                                                .color = {1.0f, 1.0f, 1.0f, 1.0f}, .text = "Fullscreen",
-                                                .fontSize = 20.0f, .checked = GetWindow().IsFullscreen()});
-        m_MenuBack = button(m_MenuOptionsPanel, "Back", "Back", 310.0f);
+        m_OptionsMenu = {};
+        m_OptionsMenu.Create(m_Scene, m_MenuCanvas);
     }
 
     void SetPaused(bool paused)
@@ -379,40 +423,29 @@ private:
             m_Scene.GetRegistry().Get<UiCanvas>(m_MenuCanvas).visible = paused;
         if (m_MenuMainPanel != NullEntity && m_Scene.GetRegistry().Valid(m_MenuMainPanel))
             m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = true;
-        if (m_MenuOptionsPanel != NullEntity && m_Scene.GetRegistry().Valid(m_MenuOptionsPanel))
-            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = false;
-        if (paused) {
-            constexpr std::array buses{AudioBus::World, AudioBus::Music, AudioBus::Ambient};
-            for (std::size_t i = 0; i < buses.size(); ++i) {
-                m_PrePauseMuted[i] = m_Audio->Engine().BusMuted(buses[i]);
-                m_Audio->Engine().SetBusMuted(buses[i], true);
-            }
-        } else {
-            constexpr std::array buses{AudioBus::World, AudioBus::Music, AudioBus::Ambient};
-            for (std::size_t i = 0; i < buses.size(); ++i)
-                m_Audio->Engine().SetBusMuted(buses[i], m_PrePauseMuted[i]);
-        }
+        m_OptionsMenu.Show(m_Scene, m_Options, false);
+        // The game's buses are muted while paused (the menu's UI bus stays); unpausing restores the
+        // options' mutes.
+        for (const AudioBus bus : kPausedBuses)
+            m_Audio->Engine().SetBusMuted(bus, paused || m_Options.Values().audio.muted[static_cast<std::size_t>(bus)]);
     }
 
     void HandleMenuEvent(const UiEvent& event)
     {
         if (!m_Paused)
             return;
-        if (event.entity == m_MenuResume)
+        bool closed = false;
+        if (event.entity == m_MenuResume) {
             SetPaused(false);
-        else if (event.entity == m_MenuOptions) {
+        } else if (event.entity == m_MenuOptions) {
             m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = false;
-            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = true;
-        } else if (event.entity == m_MenuBack) {
-            m_Scene.GetRegistry().Get<UiWidget>(m_MenuOptionsPanel).visible = false;
-            m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = true;
-        } else if (event.entity == m_MenuQuit)
+            m_OptionsMenu.Show(m_Scene, m_Options, true);
+        } else if (event.entity == m_MenuQuit) {
             GetWindow().RequestClose();
-        else if (event.entity == m_MenuMusic && event.type == UiEventType::ValueChanged) {
-            m_Audio->Engine().SetBusVolume(AudioBus::Music, event.value);
-            m_Project.settings.audio.volume[static_cast<std::size_t>(AudioBus::Music)] = event.value;
-        } else if (event.entity == m_MenuFullscreen && event.type == UiEventType::CheckedChanged)
-            GetWindow().SetFullscreen(event.checked);
+        } else if (m_OptionsMenu.Handle(m_Scene, m_Options, event, closed) && closed) {
+            m_OptionsMenu.Show(m_Scene, m_Options, false);
+            m_Scene.GetRegistry().Get<UiWidget>(m_MenuMainPanel).visible = true;
+        }
     }
 
     Project                        m_Project;
@@ -429,14 +462,17 @@ private:
     UiSystem                      m_Ui;
     Entity                        m_MenuCanvas = NullEntity;
     Entity                        m_MenuMainPanel = NullEntity;
-    Entity                        m_MenuOptionsPanel = NullEntity;
     Entity                        m_MenuResume = NullEntity;
     Entity                        m_MenuOptions = NullEntity;
     Entity                        m_MenuQuit = NullEntity;
-    Entity                        m_MenuBack = NullEntity;
-    Entity                        m_MenuMusic = NullEntity;
-    Entity                        m_MenuFullscreen = NullEntity;
-    std::array<bool, 3>           m_PrePauseMuted{};
+    OptionsMenu                   m_OptionsMenu;
+    GameOptions                   m_Options;
+    ShadowSettings                m_LevelShadows;      // the level's renderer settings (before the
+    LocalShadowSettings           m_LevelLocalShadows; // options cap them)
+    AoSettings                    m_LevelAo;
+    bool                          m_LevelBloom = true;
+    std::uint32_t                 m_AppliedWidth = 0, m_AppliedHeight = 0;
+    static constexpr std::array<AudioBus, 3> kPausedBuses{AudioBus::World, AudioBus::Music, AudioBus::Ambient};
     bool                          m_Paused = false;
     std::unique_ptr<PhysicsWorld>  m_Physics;
     std::unique_ptr<AudioSystem>   m_Audio;
@@ -502,18 +538,35 @@ int main(int argc, char** argv)
     fs::create_directories(saved, ec);
     (void)Log::OpenFile(PathToUtf8(saved / "player.log").c_str());
 
+    // Packaged game: the cooked content (Content.upak next to the project file) is mounted at the
+    // project root; without one the loose Content/ is used (development, Build & Run).
+    if (const fs::path pak = project->Root() / "Content.upak"; fs::is_regular_file(pak, ec)) {
+        try {
+            const std::shared_ptr<const PakFile> file = PakFile::Open(pak);
+            Vfs::Mount(file, project->Root());
+            ENGINE_INFO("Mounted '{}' ({} entries)", PathToUtf8(pak.filename()), file->Entries().size());
+        } catch (const std::exception& e) {
+            ENGINE_ERROR("Cannot use the game data: {}", e.what());
+            return 1;
+        }
+    }
+
+    // The player's options (window, graphics, mixer, keys), kept per user next to the saves.
+    GameOptions options(project->settings, saved / "Settings.json");
+
     bool failed = false;
     try {
-        ApplicationDesc desc;
+        const UserSettings& user = options.Values();
+        ApplicationDesc     desc;
         desc.window        = {.title      = project->settings.name,
-                              .width      = project->settings.windowWidth,
-                              .height     = project->settings.windowHeight,
+                              .width      = user.windowWidth ? user.windowWidth : project->settings.windowWidth,
+                              .height     = user.windowHeight ? user.windowHeight : project->settings.windowHeight,
                               .resizable  = true,
-                              .fullscreen = project->settings.fullscreen};
-        desc.renderer      = {.vsync = project->settings.vsync};
+                              .fullscreen = user.fullscreen};
+        desc.renderer      = {.vsync = user.vsync};
         desc.pipelineCache = saved / "pipelines.bin";
         desc.assets.textures.cacheDirectory = saved / "Cache" / "Textures";
-        PlayerApp app(desc, *project, saved / "SaveGames", frames);
+        PlayerApp app(desc, *project, saved / "SaveGames", frames, std::move(options));
         app.Run();
         failed = app.Failed();
     } catch (const std::exception& e) {

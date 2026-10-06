@@ -1,6 +1,7 @@
 add_library(Engine STATIC
     src/Assets/Animation.cpp
     src/Assets/AssetManager.cpp
+    src/Assets/ContentCooker.cpp
     src/Audio/AudioEngine.cpp
     src/Audio/AudioSystem.cpp
     src/Audio/Sound.cpp
@@ -10,6 +11,8 @@ add_library(Engine STATIC
     src/Assets/TextureCooker.cpp
     src/Assets/MeshOptimizer.cpp
     src/Core/Application.cpp
+    src/Core/FileSystem.cpp
+    src/Core/GameOptions.cpp
     src/Core/Input.cpp
     src/Core/Platform.cpp
     src/Core/Project.cpp
