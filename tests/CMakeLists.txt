@@ -1,4 +1,4 @@
-add_executable(EngineTests CoreTests.cpp ScriptTests.cpp LifecycleTests.cpp ProjectTests.cpp AudioTests.cpp BlueprintTests.cpp Blueprint2Tests.cpp BlueprintTestUtil.h Test.h)
+add_executable(EngineTests CoreTests.cpp ScriptTests.cpp LifecycleTests.cpp StreamingTests.cpp ProjectTests.cpp AudioTests.cpp BlueprintTests.cpp Blueprint2Tests.cpp BlueprintTestUtil.h Test.h)
 target_compile_definitions(EngineTests PRIVATE ENGINE_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(EngineTests PRIVATE Engine stb nlohmann_json::nlohmann_json)
 target_compile_definitions(EngineTests PRIVATE ENGINE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
@@ -49,4 +49,14 @@ if(ENGINE_GPU_TESTS)
     set_tests_properties(SmokeBasicProjectSetup PROPERTIES FIXTURES_SETUP smoke_basic)
     add_test(NAME UnginePlayerBasicSmoke COMMAND UnginePlayer ${smoke_basic}/BasicGame.ungineproj --frames 200)
     set_tests_properties(UnginePlayerBasicSmoke PROPERTIES FIXTURES_REQUIRED smoke_basic)
+    # Open Level in the background behind a custom loading screen (Basic template + start scene).
+    set(smoke_switch "${CMAKE_BINARY_DIR}/smoke_switch")
+    add_test(NAME SmokeLevelSwitchProjectSetup COMMAND ${CMAKE_COMMAND} -DTEMPLATE=${CMAKE_SOURCE_DIR}/templates/Basic
+             -DDIR=${smoke_switch} -DNAME=SwitchGame -DLEVEL_SWITCH=ON -P ${CMAKE_CURRENT_SOURCE_DIR}/MakeProject.cmake)
+    set_tests_properties(SmokeLevelSwitchProjectSetup PROPERTIES FIXTURES_SETUP smoke_switch)
+    add_test(NAME UnginePlayerLevelSwitchSmoke COMMAND UnginePlayer ${smoke_switch}/SwitchGame.ungineproj --frames 200)
+    # PASS_REGULAR_EXPRESSION ignores the exit code: errors (validation included) fail via FAIL_REGULAR_EXPRESSION.
+    set_tests_properties(UnginePlayerLevelSwitchSmoke PROPERTIES FIXTURES_REQUIRED smoke_switch
+                         PASS_REGULAR_EXPRESSION "Playing 'SwitchGame' \\([^)]*Annex\\.scene\\.json\\)"
+                         FAIL_REGULAR_EXPRESSION "\\[ERROR\\]|not used")
 endif()

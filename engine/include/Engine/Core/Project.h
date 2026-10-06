@@ -17,6 +17,9 @@ namespace Engine {
 struct ProjectSettings {
     std::string   name = "Untitled";
     std::string   startScene; // relative to the project root, '/' separated
+    // Shown while Open Level loads the next level (a scene with UI canvases; a progress bar
+    // widget tagged "LoadingProgress" follows the progress). Empty: a built-in screen.
+    std::string   loadingScreen;
     std::uint32_t windowWidth  = 1600;
     std::uint32_t windowHeight = 900;
     bool          fullscreen   = false;

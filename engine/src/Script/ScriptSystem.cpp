@@ -6,6 +6,7 @@
 #include "Engine/Core/Platform.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -269,6 +270,9 @@ struct ScriptSystem::Impl {
         };
         std::unordered_map<std::string, std::vector<Binding>> bindings; // dispatcher -> bound custom events
         std::vector<int>                                      ticking;  // nodes run with kScriptTick per update
+        // Instance-editable entity variables whose target was not in the scene (an unloaded
+        // streamed level): variable index -> UUID, resolved when a level loads.
+        std::vector<std::pair<std::size_t, std::uint64_t>> pendingRefs;
     };
     struct Breakpoint {
         ScriptBreakpointOptions options;
@@ -393,6 +397,7 @@ struct ScriptSystem::Impl {
         PhysicsWorld*      Physics() override { return m_Impl.physics; }
         AssetManager*      Assets() override { return m_Impl.assets; }
         AudioSystem*       Audio() override { return m_Impl.audio; }
+        LevelStreamer*     Streaming() override { return m_Impl.streamer; }
         const Input*       GetInput() override { return m_Impl.acceptInput ? m_Impl.input : nullptr; }
         ScriptViewport     Viewport() const override { return m_Impl.viewport; }
         ScriptValue*       Variable(const std::string& name) override
@@ -642,6 +647,11 @@ struct ScriptSystem::Impl {
                 collisions.push_back({e});
             return false;
         });
+        levelSub = events.Subscribe<LevelStreamedEvent>([this](const LevelStreamedEvent& e) {
+            if (running && !e.failed)
+                levelEvents.push_back(e);
+            return false;
+        });
     }
 
     Instance* Find(Entity e)
@@ -792,8 +802,11 @@ struct ScriptSystem::Impl {
                     ScriptValue&          slot = inst->variables[static_cast<std::size_t>(it->second)];
                     if (!v.exposed)
                         continue;
-                    if (v.type == PinType::Entity)
+                    if (v.type == PinType::Entity) {
                         slot = value.entityUuid ? scene.FindByUuid(value.entityUuid) : NullEntity;
+                        if (value.entityUuid && std::get<Entity>(slot) == NullEntity)
+                            inst->pendingRefs.emplace_back(static_cast<std::size_t>(it->second), value.entityUuid);
+                    }
                     else if (TypeOf(value.value) == v.type || CanConvert(TypeOf(value.value), v.type))
                         slot = Convert(value.value, v.type);
                 }
@@ -1362,6 +1375,7 @@ struct ScriptSystem::Impl {
         instances.clear();
         waiting.clear();
         collisions.clear();
+        levelEvents.clear();
         paused.reset();
         queued.clear();
         stepMode = StepMode::None;
@@ -1377,6 +1391,9 @@ struct ScriptSystem::Impl {
     AssetManager* assets;
     AudioSystem*  audio;
     Subscription  collisionSub;
+    Subscription  levelSub;
+    LevelStreamer*                  streamer = nullptr;
+    std::vector<LevelStreamedEvent> levelEvents; // since the last update
 
     bool           running     = false;
     bool           acceptInput = true;
@@ -1545,6 +1562,29 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
                 out[2] = trigger;
             });
         }
+    }
+
+    // Streamed levels added / removed since the last update: entity variables that were waiting
+    // for their target, then Level Loaded / Unloaded.
+    const std::vector<LevelStreamedEvent> levelEvents = std::exchange(w.levelEvents, {});
+    for (const LevelStreamedEvent& e : levelEvents) {
+        if (e.loaded)
+            forEach([&](Impl::Instance& inst) {
+                std::erase_if(inst.pendingRefs, [&](const std::pair<std::size_t, std::uint64_t>& ref) {
+                    const Entity target = scene.FindByUuid(ref.second);
+                    if (target == NullEntity || ref.first >= inst.variables.size())
+                        return false;
+                    ScriptValue& slot = inst.variables[ref.first];
+                    if (const Entity* current = std::get_if<Entity>(&slot); current && !scene.GetRegistry().Valid(*current))
+                        slot = target; // still unset (or pointing at something gone): resolved now
+                    return true;
+                });
+            });
+        const std::string level = e.level;
+        forEach([&](Impl::Instance& inst) {
+            w.Fire(scene, inst, e.loaded ? "Event.LevelLoaded" : "Event.LevelUnloaded", nullptr,
+                   [&](const CompiledNode&, std::vector<ScriptValue>& out) { out[1] = level; });
+        });
     }
 
     // Keys, mouse buttons and Tick.
@@ -1758,6 +1798,32 @@ void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)
 }
 std::optional<ScriptLevelRequest> ScriptSystem::TakeLevelRequest() { return std::exchange(m_Impl->levelRequest, std::nullopt); }
 void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = std::move(scene); }
+
+void ScriptSystem::SetLevelStreamer(LevelStreamer* streamer) { m_Impl->streamer = streamer; }
+
+void ScriptSystem::EndPlayFor(Scene& scene, std::span<const Entity> roots)
+{
+    Impl& w = *m_Impl;
+    if (!w.running)
+        return;
+    const Registry& registry = scene.GetRegistry();
+    const auto      inside   = [&](Entity e) {
+        return std::ranges::any_of(roots, [&](Entity root) { return e == root || scene.IsAncestor(root, e); });
+    };
+    std::vector<std::uint64_t> keys;
+    for (const auto& [key, inst] : w.instances)
+        if (registry.Valid(inst->entity) && inside(inst->entity))
+            keys.push_back(key);
+    for (const std::uint64_t key : keys) {
+        const auto it = w.instances.find(key);
+        if (it == w.instances.end())
+            continue;
+        std::unique_ptr<Impl::Instance> inst = std::move(it->second); // alive while EndPlay runs
+        w.instances.erase(it);
+        if (registry.Valid(inst->entity))
+            w.FireSimple(scene, *inst, "Event.EndPlay");
+    }
+}
 
 void ScriptSystem::SetBreakpoints(const std::filesystem::path& file, std::vector<std::uint32_t> nodes)
 {

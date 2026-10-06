@@ -93,6 +93,15 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     On UI Checked Changed). The standalone player opens its pause menu with Escape and supports
     keyboard, mouse and mapped gamepad navigation; Options currently control music volume and
     fullscreen for the current session.
+14. **Level-Streaming**: Hierarchy → *+ Add* → *Streaming Volume*, im Inspector die Level-Datei
+    wählen (*Browse…*). Im Spiel wird das Sub-Level additiv geladen, sobald die Kamera (bzw. eine
+    Entity mit *Streaming Source*) in der Box ist, und nach Verlassen der Box plus *Unload margin*
+    wieder entladen. Blueprints: *Load/Unload Stream Level*, *Is Level Loaded*, Events *Level
+    Loaded/Unloaded*; Verweise auf Entities eines entladenen Levels sind leer und werden beim Laden
+    wieder gültig. Im Editor zeigt das Fenster **Levels** Vorschauen (nur ansehen, nicht gespeichert;
+    bearbeitet wird ein Level durch Öffnen seiner Datei). *Open Level* lädt im Player im Hintergrund
+    hinter einem Ladebildschirm: eigene Gestaltung über *Project Settings → Loading screen* (Szene mit
+    UI-Canvas; ein Fortschrittsbalken mit dem Tag `LoadingProgress` zeigt den Fortschritt).
 
 
 ## Entwicklung

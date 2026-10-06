@@ -12,6 +12,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -251,6 +252,15 @@ void Editor::DrawHierarchy()
             PushCreated("Create reverb zone", roots);
             Select(e);
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Streaming Volume")) {
+            const Entity e = m_Ctx.scene.CreateEntity("Streaming Volume");
+            m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<LevelStreamingVolume>(e);
+            const Entity roots[] = {e};
+            PushCreated("Create streaming volume", roots);
+            Select(e);
+        }
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -299,9 +309,12 @@ void Editor::DrawHierarchyNode(Entity entity)
         flags |= ImGuiTreeNodeFlags_Selected;
     const Entity prefabRoot  = PrefabInstanceRoot(m_Ctx.scene, entity);
     const bool   constructed = registry.Has<ConstructionOwned>(entity);
-    const bool   tinted = constructed || prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
+    const bool   streamed    = IsStreamed(entity);
+    const bool   tinted = constructed || streamed || prefabRoot != NullEntity || registry.Has<MeshRenderer>(entity) || registry.Has<Light>(entity);
     if (constructed) // made by a construction script: rebuilt, not saved
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+    else if (streamed) // part of a streamed sub-level: read-only, not saved
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.75f, 1.0f));
     else if (prefabRoot != NullEntity) // prefab instances: root bright blue, members lighter
         ImGui::PushStyleColor(ImGuiCol_Text, prefabRoot == entity ? ImVec4(0.35f, 0.65f, 1.0f, 1.0f) : ImVec4(0.6f, 0.78f, 1.0f, 1.0f));
     else if (tinted)
@@ -331,21 +344,24 @@ void Editor::DrawHierarchyNode(Entity entity)
     if (ImGui::BeginPopupContextItem()) {
         if (!IsSelected(entity))
             Select(entity);
-        if (ImGui::MenuItem("Create child"))
+        const bool editable = !streamed; // streamed levels are read-only: edited in their own file
+        if (ImGui::MenuItem("Create child", nullptr, false, editable))
             Select(CreateEntity("Entity", entity));
-        if (ImGui::MenuItem("Create point light"))
+        if (ImGui::MenuItem("Create point light", nullptr, false, editable))
             Select(CreateLight(LightType::Point, entity));
-        if (ImGui::MenuItem("Create spot light"))
+        if (ImGui::MenuItem("Create spot light", nullptr, false, editable))
             Select(CreateLight(LightType::Spot, entity));
         ImGui::Separator();
         if (ImGui::MenuItem("Focus", "F"))
             FocusSelected();
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D"))
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, editable))
             m_PendingDuplicate = true;
-        if (ImGui::MenuItem("Delete", "Del"))
+        if (ImGui::MenuItem("Delete", "Del", false, editable))
             m_PendingDelete = m_Selection; // after the tree was drawn
+        if (streamed && ImGui::MenuItem("Open level"))
+            RequestSceneChange([this, file = PathFromUtf8(StreamedLevelOf(entity))] { OpenScene(file); });
         ImGui::Separator();
-        if (ImGui::MenuItem("Create prefab...", nullptr, false, m_PlayState == PlayState::Edit)) {
+        if (ImGui::MenuItem("Create prefab...", nullptr, false, editable && m_PlayState == PlayState::Edit)) {
             m_PrefabTarget  = entity;
             m_DialogPurpose = DialogPurpose::CreatePrefab;
             std::error_code ec;
@@ -355,7 +371,7 @@ void Editor::DrawHierarchyNode(Entity entity)
                                name + std::string(kPrefabExtension));
         }
         if (prefabRoot != NullEntity) {
-            const bool edit = m_PlayState == PlayState::Edit;
+            const bool edit = editable && m_PlayState == PlayState::Edit;
             if (prefabRoot != entity && ImGui::MenuItem("Select prefab root"))
                 Select(prefabRoot);
             if (ImGui::MenuItem("Apply to prefab", nullptr, false, edit))
@@ -392,6 +408,18 @@ void Editor::DrawInspector()
         if (m_InspectorEdit) // the edited entity was deselected mid-edit
             PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
         ImGui::TextDisabled("Nothing selected");
+        ImGui::End();
+        return;
+    }
+    if (const std::string level = StreamedLevelOf(e); !level.empty()) { // read-only: edited in its own file
+        if (m_InspectorEdit)
+            PushStateChange("Edit properties", std::exchange(m_InspectorEdit, std::nullopt).value());
+        ImGui::TextUnformatted(registry.Get<Name>(e).value.c_str());
+        ImGui::TextDisabled("Part of the streamed level");
+        ImGui::TextWrapped("%s", LevelStreamer::DisplayPath(PathFromUtf8(level)).c_str());
+        ImGui::TextDisabled("Streamed levels are read-only here and not saved with this scene.");
+        if (ImGui::Button("Open level"))
+            RequestSceneChange([this, file = PathFromUtf8(level)] { OpenScene(file); });
         ImGui::End();
         return;
     }
@@ -893,6 +921,51 @@ void Editor::DrawInspector()
             registry.Remove<ReverbZone>(e);
     }
 
+    if (LevelStreamingVolume* volume = registry.TryGet<LevelStreamingVolume>(e);
+        volume && ImGui::CollapsingHeader("Level Streaming Volume", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##level", "path/to/level.scene.json", &volume->level);
+        if (ImGui::Button("Browse...##level")) {
+            m_LevelTarget   = e;
+            m_DialogPurpose = DialogPurpose::AssignLevel;
+            m_FileDialog->Open("Choose level", FileDialog::Mode::Open,
+                               !volume->level.empty() ? PathFromUtf8(volume->level).parent_path() : ContentRoot(), {".json"});
+        }
+        if (m_Ctx.streaming && !volume->level.empty()) {
+            ImGui::SameLine();
+            const LevelState state = m_Ctx.streaming->State(PathFromUtf8(volume->level));
+            if (state == LevelState::Unloaded || state == LevelState::Failed) {
+                if (ImGui::Button("Preview"))
+                    m_Ctx.streaming->Load(PathFromUtf8(volume->level));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Load the level additively (read-only, not saved)");
+            } else if (ImGui::Button("Unload preview")) {
+                m_Ctx.streaming->Unload(PathFromUtf8(volume->level));
+            }
+        }
+        if (BeginProperties("streaming")) {
+            Vec3Row("Half extents", &volume->halfExtents, 0.01f, 10.0f);
+            volume->halfExtents = glm::max(volume->halfExtents, glm::vec3(0.0f));
+            DragFloatRow("Load margin", &volume->loadMargin, 0.05f, 0.0f, 1e4f);
+            DragFloatRow("Unload margin", &volume->unloadMargin, 0.05f, 0.0f, 1e4f);
+            if (m_Ctx.streaming && !volume->level.empty()) {
+                PropertyRow("State");
+                ImGui::TextUnformatted(LevelStateName(m_Ctx.streaming->State(PathFromUtf8(volume->level))));
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Loads the level while a streaming source (else the camera) is inside.");
+        if (ImGui::Button("Remove streaming volume"))
+            registry.Remove<LevelStreamingVolume>(e);
+    }
+
+    if (registry.Has<StreamingSource>(e) && ImGui::CollapsingHeader("Streaming Source", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Streaming volumes load around this entity (else around the camera).");
+        if (ImGui::Button("Remove streaming source"))
+            registry.Remove<StreamingSource>(e);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -959,6 +1032,11 @@ void Editor::DrawInspector()
             registry.Emplace<AudioListener>(e);
         if (ImGui::MenuItem("Reverb Zone", nullptr, false, !registry.Has<ReverbZone>(e)))
             registry.Emplace<ReverbZone>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Level Streaming Volume", nullptr, false, !registry.Has<LevelStreamingVolume>(e)))
+            registry.Emplace<LevelStreamingVolume>(e);
+        if (ImGui::MenuItem("Streaming Source", nullptr, false, !registry.Has<StreamingSource>(e)))
+            registry.Emplace<StreamingSource>(e);
         ImGui::EndPopup();
     }
 
@@ -974,7 +1052,7 @@ void Editor::DrawInspector()
     if (changed) {
         m_Ctx.scene.MarkChanged(e); // light / mesh edits: bounds and shadow caches
         for (Entity other : m_Selection) {
-            if (other == e)
+            if (other == e || IsStreamed(other)) // streamed levels are read-only
                 continue;
             std::string before = SnapshotEntityState(m_Ctx.scene, other);
             if (ApplyEntityStateDiff(m_Ctx.scene, other, frameState, after))

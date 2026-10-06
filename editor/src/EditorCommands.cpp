@@ -14,6 +14,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -151,7 +152,8 @@ Entity Editor::CreatePrimitiveEntity(PrimitiveShape shape)
 
 void Editor::DuplicateSelection()
 {
-    const std::vector<Entity> roots = SelectionRoots();
+    std::vector<Entity> roots = SelectionRoots();
+    std::erase_if(roots, [&](Entity e) { return IsStreamed(e); }); // streamed levels are read-only
     if (roots.empty())
         return;
     const std::vector<Entity> copies =
@@ -163,7 +165,8 @@ void Editor::DuplicateSelection()
 
 void Editor::DeleteSelection()
 {
-    const std::vector<Entity> roots = SelectionRoots();
+    std::vector<Entity> roots = SelectionRoots();
+    std::erase_if(roots, [&](Entity e) { return IsStreamed(e); }); // streamed levels are read-only
     if (roots.empty())
         return;
     std::vector<std::uint64_t> uuids;
@@ -182,6 +185,7 @@ void Editor::Reparent(Entity child, Entity parent)
 {
     Registry& registry = m_Ctx.scene.GetRegistry();
     if (!registry.Valid(child) || (parent != NullEntity && !registry.Valid(parent)) || child == parent ||
+        IsStreamed(child) || (parent != NullEntity && IsStreamed(parent)) || // streamed levels are read-only
         (parent != NullEntity && m_Ctx.scene.IsAncestor(child, parent)) ||
         registry.Get<Hierarchy>(child).parent == parent)
         return;
@@ -366,6 +370,8 @@ void Editor::RequestSceneChange(std::function<void()> action)
 
 void Editor::NewScene()
 {
+    if (m_Ctx.streaming)
+        m_Ctx.streaming->Reset(); // previews go with the scene
     m_Ctx.scene.Clear();
     ReleaseModelRefs();
     m_History->Clear();
@@ -454,6 +460,19 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
+        case DialogPurpose::AssignLevel:
+            if (m_Ctx.scene.GetRegistry().Valid(m_LevelTarget) && m_Ctx.scene.GetRegistry().Has<LevelStreamingVolume>(m_LevelTarget)) {
+                const std::string before = SnapshotEntityState(m_Ctx.scene, m_LevelTarget);
+                std::error_code   ec;
+                m_Ctx.scene.GetRegistry().Get<LevelStreamingVolume>(m_LevelTarget).level =
+                    PathToUtf8(std::filesystem::absolute(*path, ec).lexically_normal());
+                PushStateChange("Assign level", {{UuidOf(m_LevelTarget), before}});
+            }
+            break;
+        case DialogPurpose::PreviewLevel:
+            if (m_Ctx.streaming)
+                m_Ctx.streaming->Load(*path);
+            break;
         case DialogPurpose::Package:
             if (m_Ctx.project)
                 PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
@@ -569,7 +588,7 @@ namespace Engine {
 
 void Editor::AssignScript(Entity entity, const std::filesystem::path& graph)
 {
-    if (!m_Ctx.scene.GetRegistry().Valid(entity))
+    if (!m_Ctx.scene.GetRegistry().Valid(entity) || IsStreamed(entity)) // streamed levels are read-only
         return;
     std::error_code ec;
     const std::u8string path = std::filesystem::absolute(graph, ec).lexically_normal().u8string();
@@ -581,7 +600,7 @@ void Editor::AssignScript(Entity entity, const std::filesystem::path& graph)
 void Editor::AssignSound(Entity entity, const std::filesystem::path& sound)
 {
     Registry& r = m_Ctx.scene.GetRegistry();
-    if (!r.Valid(entity))
+    if (!r.Valid(entity) || IsStreamed(entity)) // streamed levels are read-only
         return;
     std::error_code ec;
     std::string     before = SnapshotEntityState(m_Ctx.scene, entity);
@@ -623,6 +642,8 @@ void Editor::Play()
     if (m_GizmoEdit)
         PushStateChange("Transform", std::exchange(m_GizmoEdit, std::nullopt).value());
 
+    if (m_Ctx.streaming) // previews are not part of the level: play streams by volumes / requests
+        m_Ctx.streaming->UnloadAll(m_Ctx.scene);
     std::vector<Entity> roots;
     m_Ctx.scene.GetRegistry().ViewOf<Hierarchy>().Each([&](Entity e, Hierarchy& h) {
         if (h.parent == NullEntity)
@@ -674,6 +695,8 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
     if (m_Ctx.audio)
         m_Ctx.audio->End(m_Ctx.scene);
     m_Ctx.scene.Clear();
+    if (m_Ctx.streaming)
+        m_Ctx.streaming->Reset(); // streamed levels went with the scene
     if (m_Ctx.physics)
         m_Ctx.physics->Reset();
     m_Selection.clear();
@@ -736,6 +759,8 @@ void Editor::Stop()
         m_Ctx.audio->SetPaused(false);
     }
     m_Ctx.scene.Clear();
+    if (m_Ctx.streaming)
+        m_Ctx.streaming->Reset(); // streamed levels went with the scene
     (void)RestoreEntities(m_Ctx.scene, m_PlaySnapshot, RestoreMode::Original);
     m_Ctx.scene.UpdateTransforms();
     if (m_Ctx.physics)

@@ -25,6 +25,7 @@ using SceneJson::CollectSubtree;
 using SceneJson::EntityToJson;
 using SceneJson::FromUtf8;
 using SceneJson::IsConstructed;
+using SceneJson::IsStreamed;
 using SceneJson::ModelRefs;
 using SceneJson::PathMode;
 using SceneJson::ToUtf8;
@@ -533,6 +534,13 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioListener"] = json::object();
     if (const auto* zone = r.TryGet<ReverbZone>(e))
         j["reverbZone"] = ReverbZoneToJson(*zone);
+    if (const auto* volume = r.TryGet<LevelStreamingVolume>(e))
+        j["levelStreamingVolume"] = {{"level", models.WritePath(volume->level)},
+                                     {"halfExtents", ToJson(volume->halfExtents)},
+                                     {"loadMargin", volume->loadMargin},
+                                     {"unloadMargin", volume->unloadMargin}};
+    if (r.Has<StreamingSource>(e))
+        j["streamingSource"] = json::object();
     if (models.Memory()) { // files store prefab instances as root + overrides (see SaveSceneFile)
         if (const auto* instance = r.TryGet<PrefabInstance>(e))
             j["prefabInstance"] = {{"file", instance->prefab}};
@@ -691,6 +699,19 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
     });
     ApplyOptional<AudioListener>(r, e, j, "audioListener", [](const json&) { return AudioListener{}; });
     ApplyOptional<ReverbZone>(r, e, j, "reverbZone", ReverbZoneFromJson);
+    ApplyOptional<LevelStreamingVolume>(r, e, j, "levelStreamingVolume", [&](const json& v) {
+        LevelStreamingVolume volume;
+        Read(v, "level", volume.level);
+        volume.level = models.ReadPath(volume.level);
+        Read(v, "halfExtents", volume.halfExtents);
+        Read(v, "loadMargin", volume.loadMargin);
+        Read(v, "unloadMargin", volume.unloadMargin);
+        volume.halfExtents  = glm::max(volume.halfExtents, glm::vec3(0.0f));
+        volume.loadMargin   = std::max(volume.loadMargin, 0.0f);
+        volume.unloadMargin = std::max(volume.unloadMargin, 0.0f);
+        return volume;
+    });
+    ApplyOptional<StreamingSource>(r, e, j, "streamingSource", [](const json&) { return StreamingSource{}; });
     if (models.Memory()) {
         if (const auto it = j.find("prefabInstance"); it != j.end()) {
             const std::string file     = it->value("file", std::string());
@@ -714,6 +735,14 @@ bool IsConstructed(const Registry& r, Entity e)
 {
     for (; e != NullEntity && r.Valid(e); e = r.Get<Hierarchy>(e).parent)
         if (r.Has<ConstructionOwned>(e))
+            return true;
+    return false;
+}
+
+bool IsStreamed(const Registry& r, Entity e)
+{
+    for (; e != NullEntity && r.Valid(e); e = r.Get<Hierarchy>(e).parent)
+        if (r.Has<StreamedLevel>(e))
             return true;
     return false;
 }
@@ -899,6 +928,8 @@ void SaveSceneFile(const std::filesystem::path& file, const Scene& scene, const 
                 continue; // rebuilt from the prefab + the instance's overrides
             if (IsConstructed(r, e))
                 continue; // rebuilt by the owner's construction script
+            if (IsStreamed(r, e))
+                continue; // part of a streamed sub-level (its own file)
             json j;
             if (r.Has<PrefabInstance>(e)) {
                 const Transform& t = r.Get<Transform>(e);
@@ -947,29 +978,116 @@ std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene&
     return LoadSceneFile(file, scene, &assets, options);
 }
 
-std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene& scene, AssetManager* assets,
-                                       const SceneFileOptions& options)
+struct PreparedScene {
+    std::filesystem::path file;
+    std::filesystem::path baseDir; // absolute directory of the file
+    json                  root;
+    std::vector<json>     modelRefs; // absolute {"file"} / {"primitive"} references (scene + its prefabs)
+};
+
+std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::path& file)
 {
-    std::ifstream in(file, std::ios::binary);
-    if (!in)
-        throw std::runtime_error("cannot read '" + ToUtf8(file) + "'");
-    json root;
-    try {
-        root = json::parse(in);
-    } catch (const json::exception& e) {
-        throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
+    auto prepared     = std::make_shared<PreparedScene>();
+    prepared->file    = file;
+    prepared->baseDir = std::filesystem::absolute(file).parent_path();
+    {
+        std::ifstream in(file, std::ios::binary);
+        if (!in)
+            throw std::runtime_error("cannot read '" + ToUtf8(file) + "'");
+        try {
+            prepared->root = json::parse(in);
+        } catch (const json::exception& e) {
+            throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
+        }
     }
-    const int version = root.value("version", 0);
+    const json& root    = prepared->root;
+    const int   version = root.is_object() ? root.value("version", 0) : 0;
     if (version < 1 || version > kSceneVersion)
         throw std::runtime_error("'" + ToUtf8(file) + "': unsupported scene version " + std::to_string(version));
+    const auto entities = root.find("entities");
+    if (entities == root.end() || !entities->is_array())
+        throw std::runtime_error("'" + ToUtf8(file) + "': no entity list");
 
-    ModelRefs models;
+    // The models to load up front: those of the scene's entities, of prefab overrides and of the
+    // prefabs it instantiates (their files are read here; instantiating reads them again).
+    const auto addModel = [&](const json& model, const std::filesystem::path& dir) {
+        if (!model.is_object())
+            return;
+        if (const auto primitive = model.find("primitive"); primitive != model.end()) {
+            prepared->modelRefs.push_back({{"primitive", *primitive}});
+        } else if (const auto f = model.find("file"); f != model.end() && f->is_string()) {
+            std::filesystem::path path = FromUtf8(f->get<std::string>());
+            if (path.is_relative())
+                path = dir / path;
+            prepared->modelRefs.push_back({{"file", ToUtf8(path.lexically_normal())}});
+        }
+    };
+    const auto addEntity = [&](const json& entity, const std::filesystem::path& dir) {
+        if (!entity.is_object())
+            return;
+        for (const char* key : {"mesh", "modelInstance"})
+            if (const auto it = entity.find(key); it != entity.end() && it->is_object())
+                if (const auto model = it->find("model"); model != it->end())
+                    addModel(*model, dir);
+    };
+    std::unordered_set<std::string> prefabs;
+    for (const json& entity : *entities) {
+        addEntity(entity, prepared->baseDir);
+        const auto prefab = entity.is_object() ? entity.find("prefab") : entity.end();
+        if (!entity.is_object() || prefab == entity.end() || !prefab->is_object())
+            continue;
+        if (const auto overrides = prefab->find("overrides"); overrides != prefab->end() && overrides->is_object())
+            for (const json& patch : *overrides)
+                addEntity(patch, prepared->baseDir);
+        std::filesystem::path prefabFile = FromUtf8(prefab->value("file", std::string()));
+        if (prefabFile.empty())
+            continue;
+        if (prefabFile.is_relative())
+            prefabFile = prepared->baseDir / prefabFile;
+        if (!prefabs.insert(ToUtf8(prefabFile.lexically_normal())).second)
+            continue;
+        std::ifstream in(prefabFile, std::ios::binary);
+        if (!in)
+            continue; // instantiating reports it (or keeps the instance unresolved)
+        try {
+            const json prefabJson = json::parse(in);
+            if (const auto list = prefabJson.find("entities"); list != prefabJson.end() && list->is_array())
+                for (const json& member : *list)
+                    addEntity(member, prefabFile.parent_path());
+        } catch (const json::exception&) {
+        }
+    }
+    return prepared;
+}
+
+const std::filesystem::path& PreparedSceneFile(const PreparedScene& scene) { return scene.file; }
+
+void AcquireSceneModels(const PreparedScene& prepared, AssetManager& assets, SceneModels& models)
+{
+    ModelRefs refs;
+    refs.mode     = PathMode::Absolute;
+    refs.assets   = &assets;
+    refs.acquired = &models;
+    for (const json& ref : prepared.modelRefs) {
+        try {
+            (void)refs.Read(ref);
+        } catch (const std::exception&) { // a broken recipe: instantiating reports it
+        }
+    }
+}
+
+std::vector<Entity> InstantiatePreparedScene(const PreparedScene& prepared, Scene& scene, AssetManager* assets,
+                                             SceneModels& sceneModels, const SceneFileOptions& options)
+{
+    const json& root = prepared.root;
+    ModelRefs   models;
     models.mode        = PathMode::File;
     models.assets      = assets;
     models.constAssets = assets;
-    models.baseDir     = std::filesystem::absolute(file).parent_path();
-    std::vector<Entity>                        created;
-    std::unordered_map<std::uint64_t, Entity>  byFileUuid;
+    models.baseDir     = prepared.baseDir;
+    models.acquired    = &sceneModels;
+    std::vector<Entity>                       created, roots;
+    std::unordered_map<std::uint64_t, Entity> byFileUuid;
     try {
         for (const json& j : root.at("entities")) {
             const std::uint64_t uuid       = j.value<std::uint64_t>("uuid", 0);
@@ -978,6 +1096,8 @@ std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene&
             const Entity        parent     = parentIt != byFileUuid.end() ? parentIt->second : NullEntity;
             const Entity        e = scene.CreateEntity(j.value("name", std::string("Entity")), parent, uuid);
             created.push_back(e);
+            if (parent == NullEntity)
+                roots.push_back(e);
             byFileUuid[uuid] = e;
             if (const auto prefab = j.find("prefab"); prefab != j.end() && prefab->is_object()) {
                 json own = json::object(); // the root's own name and transform; the rest comes from the prefab
@@ -1005,14 +1125,26 @@ std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene&
     } catch (const std::exception& e) {
         for (auto it = created.rbegin(); it != created.rend(); ++it)
             scene.DestroyEntity(*it);
-        if (assets)
-            for (const auto& [key, handle] : *models.acquired)
-                assets->Release(handle);
-        throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
+        throw std::runtime_error("'" + ToUtf8(prepared.file) + "': " + e.what());
     }
+    return roots;
+}
 
+std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene& scene, AssetManager* assets,
+                                       const SceneFileOptions& options)
+{
+    const auto  prepared = PrepareSceneFile(file);
+    SceneModels models;
+    try {
+        (void)InstantiatePreparedScene(*prepared, scene, assets, models, options);
+    } catch (...) {
+        if (assets)
+            for (const auto& [key, handle] : models)
+                assets->Release(handle);
+        throw;
+    }
     std::vector<ModelHandle> handles;
-    for (const auto& [key, handle] : *models.acquired)
+    for (const auto& [key, handle] : models)
         handles.push_back(handle);
     return handles;
 }

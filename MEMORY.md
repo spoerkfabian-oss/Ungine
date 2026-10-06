@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-05
+- Last updated: 2026-10-06
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -764,7 +764,7 @@ Verification (local, 2026-10-05):
 - CI run for 5e62aec (push to `branch`): Windows MSVC (VS 2022 Debug, /W4 /WX) build + EngineTests, Linux GCC and Linux Clang (Werror) build + EngineTests all green. The lavapipe GPU job runs only on PR/main/manual dispatch and was not part of this run.
 
 ### Phase A hardening (GPU tests for phases 21-23 + lifecycle audits, 2026-10-05)
-Branch `branch` (PR pending at the time of writing).
+Merged as PR #13.
 
 Defects found by the new tests and fixed:
 - Prefab instances (and anything rebuilt from JSON) never animated or skinned: `ModelNodeRef::instanceRoot` stayed null. New `FindModelInstanceRoot` (nearest ancestor with ModelInstance) is used by `UpdateAnimations`, `GpuScene::UpdateJointPalettes` and the serializer; `instanceRoot` is only a refreshed hint now.
@@ -777,6 +777,22 @@ Defects found by the new tests and fixed:
 - Removed the outdated glTF warning "runtime animation is not implemented yet".
 
 New tests: GPU `Render_SkinnedAnimationInstancesAndPrefabs`, `Render_RuntimeUiOverlay`, `Editor_RuntimeUiInPlayMode`, `Editor_ContentImportAndReferenceRepair`, `Asset_LifecycleStress`; CPU `tests/LifecycleTests.cpp` (scene hierarchy fuzz, prefab instance fuzz, scripts destroying/spawning while running, detached prefab member survives save, destroyed entity gets no more events), RangeAllocator best-fit case. Each fix was checked by running its test without the fix (fails) and with it (passes).
+
+### Phase 24 level/area streaming (2026-10-06)
+PR #14 from `branch`. Technical details: CLAUDE.md "Level-Streaming (Phase 24)".
+
+- Scene loading split into `PrepareSceneFile` (any thread), `AcquireSceneModels` and `InstantiatePreparedScene` (main thread); `LoadSceneFile` uses all three.
+- `LevelStreamer`: additive sub-levels wanted by requests (`Load`/Blueprint Load Stream Level) or `LevelStreamingVolume`s (box + load/unload margins = hysteresis; sources: `StreamingSource` entities, else the camera); parsed on the pool, models loaded before the entities are created in one step; unload hook = `ScriptSystem::EndPlayFor`; `LevelStreamedEvent`; streamed roots carry `StreamedLevel` and are never saved.
+- `LevelLoader`: Open Level in the player runs in the background behind a loading screen (project `loadingScreen` UI scene with a progress bar tagged "LoadingProgress", else built-in text + bar). The editor's Play-mode Open Level stays synchronous.
+- Blueprints: Load/Unload Stream Level (latent), Is Level Loaded, Level Loaded/Unloaded events; entity references into unloaded levels are null and resolve by UUID when the level loads.
+- Editor: Levels window, read-only previews in edit mode (inspector note + Open level, no gizmo, excluded from duplicate/delete/reparent/multi-edit/assign), volumes stream around the editor camera while playing, volume overlay + inspector, content browser repairs `level` paths and the project loading screen, Project Settings field. Basic template streams `Annex.scene.json`.
+
+Defects found and fixed while doing it:
+- Swapchain acquire barrier covered only COLOR_ATTACHMENT_WRITE: a pass that loads the swapchain image first (text overlay alone over the loading screen) was a READ-after-layout-transition hazard (found by the new `UnginePlayerLevelSwitchSmoke`; red before, green after).
+- Open Level node default pointed to `Main.uscene` (wrong extension).
+- `Lifecycle_PrefabInstancesFuzz` (Phase A, on main) could grow exponentially: Apply adds an instance's extra children to the prefab, instantiate/duplicate copy whole subtrees; whether it explodes depends on prefab-file mtime timing, so it passed in the full suite but ran for minutes alone (and could hang CI). Capped at 300 entities (clear instead) and Apply only for instances of at most 24 entities; still catches the stale-link bug (checked by reverting that fix).
+- Activation failure of a streamed level now releases its models.
+- Prefab Apply could write the same prefab UUID twice (unreadable prefab file): an entity created into the prefab keeps its own UUID as prefab UUID; moved below another instance whose member has that UUID as source, the dedup fell back to the entity's own (already used) UUID. Now a fresh UUID is chosen. Found by the capped prefab fuzz in CI (Clang, timing-dependent); deterministic regression test `Lifecycle_ApplyWithForeignMemberKeepsPrefabUuidsUnique` (red before, green after).
 
 ## 19. Important CI lesson
 
@@ -817,8 +833,8 @@ Blueprint:
 - no general recursion
 - no inheritance
 - restricted nested containers
-- synchronous level loading
-- Phase 24 level/area streaming is not implemented: there are no streaming volumes, background scene parsing/activation pipeline, cross-scene entity-reference policy, or loading transitions yet
+- Open Level in editor Play mode is synchronous (the player loads in the background with a loading screen)
+- level streaming: a level's entities are created in one frame (spike for big levels), box volumes only (no priorities/budgets), sub-level renderer/physics settings ignored, a sub-level's primary camera can take over, a file is loaded at most once, UUID collisions with the main scene get new UUIDs, only script entity variables/overrides resolve late, previews are read-only (edit the level by opening it), no automatic reload of a loaded level, Open Level drops running sub-levels
 - unversioned save slots
 - documented construction-script semantics
 
@@ -917,6 +933,8 @@ User-approved work plan (2026-10-05, after PR #12 merged the build repair; main 
 
 Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
 
+Status 2026-10-06: Phase A merged (PR #13); Phase 24 done on `branch`, PR #14 open. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
+
 For every concrete issue:
 - patch branch
 - add regression coverage where appropriate
@@ -934,4 +952,5 @@ If an audit finds no concrete defect:
 - Phases 21 (skeletal animation), 22 (runtime UI and pause menu) and 23 (content import and previews) are on main via PR #11 (merge 43b639d, Phase 23 = 4c73c55).
 - They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. PR #12 merged it on 2026-10-05 (merge 181cfc6); main is green.
 - Phase A added GPU tests for skinning (model, duplicate, prefab instances), runtime UI drawing and editor Play-mode interaction, content import and reference repair; import previews (thumbnails, waveforms) still have no dedicated test.
-- Phase 24 (level/area streaming) remains unimplemented; see the limitation above. Do not report it as complete until async preparation, safe main-thread activation/unload, reference behavior and user-visible loading state are implemented and verified.
+- Phase A merged as PR #13 (2026-10-06).
+- Phase 24 (level/area streaming) implemented and verified locally (section 18); PR #14, CI must be green (incl. GPU suite and MSVC) before the user merges. Next: Phase 25 after that merge.

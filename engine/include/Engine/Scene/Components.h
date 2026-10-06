@@ -297,6 +297,32 @@ struct PrefabLink {
     bool operator==(const PrefabLink&) const = default;
 };
 
+// Level streaming (see Scene/LevelStreaming.h). A box in the entity's space: while a streaming
+// source (an entity with StreamingSource, else the camera) is inside the box grown by loadMargin,
+// the sub-level is loaded additively; it is unloaded once every source is outside the box grown
+// by loadMargin + unloadMargin (hysteresis against flickering at the border).
+struct LevelStreamingVolume {
+    std::string level{};          // scene file (absolute in memory, relative to the scene in files)
+    glm::vec3   halfExtents{10.0f};
+    float       loadMargin   = 0.0f;
+    float       unloadMargin = 5.0f;
+
+    bool operator==(const LevelStreamingVolume&) const = default;
+};
+
+// Streaming volumes follow this entity (the player character); without any, the camera.
+struct StreamingSource {
+    bool operator==(const StreamingSource&) const = default;
+};
+
+// Root entity of a streamed sub-level (runtime only: not saved, not in snapshots). The whole
+// subtree belongs to the level and goes when it is unloaded.
+struct StreamedLevel {
+    std::string level{}; // normalized scene file
+
+    bool operator==(const StreamedLevel&) const = default;
+};
+
 // Made by the construction script of another entity (the owner's UUID): rebuilt whenever it runs,
 // not saved in scene files (kept in memory snapshots: undo, play).
 struct ConstructionOwned {

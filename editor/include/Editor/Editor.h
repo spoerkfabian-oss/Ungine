@@ -35,6 +35,7 @@ class AudioSystem;
 class FileDialog;
 class FlyCamera;
 class History;
+class LevelStreamer;
 class ImGuiLayer;
 class PhysicsWorld;
 class Project;
@@ -67,6 +68,9 @@ struct EditorContext {
     AudioSystem* audio = nullptr;
     // Optional: the open project (Content browser root, project settings, Build & Run, packaging).
     Project* project = nullptr;
+    // Optional: level streaming. Edit mode: sub-levels previewed from the Levels panel (not saved,
+    // read-only); play mode: streaming volumes and Load Stream Level as in the player.
+    LevelStreamer* streaming = nullptr;
     // ImGui layout file (empty: not saved).
     std::filesystem::path layoutFile = "editor.ini";
 };
@@ -167,6 +171,8 @@ public:
         return RelocateContentAsset(source, target);
     }
     [[nodiscard]] const std::string& Status() const { return m_Status; } // last file operation
+    // Part of a streamed sub-level (preview or play): shown read-only, never saved.
+    [[nodiscard]] bool IsStreamed(Entity entity) const;
 
     // Scene files. New/Open replace the scene and release the editor's model refs.
     void NewScene();
@@ -226,6 +232,9 @@ private:
     // Instance roots `uuids` (whole subtrees) were rebuilt: undo restores `before`.
     void PushSubtreesChange(std::string label, const std::vector<std::uint64_t>& uuids, std::string before);
     [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
+    void DrawLevels();             // streaming volumes and sub-levels (preview load / unload)
+    [[nodiscard]] std::string StreamedLevelOf(Entity entity) const; // level file of a streamed entity, else empty
+    void DrawStreamingOverlay(float x, float y, float width, float height); // volume boxes
     void DrawContentBrowser();
     void SelectContentFile(const std::filesystem::path& file);
     void ReleaseContentPreview();
@@ -245,7 +254,7 @@ private:
 
     // Selection helpers
     [[nodiscard]] bool                IsSelected(Entity entity) const;
-    [[nodiscard]] std::vector<Entity> SelectionRoots() const; // selected, without selected ancestors
+    [[nodiscard]] std::vector<Entity> SelectionRoots() const; // selected, without selected ancestors and streamed entities
     void                              SelectFromClick(Entity entity, bool additive);
     void                              ValidateSelection();
 
@@ -346,6 +355,8 @@ private:
     bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
     bool m_ShowProjectSettings = false;
     bool m_ShowTypes           = false; // Blueprint Types window
+    bool m_ShowLevels          = true;  // Levels window (with a level streamer)
+    bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
     struct TypeEdit;                    // the enum / struct / interface edited there
     std::shared_ptr<TypeEdit> m_TypeEdit;
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
@@ -392,7 +403,8 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel } m_DialogPurpose = DialogPurpose::None;
+    Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills

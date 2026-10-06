@@ -171,13 +171,33 @@ TEST_CASE(Lifecycle_PrefabInstancesFuzz)
     std::vector<ModelHandle> models; // none (no assets), required by the API
     std::mt19937             rng(99);
     int                      problems = 0;
+    // Instantiate / duplicate copy whole subtrees and Apply adds an instance's extra children to
+    // the prefab (so every instance grows): unbounded, the scene grows exponentially within a few
+    // hundred steps (how fast depends on prefab file mtimes, i.e. timing). Past the cap the scene is
+    // cleared instead, and only small instances are applied.
+    constexpr std::size_t kMaxEntities  = 300;
+    constexpr std::size_t kMaxApplied   = 24;
+    const auto            subtreeSize   = [&](Entity root) {
+        std::size_t         count = 0;
+        std::vector<Entity> stack{root};
+        while (!stack.empty()) {
+            const Entity e = stack.back();
+            stack.pop_back();
+            ++count;
+            for (const Entity child : scene.GetRegistry().Get<Hierarchy>(e).children)
+                stack.push_back(child);
+        }
+        return count;
+    };
     for (int step = 0; step < 1500 && problems == 0; ++step) {
         const std::vector<Entity> alive = AliveEntities(scene);
         std::vector<Entity>       roots;
         for (const Entity e : alive)
             if (scene.GetRegistry().Has<PrefabInstance>(e))
                 roots.push_back(e);
-        const int op = std::uniform_int_distribution<int>(0, 99)(rng);
+        int op = std::uniform_int_distribution<int>(0, 99)(rng);
+        if (alive.size() > kMaxEntities)
+            op = 99; // clear
         try {
             if (op < 20 || roots.empty()) {
                 const Entity parent = op % 3 == 0 ? Pick(rng, alive) : NullEntity;
@@ -217,7 +237,8 @@ TEST_CASE(Lifecycle_PrefabInstancesFuzz)
                 UnlinkPrefabInstance(scene, Pick(rng, roots));
             } else if (op < 90) {
                 // The prefab file changes (another instance applied): every instance rebuilds.
-                ApplyPrefabInstance(scene, nullptr, Pick(rng, roots), models);
+                if (const Entity root = Pick(rng, roots); subtreeSize(root) <= kMaxApplied)
+                    ApplyPrefabInstance(scene, nullptr, root, models);
             } else if (op < 95) {
                 (void)RefreshPrefabInstances(scene, nullptr, models);
             } else {
@@ -430,4 +451,45 @@ TEST_CASE(Lifecycle_DestroyedEntityGetsNoMoreEvents)
     CHECK(std::ranges::none_of(messages, [](const ScriptMessage& m) { return m.error; }));
     CHECK(scripts.Stats().instances == 1);
     scripts.End(scene);
+}
+
+TEST_CASE(Lifecycle_ApplyWithForeignMemberKeepsPrefabUuidsUnique)
+{
+    // The entity a prefab was created from keeps its UUID as prefab UUID. Moved below another
+    // instance (whose own member has that prefab UUID as source) and applied, it must not write the
+    // same prefab UUID twice (the prefab file became unreadable).
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_lifecycle_apply_{}", std::random_device{}());
+    fs::create_directories(dir);
+    std::vector<ModelHandle> models;
+    Scene                    scene;
+    const Entity             original = scene.CreateEntity("Thing");
+    const Entity             arm      = scene.CreateEntity("Arm", original);
+    CreatePrefab(dir / "Thing.uprefab", scene, nullptr, original);
+    const Entity second = InstantiatePrefab(scene, nullptr, dir / "Thing.uprefab", NullEntity, Transform{}, models);
+    CHECK(scene.SetParent(arm, second)); // after the second instance's own Arm
+    bool applied = true;
+    try {
+        ApplyPrefabInstance(scene, nullptr, second, models);
+        (void)InstantiatePrefab(scene, nullptr, dir / "Thing.uprefab", NullEntity, Transform{}, models);
+    } catch (const std::exception& e) {
+        std::printf("    %s\n", e.what());
+        applied = false;
+    }
+    CHECK(applied);
+    // Arms below each instance root: the applied one and a new instance have both prefab arms.
+    const auto arms = [&](Entity root) {
+        std::size_t count = 0;
+        for (const Entity child : scene.GetRegistry().Get<Hierarchy>(root).children)
+            count += scene.GetRegistry().Get<Name>(child).value == "Arm" ? 1 : 0;
+        return count;
+    };
+    std::vector<Entity> roots;
+    scene.GetRegistry().ViewOf<PrefabInstance>().Each([&](Entity e, const PrefabInstance&) { roots.push_back(e); });
+    std::printf("    instances %zu, arms original %zu second %zu\n", roots.size(), arms(original), arms(second));
+    CHECK(roots.size() == 3 && arms(second) == 2);
+    for (const Entity root : roots)
+        if (root != original && root != second)
+            CHECK(arms(root) == 2);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

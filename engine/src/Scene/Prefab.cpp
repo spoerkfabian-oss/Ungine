@@ -454,12 +454,19 @@ std::shared_ptr<const PrefabAsset> WriteAndLink(const std::filesystem::path& fil
         const auto  uuid   = UuidOf(r, subtree[i]);
         sources[uuid]      = link && link->instance == rootUuid && link->source != 0 ? link->source : uuid;
     }
-    {   // members of different instances could share a source: keep the prefab UUIDs unique
+    {   // Members of different instances could share a source, and an entity's own UUID (used for
+        // non-members) can be another member's source: keep the prefab UUIDs unique.
         std::unordered_set<std::uint64_t> used;
         for (Entity e : subtree) {
             auto& s = sources[UuidOf(r, e)];
+            if (used.insert(s).second)
+                continue;
+            s = UuidOf(r, e);
             if (!used.insert(s).second) {
-                s = UuidOf(r, e);
+                std::unordered_set<std::uint64_t> taken = used;
+                for (const auto& [uuid, source] : sources)
+                    taken.insert(source);
+                s = NewUuid(scene, taken);
                 used.insert(s);
             }
         }

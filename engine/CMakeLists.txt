@@ -43,6 +43,7 @@ add_library(Engine STATIC
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
     src/Scene/Prefab.cpp
+    src/Scene/LevelStreaming.cpp
     src/Scene/SpatialIndex.cpp
     src/UI/UiLayout.cpp
     src/UI/UiSystem.cpp

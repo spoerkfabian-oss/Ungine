@@ -18,6 +18,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -43,6 +44,7 @@
 #include <string_view>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <vector>
@@ -2917,6 +2919,298 @@ TEST_CASE(Asset_LifecycleStress)
     }, 600));
     std::printf("    models %zu/%zu, textures %zu/%zu, sounds %zu/%zu\n", F().assets->Models().size(), modelsBefore,
                 F().assets->Textures().size(), texturesBefore, F().assets->Sounds().size(), soundsBefore);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+namespace {
+Entity FindNamed(Scene& scene, std::string_view name)
+{
+    Entity found = NullEntity;
+    scene.GetRegistry().ViewOf<Name>().Each([&](Entity e, Name& n) {
+        if (n.value == name)
+            found = e;
+    });
+    return found;
+}
+
+std::string ReadText(const fs::path& file)
+{
+    std::ifstream in(file, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Level file with one entity `name` drawing `model` (the handle stays with the caller).
+void WriteModelLevel(const fs::path& file, const char* name, ModelHandle model, const std::string& script = {})
+{
+    Scene        level;
+    const Entity e = level.CreateEntity(name);
+    level.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = model, .meshIndex = 0});
+    if (!script.empty())
+        level.GetRegistry().Emplace<ScriptComponent>(e, script);
+    SaveSceneFile(file, level, *F().assets);
+}
+} // namespace
+
+TEST_CASE(Streaming_SubLevelModelsAndRendering)
+{
+    // A streamed sub-level with a model: prepared and its model loaded in the background, its
+    // entities created only once the model is ready (no pop-in), drawn, and on unload its model
+    // is released again. A missing level fails with an event.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_stream_gpu_{}", std::random_device{}());
+    fs::create_directories(dir);
+    const std::size_t modelsBefore = F().assets->Models().size();
+    {
+        const ModelHandle box = F().assets->LoadModel(kBox);
+        WriteModelLevel(dir / "Sub.scene.json", "LevelBox", box);
+        F().assets->Release(box);
+    }
+    CHECK(F().Pump([&] { return F().assets->Models().size() == modelsBefore; }, 600));
+
+    Scene                           scene;
+    SceneRenderer                   renderer(*F().renderer, *F().context, *F().assets);
+    const CameraData                camera = FrontCamera(4.0f);
+    const std::vector<std::uint8_t> empty  = RenderImage(renderer, scene, camera, 3);
+    LevelStreamer                   streamer(*F().jobs, F().assets.get(), &F().events);
+    std::vector<LevelStreamedEvent> events;
+    Subscription sub = F().events.Subscribe<LevelStreamedEvent>([&](const LevelStreamedEvent& e) { events.push_back(e); });
+
+    const fs::path level = dir / "Sub.scene.json";
+    streamer.Load(level);
+    bool readyWhenCreated = false;
+    CHECK(F().Pump([&] {
+        streamer.Update(scene);
+        const Entity e = FindNamed(scene, "LevelBox");
+        if (e == NullEntity)
+            return false;
+        readyWhenCreated = F().assets->State(scene.GetRegistry().Get<MeshRenderer>(e).model) == AssetState::Ready;
+        return true;
+    }, 3000));
+    CHECK(readyWhenCreated);
+    CHECK(streamer.IsLoaded(level) && !streamer.Busy());
+    CHECK(scene.GetRegistry().Has<StreamedLevel>(FindNamed(scene, "LevelBox")));
+    CHECK(events.size() == 1 && events[0].loaded && !events[0].failed);
+    CHECK(F().assets->Models().size() == modelsBefore + 1);
+    const std::vector<std::uint8_t> loaded = RenderImage(renderer, scene, camera, 3);
+    CHECK(DifferentPixels(loaded, empty) > 500);
+
+    streamer.Unload(level);
+    streamer.Update(scene);
+    CHECK(FindNamed(scene, "LevelBox") == NullEntity && streamer.State(level) == LevelState::Unloaded);
+    CHECK(events.size() == 2 && !events[1].loaded && !events[1].failed);
+    const std::vector<std::uint8_t> unloaded = RenderImage(renderer, scene, camera, 3);
+    std::printf("    loaded %zu, unloaded %zu different pixels\n", DifferentPixels(loaded, empty), DifferentPixels(unloaded, empty));
+    CHECK(DifferentPixels(unloaded, empty) < 50);
+    CHECK(F().Pump([&] { return F().assets->Models().size() == modelsBefore; }, 600));
+
+    const fs::path missing = dir / "Missing.scene.json";
+    streamer.Load(missing);
+    CHECK(F().Pump([&] {
+        streamer.Update(scene);
+        return streamer.State(missing) == LevelState::Failed;
+    }, 600));
+    CHECK(events.size() == 3 && events[2].failed && !events[2].error.empty());
+    streamer.Reset();
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_LevelStreamingPreviewAndPlay)
+{
+    // Editor: in edit mode volumes do not stream; a preview from the Levels panel is read-only (no
+    // duplicate / delete, no undo step) and not saved. While playing, the volume streams the level
+    // around the camera with BeginPlay / EndPlay of its scripts; Stop removes it.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_stream_editor_{}", std::random_device{}());
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+    const std::size_t modelsBefore = F().assets->Models().size();
+
+    ScriptGraph graph;
+    const auto  print = [&](const char* text) {
+        const std::uint32_t n = graph.AddNode("Debug.Print", {});
+        graph.FindNode(n)->defaults["Text"] = std::string(text);
+        return n;
+    };
+    CHECK(graph.Connect(graph.AddNode("Event.BeginPlay", {}), "Out", print("sub begin"), "In").empty());
+    CHECK(graph.Connect(graph.AddNode("Event.EndPlay", {}), "Out", print("sub end"), "In").empty());
+    SaveScriptGraph(dir / "Sub.ugraph", graph);
+    const fs::path level = dir / "Sub.scene.json";
+    {
+        const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+        WriteModelLevel(level, "SubBox", box, PathToUtf8(dir / "Sub.ugraph"));
+        F().assets->Release(box);
+        Scene        mainScene;
+        const Entity volume = mainScene.CreateEntity("Volume");
+        mainScene.GetRegistry().Emplace<LevelStreamingVolume>(
+            volume, LevelStreamingVolume{.level = PathToUtf8(level), .halfExtents = glm::vec3(5.0f), .unloadMargin = 2.0f});
+        SaveSceneFile(dir / "Main.scene.json", mainScene, *F().assets);
+    }
+
+    Scene         scene;
+    ScriptSystem  scripts(F().events, nullptr, nullptr, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera camera;
+    camera.position = glm::vec3(0.0f, 1.0f, 3.0f); // inside the volume
+    std::vector<ModelHandle> modelRefs;
+    LevelStreamer            streamer(*F().jobs, F().assets.get(), &F().events);
+    {
+        Editor     editor({.window        = *F().window,
+                           .renderer      = *F().renderer,
+                           .scene         = scene,
+                           .assets        = *F().assets,
+                           .sceneRenderer = sceneRenderer,
+                           .camera        = camera,
+                           .modelRefs     = modelRefs,
+                           .scripts       = &scripts,
+                           .streaming     = &streamer,
+                           .layoutFile    = {}});
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                F().assets->Update();
+                editor.Update(1.0f / 60.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame, 0.5f);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        const auto runUntil = [&](const std::function<bool()>& done) {
+            for (int i = 0; i < 1200; ++i) {
+                if (done())
+                    return true;
+                runFrames(1);
+            }
+            return done();
+        };
+        const auto printed = [&](std::string_view text) {
+            return std::ranges::count_if(scripts.Messages(), [&](const ScriptMessage& m) { return m.text == text; });
+        };
+
+        CHECK(editor.OpenScene(dir / "Main.scene.json"));
+        runFrames(20);
+        CHECK(!streamer.IsLoaded(level)); // edit mode: volumes do not stream
+        const std::size_t entities = scene.GetRegistry().AliveCount();
+
+        // Preview (Levels panel / inspector): read-only, not saved, no undo step, no scripts.
+        streamer.Load(level);
+        CHECK(runUntil([&] { return streamer.IsLoaded(level); }));
+        const Entity preview = FindNamed(scene, "SubBox");
+        CHECK(preview != NullEntity && editor.IsStreamed(preview) && !editor.IsStreamed(FindNamed(scene, "Volume")));
+        CHECK(!editor.CanUndo() && !editor.HasUnsavedChanges());
+        editor.Select(preview);
+        editor.DuplicateSelection();
+        editor.DeleteSelection();
+        runFrames(2);
+        CHECK(FindNamed(scene, "SubBox") == preview && scene.GetRegistry().AliveCount() == entities + 1);
+        editor.ToggleSelection(FindNamed(scene, "Volume")); // mixed selection: only the scene's entity goes
+        editor.DeleteSelection();
+        runFrames(2);
+        CHECK(FindNamed(scene, "Volume") == NullEntity && FindNamed(scene, "SubBox") == preview);
+        editor.Undo();
+        runFrames(2);
+        CHECK(FindNamed(scene, "Volume") != NullEntity && !editor.CanUndo());
+        CHECK(editor.SaveScene(dir / "Saved.scene.json"));
+        const std::string saved = ReadText(dir / "Saved.scene.json");
+        CHECK(saved.find("SubBox") == std::string::npos && saved.find("Volume") != std::string::npos &&
+              saved.find("Sub.scene.json") != std::string::npos);
+        streamer.UnloadAll(scene);
+        CHECK(FindNamed(scene, "SubBox") == NullEntity && scene.GetRegistry().AliveCount() == entities);
+        CHECK(printed("sub begin") == 0 && printed("sub end") == 0);
+
+        // Play: the volume streams around the camera, scripts begin and end with the level.
+        editor.Play();
+        CHECK(runUntil([&] { return streamer.IsLoaded(level) && printed("sub begin") == 1; }));
+        camera.position = glm::vec3(0.0f, 1.0f, 6.0f); // outside the box, inside the unload margin: stays
+        runFrames(5);
+        CHECK(streamer.IsLoaded(level));
+        camera.position = glm::vec3(0.0f, 1.0f, 40.0f);
+        CHECK(runUntil([&] { return !streamer.IsLoaded(level) && printed("sub end") == 1; }));
+        CHECK(FindNamed(scene, "SubBox") == NullEntity);
+        camera.position = glm::vec3(0.0f, 1.0f, 3.0f);
+        CHECK(runUntil([&] { return streamer.IsLoaded(level) && printed("sub begin") == 2; }));
+        editor.Stop();
+        runFrames(3);
+        CHECK(!streamer.IsLoaded(level) && FindNamed(scene, "SubBox") == NullEntity && FindNamed(scene, "Volume") != NullEntity);
+        CHECK(scene.GetRegistry().AliveCount() == entities);
+    }
+    scene.Clear();
+    for (ModelHandle h : modelRefs)
+        F().assets->Release(h);
+    CHECK(F().Pump([&] { return F().assets->Models().size() == modelsBefore; }, 600));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Streaming_LevelLoaderSwitch)
+{
+    // Open Level with a loading screen: the next level is prepared and its models loaded in the
+    // background (progress rises to 1), then created in one step; cancelling releases the models,
+    // a missing file fails.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_loader_{}", std::random_device{}());
+    fs::create_directories(dir);
+    const std::size_t modelsBefore = F().assets->Models().size();
+    const fs::path    next         = dir / "Next.scene.json";
+    {
+        const ModelHandle box = F().assets->LoadModel(kBox);
+        WriteModelLevel(next, "NextBox", box);
+        F().assets->Release(box);
+    }
+
+    LevelLoader loader(*F().jobs, F().assets.get());
+    CHECK(loader.Begin(next));
+    CHECK(!loader.Begin(next)); // busy
+    float last = 0.0f;
+    bool  rising = true;
+    CHECK(F().Pump([&] {
+        loader.Update();
+        const float p = loader.Progress();
+        rising        = rising && p >= last;
+        last          = p;
+        return loader.State() == LevelState::Ready;
+    }, 3000));
+    CHECK(rising && last == 1.0f);
+    std::optional<LevelLoader::Result> result = loader.Take();
+    CHECK(result.has_value() && loader.State() == LevelState::Unloaded && result->models.size() == 1);
+    for (const auto& [key, handle] : result->models)
+        CHECK(F().assets->State(handle) == AssetState::Ready);
+
+    Scene                     scene;
+    SceneRenderer             renderer(*F().renderer, *F().context, *F().assets);
+    const CameraData          camera = FrontCamera(4.0f);
+    const std::vector<Entity> roots  = InstantiatePreparedScene(*result->scene, scene, F().assets.get(), result->models);
+    CHECK(roots.size() == 1 && FindNamed(scene, "NextBox") == roots[0]);
+    scene.UpdateTransforms();
+    const std::vector<std::uint8_t> image = RenderImage(renderer, scene, camera, 3);
+    scene.Clear();
+    CHECK(DifferentPixels(image, RenderImage(renderer, scene, camera, 3)) > 500);
+    for (const auto& [key, handle] : result->models)
+        F().assets->Release(handle);
+
+    CHECK(loader.Begin(next));
+    loader.Update();
+    loader.Cancel();
+    CHECK(loader.State() == LevelState::Unloaded && !loader.Take());
+    CHECK(F().Pump([&] {
+        loader.Update();
+        return F().assets->Models().size() == modelsBefore;
+    }, 600));
+
+    CHECK(loader.Begin(dir / "Missing.scene.json"));
+    CHECK(F().Pump([&] {
+        loader.Update();
+        return loader.State() == LevelState::Failed;
+    }, 600));
+    CHECK(!loader.Error().empty());
+    loader.Cancel();
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);

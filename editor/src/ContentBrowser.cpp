@@ -147,7 +147,7 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
             if (it.value().is_string() && (it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
-                                          it.key() == "file" || it.key() == "uri")) {
+                                          it.key() == "file" || it.key() == "uri" || it.key() == "level")) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -863,6 +863,13 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
             m_Ctx.project->settings.startScene = m_Ctx.project->Relative(*relocated);
             m_ProjectDirty = !m_Ctx.project->Save();
         }
+        if (!m_Ctx.project->settings.loadingScreen.empty())
+            if (const auto relocated = RelocateReference(
+                    PathToUtf8(m_Ctx.project->Root() / PathFromUtf8(m_Ctx.project->settings.loadingScreen)), source, target,
+                    wasDirectory)) {
+                m_Ctx.project->settings.loadingScreen = m_Ctx.project->Relative(*relocated);
+                m_ProjectDirty = !m_Ctx.project->Save();
+            }
     }
     if (const auto relocated = RelocateReference(PathToUtf8(m_ScenePath), source, target, wasDirectory))
         m_ScenePath = *relocated;
@@ -897,10 +904,13 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
     std::vector<StateEdit> edits;
     Registry& registry = m_Ctx.scene.GetRegistry();
     registry.ViewOf<Hierarchy>().Each([&](Entity entity, Hierarchy&) {
+        if (IsStreamed(entity)) // sub-level previews: their files are rewritten instead
+            return;
         ScriptComponent* script = registry.TryGet<ScriptComponent>(entity);
         AudioSource* audio = registry.TryGet<AudioSource>(entity);
         UiWidget* widget = registry.TryGet<UiWidget>(entity);
         PrefabInstance* prefab = registry.TryGet<PrefabInstance>(entity);
+        LevelStreamingVolume* volume = registry.TryGet<LevelStreamingVolume>(entity);
         MeshRenderer* mesh = registry.TryGet<MeshRenderer>(entity);
         ModelInstance* instance = registry.TryGet<ModelInstance>(entity);
         const auto meshModel = mesh ? relocateModel(mesh->model) : std::optional<ModelHandle>{};
@@ -913,7 +923,9 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
                                       : std::optional<fs::path>{};
         const auto prefabPath = prefab ? RelocateReference(prefab->prefab, source, target, wasDirectory)
                                        : std::optional<fs::path>{};
-        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !imagePath && !prefabPath)
+        const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
+                                      : std::optional<fs::path>{};
+        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !imagePath && !prefabPath && !levelPath)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -922,6 +934,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (audioPath) audio->sound = PathToUtf8(*audioPath);
         if (imagePath) widget->image = PathToUtf8(*imagePath);
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
+        if (levelPath) volume->level = PathToUtf8(*levelPath);
         m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
@@ -1321,6 +1334,13 @@ void Editor::DrawContentBrowser()
                                 m_Ctx.project->settings.startScene = m_Ctx.project->Relative(*relocated);
                                 m_ProjectDirty = !m_Ctx.project->Save();
                             }
+                            if (!m_Ctx.project->settings.loadingScreen.empty())
+                                if (const auto relocated = RelocateReference(
+                                        PathToUtf8(m_Ctx.project->Root() / PathFromUtf8(m_Ctx.project->settings.loadingScreen)),
+                                        previous, target, wasDirectory)) {
+                                    m_Ctx.project->settings.loadingScreen = m_Ctx.project->Relative(*relocated);
+                                    m_ProjectDirty = !m_Ctx.project->Save();
+                                }
                         }
                         if (const auto relocated = RelocateReference(PathToUtf8(m_ScenePath), previous, target, wasDirectory))
                             m_ScenePath = *relocated;
@@ -1356,10 +1376,13 @@ void Editor::DrawContentBrowser()
                         std::vector<StateEdit> edits;
                         Registry& registry = m_Ctx.scene.GetRegistry();
                         registry.ViewOf<Hierarchy>().Each([&](Entity entity, Hierarchy&) {
+                        if (IsStreamed(entity)) // sub-level previews: their files are rewritten instead
+                            return;
                         ScriptComponent* script = registry.TryGet<ScriptComponent>(entity);
                         AudioSource* audio = registry.TryGet<AudioSource>(entity);
                         UiWidget* widget = registry.TryGet<UiWidget>(entity);
                         PrefabInstance* prefab = registry.TryGet<PrefabInstance>(entity);
+                        LevelStreamingVolume* volume = registry.TryGet<LevelStreamingVolume>(entity);
                         MeshRenderer* mesh = registry.TryGet<MeshRenderer>(entity);
                         ModelInstance* instance = registry.TryGet<ModelInstance>(entity);
                         const auto meshModel = mesh ? relocateModel(mesh->model) : std::optional<ModelHandle>{};
@@ -1376,7 +1399,9 @@ void Editor::DrawContentBrowser()
                         const bool moveAudio = audioPath.has_value();
                         const bool moveImage = imagePath.has_value();
                         const bool movePrefab = prefabPath.has_value();
-                        if (!moveScript && !moveAudio && !moveImage && !movePrefab && !meshModel && !instanceModel)
+                        const auto levelPath = volume ? RelocateReference(volume->level, previous, target, wasDirectory)
+                                                      : std::optional<fs::path>{};
+                        if (!moveScript && !moveAudio && !moveImage && !movePrefab && !levelPath && !meshModel && !instanceModel)
                             return;
                         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
                         if (moveScript)
@@ -1387,6 +1412,8 @@ void Editor::DrawContentBrowser()
                             widget->image = PathToUtf8(*imagePath);
                         if (movePrefab)
                             prefab->prefab = PathToUtf8(*prefabPath);
+                        if (levelPath)
+                            volume->level = PathToUtf8(*levelPath);
                         if (meshModel)
                             mesh->model = *meshModel;
                         if (instanceModel)
@@ -1477,6 +1504,24 @@ void Editor::DrawProjectSettings()
         }
         ImGui::EndCombo();
     }
+    // Loading screen of Open Level: a scene with UI canvases (else the built-in text + bar).
+    if (ImGui::BeginCombo("Loading screen", s.loadingScreen.empty() ? "(built-in)" : s.loadingScreen.c_str())) {
+        if (ImGui::Selectable("(built-in)", s.loadingScreen.empty()))
+            s.loadingScreen.clear();
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(project.ContentDirectory(), ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string name = Lower(PathToUtf8(it->path().filename()));
+            if (!EndsWith(name, ".scene.json"))
+                continue;
+            const std::string relative = project.Relative(it->path());
+            if (ImGui::Selectable(relative.c_str(), relative == s.loadingScreen))
+                s.loadingScreen = relative;
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Shown while Open Level loads: UI canvases of this scene; a progress bar tagged\n"
+                          "\"LoadingProgress\" follows the progress");
     int size[2] = {static_cast<int>(s.windowWidth), static_cast<int>(s.windowHeight)};
     if (ImGui::InputInt2("Window size", size)) {
         s.windowWidth  = static_cast<std::uint32_t>(std::clamp(size[0], 320, 16384));
