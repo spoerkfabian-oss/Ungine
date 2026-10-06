@@ -1,4 +1,5 @@
 #include "Engine/Assets/GltfLoader.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
 
 #include <cgltf.h>
@@ -33,15 +34,16 @@ std::int32_t IndexIn(const T* base, const T* element)
     return element ? static_cast<std::int32_t>(element - base) : -1;
 }
 
-std::vector<std::uint8_t> ReadFile(const std::filesystem::path& path)
+// Through the virtual file system (pak entries or disk); empty when missing or unreadable.
+std::vector<std::byte> ReadFile(const std::filesystem::path& path)
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
-        return {};
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(file.tellg()));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return bytes;
+    try {
+        if (std::optional<std::vector<std::byte>> bytes = Vfs::Read(path))
+            return std::move(*bytes);
+    } catch (const std::exception& e) {
+        ENGINE_ERROR("glTF: {}", e.what());
+    }
+    return {};
 }
 
 std::filesystem::path Utf8Path(const std::string& utf8)
@@ -583,7 +585,7 @@ std::string Utf8(const std::filesystem::path& path)
 cgltf_result ReadUtf8File(const cgltf_memory_options*, const cgltf_file_options*, const char* path, cgltf_size* size,
                           void** data)
 {
-    const std::vector<std::uint8_t> bytes = ReadFile(Utf8Path(path));
+    const std::vector<std::byte> bytes = ReadFile(Utf8Path(path));
     if (bytes.empty())
         return cgltf_result_file_not_found;
     void* copy = std::malloc(bytes.size());
@@ -603,7 +605,7 @@ void ReleaseFile(const cgltf_memory_options*, const cgltf_file_options*, void* d
 
 ModelData LoadGltf(const std::filesystem::path& path)
 {
-    const std::vector<std::uint8_t> file = ReadFile(path);
+    const std::vector<std::byte> file = ReadFile(path);
     if (file.empty())
         throw std::runtime_error(std::format("glTF: cannot read '{}'", Utf8(path)));
 

@@ -159,6 +159,7 @@ struct ModelData {
     glm::vec3                  boundsMax{0.0f};
     // Files read besides the source itself (external buffers): hot reload watches them too.
     std::vector<std::filesystem::path> dependencies;
+    bool optimized = false; // OptimizeMeshes ran (cooked models arrive optimized)
 };
 
 [[nodiscard]] std::uint64_t TextureContentHash(std::span<const std::byte> bytes); // FNV-1a 64

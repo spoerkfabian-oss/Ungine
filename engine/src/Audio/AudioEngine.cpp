@@ -4,6 +4,8 @@
 #include <miniaudio.h>
 #include <verblib.h>
 
+#include "SoundFile.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -436,11 +438,7 @@ VoiceId AudioEngine::Play(std::shared_ptr<const SoundData> sound, const VoiceDes
     ma_data_source* source = nullptr;
     if (v.data->Streamed()) {
         const ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);
-#ifdef _WIN32
-        const ma_result result = ma_decoder_init_file_w(v.data->streamFile.c_str(), &config, &v.decoder);
-#else
-        const ma_result result = ma_decoder_init_file(v.data->streamFile.c_str(), &config, &v.decoder);
-#endif
+        const ma_result         result = InitFileDecoder(v.data->streamFile, config, v.decoder); // pak or disk
         if (result != MA_SUCCESS) {
             ENGINE_WARN("Audio: cannot stream '{}' ({})", v.data->streamFile.string(), ma_result_description(result));
             return 0;

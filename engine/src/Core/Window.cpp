@@ -131,6 +131,18 @@ void Window::SetFullscreen(bool fullscreen)
 
 bool Window::IsFullscreen() const { return glfwGetWindowMonitor(m_Handle) != nullptr; }
 
+void Window::SetSize(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return;
+    if (IsFullscreen()) {
+        m_WindowedW = width;
+        m_WindowedH = height;
+    } else {
+        glfwSetWindowSize(m_Handle, width, height);
+    }
+}
+
 Window::~Window()
 {
     if (m_Handle)

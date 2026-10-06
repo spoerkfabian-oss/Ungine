@@ -46,6 +46,9 @@ MeshOptimizeStats OptimizeMeshes(ModelData& data, const MeshOptimizeSettings& se
 {
     MeshOptimizeStats stats;
     const std::uint32_t lodCount = std::clamp(settings.lodCount, 1u, kMaxLods);
+    if (data.optimized) // cooked: already done (a second pass would add LODs of LODs)
+        return stats;
+    data.optimized = true;
     if (!settings.optimize && lodCount == 1)
         return stats;
 

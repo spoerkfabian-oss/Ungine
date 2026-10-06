@@ -18,6 +18,7 @@ Renderer::Renderer(VulkanContext& ctx, Window& window, EventBus& events, const R
     while (window.IsMinimized())
         window.WaitEvents();
     m_Swapchain = std::make_unique<Swapchain>(ctx, window.FramebufferExtent(), SwapchainDesc{.vsync = desc.vsync});
+    m_VSync     = desc.vsync;
     m_Bindless  = std::make_unique<BindlessRegistry>(ctx);
     m_Upload    = std::make_unique<UploadQueue>(ctx, desc.upload);
     m_Profiler  = std::make_unique<GpuProfiler>(ctx, kFramesInFlight);
@@ -371,19 +372,33 @@ void Renderer::CollectGarbage(FrameData& frame)
     frame.garbage.clear();
 }
 
+void Renderer::SetVSync(bool vsync)
+{
+    if (vsync == m_VSync)
+        return;
+    m_VSync         = vsync;
+    m_ResizePending = true; // recreated with the new present mode before the next acquire
+}
+
 void Renderer::RecreateSwapchain()
 {
     const VkExtent2D extent = m_Window.FramebufferExtent();
     if (extent.width == 0 || extent.height == 0)
         return; // minimized: stay pending
 
+    SwapchainDesc desc = m_Swapchain->Desc();
+    desc.vsync         = m_VSync;
     if (m_PresentFences) {
         // No stall: the driver retires the old swapchain; it is destroyed once its presents are
         // done and no frame in flight can still reference its images (RetirePresents).
-        auto fresh = std::make_unique<Swapchain>(m_Ctx, extent, m_Swapchain->Desc(), m_Swapchain->Handle());
+        auto fresh = std::make_unique<Swapchain>(m_Ctx, extent, desc, m_Swapchain->Handle());
         m_RetiredSwapchains.push_back({.swapchain = std::move(m_Swapchain), .id = m_SwapchainId, .retiredAt = m_FrameCounter});
         m_Swapchain = std::move(fresh);
         ++m_SwapchainId;
+    } else if (desc.vsync != m_Swapchain->Desc().vsync) { // other present mode: a new swapchain
+        m_Ctx.WaitIdle();
+        m_Swapchain = std::make_unique<Swapchain>(m_Ctx, extent, desc, m_Swapchain->Handle());
+        GrowRenderFinishedSemaphores();
     } else {
         m_Ctx.WaitIdle();
         m_Swapchain->Recreate(extent);

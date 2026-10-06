@@ -36,6 +36,8 @@ class FileDialog;
 class FlyCamera;
 class History;
 class LevelStreamer;
+class GameOptions;
+struct CookReport;
 class ImGuiLayer;
 class PhysicsWorld;
 class Project;
@@ -154,6 +156,8 @@ public:
     [[nodiscard]] std::filesystem::path ContentRoot() const;
     bool BuildAndRun();
     bool PackageProject(const std::filesystem::path& outputDirectory);
+    // Cook report of the last packaging (null before), shown in the "Package report" window.
+    [[nodiscard]] const CookReport* PackageReport() const { return m_PackageReport.get(); }
     bool SaveAll(); // scene (if it has a file) + open blueprints
     // Window close request: true if the application may quit now; with unsaved changes it asks
     // (Save all / Discard / Cancel) and closes the window itself once decided.
@@ -242,6 +246,7 @@ private:
     void UpdateContentImport();
     bool RelocateContentAsset(const std::filesystem::path& source, const std::filesystem::path& target);
     void DrawProjectSettings();
+    void DrawPackageReport();
     void DrawBlueprintTypes();
     void OpenTypeFile(const std::filesystem::path& file);
     void RefreshContent();
@@ -354,6 +359,7 @@ private:
     bool m_ShowHierarchy = true, m_ShowInspector = true, m_ShowRenderer = true, m_ShowStats = true;
     bool m_ShowAssets = true, m_ShowDemo = false, m_ShowBlueprint = true, m_ShowContent = true;
     bool m_ShowProjectSettings = false;
+    bool m_ShowPackageReport   = false;
     bool m_ShowTypes           = false; // Blueprint Types window
     bool m_ShowLevels          = true;  // Levels window (with a level streamer)
     bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
@@ -405,6 +411,9 @@ private:
     bool                        m_ConfirmDiscard = false;
     enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
+    std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
+    std::unique_ptr<CookReport>  m_PackageReport; // last packaging
+    std::filesystem::path        m_PackageOutput;
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills

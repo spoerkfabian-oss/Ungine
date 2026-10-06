@@ -20,6 +20,9 @@ struct ProjectSettings {
     // Shown while Open Level loads the next level (a scene with UI canvases; a progress bar
     // widget tagged "LoadingProgress" follows the progress). Empty: a built-in screen.
     std::string   loadingScreen;
+    // Written into every save slot; raise it when the saved data changes. Older slots fire
+    // "On Migrate Save Game" when read, newer ones are refused (ScriptSystem::SetSaveVersion).
+    std::uint32_t saveVersion = 1;
     std::uint32_t windowWidth  = 1600;
     std::uint32_t windowHeight = 900;
     bool          fullscreen   = false;
@@ -79,9 +82,14 @@ struct RecentProject {
 void AddRecentProject(const Project& project, const std::filesystem::path& list = {}); // front, max 20
 void RemoveRecentProject(const std::filesystem::path& file, const std::filesystem::path& list = {});
 
+struct CookReport;
+
 // Standalone game folder: the player executable renamed after the project, the shaders, the
-// project file and Content/. Returns false with a message in `error`.
+// project file, Content.upak (everything below Content/, cooked: CookProjectContent) and
+// BuildReport.txt. Texture encoding reuses the project's cache (Saved/Cache/Textures). Returns
+// false with a message in `error` (also when cooking reported errors); `report` gets the details.
 bool PackageProject(const Project& project, const std::filesystem::path& playerExecutable,
-                    const std::filesystem::path& outputDirectory, std::string* error = nullptr);
+                    const std::filesystem::path& outputDirectory, std::string* error = nullptr,
+                    CookReport* report = nullptr);
 
 } // namespace Engine

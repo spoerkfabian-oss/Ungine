@@ -1,4 +1,5 @@
 #include "Engine/Script/ScriptGraph.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Script/ScriptNodes.h"
 #include "Engine/Script/ScriptRegistry.h"
 
@@ -878,12 +879,11 @@ void SaveScriptGraph(const std::filesystem::path& file, const ScriptGraph& graph
 
 ScriptGraph LoadScriptGraph(const std::filesystem::path& file)
 {
-    std::ifstream in(file, std::ios::binary);
-    if (!in)
+    const std::optional<std::string> text = Vfs::ReadText(file); // pak entry or disk
+    if (!text)
         throw std::runtime_error("cannot read '" + ToUtf8(file) + "'");
-    const std::string text{std::istreambuf_iterator<char>(in), {}};
     try {
-        return ScriptGraphFromJson(text);
+        return ScriptGraphFromJson(*text);
     } catch (const std::exception& e) {
         throw std::runtime_error("'" + ToUtf8(file) + "': " + e.what());
     }

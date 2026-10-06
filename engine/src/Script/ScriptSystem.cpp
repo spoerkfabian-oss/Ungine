@@ -22,6 +22,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <format>
 #include <unordered_set>
 
 namespace Engine {
@@ -398,6 +399,7 @@ struct ScriptSystem::Impl {
         AssetManager*      Assets() override { return m_Impl.assets; }
         AudioSystem*       Audio() override { return m_Impl.audio; }
         LevelStreamer*     Streaming() override { return m_Impl.streamer; }
+        GameOptions*       Options() override { return m_Impl.options; }
         const Input*       GetInput() override { return m_Impl.acceptInput ? m_Impl.input : nullptr; }
         ScriptViewport     Viewport() const override { return m_Impl.viewport; }
         ScriptValue*       Variable(const std::string& name) override
@@ -564,7 +566,7 @@ struct ScriptSystem::Impl {
             return ConvertFrom(SaveValueFromJson(entry.value("value", nlohmann::json()), *stored, m_Scene), *stored, type);
         }
         bool SaveWrite(const std::string& slot) override { return SlotOrError(slot) && m_Impl.WriteSlot(slot); }
-        bool SaveRead(const std::string& slot) override { return ValidSlot(slot) && m_Impl.ReadSlot(slot); }
+        bool SaveRead(const std::string& slot) override { return ValidSlot(slot) && m_Impl.ReadSlot(slot, &m_Scene); }
         bool SaveExists(const std::string& slot) override
         {
             std::error_code ec;
@@ -575,6 +577,7 @@ struct ScriptSystem::Impl {
             if (!ValidSlot(slot))
                 return false;
             m_Impl.saves.erase(slot);
+            m_Impl.incompatibleSlots.erase(slot);
             std::error_code ec;
             return !m_Impl.saveDirectory.empty() && std::filesystem::remove(m_Impl.SlotFile(slot), ec);
         }
@@ -591,6 +594,22 @@ struct ScriptSystem::Impl {
                     names.push_back(slot);
             std::ranges::sort(names);
             return names;
+        }
+        std::uint32_t                SaveVersion() const override { return m_Impl.saveVersion; }
+        std::optional<std::uint32_t> SaveSlotVersion(const std::string& slot) override
+        {
+            if (!ValidSlot(slot))
+                return std::nullopt;
+            if (m_Impl.saveDirectory.empty()) // memory only: written by this game
+                return m_Impl.saves.contains(slot) ? std::optional<std::uint32_t>(m_Impl.saveVersion) : std::nullopt;
+            std::ifstream in(m_Impl.SlotFile(slot), std::ios::binary);
+            if (!in)
+                return std::nullopt;
+            try {
+                return Impl::SlotVersionOf(nlohmann::json::parse(in));
+            } catch (const std::exception&) {
+                return std::nullopt; // damaged
+            }
         }
         void Construct(Entity root) override
         {
@@ -624,7 +643,17 @@ struct ScriptSystem::Impl {
             Error("Invalid save slot name '" + slot + "' (letters, digits, '_', ' ')");
             return false;
         }
-        nlohmann::json* SlotOrError(const std::string& slot) { return ValidSlot(slot) ? &m_Impl.Slot(slot) : nullptr; }
+        nlohmann::json* SlotOrError(const std::string& slot)
+        {
+            if (!ValidSlot(slot))
+                return nullptr;
+            nlohmann::json& values = m_Impl.Slot(slot, &m_Scene);
+            if (m_Impl.incompatibleSlots.contains(slot)) { // newer game version: neither read nor overwritten
+                Error("Save slot '" + slot + "' is from a newer game version");
+                return nullptr;
+            }
+            return &values;
+        }
 
         Impl&     m_Impl;
         Scene&    m_Scene;
@@ -665,29 +694,76 @@ struct ScriptSystem::Impl {
     std::filesystem::path SlotFile(const std::string& slot) const { return saveDirectory / PathFromUtf8(slot + ".sav"); }
 
     // The cached values of a slot (read from its file the first time).
-    nlohmann::json& Slot(const std::string& slot)
+    nlohmann::json& Slot(const std::string& slot, Scene* scene)
     {
         if (const auto it = saves.find(slot); it != saves.end())
             return it->second;
-        if (!ReadSlot(slot))
+        if (!ReadSlot(slot, scene))
             saves[slot] = nlohmann::json::object();
         return saves[slot];
     }
 
-    bool ReadSlot(const std::string& slot)
+    // The save version a slot file was written with (files from before versioning: 1).
+    static std::uint32_t SlotVersionOf(const nlohmann::json& root)
+    {
+        const auto it = root.find("gameVersion");
+        return it != root.end() && it->is_number_unsigned() ? std::max(it->get<std::uint32_t>(), 1u) : 1u;
+    }
+
+    // Reads a slot file into the cache. An older save version is migrated (Event.MigrateSaveGame on
+    // all scripts, right away when a scene is at hand); a newer one is refused and protected.
+    bool ReadSlot(const std::string& slot, Scene* scene)
     {
         if (saveDirectory.empty())
             return saves.contains(slot); // memory only
         std::ifstream in(SlotFile(slot), std::ios::binary);
         if (!in)
             return false;
+        nlohmann::json root;
         try {
-            const nlohmann::json root = nlohmann::json::parse(in);
-            saves[slot]               = root.value("values", nlohmann::json::object());
-            return true;
+            root = nlohmann::json::parse(in);
         } catch (const std::exception& e) {
             PrintMessage("Save slot '" + slot + "' is damaged: " + e.what(), 4.0f, true);
             return false;
+        }
+        const std::uint32_t version = SlotVersionOf(root);
+        if (version > saveVersion) {
+            incompatibleSlots.insert(slot);
+            PrintMessage(std::format("Save slot '{}' is from a newer game version ({} > {}): not loaded", slot, version,
+                                     saveVersion),
+                         4.0f, true);
+            return false;
+        }
+        incompatibleSlots.erase(slot);
+        saves[slot] = root.value("values", nlohmann::json::object());
+        if (version < saveVersion && !migratingSlots.contains(slot)) {
+            pendingMigrations.emplace_back(slot, version);
+            if (scene)
+                RunMigrations(*scene);
+        }
+        return true;
+    }
+
+    // On Migrate Save Game on every script (in instance order); the slot counts as current then.
+    void RunMigrations(Scene& scene)
+    {
+        while (!pendingMigrations.empty()) {
+            const auto [slot, from] = pendingMigrations.front();
+            pendingMigrations.erase(pendingMigrations.begin());
+            ENGINE_INFO("Save slot '{}': migrating from version {} to {}", slot, from, saveVersion);
+            migratingSlots.insert(slot);
+            std::vector<std::uint64_t> keys;
+            for (const auto& [key, inst] : instances)
+                keys.push_back(key);
+            for (const std::uint64_t key : keys)
+                if (const auto it = instances.find(key); it != instances.end() && it->second->program)
+                    Fire(scene, *it->second, "Event.MigrateSaveGame", nullptr,
+                         [&](const CompiledNode&, std::vector<ScriptValue>& out) {
+                             out[1] = slot;
+                             out[2] = static_cast<std::int32_t>(from);
+                             out[3] = static_cast<std::int32_t>(saveVersion);
+                         });
+            migratingSlots.erase(slot);
         }
     }
 
@@ -700,7 +776,7 @@ struct ScriptSystem::Impl {
         const std::filesystem::path file = SlotFile(slot), temp = file.string() + ".tmp";
         {
             std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-            out << nlohmann::json{{"version", 1}, {"values", Slot(slot)}}.dump(2);
+            out << nlohmann::json{{"version", 1}, {"gameVersion", saveVersion}, {"values", Slot(slot, nullptr)}}.dump(2);
             if (!out)
                 return false;
         }
@@ -1393,6 +1469,7 @@ struct ScriptSystem::Impl {
     Subscription  collisionSub;
     Subscription  levelSub;
     LevelStreamer*                  streamer = nullptr;
+    GameOptions*                    options  = nullptr;
     std::vector<LevelStreamedEvent> levelEvents; // since the last update
 
     bool           running     = false;
@@ -1418,6 +1495,10 @@ struct ScriptSystem::Impl {
     InputMap                                                        inputMap;
     std::filesystem::path                                           saveDirectory;
     std::map<std::string, nlohmann::json>                           saves; // slot -> values (cache)
+    std::uint32_t                                                   saveVersion = 1;
+    std::unordered_set<std::string>                                 incompatibleSlots; // newer save version
+    std::unordered_set<std::string>                                 migratingSlots;
+    std::vector<std::pair<std::string, std::uint32_t>>              pendingMigrations; // slot, from version
     std::optional<ScriptLevelRequest>                               levelRequest;
     std::uint64_t                                                   constructing = 0; // owner UUID while a construction script runs
     std::unordered_map<std::uint64_t, std::vector<ModelHandle>>     constructionModels; // by owner UUID
@@ -1492,6 +1573,8 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     w.time += std::max(dt, 0.0f);
     w.frameDt = std::max(dt, 0.0f);
     scene.UpdateTransforms();
+    if (!w.pendingMigrations.empty()) // slots read without a scene at hand
+        w.RunMigrations(scene);
 
     w.SyncInstances(scene);
 
@@ -1795,11 +1878,22 @@ void ScriptSystem::SetSaveDirectory(std::filesystem::path directory)
 {
     m_Impl->saveDirectory = std::move(directory);
     m_Impl->saves.clear();
+    m_Impl->incompatibleSlots.clear();
 }
+
+void ScriptSystem::SetSaveVersion(std::uint32_t version)
+{
+    m_Impl->saveVersion = std::max(version, 1u);
+    m_Impl->saves.clear(); // slots are re-read (and migrated) against the new version
+    m_Impl->incompatibleSlots.clear();
+}
+
+std::uint32_t ScriptSystem::SaveVersion() const { return m_Impl->saveVersion; }
 std::optional<ScriptLevelRequest> ScriptSystem::TakeLevelRequest() { return std::exchange(m_Impl->levelRequest, std::nullopt); }
 void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = std::move(scene); }
 
 void ScriptSystem::SetLevelStreamer(LevelStreamer* streamer) { m_Impl->streamer = streamer; }
+void ScriptSystem::SetGameOptions(GameOptions* options) { m_Impl->options = options; }
 
 void ScriptSystem::EndPlayFor(Scene& scene, std::span<const Entity> roots)
 {

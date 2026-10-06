@@ -2,6 +2,7 @@
 
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Script/ScriptGraph.h"
 
 #include <nlohmann/json.hpp>
@@ -101,7 +102,7 @@ TEST_CASE(Project_RecentListAndPackaging)
     RemoveRecentProject(a->File(), list);
     CHECK(LoadRecentProjects(list).empty());
 
-    // Packaging: renamed player, shaders, project file, Content.
+    // Packaging: renamed player, shaders, project file, cooked Content.upak + build report.
     fs::create_directories(a->ContentDirectory() / "Scenes", ec);
     std::ofstream(a->ContentDirectory() / "Scenes" / "Main.scene.json") << "{\"version\":1,\"entities\":[]}";
     const fs::path fakePlayer = dir / "UnginePlayer.bin";
@@ -109,9 +110,17 @@ TEST_CASE(Project_RecentListAndPackaging)
     const fs::path out = dir / "Package";
     std::string    error;
     CHECK(!PackageProject(*a, dir / "missing", out, &error) && !error.empty());
+    // Never into the project itself (its Content/ would be replaced) or below Content/.
+    error.clear();
+    CHECK(!PackageProject(*a, fakePlayer, a->Root(), &error) && !error.empty());
+    CHECK(!PackageProject(*a, fakePlayer, a->ContentDirectory() / "Build", &error));
+    CHECK(fs::exists(a->ContentDirectory() / "Scenes" / "Main.scene.json") && !fs::exists(a->ContentDirectory() / "Build"));
     CHECK(PackageProject(*a, fakePlayer, out, &error));
     CHECK(fs::exists(out / "Alpha.bin") && fs::exists(out / "Alpha.ungineproj"));
-    CHECK(fs::exists(out / "Content" / "Scenes" / "Main.scene.json") && fs::exists(out / "shaders" / "mesh.vert.spv"));
+    CHECK(fs::exists(out / "Content.upak") && fs::exists(out / "BuildReport.txt") && fs::exists(out / "shaders" / "mesh.vert.spv"));
+    CHECK(!fs::exists(out / "Content"));
+    if (const auto pak = PakFile::Open(out / "Content.upak"))
+        CHECK(pak->Find("Content/Scenes/Main.scene.json") != nullptr);
     CHECK(PackageProject(*a, fakePlayer, out, &error)); // again: replaces
     fs::remove_all(dir, ec);
 }

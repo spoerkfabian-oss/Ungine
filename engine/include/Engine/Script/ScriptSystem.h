@@ -16,6 +16,7 @@ namespace Engine {
 class AssetManager;
 class AudioSystem;
 class LevelStreamer;
+class GameOptions;
 struct UiEvent;
 class EventBus;
 class Input;
@@ -140,6 +141,15 @@ public:
     void SetInputMap(InputMap map);
     // Where save game slots are written (<slot>.sav); empty: slots live in memory only.
     void SetSaveDirectory(std::filesystem::path directory);
+    // The game's save version (project setting, >= 1), written into every slot. Reading a slot of
+    // an older version fires "On Migrate Save Game" (Slot, From Version, To Version) on all scripts
+    // right away (they convert values with Get / Set Save Value); afterwards it counts as current.
+    // Slots of a newer version are refused: not read, not overwritten (deleting works).
+    void                        SetSaveVersion(std::uint32_t version);
+    // The user's options (Options nodes; Input Remap updates the input map through its apply
+    // callback). Null: the nodes report that no options are available.
+    void SetGameOptions(GameOptions* options);
+    [[nodiscard]] std::uint32_t SaveVersion() const;
     // Open Level / Quit Game since the last call (the latest wins).
     [[nodiscard]] std::optional<ScriptLevelRequest> TakeLevelRequest();
     void SetCurrentLevel(std::string scene); // Get Current Level

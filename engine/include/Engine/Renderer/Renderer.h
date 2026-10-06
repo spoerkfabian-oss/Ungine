@@ -69,6 +69,9 @@ public:
     // used from worker threads. Everything else, DeferRelease/DeferCall included: main thread.
     [[nodiscard]] const VulkanContext& GetContext() const { return m_Ctx; }
     [[nodiscard]] const Swapchain&   GetSwapchain() const { return *m_Swapchain; }
+    // Present mode (FIFO when on): takes effect with the next frame (the swapchain is recreated).
+    void               SetVSync(bool vsync);
+    [[nodiscard]] bool VSync() const { return m_VSync; }
     // Replaced swapchains still waiting for their presents (swapchain maintenance), diagnostics.
     [[nodiscard]] std::size_t        RetiredSwapchains() const { return m_RetiredSwapchains.size(); }
     [[nodiscard]] BindlessRegistry&  GetBindless()        { return *m_Bindless; }
@@ -154,6 +157,7 @@ private:
     VulkanContext&             m_Ctx;
     Window&                    m_Window;
     std::unique_ptr<Swapchain>        m_Swapchain;
+    bool                              m_VSync = true; // wanted present mode (the swapchain follows)
     std::unique_ptr<BindlessRegistry> m_Bindless;
     std::unique_ptr<UploadQueue>      m_Upload;
     std::unique_ptr<GpuProfiler>      m_Profiler;

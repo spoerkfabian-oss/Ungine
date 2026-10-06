@@ -1,4 +1,5 @@
 #include "Engine/Core/Project.h"
+#include "Engine/Assets/ContentCooker.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <system_error>
@@ -104,6 +106,7 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
         s.name                         = root->value("name", project.m_File.stem().string());
         s.startScene                   = root->value("startScene", std::string());
         s.loadingScreen                = root->value("loadingScreen", std::string());
+        s.saveVersion                  = std::max(root->value("saveVersion", 1u), 1u);
         if (const auto w = root->find("window"); w != root->end()) {
             s.windowWidth  = std::clamp(w->value("width", s.windowWidth), 320u, 16384u);
             s.windowHeight = std::clamp(w->value("height", s.windowHeight), 200u, 16384u);
@@ -157,6 +160,7 @@ bool Project::Save(std::string* error) const
                     {"name", settings.name},
                     {"startScene", settings.startScene},
                     {"loadingScreen", settings.loadingScreen},
+                    {"saveVersion", settings.saveVersion},
                     {"window",
                      {{"width", settings.windowWidth},
                       {"height", settings.windowHeight},
@@ -302,12 +306,25 @@ void RemoveRecentProject(const fs::path& file, const fs::path& list)
 // --- Packaging ----------------------------------------------------------------------------------
 
 bool PackageProject(const Project& project, const fs::path& playerExecutable, const fs::path& outputDirectory,
-                    std::string* error)
+                    std::string* error, CookReport* reportOut)
 {
     std::error_code ec;
     if (!fs::exists(playerExecutable, ec)) {
         SetError(error, "player executable not found: '" + PathToUtf8(playerExecutable) + "'");
         return false;
+    }
+    // The output's Content/ is removed below: never the project's own folder (or one inside Content/).
+    {
+        const fs::path out     = fs::weakly_canonical(fs::absolute(outputDirectory), ec);
+        const fs::path root    = fs::weakly_canonical(fs::absolute(project.Root()), ec);
+        const fs::path content = fs::weakly_canonical(fs::absolute(project.ContentDirectory()), ec);
+        const fs::path inside  = out.lexically_relative(content);
+        if (out == root || (!inside.empty() && *inside.begin() != "..")) {
+            SetError(error, "the output directory '" + PathToUtf8(outputDirectory) +
+                                "' is the project folder or inside Content/; choose another folder");
+            return false;
+        }
+        ec.clear();
     }
     fs::create_directories(outputDirectory / "shaders", ec);
     if (ec) {
@@ -331,11 +348,32 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     fs::copy_file(project.File(), outputDirectory / project.File().filename(), fs::copy_options::overwrite_existing, ec);
     if (ec)
         return fail("copying the project file");
-    fs::remove_all(outputDirectory / "Content", ec);
-    fs::copy(project.ContentDirectory(), outputDirectory / "Content", fs::copy_options::recursive, ec);
-    if (ec)
-        return fail("copying Content");
-    ENGINE_INFO("Packaged '{}' into '{}'", project.settings.name, PathToUtf8(outputDirectory));
+    fs::remove_all(outputDirectory / "Content", ec); // loose content of older packages
+    ec.clear();
+
+    // The content: cooked into one pak (+ a build report next to it).
+    CookOptions options;
+    options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
+    const CookReport report = CookProjectContent(project, outputDirectory / "Content.upak", options);
+    {
+        std::ofstream text(outputDirectory / "BuildReport.txt", std::ios::binary | std::ios::trunc);
+        text << report.Text();
+    }
+    if (reportOut)
+        *reportOut = report;
+    if (!report.Ok()) {
+        SetError(error, std::format("cooking failed with {} error(s), first: {} (see BuildReport.txt)", report.errors.size(),
+                                    report.errors.front()));
+        return false;
+    }
+    for (const std::string& file : {project.settings.startScene, project.settings.loadingScreen})
+        if (!file.empty() && !std::ranges::any_of(report.entries, [&](const CookReport::Entry& e) { return e.path == file; })) {
+            SetError(error, "'" + file + "' (project settings) is not in Content/ and was not packaged");
+            return false;
+        }
+    ENGINE_INFO("Packaged '{}' into '{}': {} raw files, {} cooked models, {} cooked textures, {:.1f} MB pak",
+                project.settings.name, PathToUtf8(outputDirectory), report.rawFiles, report.cookedModels,
+                report.cookedTextures, report.pakBytes / 1048576.0);
     return true;
 }
 
