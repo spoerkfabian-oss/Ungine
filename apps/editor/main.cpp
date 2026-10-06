@@ -14,6 +14,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Script/ScriptSystem.h"
 
@@ -75,6 +76,7 @@ protected:
         m_Audio         = std::make_unique<AudioSystem>(GetAudio(), &GetAssets(), m_Physics.get());
         m_Audio->Apply(m_Project.settings.audio);
         m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
+        m_Streamer      = std::make_unique<LevelStreamer>(GetJobs(), &GetAssets(), &GetEvents());
         m_Editor        = std::make_unique<Editor>(EditorContext{.window        = GetWindow(),
                                                                  .renderer      = GetRenderer(),
                                                                  .scene         = m_Scene,
@@ -86,6 +88,7 @@ protected:
                                                                  .scripts       = m_Scripts.get(),
                                                                  .audio         = m_Audio.get(),
                                                                  .project       = &m_Project,
+                                                                 .streaming     = m_Streamer.get(),
                                                                  .layoutFile    = m_Project.SavedDirectory() / "EditorLayout.ini"});
         std::error_code ec;
         if (const fs::path start = m_Project.StartScene(); !start.empty() && fs::exists(start, ec))
@@ -119,8 +122,9 @@ protected:
 
     void OnShutdown() override
     {
-        m_Editor.reset(); // stops playing
+        m_Editor.reset(); // stops playing, unloads streamed levels
         m_Scripts->End(m_Scene);
+        m_Streamer.reset();
         m_Audio.reset(); // releases its sounds
         m_Scene.Clear();
         for (ModelHandle h : m_ModelRefs)
@@ -142,6 +146,7 @@ private:
     std::unique_ptr<PhysicsWorld>  m_Physics;
     std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;
+    std::unique_ptr<LevelStreamer> m_Streamer;
     std::unique_ptr<Editor>        m_Editor; // references the members above: declared after them
 };
 

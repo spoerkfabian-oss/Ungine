@@ -103,6 +103,7 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
         ProjectSettings& s             = project.settings;
         s.name                         = root->value("name", project.m_File.stem().string());
         s.startScene                   = root->value("startScene", std::string());
+        s.loadingScreen                = root->value("loadingScreen", std::string());
         if (const auto w = root->find("window"); w != root->end()) {
             s.windowWidth  = std::clamp(w->value("width", s.windowWidth), 320u, 16384u);
             s.windowHeight = std::clamp(w->value("height", s.windowHeight), 200u, 16384u);
@@ -155,6 +156,7 @@ bool Project::Save(std::string* error) const
                     {"engine", "Ungine"},
                     {"name", settings.name},
                     {"startScene", settings.startScene},
+                    {"loadingScreen", settings.loadingScreen},
                     {"window",
                      {{"width", settings.windowWidth},
                       {"height", settings.windowHeight},

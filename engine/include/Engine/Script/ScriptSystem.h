@@ -15,6 +15,7 @@ namespace Engine {
 
 class AssetManager;
 class AudioSystem;
+class LevelStreamer;
 struct UiEvent;
 class EventBus;
 class Input;
@@ -142,6 +143,12 @@ public:
     // Open Level / Quit Game since the last call (the latest wins).
     [[nodiscard]] std::optional<ScriptLevelRequest> TakeLevelRequest();
     void SetCurrentLevel(std::string scene); // Get Current Level
+    // Level streaming (Load / Unload Stream Level, Is Level Loaded); null: those nodes report errors.
+    // Level Loaded / Unloaded events and entity references into streamed levels follow its
+    // LevelStreamedEvents on the EventBus.
+    void SetLevelStreamer(LevelStreamer* streamer);
+    // Ends the scripts in these subtrees (EndPlay) before they are destroyed (level unload).
+    void EndPlayFor(Scene& scene, std::span<const Entity> roots);
 
     // --- Debugger. Breakpoints start as the graph's saved ones; SetBreakpoints replaces them for a
     // graph while running (also before Begin compiles it).

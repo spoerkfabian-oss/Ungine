@@ -29,6 +29,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Asynchrones Laden/Entladen von Szenen und Teilbereichen ohne Blockieren des Hauptthreads.
 - Explizite Streaming-Volumes/Anforderungen, Ladezustand und Übergänge/Ladebildschirm.
 - Gültige Entity-/Asset-Referenzen über Szenengrenzen und definierte Fehler beim Entladen.
+- Fortschritt (2026-10-06): umgesetzt und lokal verifiziert – Szenen werden auf dem ThreadPool geparst, Modelle vorab geladen und Entities in einem Schritt erzeugt; additive Sub-Level per Streaming-Volumen (Hysterese, StreamingSource) oder Blueprint (Load/Unload Stream Level, Is Level Loaded, Level-Events); Querverweise per UUID (null solange entladen); Open Level im Player asynchron mit anpassbarem Ladebildschirm; Editor-Levels-Fenster mit schreibgeschützter Vorschau. Grenzen in CLAUDE.md, Offene Punkte 18.
 
 ### Phase 25 – Gekochte Builds und Savegame-Versionierung
 - Reproduzierbarer Cook-Schritt für Assets, gepackte Laufzeitdaten und selektive Einbeziehung von Content.

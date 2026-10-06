@@ -8,6 +8,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Script/ScriptSystem.h"
 
@@ -65,6 +66,7 @@ protected:
         // Visual scripts and audio sources run in the game view; the editor runs them only while playing.
         m_Scripts = std::make_unique<Engine::ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(),
                                                            m_Audio.get());
+        m_Streamer = std::make_unique<Engine::LevelStreamer>(GetJobs(), &GetAssets(), &GetEvents()); // editor previews
         if (!m_StartWithEditor) {
             m_Audio->Begin(m_Scene);
             m_Scripts->Begin(m_Scene);
@@ -186,7 +188,8 @@ protected:
 
     void OnShutdown() override
     {
-        m_Editor.reset();
+        m_Editor.reset(); // unloads streamed levels
+        m_Streamer.reset();
         m_Scripts->End(m_Scene); // releases spawned models
         m_Audio->End(m_Scene);
         m_Audio.reset(); // releases its sounds
@@ -226,7 +229,8 @@ private:
                 .modelRefs     = m_EditorModels,
                 .physics       = m_Physics.get(),
                 .scripts       = m_Scripts.get(),
-                .audio         = m_Audio.get()});
+                .audio         = m_Audio.get(),
+                .streaming     = m_Streamer.get()});
         } else {
             m_Editor.reset(); // waits for the GPU once
             m_Audio->Begin(m_Scene);
@@ -627,6 +631,7 @@ private:
     std::unique_ptr<Engine::AudioSystem>   m_Audio; // before the scripts: they play through it
     std::uint32_t                          m_ImpactsThisFrame = 0;
     std::unique_ptr<Engine::ScriptSystem>  m_Scripts;
+    std::unique_ptr<Engine::LevelStreamer> m_Streamer;
     std::filesystem::path                  m_StartScript; // --script
     Engine::Subscription                   m_CollisionSub;
     std::uint32_t                          m_Collisions = 0; // Begin events since the last title update

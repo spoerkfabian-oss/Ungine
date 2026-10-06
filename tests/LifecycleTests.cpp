@@ -171,13 +171,33 @@ TEST_CASE(Lifecycle_PrefabInstancesFuzz)
     std::vector<ModelHandle> models; // none (no assets), required by the API
     std::mt19937             rng(99);
     int                      problems = 0;
+    // Instantiate / duplicate copy whole subtrees and Apply adds an instance's extra children to
+    // the prefab (so every instance grows): unbounded, the scene grows exponentially within a few
+    // hundred steps (how fast depends on prefab file mtimes, i.e. timing). Past the cap the scene is
+    // cleared instead, and only small instances are applied.
+    constexpr std::size_t kMaxEntities  = 300;
+    constexpr std::size_t kMaxApplied   = 24;
+    const auto            subtreeSize   = [&](Entity root) {
+        std::size_t         count = 0;
+        std::vector<Entity> stack{root};
+        while (!stack.empty()) {
+            const Entity e = stack.back();
+            stack.pop_back();
+            ++count;
+            for (const Entity child : scene.GetRegistry().Get<Hierarchy>(e).children)
+                stack.push_back(child);
+        }
+        return count;
+    };
     for (int step = 0; step < 1500 && problems == 0; ++step) {
         const std::vector<Entity> alive = AliveEntities(scene);
         std::vector<Entity>       roots;
         for (const Entity e : alive)
             if (scene.GetRegistry().Has<PrefabInstance>(e))
                 roots.push_back(e);
-        const int op = std::uniform_int_distribution<int>(0, 99)(rng);
+        int op = std::uniform_int_distribution<int>(0, 99)(rng);
+        if (alive.size() > kMaxEntities)
+            op = 99; // clear
         try {
             if (op < 20 || roots.empty()) {
                 const Entity parent = op % 3 == 0 ? Pick(rng, alive) : NullEntity;
@@ -217,7 +237,8 @@ TEST_CASE(Lifecycle_PrefabInstancesFuzz)
                 UnlinkPrefabInstance(scene, Pick(rng, roots));
             } else if (op < 90) {
                 // The prefab file changes (another instance applied): every instance rebuilds.
-                ApplyPrefabInstance(scene, nullptr, Pick(rng, roots), models);
+                if (const Entity root = Pick(rng, roots); subtreeSize(root) <= kMaxApplied)
+                    ApplyPrefabInstance(scene, nullptr, root, models);
             } else if (op < 95) {
                 (void)RefreshPrefabInstances(scene, nullptr, models);
             } else {

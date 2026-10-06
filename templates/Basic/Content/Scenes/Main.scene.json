@@ -321,6 +321,18 @@
       "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
       "modelNode": 3,
       "mesh": {"model": {"file": "../Models/AnimatedBanner.gltf"}, "index": 0}
+    },
+    {
+      "uuid": 1012,
+      "parent": 0,
+      "name": "Annex Streaming",
+      "transform": {"position": [0, 2, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "levelStreamingVolume": {
+        "level": "Annex.scene.json",
+        "halfExtents": [10, 4, 10],
+        "loadMargin": 0.0,
+        "unloadMargin": 4.0
+      }
     }
   ],
   "camera": {

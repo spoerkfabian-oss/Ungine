@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "entities": [
+    {
+      "uuid": 2001,
+      "parent": 0,
+      "name": "Annex Gate",
+      "transform": {
+        "position": [
+          -4.5,
+          0,
+          -2.5
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "uuid": 2002,
+      "parent": 2001,
+      "name": "Pillar L",
+      "transform": {
+        "position": [
+          -1.1,
+          1.25,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          0.4,
+          2.5,
+          0.4
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "box",
+            "size": 1.0,
+            "baseColor": [
+              0.95,
+              0.55,
+              0.2,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.6
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "static"
+      },
+      "collider": {
+        "shape": "box",
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "uuid": 2003,
+      "parent": 2001,
+      "name": "Pillar R",
+      "transform": {
+        "position": [
+          1.1,
+          1.25,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          0.4,
+          2.5,
+          0.4
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "box",
+            "size": 1.0,
+            "baseColor": [
+              0.95,
+              0.55,
+              0.2,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.6
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "static"
+      },
+      "collider": {
+        "shape": "box",
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "uuid": 2004,
+      "parent": 2001,
+      "name": "Lintel",
+      "transform": {
+        "position": [
+          0,
+          2.7,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          2.8,
+          0.4,
+          0.6
+        ]
+      },
+      "mesh": {
+        "model": {
+          "primitive": {
+            "shape": "box",
+            "size": 1.0,
+            "baseColor": [
+              0.95,
+              0.55,
+              0.2,
+              1.0
+            ],
+            "metallic": 0.0,
+            "roughness": 0.6
+          }
+        },
+        "index": 0
+      },
+      "rigidBody": {
+        "type": "static"
+      },
+      "collider": {
+        "shape": "box",
+        "halfExtents": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "uuid": 2005,
+      "parent": 2001,
+      "name": "Gate Light",
+      "transform": {
+        "position": [
+          0,
+          2.0,
+          1.2
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "light": {
+        "type": "point",
+        "color": [
+          1.0,
+          0.6,
+          0.3
+        ],
+        "intensity": 8.0,
+        "range": 0.0,
+        "innerCone": 0.0,
+        "outerCone": 0.785398,
+        "castShadows": false
+      }
+    }
+  ]
+}

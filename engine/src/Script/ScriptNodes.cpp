@@ -4,7 +4,9 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Scene/Components.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Scene/Scene.h"
@@ -456,6 +458,10 @@ std::vector<NodeDesc> BuildRegistry()
               "This entity starts touching another body (physics)"));
     add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
               "This entity stops touching another body"));
+    add(Event("Event.LevelLoaded", "On Level Loaded", {Out("Level", P::String)},
+              "A streamed level was added to the scene (Level: its file, relative to the project)"));
+    add(Event("Event.LevelUnloaded", "On Level Unloaded", {Out("Level", P::String)},
+              "A streamed level was removed from the scene"));
     add(Event("Event.UIClicked", "On UI Clicked", {}, "An interactive UI button was clicked"));
     add(Event("Event.UIValueChanged", "On UI Value Changed", {Out("Value", P::Float)},
               "A UI slider value changed"));
@@ -2224,11 +2230,68 @@ std::vector<NodeDesc> BuildRegistry()
     add(WithDefaults(Action("Game.OpenLevel", "Open Level", "Game", {In("Scene", P::String)},
                             [](ScriptContext& c) { c.RequestLevel(c.InString(2), false); },
                             "Loads a scene file (relative to the project) after this frame; scripts restart"),
-                     {{"Scene", std::string("Content/Scenes/Main.uscene")}}));
+                     {{"Scene", std::string("Content/Scenes/Main.scene.json")}}));
     add(Action("Game.Quit", "Quit Game", "Game", {}, [](ScriptContext& c) { c.RequestLevel({}, true); },
                "Ends the game after this frame (in the editor: stops playing)"));
     add(Pure("Game.CurrentLevel", "Get Current Level", "Game", {Out("Scene", P::String)},
              [](ScriptContext& c) { c.Out(0, c.CurrentLevel()); }, "The scene file being played"));
+
+    // Level streaming: sub-levels added to / removed from the running scene (LevelStreamer).
+    // Latent: they wait (re-checked every update) until the level is in / out of the scene.
+    for (const bool load : {true, false}) {
+        NodeDesc d = Flow(load ? "Level.LoadStream" : "Level.UnloadStream", load ? "Load Stream Level" : "Unload Stream Level",
+                          {ExecIn(), In("Level", P::String), ExecOut("Completed")},
+                          [load](ScriptContext& c, int entry) {
+                              ScriptContext::NodeState& s        = c.State();
+                              LevelStreamer*            streamer = c.Streaming();
+                              if (!streamer) {
+                                  s.flag = false;
+                                  c.Error("Level streaming is not available here");
+                                  return kScriptStop;
+                              }
+                              const std::string level = c.InString(1);
+                              if (level.empty()) {
+                                  s.flag = false;
+                                  c.Error("No level given");
+                                  return kScriptStop;
+                              }
+                              if (entry != kScriptResume) {
+                                  if (s.flag) // already waiting: ignored (like Delay)
+                                      return kScriptStop;
+                                  if (load)
+                                      streamer->Load(PathFromUtf8(level));
+                                  else
+                                      streamer->Unload(PathFromUtf8(level));
+                              }
+                              const LevelState state = streamer->State(PathFromUtf8(level));
+                              const bool done = load ? state == LevelState::Loaded
+                                                     : state == LevelState::Unloaded || state == LevelState::Failed;
+                              if (done) {
+                                  s.flag = false;
+                                  return 2;
+                              }
+                              if (load && state == LevelState::Failed && entry == kScriptResume) { // a new try failed
+                                  s.flag = false;
+                                  c.Error("Stream level failed to load: " + level);
+                                  return kScriptStop;
+                              }
+                              s.flag = true;
+                              c.Suspend(0.0f, 0); // checked again on the next update
+                              return kScriptStop;
+                          },
+                          load ? "Adds a scene file (relative to the project) to the running scene and continues once it is there"
+                               : "Removes a streamed level again (unless a streaming volume still wants it) and continues once it is gone");
+        d.category = "Level";
+        add(WithDefaults(std::move(d), {{"Level", std::string("Content/Scenes/Sub.scene.json")}}));
+        r.back().latent = true;
+    }
+    add(WithDefaults(Pure("Level.IsLoaded", "Is Level Loaded", "Level", {In("Level", P::String), Out("Loaded", P::Bool)},
+                          [](ScriptContext& c) {
+                              LevelStreamer* streamer = c.Streaming();
+                              c.Out(1, streamer && streamer->IsLoaded(PathFromUtf8(c.InString(0))));
+                          },
+                          "The streamed level is in the scene"),
+                     {{"Level", std::string("Content/Scenes/Sub.scene.json")}}));
     return r;
 }
 

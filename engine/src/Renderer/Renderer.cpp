@@ -135,14 +135,15 @@ std::optional<FrameContext> Renderer::BeginFrame()
     f.uploadWait = m_Upload->RecordAcquires(f.cmd);
 
     const VkImage image = m_Swapchain->Image(imageIndex);
-    // srcStage = COLOR_ATTACHMENT_OUTPUT chains with the acquire-semaphore wait stage.
+    // srcStage = COLOR_ATTACHMENT_OUTPUT chains with the acquire-semaphore wait stage. READ too: a
+    // pass may load the (undefined) contents, e.g. an overlay drawn alone over a loading screen.
     CmdImageBarrier(f.cmd, {.image     = image,
                             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                             .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                             .srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                             .srcAccess = VK_ACCESS_2_NONE,
                             .dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
+                            .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT});
 
     m_FrameActive = true;
     return FrameContext{.cmd        = f.cmd,

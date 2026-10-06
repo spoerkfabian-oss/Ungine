@@ -5,6 +5,7 @@ add_library(Editor STATIC
     src/EditorCommands.cpp
     src/FileDialog.cpp
     src/History.cpp
+    src/Levels.cpp
     src/ImGuiLayer.cpp
     src/Panels.cpp
     src/ProjectLauncher.cpp

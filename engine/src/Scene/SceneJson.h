@@ -67,6 +67,8 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models);
 void CollectSubtree(const Registry& r, Entity root, std::vector<Entity>& out);
 // Made by a construction script (ConstructionOwned on the entity or an ancestor): not saved.
 [[nodiscard]] bool IsConstructed(const Registry& r, Entity e);
+// Part of a streamed sub-level (StreamedLevel on the entity or an ancestor): not saved.
+[[nodiscard]] bool IsStreamed(const Registry& r, Entity e);
 [[nodiscard]] std::uint64_t UuidOf(const Registry& r, Entity e); // 0 for NullEntity
 
 // A model reference ({"file"} / {"primitive"} / {"handle"}) in the form EntityToJson writes in
@@ -98,6 +100,8 @@ void TransformPaths(json& entity, F&& fn)
     apply(at(entity, {"modelInstance", "model", "file"}));
     apply(at(entity, {"script", "graph"}));
     apply(at(entity, {"audioSource", "sound"}));
+    apply(at(entity, {"uiWidget", "image"}));
+    apply(at(entity, {"levelStreamingVolume", "level"}));
 }
 
 // Rewrites entity references by UUID inside components (script entity variables) in place.

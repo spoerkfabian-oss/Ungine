@@ -3,8 +3,10 @@
 #include "Engine/ECS/Entity.h"
 
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Engine {
@@ -42,6 +44,26 @@ void SaveSceneFile(const std::filesystem::path& file, const Scene& scene, const 
 // Without an asset manager (tools, tests): no models are loaded.
 [[nodiscard]] std::vector<ModelHandle> LoadSceneFile(const std::filesystem::path& file, Scene& scene,
                                                      AssetManager* assets, const SceneFileOptions& options = {});
+
+// --- Asynchronous loading (level streaming, Open Level with a loading screen) ---
+// PrepareSceneFile reads and parses a scene file on any thread (no Scene, no AssetManager access);
+// it also collects the models the scene and its prefabs use. On the main thread
+// AcquireSceneModels starts loading them (handles go into `models`), and once they are ready
+// InstantiatePreparedScene creates the entities: no pop-in. LoadSceneFile = all three at once.
+struct PreparedScene;
+// Model key (normalized file or primitive recipe) -> handle; the caller releases the handles.
+using SceneModels = std::unordered_map<std::string, ModelHandle>;
+
+// Throws std::runtime_error on I/O or format errors.
+[[nodiscard]] std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::path& file);
+[[nodiscard]] const std::filesystem::path&       PreparedSceneFile(const PreparedScene& scene);
+// Main thread. Models already in `models` are not acquired again.
+void AcquireSceneModels(const PreparedScene& prepared, AssetManager& assets, SceneModels& models);
+// Main thread: adds the entities (models not yet in `models` are acquired into it). Returns the
+// created root entities (the file's top-level entities). Throws std::runtime_error on format
+// errors; the entities created so far are destroyed again (`models` keeps its handles).
+std::vector<Entity> InstantiatePreparedScene(const PreparedScene& prepared, Scene& scene, AssetManager* assets,
+                                             SceneModels& models, const SceneFileOptions& options = {});
 
 // --- In-memory snapshots (editor undo / duplicate) ---
 // Models are stored as raw handles: no reference counting, stale handles render nothing.

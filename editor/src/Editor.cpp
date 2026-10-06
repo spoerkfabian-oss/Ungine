@@ -14,6 +14,7 @@
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
@@ -71,6 +72,14 @@ Editor::Editor(const EditorContext& context)
     ReloadScriptRegistry();
     if (m_Ctx.project)
         m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
+    if (m_Ctx.streaming) {
+        m_Ctx.streaming->volumesEnabled = false; // edit mode: previews only
+        if (m_Ctx.scripts) {
+            ScriptSystem* scripts = m_Ctx.scripts;
+            m_Ctx.streaming->SetUnloadHook([scripts](Scene& scene, std::span<const Entity> roots) { scripts->EndPlayFor(scene, roots); });
+            scripts->SetLevelStreamer(m_Ctx.streaming);
+        }
+    }
 }
 
 void Editor::SimulateMouse(glm::vec2 position, int button, bool down)
@@ -129,6 +138,12 @@ Editor::~Editor()
         m_ImportWorker.join();
     }
     Stop(); // leaving the editor while playing returns to the edit scene
+    if (m_Ctx.streaming) { // previews belong to the editor
+        m_Ctx.streaming->UnloadAll(m_Ctx.scene);
+        m_Ctx.streaming->SetUnloadHook({});
+        if (m_Ctx.scripts)
+            m_Ctx.scripts->SetLevelStreamer(nullptr);
+    }
     ReleaseContentPreview();
     m_Ctx.camera.moveRequiresLook = false;
     m_Ctx.sceneRenderer.overlay   = {};
@@ -198,6 +213,8 @@ void Editor::Update(float dt)
         DrawProjectSettings();
     if (m_ShowTypes)
         DrawBlueprintTypes();
+    if (m_ShowLevels && m_Ctx.streaming)
+        DrawLevels();
     if (m_ShowStats)
         DrawStats();
     if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
@@ -241,6 +258,12 @@ void Editor::Update(float dt)
 
     if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
         UpdateAnimations(m_Ctx.scene, m_Ctx.assets, static_cast<float>(dt));
+    // Level streaming: previews in edit mode, volumes + requests while playing (around the camera).
+    if (m_Ctx.streaming && (m_PlayState == PlayState::Edit ||
+                            (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused())))) {
+        m_Ctx.streaming->volumesEnabled = m_PlayState != PlayState::Edit;
+        m_Ctx.streaming->Update(m_Ctx.scene, m_Ctx.camera.GetData(ViewportAspect()).position);
+    }
 
     // Inspector and gizmo edit local transforms: propagate before this frame is rendered.
     m_Ctx.scene.UpdateTransforms();
@@ -347,6 +370,7 @@ void Editor::BuildDefaultLayout(ImGuiID dockspace)
     ImGui::DockBuilderDockWindow("Renderer", rightBottom);
     ImGui::DockBuilderDockWindow("Stats", bottom);
     ImGui::DockBuilderDockWindow("Assets", bottom);
+    ImGui::DockBuilderDockWindow("Levels", left);
     ImGui::DockBuilderFinish(dockspace);
 }
 
@@ -429,6 +453,8 @@ void Editor::DrawMenuBar()
         if (ImGui::MenuItem("Blueprint", nullptr, &m_ShowBlueprint) && m_ShowBlueprint)
             m_Graphs->Focus();
         ImGui::MenuItem("Blueprint types", nullptr, &m_ShowTypes);
+        if (m_Ctx.streaming)
+            ImGui::MenuItem("Levels", nullptr, &m_ShowLevels);
         if (ImGui::MenuItem("Find in Blueprints", "Ctrl+F (Blueprint)")) {
             m_ShowBlueprint = true;
             m_Graphs->OpenSearch({});
@@ -586,6 +612,8 @@ void Editor::DrawViewport()
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics)
         DrawColliderOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    if (m_ShowVolumes)
+        DrawStreamingOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     // Script prints (like UE's on-screen debug messages), newest at the top.
     if (m_Ctx.scripts && m_Ctx.scripts->Running()) {
         const auto  messages = m_Ctx.scripts->Messages();
@@ -669,13 +697,15 @@ void Editor::DrawViewport()
         m_ShowColliders = !m_ShowColliders;
     if (toolButton("Audio", m_ShowAudio))
         m_ShowAudio = !m_ShowAudio;
+    if (toolButton("Volumes", m_ShowVolumes))
+        m_ShowVolumes = !m_ShowVolumes;
     if (toolButton("Game cam", m_GameCamera))
         m_GameCamera = !m_GameCamera;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Look through the scene's primary Camera component (as the player will)");
     ImGui::NewLine();
 
-    if (!m_GameCamera) // the gizmo works in the editor camera
+    if (!m_GameCamera && !IsStreamed(Selected())) // the gizmo works in the editor camera; streamed levels are read-only
         DrawGizmo(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     ImGui::End();
 }
@@ -913,6 +943,47 @@ bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool 
         SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
     list->PopClipRect();
     return clicked && hit != NullEntity;
+}
+
+void Editor::DrawStreamingOverlay(float x, float y, float width, float height)
+{
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    // Streaming volumes: oriented boxes (entity transform), the load box of selected ones dashed
+    // by its margin; the level's file name at the top center.
+    registry.ViewOf<LevelStreamingVolume, WorldTransform>().Each(
+        [&](Entity e, LevelStreamingVolume& volume, WorldTransform& world) {
+            const bool  selected = IsSelected(e);
+            const bool  loaded   = m_Ctx.streaming && !volume.level.empty() && m_Ctx.streaming->IsLoaded(PathFromUtf8(volume.level));
+            const auto  box      = [&](const glm::vec3& h, ImU32 color) {
+                glm::vec3 c[8];
+                for (int i = 0; i < 8; ++i)
+                    c[i] = glm::vec3(world.matrix * glm::vec4((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z, 1.0f));
+                static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                                      {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+                for (const auto& edge : kEdges)
+                    projector.Line(list, c[edge[0]], c[edge[1]], color);
+            };
+            const ImU32 color = selected ? IM_COL32(255, 190, 80, 255)
+                                : loaded ? IM_COL32(240, 150, 50, 200)
+                                         : IM_COL32(200, 120, 40, 120);
+            box(volume.halfExtents, color);
+            if (selected && volume.loadMargin > 0.0f)
+                box(volume.halfExtents + volume.loadMargin, IM_COL32(255, 190, 80, 110));
+            if (selected && volume.unloadMargin > 0.0f)
+                box(volume.halfExtents + volume.loadMargin + volume.unloadMargin, IM_COL32(255, 190, 80, 60));
+            ImVec2 p;
+            if (!volume.level.empty() &&
+                projector.Project(glm::vec3(world.matrix * glm::vec4(0.0f, volume.halfExtents.y, 0.0f, 1.0f)), p)) {
+                const std::string label = PathToUtf8(PathFromUtf8(volume.level).filename()) + (loaded ? " (loaded)" : "");
+                const ImVec2      size  = ImGui::CalcTextSize(label.c_str());
+                list->AddText(ImVec2(p.x - size.x * 0.5f, p.y - size.y - 2.0f), color, label.c_str());
+            }
+        });
+    list->PopClipRect();
 }
 
 void Editor::DrawBvhOverlay(float x, float y, float width, float height)
@@ -1235,6 +1306,8 @@ std::vector<Entity> Editor::SelectionRoots() const
 {
     std::vector<Entity> roots;
     for (Entity e : m_Selection) {
+        if (IsStreamed(e)) // streamed levels are read-only: not moved, duplicated or deleted
+            continue;
         const bool coveredByAncestor = std::ranges::any_of(
             m_Selection, [&](Entity other) { return other != e && m_Ctx.scene.IsAncestor(other, e); });
         if (!coveredByAncestor)

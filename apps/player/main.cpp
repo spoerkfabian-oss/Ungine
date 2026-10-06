@@ -1,7 +1,8 @@
 // UnginePlayer: runs a project's start scene as the game (physics, visual scripts, audio, the
 // scene's primary Camera component). Started by the editor (Build & Run) with the project file, or as a
 // packaged game that finds the .ungineproj next to the executable.
-// Keys: Esc opens/closes the pause menu, F11 toggles fullscreen.
+// Keys: Esc opens/closes the pause menu, F11 toggles fullscreen. Open Level loads the next scene in
+// the background behind a loading screen; streaming volumes / Load Stream Level add sub-levels.
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Application.h"
@@ -14,6 +15,7 @@
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptRegistry.h"
@@ -64,6 +66,11 @@ protected:
         m_Scripts       = std::make_unique<ScriptSystem>(GetEvents(), &GetInput(), m_Physics.get(), &GetAssets(), m_Audio.get());
         m_Scripts->SetInputMap(m_Project.settings.input);
         m_Scripts->SetSaveDirectory(m_SaveDirectory);
+        m_Streamer = std::make_unique<LevelStreamer>(GetJobs(), &GetAssets(), &GetEvents());
+        m_Streamer->SetUnloadHook([this](Scene& scene, std::span<const Entity> roots) { m_Scripts->EndPlayFor(scene, roots); });
+        m_Scripts->SetLevelStreamer(m_Streamer.get());
+        m_Loader = std::make_unique<LevelLoader>(GetJobs(), &GetAssets());
+        LoadLoadingScreen();
 
         // Blueprint types, interfaces and libraries of the project (before the scene: values of them).
         ScriptRegistry::Clear();
@@ -84,6 +91,12 @@ protected:
             ENGINE_ERROR("Cannot load the scene: {}", e.what());
             return false;
         }
+        StartLevel(scene);
+        return true;
+    }
+
+    void StartLevel(const fs::path& scene)
+    {
         m_Scene.UpdateTransforms();
         m_Physics->Sync(m_Scene);
         m_Audio->Begin(m_Scene);
@@ -91,41 +104,115 @@ protected:
         m_Scripts->Begin(m_Scene);
         CreatePauseMenu();
         ENGINE_INFO("Playing '{}' ({})", m_Project.settings.name, PathToUtf8(scene));
-        return true;
     }
 
-    // Open Level: the scene replaces the current one (scripts, audio and physics start over; save
-    // game values in memory stay). A file that does not load keeps the current level.
+    // Open Level: the next scene is read and its models loaded in the background while a loading
+    // screen shows (the current level waits); then it replaces the current one (scripts, audio,
+    // physics and streamed levels start over; save game values in memory stay). A file that does
+    // not load keeps the current level.
     void ChangeLevel(const std::string& scene)
     {
         std::error_code ec;
         const fs::path  file = fs::absolute(PathFromUtf8(scene), ec).lexically_normal(); // relative to the project root
-        std::vector<ModelHandle> probe; // keeps shared models loaded across the switch
-        try {
-            Scene scratch;
-            probe = LoadSceneFile(file, scratch, GetAssets());
-        } catch (const std::exception& e) {
-            ENGINE_ERROR("Open Level '{}' failed: {}", scene, e.what());
+        if (!m_Loader->Begin(file)) {
+            ENGINE_WARN("Open Level '{}' ignored: another level is loading", scene);
             return;
         }
+        m_LoadingName = scene;
+        m_Audio->SetPaused(true);
+    }
+
+    [[nodiscard]] bool LoadingLevel() const { return m_Loader && m_Loader->State() != LevelState::Unloaded; }
+
+    void UpdateLevelLoad()
+    {
+        m_Loader->Update();
+        if (m_Loader->State() == LevelState::Failed) {
+            ENGINE_ERROR("Open Level '{}' failed: {}", m_LoadingName, m_Loader->Error());
+            m_Loader->Cancel();
+            m_Audio->SetPaused(false);
+            return;
+        }
+        if (m_Loader->State() != LevelState::Ready)
+            return;
+        const fs::path                     file   = m_Loader->File();
+        std::optional<LevelLoader::Result> result = m_Loader->Take();
         m_Scripts->End(m_Scene);
         m_Audio->End(m_Scene);
+        m_Audio->SetPaused(false);
         m_Scene.Clear();
+        m_Streamer->Reset(); // the streamed levels went with the scene
         m_Physics->Reset();
-        const std::vector<ModelHandle> previous = std::exchange(m_Models, {});
-        if (!LoadLevel(file)) {
+        const std::vector<ModelHandle> previous = std::exchange(m_Models, {}); // released after the new level holds its models
+        try {
+            (void)InstantiatePreparedScene(*result->scene, m_Scene, &GetAssets(), result->models,
+                                           {.renderer = m_SceneRenderer.get(), .camera = &m_FallbackCamera, .physics = &m_Physics->settings});
+        } catch (const std::exception& e) {
+            ENGINE_ERROR("Open Level '{}' failed: {}", m_LoadingName, e.what());
             m_Failed = true;
             GetWindow().RequestClose();
         }
-        for (ModelHandle h : probe)
-            GetAssets().Release(h);
+        for (const auto& [key, handle] : result->models)
+            m_Models.push_back(handle);
         for (ModelHandle h : previous)
             GetAssets().Release(h);
+        if (!m_Failed)
+            StartLevel(file);
+    }
+
+    // The project's loading screen scene (UI canvases), if it has one.
+    void LoadLoadingScreen()
+    {
+        if (m_Project.settings.loadingScreen.empty())
+            return;
+        const fs::path file = (m_Project.Root() / PathFromUtf8(m_Project.settings.loadingScreen)).lexically_normal();
+        try {
+            m_LoadingModels = LoadSceneFile(file, m_LoadingScene, GetAssets());
+            m_LoadingScene.UpdateTransforms();
+            m_HasLoadingScreen = true;
+        } catch (const std::exception& e) {
+            ENGINE_WARN("Loading screen '{}' not used: {}", m_Project.settings.loadingScreen, e.what());
+        }
+    }
+
+    void DrawLoadingScreen(const FrameContext& frame)
+    {
+        const glm::vec2 size(static_cast<float>(frame.extent.width), static_cast<float>(frame.extent.height));
+        const float     progress = m_Loader->Progress();
+        m_Text->AddRect(glm::vec2(0.0f), size, glm::vec4(0.02f, 0.02f, 0.03f, 1.0f)); // covers the old frame
+        if (m_HasLoadingScreen) {
+            m_LoadingScene.GetRegistry().ViewOf<UiWidget, Tags>().Each([&](Entity, UiWidget& widget, const Tags& tags) {
+                if (tags.Has("LoadingProgress"))
+                    widget.value = widget.minimum + progress * (widget.maximum - widget.minimum);
+            });
+            m_LoadingUi.PrepareLayout(m_LoadingScene, size);
+            m_LoadingUi.SyncAssets(m_LoadingScene, GetAssets());
+            m_LoadingUi.Draw(m_LoadingScene, *m_Text);
+        } else { // built in: name and a bar in the lower third
+            const glm::vec2 window = GetWindow().WindowSize();
+            const float     dpi    = window.x > 0.0f ? size.x / window.x : 1.0f;
+            const glm::vec2 bar(std::min(size.x * 0.5f, 640.0f * dpi), 8.0f * dpi);
+            const glm::vec2 at((size.x - bar.x) * 0.5f, size.y * 0.7f);
+            m_Text->Add("Loading " + m_LoadingName, {at.x, at.y - 28.0f * dpi}, glm::vec4(0.85f, 0.88f, 0.95f, 1.0f), 2.0f * dpi);
+            m_Text->AddRect(at, bar, glm::vec4(0.15f, 0.16f, 0.2f, 1.0f));
+            m_Text->AddRect(at, {bar.x * std::clamp(progress, 0.0f, 1.0f), bar.y}, glm::vec4(0.35f, 0.75f, 1.0f, 1.0f));
+        }
+        m_Text->Render(frame);
+    }
+
+    // The game camera: the scene's primary Camera component, else the camera saved with the scene.
+    [[nodiscard]] CameraData CurrentCamera(float aspect)
+    {
+        if (const Entity e = m_Scene.FindPrimaryCamera(); e != NullEntity) {
+            const CameraComponent& cam = m_Scene.GetRegistry().Get<CameraComponent>(e);
+            return CameraFromWorld(m_Scene.GetRegistry().Get<WorldTransform>(e).matrix, cam.fovY, cam.nearPlane, aspect);
+        }
+        return m_FallbackCamera.GetData(aspect);
     }
 
     void OnFixedUpdate(double dt) override
     {
-        if (!m_Failed && !m_Paused)
+        if (!m_Failed && !m_Paused && !LoadingLevel())
             m_Physics->Step(m_Scene, static_cast<float>(dt));
     }
 
@@ -133,6 +220,10 @@ protected:
     {
         if (m_Failed)
             return;
+        if (LoadingLevel()) { // the current level waits behind the loading screen
+            UpdateLevelLoad();
+            return;
+        }
         // Mouse / camera nodes work in window coordinates of the whole window.
         m_Scripts->SetViewport({.origin = glm::vec2(0.0f), .size = GetWindow().WindowSize()});
         if (GetInput().WasKeyPressed(Key::Escape))
@@ -159,6 +250,11 @@ protected:
         }
         UpdateAnimations(m_Scene, GetAssets(), static_cast<float>(dt));
         m_Scene.UpdateTransforms();
+        // Sub-levels follow the streaming sources (else the camera).
+        if (!m_Paused) {
+            m_Streamer->Update(m_Scene, CurrentCamera(1.0f).position);
+            m_Scene.UpdateTransforms();
+        }
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
         const CameraData view = m_FallbackCamera.GetData(1.0f);
         m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
@@ -170,14 +266,13 @@ protected:
     {
         if (m_Failed)
             return;
+        if (LoadingLevel()) {
+            DrawLoadingScreen(frame);
+            return;
+        }
         m_Physics->Interpolate(m_Scene, static_cast<float>(alpha));
         const float aspect = static_cast<float>(frame.extent.width) / static_cast<float>(std::max(frame.extent.height, 1u));
-        CameraData  camera = m_FallbackCamera.GetData(aspect); // the camera saved with the scene
-        if (const Entity e = m_Scene.FindPrimaryCamera(); e != NullEntity) {
-            const CameraComponent& cam = m_Scene.GetRegistry().Get<CameraComponent>(e);
-            camera = CameraFromWorld(m_Scene.GetRegistry().Get<WorldTransform>(e).matrix, cam.fovY, cam.nearPlane, aspect);
-        }
-        m_SceneRenderer->Render(frame, m_Scene, camera);
+        m_SceneRenderer->Render(frame, m_Scene, CurrentCamera(aspect));
         m_Ui.Draw(m_Scene, *m_Text);
         DrawPrints(frame);
     }
@@ -208,7 +303,12 @@ protected:
         m_Audio->End(m_Scene);
         m_Audio.reset(); // releases its sounds
         m_Scene.Clear();
+        m_Streamer->Reset();
+        m_Loader->Cancel();
         for (ModelHandle h : m_Models)
+            GetAssets().Release(h);
+        m_LoadingScene.Clear();
+        for (ModelHandle h : m_LoadingModels)
             GetAssets().Release(h);
     }
 
@@ -341,6 +441,13 @@ private:
     std::unique_ptr<PhysicsWorld>  m_Physics;
     std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;
+    std::unique_ptr<LevelStreamer> m_Streamer;
+    std::unique_ptr<LevelLoader>   m_Loader;
+    std::string                    m_LoadingName;
+    Scene                          m_LoadingScene; // the project's loading screen (UI)
+    UiSystem                       m_LoadingUi;
+    std::vector<ModelHandle>       m_LoadingModels;
+    bool                           m_HasLoadingScreen = false;
 };
 
 // The project next to the executable (packaged game).

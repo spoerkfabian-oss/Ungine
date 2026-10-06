@@ -13,6 +13,7 @@ namespace Engine {
 
 class AssetManager;
 class AudioSystem;
+class LevelStreamer;
 class Input;
 class PhysicsWorld;
 class Scene;
@@ -101,6 +102,7 @@ public:
     [[nodiscard]] virtual PhysicsWorld* Physics() = 0;    // may be null
     [[nodiscard]] virtual AssetManager* Assets() = 0;     // may be null
     [[nodiscard]] virtual AudioSystem*  Audio() = 0;      // may be null
+    [[nodiscard]] virtual LevelStreamer* Streaming() = 0;  // may be null (no level streaming)
     [[nodiscard]] virtual const Input*  GetInput() = 0;   // null while the game does not have the input
     // A variable of this instance: the running function's locals first, then the graph's. Null:
     // no such variable.
