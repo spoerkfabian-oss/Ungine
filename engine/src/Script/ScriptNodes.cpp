@@ -1104,9 +1104,9 @@ std::vector<NodeDesc> BuildRegistry()
                    Joint* joint = jointOf(c, 2);
                    if (!joint)
                        return;
-                   const Entity other = c.InEntity(3);
-                   const Registry& r  = c.GetScene().GetRegistry();
-                   joint->connectedBody = other != NullEntity && r.Valid(other) ? r.Get<Uuid>(other).value : 0;
+                   const Entity    other    = c.InEntity(3);
+                   const Registry& registry = c.GetScene().GetRegistry();
+                   joint->connectedBody = other != NullEntity && registry.Valid(other) ? registry.Get<Uuid>(other).value : 0;
                }, "Joins the target's joint to another body (unconnected / none: the world), from the current poses"));
     add(WithParam(WithDefaults(Action("Joint.SetMotor", "Set Joint Motor", "Physics",
                                       {In("Target", P::Entity), In("Value", P::Float), In("Max Force", P::Float)},

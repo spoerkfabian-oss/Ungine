@@ -1580,14 +1580,14 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
     constexpr float  kPi = 3.14159265f;
     const JPH::SpringSettings spring(JPH::ESpringMode::FrequencyAndDamping, std::max(j.limitSpring, 0.0f),
                                      std::max(j.limitDamping, 0.0f));
-    JPH::Ref<JPH::TwoBodyConstraintSettings> settings;
+    JPH::Ref<JPH::TwoBodyConstraintSettings> jointSettings;
     switch (j.type) {
     case JointType::Fixed: {
         auto* f    = new JPH::FixedConstraintSettings();
         f->mPoint1 = f->mPoint2 = p;
         f->mAxisX1 = f->mAxisX2 = x;
         f->mAxisY1 = f->mAxisY2 = y;
-        settings   = f;
+        jointSettings = f;
         break;
     }
     case JointType::Hinge: {
@@ -1602,7 +1602,7 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
         }
         h->mMaxFrictionTorque = std::max(j.friction, 0.0f);
         h->mMotorSettings     = MotorFor(j.motor);
-        settings              = h;
+        jointSettings = h;
         break;
     }
     case JointType::Slider: {
@@ -1617,13 +1617,13 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
         }
         sl->mMaxFrictionForce = std::max(j.friction, 0.0f);
         sl->mMotorSettings    = MotorFor(j.motor);
-        settings              = sl;
+        jointSettings = sl;
         break;
     }
     case JointType::Ball: {
         auto* b    = new JPH::PointConstraintSettings();
         b->mPoint1 = b->mPoint2 = p;
-        settings   = b;
+        jointSettings = b;
         break;
     }
     case JointType::Distance: {
@@ -1642,7 +1642,7 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
             d->mMaxDistance = std::max(j.maxLimit, d->mMinDistance);
         }
         d->mLimitsSpringSettings = spring;
-        settings                 = d;
+        jointSettings = d;
         break;
     }
     case JointType::Cone: {
@@ -1650,7 +1650,7 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
         c->mPoint1     = c->mPoint2 = p;
         c->mTwistAxis1 = c->mTwistAxis2 = x;
         c->mHalfConeAngle = std::clamp(j.coneAngle, 0.0f, kPi);
-        settings          = c;
+        jointSettings = c;
         break;
     }
     case JointType::SwingTwist: {
@@ -1665,7 +1665,7 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
         st->mMaxFrictionTorque   = std::max(j.friction, 0.0f);
         st->mTwistMotorSettings  = MotorFor(j.motor);
         st->mSwingMotorSettings  = MotorFor(j.motor);
-        settings                 = st;
+        jointSettings = st;
         break;
     }
     case JointType::SixDof: {
@@ -1693,12 +1693,12 @@ bool PhysicsWorld::Impl::CreateJoint(JointRecord& record, const Pose& frame)
         }
         for (int i = 0; i < 3; ++i)
             six->mLimitsSpringSettings[i] = spring;
-        settings = six;
+        jointSettings = six;
         break;
     }
     }
     // Body 1 = B (or the world), body 2 = A: angles, positions and motors are A relative to B.
-    record.constraint = Bodies().CreateConstraint(settings, record.b, record.a);
+    record.constraint = Bodies().CreateConstraint(jointSettings, record.b, record.a);
     if (!record.constraint) {
         ENGINE_WARN("Physics: joint on entity {} could not be created", static_cast<std::uint64_t>(record.entity));
         return false;
