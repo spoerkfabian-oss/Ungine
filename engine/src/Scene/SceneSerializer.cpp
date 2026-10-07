@@ -191,7 +191,8 @@ json ColliderToJson(const Collider& c)
             {"friction", c.friction},
             {"restitution", c.restitution},
             {"trigger", c.trigger},
-            {"layer", c.layer}};
+            {"layer", c.layer},
+            {"rotation", ToJson(c.rotation)}};
 }
 
 Collider ColliderFromJson(const json& j)
@@ -207,7 +208,97 @@ Collider ColliderFromJson(const json& j)
     Read(j, "trigger", c.trigger);
     Read(j, "layer", c.layer);
     c.layer = static_cast<std::uint8_t>(std::min<unsigned>(c.layer, 15u));
+    Read(j, "rotation", c.rotation);
+    c.rotation = glm::length(c.rotation) > 1e-6f ? glm::normalize(c.rotation) : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    Read(j, "material", c.material);
+    if (const auto it = j.find("meshMaterials"); it != j.end() && it->is_object())
+        for (auto m = it->begin(); m != it->end(); ++m)
+            if (m->is_string() && !m->get<std::string>().empty())
+                c.meshMaterials[m.key()] = m->get<std::string>();
     return c;
+}
+
+constexpr const char* kCharacterRotations[] = {"none", "movement", "camera", "script"};
+constexpr const char* kJointTypes[]         = {"fixed", "hinge", "slider", "ball", "distance", "cone", "swingTwist", "sixDof"};
+constexpr const char* kJointMotorModes[]    = {"off", "velocity", "position"};
+constexpr const char* kJointAxisModes[]     = {"free", "limited", "locked"};
+
+json JointToJson(const Joint& j)
+{
+    json axes = json::array(), mins = json::array(), maxs = json::array();
+    for (std::size_t i = 0; i < 6; ++i) {
+        axes.push_back(EnumToJson(j.axes[i], kJointAxisModes));
+        mins.push_back(j.axisMin[i]);
+        maxs.push_back(j.axisMax[i]);
+    }
+    return {{"type", EnumToJson(j.type, kJointTypes)},
+            {"connectedBody", j.connectedBody},
+            {"ownerBody", j.ownerBody},
+            {"anchor", ToJson(j.anchor)},
+            {"anchorRotation", ToJson(j.anchorRotation)},
+            {"limits", j.limits},
+            {"minLimit", j.minLimit},
+            {"maxLimit", j.maxLimit},
+            {"coneAngle", j.coneAngle},
+            {"planeAngle", j.planeAngle},
+            {"limitSpring", j.limitSpring},
+            {"limitDamping", j.limitDamping},
+            {"friction", j.friction},
+            {"motor",
+             {{"mode", EnumToJson(j.motor.mode, kJointMotorModes)},
+              {"target", j.motor.target},
+              {"maxForce", j.motor.maxForce},
+              {"frequency", j.motor.frequency},
+              {"damping", j.motor.damping}}},
+            {"axes", std::move(axes)},
+            {"axisMin", std::move(mins)},
+            {"axisMax", std::move(maxs)},
+            {"breakForce", j.breakForce},
+            {"breakTorque", j.breakTorque},
+            {"collideConnected", j.collideConnected},
+            {"enabled", j.enabled}};
+}
+
+Joint JointFromJson(const json& j)
+{
+    Joint out;
+    ReadEnum(j, "type", out.type, kJointTypes);
+    Read(j, "connectedBody", out.connectedBody);
+    Read(j, "ownerBody", out.ownerBody);
+    Read(j, "anchor", out.anchor);
+    Read(j, "anchorRotation", out.anchorRotation);
+    out.anchorRotation = glm::length(out.anchorRotation) > 1e-6f ? glm::normalize(out.anchorRotation) : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    Read(j, "limits", out.limits);
+    Read(j, "minLimit", out.minLimit);
+    Read(j, "maxLimit", out.maxLimit);
+    Read(j, "coneAngle", out.coneAngle);
+    Read(j, "planeAngle", out.planeAngle);
+    Read(j, "limitSpring", out.limitSpring);
+    Read(j, "limitDamping", out.limitDamping);
+    Read(j, "friction", out.friction);
+    if (const auto m = j.find("motor"); m != j.end() && m->is_object()) {
+        ReadEnum(*m, "mode", out.motor.mode, kJointMotorModes);
+        Read(*m, "target", out.motor.target);
+        Read(*m, "maxForce", out.motor.maxForce);
+        Read(*m, "frequency", out.motor.frequency);
+        Read(*m, "damping", out.motor.damping);
+    }
+    const auto axes = j.find("axes"), mins = j.find("axisMin"), maxs = j.find("axisMax");
+    for (std::size_t i = 0; i < 6; ++i) {
+        if (axes != j.end() && axes->is_array() && i < axes->size()) {
+            const json wrapper{{"v", (*axes)[i]}};
+            ReadEnum(wrapper, "v", out.axes[i], kJointAxisModes);
+        }
+        if (mins != j.end() && mins->is_array() && i < mins->size() && (*mins)[i].is_number())
+            out.axisMin[i] = (*mins)[i].get<float>();
+        if (maxs != j.end() && maxs->is_array() && i < maxs->size() && (*maxs)[i].is_number())
+            out.axisMax[i] = (*maxs)[i].get<float>();
+    }
+    Read(j, "breakForce", out.breakForce);
+    Read(j, "breakTorque", out.breakTorque);
+    Read(j, "collideConnected", out.collideConnected);
+    Read(j, "enabled", out.enabled);
+    return out;
 }
 
 json PhysicsSettingsToJson(const PhysicsSettings& p)
@@ -216,6 +307,7 @@ json PhysicsSettingsToJson(const PhysicsSettings& p)
             {"collisionSteps", p.collisionSteps},
             {"airControl", p.airControl},
             {"interpolate", p.interpolate},
+            {"persistEvents", p.persistEvents},
             {"layerCollision", p.layerCollision}};
 }
 
@@ -226,6 +318,7 @@ void PhysicsSettingsFromJson(const json& j, PhysicsSettings& p)
     p.collisionSteps = std::clamp(p.collisionSteps, 1, 16);
     Read(j, "airControl", p.airControl);
     Read(j, "interpolate", p.interpolate);
+    Read(j, "persistEvents", p.persistEvents);
     if (const auto it = j.find("layerCollision"); it != j.end() && it->is_array() && it->size() == kPhysicsLayers)
         for (std::uint32_t a = 0; a < kPhysicsLayers; ++a)
             for (std::uint32_t b = 0; b < kPhysicsLayers; ++b) // symmetric by construction
@@ -235,8 +328,18 @@ void PhysicsSettingsFromJson(const json& j, PhysicsSettings& p)
 
 json CharacterToJson(const CharacterController& c)
 {
-    return {{"radius", c.radius},         {"height", c.height},         {"maxSlope", c.maxSlope},
-            {"stepHeight", c.stepHeight}, {"jumpSpeed", c.jumpSpeed}};
+    return {{"radius", c.radius},
+            {"height", c.height},
+            {"maxSlope", c.maxSlope},
+            {"stepHeight", c.stepHeight},
+            {"jumpSpeed", c.jumpSpeed},
+            {"rotation", EnumToJson(c.rotation, kCharacterRotations)},
+            {"turnSpeed", c.turnSpeed},
+            {"crouchHeight", c.crouchHeight},
+            {"mass", c.mass},
+            {"pushStrength", c.pushStrength},
+            {"slideOnSteepSlopes", c.slideOnSteepSlopes},
+            {"movingPlatforms", c.movingPlatforms}};
 }
 
 CharacterController CharacterFromJson(const json& j)
@@ -247,6 +350,17 @@ CharacterController CharacterFromJson(const json& j)
     Read(j, "maxSlope", c.maxSlope);
     Read(j, "stepHeight", c.stepHeight);
     Read(j, "jumpSpeed", c.jumpSpeed);
+    ReadEnum(j, "rotation", c.rotation, kCharacterRotations);
+    Read(j, "turnSpeed", c.turnSpeed);
+    Read(j, "crouchHeight", c.crouchHeight);
+    Read(j, "mass", c.mass);
+    Read(j, "pushStrength", c.pushStrength);
+    Read(j, "slideOnSteepSlopes", c.slideOnSteepSlopes);
+    Read(j, "movingPlatforms", c.movingPlatforms);
+    c.turnSpeed    = std::max(c.turnSpeed, 0.0f);
+    c.crouchHeight = std::max(c.crouchHeight, 0.0f);
+    c.mass         = std::max(c.mass, 1e-3f);
+    c.pushStrength = std::max(c.pushStrength, 0.0f);
     return c;
 }
 
@@ -508,10 +622,26 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["modelNode"] = node->node;
     if (const auto* body = r.TryGet<RigidBody>(e))
         j["rigidBody"] = RigidBodyToJson(*body);
-    if (const auto* collider = r.TryGet<Collider>(e))
-        j["collider"] = ColliderToJson(*collider);
+    if (const auto* collider = r.TryGet<Collider>(e)) {
+        json c = ColliderToJson(*collider);
+        if (!collider->material.empty())
+            c["material"] = models.WritePath(collider->material);
+        if (!collider->meshMaterials.empty()) {
+            json materials = json::object();
+            for (const auto& [name, path] : collider->meshMaterials)
+                materials[name] = models.WritePath(path);
+            c["meshMaterials"] = std::move(materials);
+        }
+        j["collider"] = std::move(c);
+    }
     if (const auto* character = r.TryGet<CharacterController>(e))
         j["character"] = CharacterToJson(*character);
+    if (const auto* joint = r.TryGet<Joint>(e))
+        j["joint"] = JointToJson(*joint);
+    if (const auto* ragdoll = r.TryGet<Ragdoll>(e))
+        j["ragdoll"] = {{"simulate", ragdoll->simulate}, {"mass", ragdoll->mass}};
+    if (r.Has<RagdollBone>(e))
+        j["ragdollBone"] = json::object();
     if (const auto* cam = r.TryGet<CameraComponent>(e))
         j["cameraComponent"] = {{"fovY", cam->fovY}, {"nearPlane", cam->nearPlane}, {"primary", cam->primary}};
     if (const auto* script = r.TryGet<ScriptComponent>(e)) {
@@ -656,8 +786,23 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
     else
         r.Remove<ModelNodeRef>(e);
     ApplyOptional<RigidBody>(r, e, j, "rigidBody", RigidBodyFromJson);
-    ApplyOptional<Collider>(r, e, j, "collider", ColliderFromJson);
+    ApplyOptional<Collider>(r, e, j, "collider", [&](const json& c) {
+        Collider collider = ColliderFromJson(c);
+        collider.material = models.ReadPath(collider.material);
+        for (auto& [name, path] : collider.meshMaterials)
+            path = models.ReadPath(path);
+        return collider;
+    });
     ApplyOptional<CharacterController>(r, e, j, "character", CharacterFromJson);
+    ApplyOptional<Joint>(r, e, j, "joint", JointFromJson);
+    ApplyOptional<Ragdoll>(r, e, j, "ragdoll", [](const json& d) {
+        Ragdoll ragdoll;
+        Read(d, "simulate", ragdoll.simulate);
+        Read(d, "mass", ragdoll.mass);
+        ragdoll.mass = std::max(ragdoll.mass, 0.01f);
+        return ragdoll;
+    });
+    ApplyOptional<RagdollBone>(r, e, j, "ragdollBone", [](const json&) { return RagdollBone{}; });
     ApplyOptional<CameraComponent>(r, e, j, "cameraComponent", [](const json& c) {
         CameraComponent cam;
         Read(c, "fovY", cam.fovY);
@@ -1122,6 +1267,21 @@ std::vector<Entity> InstantiatePreparedScene(const PreparedScene& prepared, Scen
         if (options.physics)
             if (const auto it = root.find("physics"); it != root.end())
                 PhysicsSettingsFromJson(*it, *options.physics);
+        // UUIDs already used in the scene were replaced: references inside this file follow them.
+        Registry& registry = scene.GetRegistry();
+        for (const Entity e : created) {
+            const auto follow = [&](std::uint64_t& uuid) {
+                if (const auto it = byFileUuid.find(uuid); uuid != 0 && it != byFileUuid.end())
+                    uuid = UuidOf(registry, it->second);
+            };
+            if (auto* joint = registry.TryGet<Joint>(e)) {
+                follow(joint->connectedBody);
+                follow(joint->ownerBody);
+            }
+            if (auto* script = registry.TryGet<ScriptComponent>(e))
+                for (auto& [name, v] : script->variables)
+                    follow(v.entityUuid);
+        }
         BindModelNodeRefsToInstances(scene);
     } catch (const std::exception& e) {
         for (auto it = created.rbegin(); it != created.rend(); ++it)
@@ -1202,11 +1362,16 @@ std::vector<Entity> RestoreEntities(Scene& scene, const std::string& snapshot, R
         }
         if (mode == RestoreMode::Duplicate) { // members follow their duplicated root, else become plain
             Registry& r = scene.GetRegistry();
-            for (const auto& [oldUuid, e] : byOldUuid) // references inside the copy point into the copy
+            for (const auto& [oldUuid, e] : byOldUuid) { // references inside the copy point into the copy
                 if (auto* script = r.TryGet<ScriptComponent>(e))
                     for (auto& [name, v] : script->variables)
                         if (const auto it = byOldUuid.find(v.entityUuid); v.entityUuid != 0 && it != byOldUuid.end())
                             v.entityUuid = UuidOf(r, it->second);
+                if (auto* joint = r.TryGet<Joint>(e))
+                    for (std::uint64_t* ref : {&joint->connectedBody, &joint->ownerBody})
+                        if (const auto it = byOldUuid.find(*ref); *ref != 0 && it != byOldUuid.end())
+                            *ref = UuidOf(r, it->second);
+            }
             for (const auto& [oldUuid, e] : byOldUuid) {
                 const auto* link = r.TryGet<PrefabLink>(e);
                 if (!link)

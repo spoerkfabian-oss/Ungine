@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -323,6 +325,7 @@ struct ScriptSystem::Impl {
     };
     struct QueuedCollision {
         CollisionEvent event;
+        bool           persist = false; // Collision Stay (event.begin unused)
     };
 
     // The context node implementations see: one per running node / evaluation.
@@ -673,7 +676,18 @@ struct ScriptSystem::Impl {
     {
         collisionSub = events.Subscribe<CollisionEvent>([this](const CollisionEvent& e) {
             if (running)
-                collisions.push_back({e});
+                collisions.push_back({e, false});
+            return false;
+        });
+        persistSub = events.Subscribe<CollisionPersistEvent>([this](const CollisionPersistEvent& e) {
+            // Every step for every touching pair: only what a script can receive.
+            if (running && (instances.contains(EntityKey(e.a)) || instances.contains(EntityKey(e.b))))
+                collisions.push_back({CollisionEvent{e.a, e.b, false, e.trigger, e.contact}, true});
+            return false;
+        });
+        jointSub = events.Subscribe<JointBrokenEvent>([this](const JointBrokenEvent& e) {
+            if (running)
+                brokenJoints.push_back(e);
             return false;
         });
         levelSub = events.Subscribe<LevelStreamedEvent>([this](const LevelStreamedEvent& e) {
@@ -1400,6 +1414,29 @@ struct ScriptSystem::Impl {
 
     void FireSimple(Scene& scene, Instance& inst, const std::string& type) { Fire(scene, inst, type, nullptr, {}); }
 
+    // Fire for the event nodes `accept` takes (e.g. by their param).
+    void FireIf(Scene& scene, Instance& inst, const std::string& type, const std::function<bool(const CompiledNode&)>& accept,
+                const std::function<void(const CompiledNode&, std::vector<ScriptValue>&)>& outputs)
+    {
+        if (!inst.program || !scene.GetRegistry().Valid(inst.entity))
+            return;
+        const auto it = inst.program->events.find(type);
+        if (it == inst.program->events.end())
+            return;
+        const std::vector<int> nodes = it->second;
+        for (int node : nodes) {
+            const CompiledNode& compiled = inst.program->nodes[static_cast<std::size_t>(node)];
+            if (!accept(compiled))
+                continue;
+            ++stats.eventsFired;
+            MarkNode(inst, node);
+            outputs(compiled, inst.outputs[static_cast<std::size_t>(node)]);
+            int next = 0, entry = 0;
+            if (Follow(inst, node, 0, next, entry))
+                RunChain(scene, inst, next, entry, 0);
+        }
+    }
+
     // Arguments fill the event's parameter outputs in order (converted where possible).
     void CallCustomEvent(Scene& scene, Instance& inst, const std::string& name, const std::vector<ScriptValue>& args = {})
     {
@@ -1451,6 +1488,7 @@ struct ScriptSystem::Impl {
         instances.clear();
         waiting.clear();
         collisions.clear();
+        brokenJoints.clear();
         levelEvents.clear();
         paused.reset();
         queued.clear();
@@ -1467,6 +1505,9 @@ struct ScriptSystem::Impl {
     AssetManager* assets;
     AudioSystem*  audio;
     Subscription  collisionSub;
+    Subscription  persistSub;
+    Subscription  jointSub;
+    std::vector<JointBrokenEvent> brokenJoints; // since the last update
     Subscription  levelSub;
     LevelStreamer*                  streamer = nullptr;
     GameOptions*                    options  = nullptr;
@@ -1633,18 +1674,60 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     const std::vector<Impl::QueuedCollision> collisions = std::exchange(w.collisions, {});
     for (const Impl::QueuedCollision& q : collisions) {
         const CollisionEvent& e    = q.event;
-        const std::string     type = e.begin ? "Event.CollisionBegin" : "Event.CollisionEnd";
-        for (const auto& [self, other] : {std::pair{e.a, e.b}, std::pair{e.b, e.a}}) {
-            const auto it = w.instances.find(static_cast<std::uint64_t>(self));
+        const std::string     type = q.persist ? "Event.CollisionStay" : e.begin ? "Event.CollisionBegin" : "Event.CollisionEnd";
+        for (const bool selfIsA : {true, false}) {
+            const Entity self = selfIsA ? e.a : e.b;
+            const auto   it   = w.instances.find(static_cast<std::uint64_t>(self));
             if (it == w.instances.end())
                 continue;
-            const Entity otherEntity = other;
-            const bool   trigger     = e.trigger;
-            w.Fire(scene, *it->second, type, nullptr, [&](const CompiledNode&, std::vector<ScriptValue>& out) {
-                out[1] = otherEntity;
-                out[2] = trigger;
-            });
+            // Seen from self: the normal points towards the other body.
+            const Entity      other   = selfIsA ? e.b : e.a;
+            const glm::vec3   normal  = selfIsA ? e.contact.normal : -e.contact.normal;
+            const std::string surface = selfIsA ? e.contact.surfaceA : e.contact.surfaceB;
+            const std::string otherSurface = selfIsA ? e.contact.surfaceB : e.contact.surfaceA;
+            const auto fill = [&](const CompiledNode&, std::vector<ScriptValue>& out) {
+                out[1] = other;
+                out[2] = e.trigger;
+                out[3] = e.contact.point;
+                out[4] = normal;
+                out[5] = e.contact.impulse;
+                out[6] = surface;
+                out[7] = otherSurface;
+            };
+            w.Fire(scene, *it->second, type, nullptr, fill);
+            // Hit: a blocking contact with at least the node's impulse. Found again: the chain above
+            // may have spawned (rehash) or removed instances.
+            const auto hit = w.instances.find(static_cast<std::uint64_t>(self));
+            if (e.begin && !q.persist && !e.trigger && hit != w.instances.end())
+                w.FireIf(scene, *hit->second, "Event.Hit",
+                         [&](const CompiledNode& node) {
+                             char* end       = nullptr;
+                             const float min = std::strtof(node.node->param.c_str(), &end);
+                             return e.contact.impulse >= (end != node.node->param.c_str() && std::isfinite(min) ? min : 0.0f);
+                         },
+                         [&](const CompiledNode&, std::vector<ScriptValue>& out) { // no trigger output
+                             out[1] = other;
+                             out[2] = e.contact.point;
+                             out[3] = normal;
+                             out[4] = e.contact.impulse;
+                             out[5] = surface;
+                             out[6] = otherSurface;
+                         });
         }
+    }
+    const std::vector<JointBrokenEvent> broken = std::exchange(w.brokenJoints, {});
+    for (const JointBrokenEvent& e : broken) {
+        std::vector<Entity> receivers{e.joint};
+        for (const Entity x : {e.a, e.b})
+            if (x != NullEntity && std::ranges::find(receivers, x) == receivers.end())
+                receivers.push_back(x);
+        for (const Entity self : receivers)
+            if (const auto it = w.instances.find(static_cast<std::uint64_t>(self)); it != w.instances.end())
+                w.Fire(scene, *it->second, "Event.JointBroken", nullptr, [&](const CompiledNode&, std::vector<ScriptValue>& out) {
+                    out[1] = e.joint;
+                    out[2] = e.a;
+                    out[3] = e.b;
+                });
     }
 
     // Streamed levels added / removed since the last update: entity variables that were waiting

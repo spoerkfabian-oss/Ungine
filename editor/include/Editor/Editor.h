@@ -2,6 +2,7 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
+#include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
 #include "Engine/Scene/Frustum.h"
@@ -208,6 +209,7 @@ private:
     bool DrawLightOverlay(float x, float y, float width, float height, bool clicked);
     void DrawBvhOverlay(float x, float y, float width, float height);
     void DrawColliderOverlay(float x, float y, float width, float height);
+    void DrawJointOverlay(float x, float y, float width, float height); // frames, bodies, limits
     // Local bounds of the entity's MeshRenderer mesh (collider fitting); nullopt without a ready mesh.
     [[nodiscard]] std::optional<std::pair<glm::vec3, glm::vec3>> MeshBounds(Entity entity) const;
     // World bounds of the selection (meshes in the selected subtrees); nullopt if there are none.
@@ -248,6 +250,7 @@ private:
     void DrawProjectSettings();
     void DrawPackageReport();
     void DrawBlueprintTypes();
+    void DrawPhysicsMaterial();
     void OpenTypeFile(const std::filesystem::path& file);
     void RefreshContent();
     void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
@@ -332,6 +335,7 @@ private:
     bool                m_ShowBvh         = false; // BVH nodes + selection bounds in the viewport
     int                 m_BvhDepth        = 8;
     bool                m_ShowColliders   = true;
+    bool                m_EditJointAnchor = false; // the gizmo moves the selected joint's anchor
     bool                m_ShowAudio       = true; // audio source icons / ranges, reverb zones
     bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
@@ -361,6 +365,10 @@ private:
     bool m_ShowProjectSettings = false;
     bool m_ShowPackageReport   = false;
     bool m_ShowTypes           = false; // Blueprint Types window
+    bool m_ShowPhysicsMaterial = false; // physics material (.uphysmat) editor
+    std::filesystem::path m_PhysicsMaterialFile;
+    PhysicsMaterialData   m_PhysicsMaterialEdit;
+    bool                  m_PhysicsMaterialDirty = false;
     bool m_ShowLevels          = true;  // Levels window (with a level streamer)
     bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
     struct TypeEdit;                    // the enum / struct / interface edited there
@@ -372,7 +380,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -409,12 +417,14 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
     std::filesystem::path        m_PackageOutput;
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
+    Entity                      m_MaterialTarget = NullEntity; // collider the physics material dialog fills
+    std::optional<std::string>  m_MaterialSlot;                // its glTF material (nullopt: the collider's)
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";

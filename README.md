@@ -108,6 +108,16 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Blueprints: Kategorie *Options* und *Input → Remap Action*. *Project Settings → Save version*
     versioniert Spielstände: ältere Slots lösen beim Laden das Event *Migrate Save Game* aus,
     Slots einer neueren Spielversion werden abgelehnt (nicht gelesen, nicht überschrieben).
+16. **Physik-Werkzeuge**: *Content → + New → Physics material* legt ein `.uphysmat` an (Reibung,
+    Abprallen, Oberflächen-Name); im Collider-Inspector zuweisen, bei Mesh-Collidern auch pro
+    glTF-Material. Raycasts und Kollisions-Events melden Oberfläche, Kontaktpunkt, Normale und
+    Impuls (*On Hit* mit Mindest-Impuls, *On Collision Stay* jeden Step). *Add component → Joint*
+    verbindet zwei Körper (Fixed, Hinge, Slider, Ball, Distance, Cone, Swing-Twist, 6DOF) mit
+    Limits, Motor und Bruchkraft; den Joint-Anker verschiebt die Toolbar-Schaltfläche *Anchor* per
+    Gizmo. *Add component → Ragdoll (from skeleton)* auf einem animierten Modell erzeugt Knochen mit
+    Kapseln und Gelenken; *Simulate* (oder Blueprint *Set Ragdoll Simulating*) lässt es fallen.
+    Character Controller: Drehmodus (Bewegung/Kamera/Script), Ducken, bewegte Plattformen,
+    Rutschen an steilen Hängen.
 
 
 ## Entwicklung

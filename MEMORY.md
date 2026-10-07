@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-06 (Phase 25 implemented and verified locally; PR pending)
+- Last updated: 2026-10-07 (Phase 26 implemented on `branch`, PR pending; Phase 27 next after the merge)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -460,11 +460,16 @@ Regression tests:
 Important historical failure:
 ValidPhysicsScale existed but was not used. With warning-as-error builds this produced an unused-function failure. It is now called from SyncBody.
 
+Phase 26 additions (details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)"):
+- physics material assets (`.uphysmat`), per collider and per glTF material of a mesh collider; surface in raycasts and contacts
+- contact data (point, normal, impulse estimate, relative velocity, surfaces), CollisionPersistEvent, Blueprint On Hit / On Collision Stay
+- Joint component (Fixed/Hinge/Slider/Ball/Distance/Cone/SwingTwist/6DOF): Jolt body1 = B (connected or world), body2 = A, so limits/motors are A relative to B
+- ragdolls from skeletons (Ragdoll.h), character rotation modes / moving platforms / crouch / slope sliding / push strength
+- Jolt objects (GroupFilter, materials) must be created after AcquireJolt and released before ReleaseJolt (allocator registration)
+
 Known limitations:
 - mesh colliders are for static/kinematic use
-- no joints/constraints
-- no per-triangle material system
-- collision events lack full contact information
+- contact impulse is estimated, not Jolt's solver lambda; motors only on hinge/slider/swing-twist
 - CCD is more expensive
 - negative scale is not preserved through current decomposition
 - Scaled uses absolute scale
@@ -806,6 +811,15 @@ Technical details: CLAUDE.md "Gekochte Builds, Savegame-Versionen, Optionen (Pha
 - `Core/GameOptions.h`: per-user `Settings.json` (graphics, bus volumes, remapped bindings); player options menu (Graphics/Audio/Controls with key capture, conflict hint, paging, resets), `Renderer::SetVSync`, `Window::SetSize`; Blueprint Options/Remap nodes; editor Play applies only the remapped input.
 - Tests: CPU `tests/CookTests.cpp` (5 cases), GPU editor package-report check, smokes `SmokePackageSetup` + `UnginePackagedPlayerSmoke` (Basic level-switch project with a textured model, played from the pak).
 
+### Phase 26 physics and character tools (2026-10-07)
+Technical details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)".
+
+- New: `Physics/PhysicsMaterial.h`, `Physics/Ragdoll.h`; Components Collider (rotation, material, meshMaterials), CharacterController (rotation, turnSpeed, crouchHeight, mass, pushStrength, slideOnSteepSlopes, movingPlatforms), Joint/JointMotor, Ragdoll/RagdollBone; serialized (joint UUIDs remapped on duplicate/prefab/level instantiation; material paths relative in files).
+- Blueprint: On Collision Stay, On Hit, On Joint Broken, contact outputs on Begin/End, Raycast Surface, character crouch/yaw/state, joint enable/connect/motor/state, ragdoll create/simulate.
+- Editor: inspector sections, joint overlay + "Anchor" gizmo mode, PHYS content type + Physics material window.
+- Fixes during development: GroupFilter created before Jolt's allocator was registered (ctor crash); slider/6DOF limits inverted (body order).
+- Tests: CPU `tests/PhysicsToolsTests.cpp` (7 cases), GPU `Physics_TriangleMaterialsAndEditorTools`.
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -949,7 +963,7 @@ User-approved work plan (2026-10-05, after PR #12 merged the build repair; main 
 
 Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
 
-Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 implemented and verified locally (section 18); PR #15 from `branch`, drive CI green, then wait for the user's merge; next Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – ask the user about its open decisions first. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
+Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 merged (PR #15, merge 4c58715); `branch` fast-forwarded to main. Phase 26 implemented on `branch` (2026-10-07), PR pending; afterwards Phase 27 (sound cues, voice priority, snapshots/ducking, multi-ray occlusion; ask the user first). Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – decisions (user, 2026-10-06): joints as a component with Fixed/Hinge/Slider/Ball/Distance/Cone + generic 6DOF and ragdoll creation from skeletons (limits, motors, break force, editor gizmo, Blueprint nodes); per-triangle collision materials as physics material assets (`.uphysmat`: friction, restitution, surface tag) assigned per glTF material of a mesh collider, surface reported in raycasts and contacts; contact events with point, normal, impulse, relative velocity, surfaces + Hit event with threshold + per-frame Persist events; character: rotation modes (none/movement/camera yaw/script, turn speed), moving platforms (ground velocity), crouch with headroom check, steep-slope sliding and push strength. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
 
 For every concrete issue:
 - patch branch
@@ -970,4 +984,5 @@ If an audit finds no concrete defect:
 - Phase A added GPU tests for skinning (model, duplicate, prefab instances), runtime UI drawing and editor Play-mode interaction, content import and reference repair; import previews (thumbnails, waveforms) still have no dedicated test.
 - Phase A merged as PR #13 (2026-10-06).
 - Phase 24 (level/area streaming) merged as PR #14.
-- Phase 25 (cooked builds, savegame versions, options/remapping) implemented and verified locally (section 18); PR #15 open, CI must be green before the user merges.
+- Phase 25 (cooked builds, savegame versions, options/remapping) merged as PR #15 (merge 4c58715, 2026-10-06).
+- Phase 26 (physics materials, contact data, joints, ragdolls, character tools) implemented on `branch` (2026-10-07), PR pending.

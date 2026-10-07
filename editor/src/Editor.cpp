@@ -217,6 +217,8 @@ void Editor::Update(float dt)
         DrawPackageReport();
     if (m_ShowTypes)
         DrawBlueprintTypes();
+    if (m_ShowPhysicsMaterial)
+        DrawPhysicsMaterial();
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
     if (m_ShowStats)
@@ -614,8 +616,10 @@ void Editor::DrawViewport()
         iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
-    if (m_ShowColliders && m_Ctx.physics)
+    if (m_ShowColliders && m_Ctx.physics) {
         DrawColliderOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+        DrawJointOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    }
     if (m_ShowVolumes)
         DrawStreamingOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     // Script prints (like UE's on-screen debug messages), newest at the top.
@@ -699,6 +703,12 @@ void Editor::DrawViewport()
         m_ShowBvh = !m_ShowBvh;
     if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
         m_ShowColliders = !m_ShowColliders;
+    if (m_Ctx.scene.GetRegistry().Valid(Selected()) && m_Ctx.scene.GetRegistry().Has<Joint>(Selected())) {
+        if (toolButton("Anchor", m_EditJointAnchor))
+            m_EditJointAnchor = !m_EditJointAnchor;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The gizmo moves / turns the selected joint's anchor (X: hinge / slider / twist axis)");
+    }
     if (toolButton("Audio", m_ShowAudio))
         m_ShowAudio = !m_ShowAudio;
     if (toolButton("Volumes", m_ShowVolumes))
@@ -729,6 +739,33 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
 
     // The engine projection is reverse-Z with an infinite far plane; ImGuizmo handles both.
     const CameraData camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+
+    // Joint anchor: the frame (entity world x anchor) moves; the entity stays.
+    if (Joint* joint = registry.TryGet<Joint>(primary); joint && m_EditJointAnchor && m_GizmoOperation != GizmoOperation::Scale) {
+        const glm::mat4 entityWorld = registry.Get<WorldTransform>(primary).matrix;
+        glm::vec3       scale, translation, skew;
+        glm::vec4       perspective;
+        glm::quat       rotation;
+        glm::decompose(entityWorld, scale, rotation, translation, skew, perspective);
+        glm::mat4 frame = glm::translate(glm::mat4(1.0f), glm::vec3(entityWorld * glm::vec4(joint->anchor, 1.0f))) *
+                          glm::mat4_cast(glm::normalize(rotation) * glm::normalize(joint->anchorRotation));
+        const bool moved = ImGuizmo::Manipulate(glm::value_ptr(camera.view), glm::value_ptr(camera.projection),
+                                                m_GizmoOperation == GizmoOperation::Translate ? ImGuizmo::TRANSLATE : ImGuizmo::ROTATE,
+                                                ImGuizmo::LOCAL, glm::value_ptr(frame));
+        if (ImGuizmo::IsUsing() && !m_GizmoEdit)
+            m_GizmoEdit.emplace(std::vector<StateEdit>{{UuidOf(primary), SnapshotEntityState(m_Ctx.scene, primary)}});
+        if (moved) {
+            joint->anchor = glm::vec3(glm::inverse(entityWorld) * frame[3]);
+            joint->anchorRotation =
+                glm::normalize(glm::conjugate(glm::normalize(rotation)) * glm::normalize(glm::quat_cast(glm::mat3(frame))));
+        }
+        if (!ImGuizmo::IsUsing() && m_GizmoEdit) {
+            PushStateChange("Move joint anchor", std::move(*m_GizmoEdit));
+            m_GizmoEdit.reset();
+        }
+        return;
+    }
+
     const glm::mat4  before = registry.Get<WorldTransform>(primary).matrix;
     glm::mat4        world  = before;
 
@@ -1017,6 +1054,73 @@ void Editor::DrawBvhOverlay(float x, float y, float width, float height)
     });
     if (const std::optional<Aabb> selection = SelectionBounds())
         box(*selection, IM_COL32(255, 220, 60, 255));
+    list->PopClipRect();
+}
+
+void Editor::DrawJointOverlay(float x, float y, float width, float height)
+{
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    registry.ViewOf<Joint>().Each([&](Entity e, Joint& joint) {
+        const glm::mat4& world = registry.Get<WorldTransform>(e).matrix;
+        glm::vec3        scale, translation, skew;
+        glm::vec4        perspective;
+        glm::quat        rotation;
+        glm::decompose(world, scale, rotation, translation, skew, perspective);
+        const glm::quat q      = glm::normalize(rotation) * glm::normalize(joint.anchorRotation);
+        const glm::vec3 p      = glm::vec3(world * glm::vec4(joint.anchor, 1.0f));
+        const glm::vec3 ax     = q * glm::vec3(1.0f, 0.0f, 0.0f), ay = q * glm::vec3(0.0f, 1.0f, 0.0f), az = q * glm::vec3(0.0f, 0.0f, 1.0f);
+        const bool      active = m_Ctx.physics->GetJointState(e).active;
+        const float     alpha  = IsSelected(e) ? 1.0f : 0.55f;
+        const ImU32     line   = active ? ImGui::GetColorU32(ImVec4(1.0f, 0.6f, 0.2f, alpha)) : ImGui::GetColorU32(ImVec4(0.6f, 0.6f, 0.6f, alpha));
+        const float     size   = 0.25f;
+        // Bodies: lines from their origins to the anchor.
+        for (const std::uint64_t uuid : {joint.ownerBody, joint.connectedBody})
+            if (const Entity body = uuid ? m_Ctx.scene.FindByUuid(uuid) : NullEntity; body != NullEntity)
+                projector.Line(list, glm::vec3(registry.Get<WorldTransform>(body).matrix[3]), p, line);
+        if (!joint.ownerBody)
+            projector.Line(list, glm::vec3(world[3]), p, line);
+        // Frame: X (joint axis) red, Y (normal) green.
+        projector.Line(list, p, p + ax * size, ImGui::GetColorU32(ImVec4(1.0f, 0.25f, 0.25f, alpha)));
+        projector.Line(list, p, p + ay * size * 0.6f, ImGui::GetColorU32(ImVec4(0.3f, 1.0f, 0.3f, alpha)));
+        // Limits.
+        const auto arc = [&](float from, float to) { // about X, from Y
+            constexpr int kSteps = 24;
+            glm::vec3     prev   = p + (ay * std::cos(from) + az * std::sin(from)) * size;
+            projector.Line(list, p, prev, line);
+            for (int i = 1; i <= kSteps; ++i) {
+                const float     t    = from + (to - from) * static_cast<float>(i) / kSteps;
+                const glm::vec3 next = p + (ay * std::cos(t) + az * std::sin(t)) * size;
+                projector.Line(list, prev, next, line);
+                prev = next;
+            }
+            projector.Line(list, p, prev, line);
+        };
+        switch (joint.type) {
+        case JointType::Hinge:
+            if (joint.limits)
+                arc(joint.minLimit, joint.maxLimit);
+            else
+                projector.Circle(list, p, ay, az, size, line);
+            break;
+        case JointType::Slider:
+            if (joint.limits)
+                projector.Line(list, p + ax * joint.minLimit, p + ax * joint.maxLimit, line);
+            break;
+        case JointType::Cone:
+        case JointType::SwingTwist: {
+            const float angle = std::min(joint.coneAngle, glm::radians(89.0f));
+            projector.Circle(list, p + ax * size, ay, az, size * std::tan(angle), line);
+            if (joint.type == JointType::SwingTwist)
+                arc(joint.minLimit, joint.maxLimit);
+            break;
+        }
+        default: break;
+        }
+    });
     list->PopClipRect();
 }
 

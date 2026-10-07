@@ -9,7 +9,9 @@
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Physics/Ragdoll.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/LevelStreaming.h"
@@ -189,6 +191,32 @@ bool ReverbRows(ReverbParams* r)
     return changed;
 }
 constexpr const char* kColliderShapeNames[] = {"Box", "Sphere", "Capsule", "Mesh"};
+constexpr const char* kCharacterRotationNames[] = {"None", "Movement", "Camera", "Script"};
+constexpr const char* kJointTypeNames[]     = {"Fixed", "Hinge", "Slider", "Ball", "Distance", "Cone", "Swing-twist", "6DOF"};
+constexpr const char* kJointMotorNames[]    = {"Off", "Velocity", "Position"};
+constexpr const char* kJointAxisNames[]     = {"Free", "Limited", "Locked"};
+constexpr const char* kSixDofAxisLabels[]   = {"Move X", "Move Y", "Move Z", "Twist X", "Swing Y", "Swing Z"};
+
+// Rotation as Euler degrees (XYZ); true when edited.
+bool RotationRow(const char* label, glm::quat* q)
+{
+    PropertyRow(label);
+    glm::vec3  euler   = glm::degrees(glm::eulerAngles(glm::normalize(*q)));
+    const bool changed = ImGui::DragFloat3("##v", &euler.x, 0.5f, -360.0f, 360.0f, "%.1f");
+    if (changed)
+        *q = glm::normalize(glm::quat(glm::radians(euler)));
+    ImGui::PopID();
+    return changed;
+}
+
+// Angle in degrees bound to radians.
+bool AngleRow(const char* label, float* radians, float minDegrees, float maxDegrees)
+{
+    PropertyRow(label);
+    const bool changed = ImGui::SliderAngle("##v", radians, minDegrees, maxDegrees);
+    ImGui::PopID();
+    return changed;
+}
 constexpr const char* kActivityNames[]      = {"-", "static", "kinematic", "active", "sleeping", "character"};
 
 bool Vec3Row(const char* label, glm::vec3* v, float speed, float resetValue, const char* fmt = "%.3f")
@@ -716,10 +744,60 @@ void Editor::DrawInspector()
             ImGui::PopID();
             break;
         }
-        if (collider->shape != ColliderShape::Mesh)
+        if (collider->shape != ColliderShape::Mesh) {
             Vec3Row("Center", &collider->center, 0.005f, 0.0f);
-        DragFloatRow("Friction", &collider->friction, 0.005f, 0.0f, 10.0f);
-        DragFloatRow("Restitution", &collider->restitution, 0.005f, 0.0f, 1.0f);
+            RotationRow("Rotation", &collider->rotation);
+        }
+        // Physics material: replaces friction / restitution, names the surface.
+        const auto materialRow = [&](const char* label, std::string& path, std::optional<std::string> slot) {
+            PropertyRow(label);
+            const std::string shown = path.empty() ? std::string("(none)") : PathToUtf8(PathFromUtf8(path).filename());
+            ImGui::SetNextItemWidth(-56.0f);
+            ImGui::InputText("##material", const_cast<char*>(shown.c_str()), shown.size() + 1, ImGuiInputTextFlags_ReadOnly);
+            if (ImGui::IsItemHovered() && !path.empty())
+                ImGui::SetTooltip("%s", path.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("...")) {
+                m_MaterialTarget = e;
+                m_MaterialSlot   = slot;
+                m_DialogPurpose  = DialogPurpose::AssignPhysicsMaterial;
+                m_FileDialog->Open("Choose physics material", FileDialog::Mode::Open,
+                                   path.empty() ? ContentRoot() : PathFromUtf8(path).parent_path(),
+                                   {std::string(kPhysicsMaterialExtension)});
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                path.clear();
+            ImGui::PopID();
+        };
+        materialRow("Material", collider->material, std::nullopt);
+        if (collider->material.empty()) {
+            DragFloatRow("Friction", &collider->friction, 0.005f, 0.0f, 10.0f);
+            DragFloatRow("Restitution", &collider->restitution, 0.005f, 0.0f, 1.0f);
+        }
+        if (collider->shape == ColliderShape::Mesh) // per glTF material of the mesh
+            if (const auto* renderer = registry.TryGet<MeshRenderer>(e))
+                if (const Model* model = m_Ctx.assets.Get(renderer->model)) {
+                    std::vector<std::string> names;
+                    if (renderer->meshIndex < model->meshes.size())
+                        for (const Submesh& sm : model->meshes[renderer->meshIndex].submeshes)
+                            if (sm.material < model->previewMaterials.size() &&
+                                std::ranges::find(names, model->previewMaterials[sm.material].name) == names.end())
+                                names.push_back(model->previewMaterials[sm.material].name);
+                    for (const std::string& name : names) {
+                        std::string path = collider->meshMaterials.contains(name) ? collider->meshMaterials.at(name) : std::string();
+                        const std::string before = path;
+                        ImGui::PushID(name.c_str());
+                        materialRow(("  " + (name.empty() ? std::string("(unnamed)") : name)).c_str(), path, name);
+                        ImGui::PopID();
+                        if (path != before) {
+                            if (path.empty())
+                                collider->meshMaterials.erase(name);
+                            else
+                                collider->meshMaterials[name] = path;
+                        }
+                    }
+                }
         CheckboxRow("Trigger", &collider->trigger);
         std::uint32_t layer = collider->layer;
         if (SliderUintRow("Layer", &layer, 0, kPhysicsLayers - 1))
@@ -753,16 +831,184 @@ void Editor::DrawInspector()
         ImGui::PopID();
         DragFloatRow("Step height", &character->stepHeight, 0.005f, 0.0f, 5.0f);
         DragFloatRow("Jump speed", &character->jumpSpeed, 0.05f, 0.0f, 100.0f, "%.2f m/s");
+        ComboRow("Rotation", &character->rotation, kCharacterRotationNames);
+        if (character->rotation != CharacterRotation::None)
+            DragFloatRow("Turn speed", &character->turnSpeed, 1.0f, 0.0f, 10000.0f, "%.0f deg/s");
+        DragFloatRow("Crouch height", &character->crouchHeight, 0.005f, 0.05f, character->height);
+        DragFloatRow("Mass", &character->mass, 0.5f, 0.001f, 1e5f, "%.1f kg");
+        DragFloatRow("Push strength", &character->pushStrength, 1.0f, 0.0f, 1e6f, "%.0f N");
+        CheckboxRow("Slide on steep slopes", &character->slideOnSteepSlopes);
+        CheckboxRow("Moving platforms", &character->movingPlatforms);
         if (m_Ctx.physics) {
             if (const std::optional<CharacterState> state = m_Ctx.physics->GetCharacterState(e)) {
+                static constexpr const char* kGround[] = {"on ground", "on steep ground", "not supported", "in air"};
                 PropertyRow("State");
-                ImGui::TextDisabled("%s, v %.2f m/s", state->onGround ? "on ground" : "in air", glm::length(state->velocity));
+                ImGui::TextDisabled("%s%s, v %.2f m/s", kGround[static_cast<int>(state->ground)], state->crouching ? ", crouching" : "",
+                                    glm::length(state->velocity));
                 ImGui::PopID();
             }
         }
         ImGui::EndTable();
         if (ImGui::Button("Remove character controller"))
             registry.Remove<CharacterController>(e);
+    }
+
+    if (Joint* joint = registry.TryGet<Joint>(e);
+        joint && ImGui::CollapsingHeader("Joint", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("joint")) {
+        // Bodies by UUID: B = connected body (none: the world), A = this entity unless set.
+        const auto bodyRow = [&](const char* label, std::uint64_t& uuid, const char* none) {
+            PropertyRow(label);
+            const Entity      target  = uuid ? m_Ctx.scene.FindByUuid(uuid) : NullEntity;
+            const std::string preview = !uuid ? std::string(none) : target != NullEntity ? registry.Get<Name>(target).value : "(missing)";
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##body", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+                if (ImGui::Selectable(none, uuid == 0))
+                    uuid = 0;
+                int shown = 0;
+                registry.ViewOf<RigidBody>().Each([&](Entity other, RigidBody&) {
+                    if (other == e || ++shown > 2000)
+                        return;
+                    const std::uint64_t id = UuidOf(other);
+                    ImGui::PushID(static_cast<int>(EntityIndex(other)));
+                    if (ImGui::Selectable(registry.Get<Name>(other).value.c_str(), id == uuid))
+                        uuid = id;
+                    ImGui::PopID();
+                });
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        };
+        ComboRow("Type", &joint->type, kJointTypeNames);
+        bodyRow("Connected body", joint->connectedBody, "(world)");
+        bodyRow("Body", joint->ownerBody, "(this entity)");
+        Vec3Row("Anchor", &joint->anchor, 0.005f, 0.0f);
+        RotationRow("Anchor rotation", &joint->anchorRotation);
+        const auto motorRows = [&](bool angular) {
+            ComboRow("Motor", &joint->motor.mode, kJointMotorNames);
+            if (joint->motor.mode == JointMotorMode::Off)
+                return;
+            if (angular) {
+                float degrees = glm::degrees(joint->motor.target);
+                if (DragFloatRow(joint->motor.mode == JointMotorMode::Velocity ? "Target speed" : "Target angle", &degrees, 0.5f,
+                                 -100000.0f, 100000.0f, joint->motor.mode == JointMotorMode::Velocity ? "%.1f deg/s" : "%.1f deg"))
+                    joint->motor.target = glm::radians(degrees);
+            } else {
+                DragFloatRow(joint->motor.mode == JointMotorMode::Velocity ? "Target speed" : "Target position", &joint->motor.target,
+                             0.005f, -1e5f, 1e5f, joint->motor.mode == JointMotorMode::Velocity ? "%.3f m/s" : "%.3f m");
+            }
+            DragFloatRow("Max force", &joint->motor.maxForce, 1.0f, 0.0f, 1e8f, angular ? "%.0f N*m" : "%.0f N");
+            if (joint->motor.mode == JointMotorMode::Position) {
+                DragFloatRow("Frequency", &joint->motor.frequency, 0.05f, 0.01f, 100.0f, "%.2f Hz");
+                DragFloatRow("Damping", &joint->motor.damping, 0.01f, 0.0f, 10.0f);
+            }
+        };
+        const auto softLimitRows = [&] {
+            DragFloatRow("Limit spring", &joint->limitSpring, 0.05f, 0.0f, 100.0f, "%.2f Hz");
+            if (joint->limitSpring > 0.0f)
+                DragFloatRow("Limit damping", &joint->limitDamping, 0.01f, 0.0f, 10.0f);
+        };
+        switch (joint->type) {
+        case JointType::Hinge:
+            CheckboxRow("Limits", &joint->limits);
+            if (joint->limits) {
+                AngleRow("Min angle", &joint->minLimit, -180.0f, 0.0f);
+                AngleRow("Max angle", &joint->maxLimit, 0.0f, 180.0f);
+                softLimitRows();
+            }
+            DragFloatRow("Friction", &joint->friction, 0.05f, 0.0f, 1e6f, "%.2f N*m");
+            motorRows(true);
+            break;
+        case JointType::Slider:
+            CheckboxRow("Limits", &joint->limits);
+            if (joint->limits) {
+                DragFloatRow("Min position", &joint->minLimit, 0.005f, -1e4f, 0.0f, "%.3f m");
+                DragFloatRow("Max position", &joint->maxLimit, 0.005f, 0.0f, 1e4f, "%.3f m");
+                softLimitRows();
+            }
+            DragFloatRow("Friction", &joint->friction, 0.05f, 0.0f, 1e6f, "%.2f N");
+            motorRows(false);
+            break;
+        case JointType::Distance:
+            CheckboxRow("Limits", &joint->limits);
+            if (joint->limits) {
+                DragFloatRow("Min distance", &joint->minLimit, 0.005f, 0.0f, 1e4f, "%.3f m");
+                DragFloatRow("Max distance", &joint->maxLimit, 0.005f, 0.0f, 1e4f, "%.3f m");
+            } else {
+                PropertyRow("Distance");
+                ImGui::TextDisabled("kept as when created");
+                ImGui::PopID();
+            }
+            softLimitRows();
+            break;
+        case JointType::Cone: AngleRow("Cone angle", &joint->coneAngle, 0.0f, 180.0f); break;
+        case JointType::SwingTwist:
+            AngleRow("Swing (normal)", &joint->coneAngle, 0.0f, 180.0f);
+            AngleRow("Swing (plane)", &joint->planeAngle, 0.0f, 180.0f);
+            AngleRow("Min twist", &joint->minLimit, -180.0f, 0.0f);
+            AngleRow("Max twist", &joint->maxLimit, 0.0f, 180.0f);
+            DragFloatRow("Friction", &joint->friction, 0.05f, 0.0f, 1e6f, "%.2f N*m");
+            motorRows(true);
+            break;
+        case JointType::SixDof:
+            for (std::size_t i = 0; i < 6; ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ComboRow(kSixDofAxisLabels[i], &joint->axes[i], kJointAxisNames);
+                if (joint->axes[i] == JointAxisMode::Limited) {
+                    if (i < 3) {
+                        DragFloatRow("  min", &joint->axisMin[i], 0.005f, -1e4f, 1e4f, "%.3f m");
+                        DragFloatRow("  max", &joint->axisMax[i], 0.005f, -1e4f, 1e4f, "%.3f m");
+                    } else {
+                        AngleRow("  min", &joint->axisMin[i], -180.0f, 0.0f);
+                        AngleRow("  max", &joint->axisMax[i], 0.0f, 180.0f);
+                    }
+                }
+                ImGui::PopID();
+            }
+            softLimitRows();
+            DragFloatRow("Friction", &joint->friction, 0.05f, 0.0f, 1e6f);
+            break;
+        case JointType::Fixed:
+        case JointType::Ball: break;
+        }
+        DragFloatRow("Break force", &joint->breakForce, 10.0f, 0.0f, 1e9f, joint->breakForce > 0.0f ? "%.0f N" : "unbreakable");
+        DragFloatRow("Break torque", &joint->breakTorque, 10.0f, 0.0f, 1e9f, joint->breakTorque > 0.0f ? "%.0f N*m" : "unbreakable");
+        CheckboxRow("Collide connected", &joint->collideConnected);
+        CheckboxRow("Enabled", &joint->enabled);
+        if (m_Ctx.physics) {
+            const JointState state = m_Ctx.physics->GetJointState(e);
+            PropertyRow("State");
+            if (!state.active)
+                ImGui::TextDisabled(joint->enabled ? "waiting for its bodies" : "disabled");
+            else if (joint->type == JointType::Hinge)
+                ImGui::TextDisabled("%.1f deg, %.0f N", glm::degrees(state.angle), glm::length(state.force));
+            else if (joint->type == JointType::Slider || joint->type == JointType::Distance)
+                ImGui::TextDisabled("%.3f m, %.0f N", state.position, glm::length(state.force));
+            else
+                ImGui::TextDisabled("%.0f N, %.0f N*m", glm::length(state.force), glm::length(state.torque));
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (!registry.Has<RigidBody>(e) && joint->ownerBody == 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Needs a Rigid Body (or a Body set above)");
+        if (ImGui::Button("Remove joint"))
+            registry.Remove<Joint>(e);
+    }
+
+    if (Ragdoll* ragdoll = registry.TryGet<Ragdoll>(e);
+        ragdoll && ImGui::CollapsingHeader("Ragdoll", ImGuiTreeNodeFlags_DefaultOpen) && BeginProperties("ragdoll")) {
+        CheckboxRow("Simulate", &ragdoll->simulate);
+        DragFloatRow("Mass", &ragdoll->mass, 0.5f, 0.01f, 1e5f, "%.1f kg");
+        PropertyRow("Bones");
+        ImGui::TextDisabled("%zu", RagdollBones(m_Ctx.scene, e).size());
+        ImGui::PopID();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Simulating: the bones fall, the animation pauses.");
+        if (const auto* instance = registry.TryGet<ModelInstance>(e))
+            if (const Model* model = m_Ctx.assets.Get(instance->model); model && ImGui::Button("Rebuild"))
+                CreateRagdoll(m_Ctx.scene, e, *model, {.mass = ragdoll->mass});
+        ImGui::SameLine();
+        if (ImGui::Button("Remove ragdoll"))
+            RemoveRagdoll(m_Ctx.scene, e);
     }
 
     if (CameraComponent* cam = registry.TryGet<CameraComponent>(e);
@@ -999,6 +1245,14 @@ void Editor::DrawInspector()
         }
         if (ImGui::MenuItem("Character Controller", nullptr, false, !registry.Has<CharacterController>(e)))
             registry.Emplace<CharacterController>(e);
+        if (ImGui::MenuItem("Joint", nullptr, false, !registry.Has<Joint>(e)))
+            registry.Emplace<Joint>(e);
+        {
+            const auto*  instance = registry.TryGet<ModelInstance>(e);
+            const Model* model    = instance ? m_Ctx.assets.Get(instance->model) : nullptr;
+            if (ImGui::MenuItem("Ragdoll (from skeleton)", nullptr, false, model && !model->skins.empty() && !registry.Has<Ragdoll>(e)))
+                CreateRagdoll(m_Ctx.scene, e, *model);
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Script (Blueprint)", nullptr, false, !registry.Has<ScriptComponent>(e)))
             registry.Emplace<ScriptComponent>(e);
@@ -1423,6 +1677,7 @@ void Editor::DrawRendererSettings()
         ImGui::PopID();
         DragFloatRow("Air control", &ps.airControl, 0.01f, 0.0f, 20.0f, "%.2f /s");
         CheckboxRow("Interpolate", &ps.interpolate);
+        CheckboxRow("Persist events", &ps.persistEvents); // Collision Stay every step
         CheckboxRow("Show colliders", &m_ShowColliders);
         ImGui::EndTable();
 
@@ -1579,6 +1834,7 @@ void Editor::DrawStats()
             ImGui::SeparatorText("Physics");
             ImGui::Text("Bodies         %u  (%u active), %u characters", ps.bodies, ps.activeBodies, ps.characters);
             ImGui::Text("Contacts       %u pairs", ps.contactPairs);
+            ImGui::Text("Joints         %u active, %u waiting", ps.joints, ps.pendingJoints);
             ImGui::Text("Sync / step    %.3f / %.3f ms  (+%u -%u, %u meshes pending)", ps.syncMs, ps.stepMs, ps.created,
                         ps.removed, ps.pendingMeshes);
         }

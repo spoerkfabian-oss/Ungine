@@ -41,6 +41,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Joints/Constraints mit Grenzwerten, Motoren und serialisierbaren Parametern.
 - Steuerbare Character-Rotation und robuste Character-Bewegung.
 - Kollisionsmaterialien pro Dreieck sowie Collision-Events mit Kontaktpunkt/Impuls.
+- Fortschritt (2026-10-07): umgesetzt und lokal verifiziert – Physik-Material-Assets (`.uphysmat`) pro Collider und pro glTF-Material eines Mesh-Colliders (Oberfläche in Raycasts/Kontakten), Kontaktdaten (Punkt/Normale/Impuls/Geschwindigkeit) + Persist-/Hit-Events, Joints (Fixed/Hinge/Slider/Ball/Distance/Cone/Swing-Twist/6DOF mit Limits, Motoren, Bruch), Ragdolls aus Skeletten, Character-Rotationsmodi/Plattformen/Ducken/Rutschen/Push-Kraft, Blueprint-Knoten und Editor-Werkzeuge (Inspector, Joint-Overlay + Anker-Gizmo, Material-Fenster). Grenzen in CLAUDE.md, Offene Punkte 11.
 
 ### Phase 27 – Audio-Ausbau
 - Sound-Cues mit gewichteten Variationen, Zufall, Random-Pitch und Loop-Regeln.
