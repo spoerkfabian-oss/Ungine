@@ -102,12 +102,21 @@ void TransformPaths(json& entity, F&& fn)
     apply(at(entity, {"audioSource", "sound"}));
     apply(at(entity, {"uiWidget", "image"}));
     apply(at(entity, {"levelStreamingVolume", "level"}));
+    apply(at(entity, {"collider", "material"}));
+    if (json* materials = at(entity, {"collider", "meshMaterials"}); materials && materials->is_object())
+        for (auto& path : *materials)
+            apply(&path);
 }
 
-// Rewrites entity references by UUID inside components (script entity variables) in place.
+// Rewrites entity references by UUID inside components (script entity variables, joints) in place.
 template <class F>
 void RemapEntityRefs(json& entity, F&& fn)
 {
+    if (const auto joint = entity.find("joint"); joint != entity.end() && joint->is_object())
+        for (const char* key : {"connectedBody", "ownerBody"})
+            if (const auto uuid = joint->find(key); uuid != joint->end() && uuid->is_number_unsigned() &&
+                                                    uuid->get<std::uint64_t>() != 0)
+                *uuid = fn(uuid->get<std::uint64_t>());
     const auto script = entity.find("script");
     if (script == entity.end() || !script->is_object())
         return;

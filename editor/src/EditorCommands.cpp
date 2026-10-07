@@ -461,6 +461,21 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
+        case DialogPurpose::AssignPhysicsMaterial: {
+            Registry& r = m_Ctx.scene.GetRegistry();
+            if (!r.Valid(m_MaterialTarget) || !r.Has<Collider>(m_MaterialTarget) || IsStreamed(m_MaterialTarget))
+                break;
+            std::error_code   ec;
+            std::string       before   = SnapshotEntityState(m_Ctx.scene, m_MaterialTarget);
+            const std::string material = PathToUtf8(std::filesystem::absolute(*path, ec).lexically_normal());
+            Collider&         collider = r.Get<Collider>(m_MaterialTarget);
+            if (m_MaterialSlot)
+                collider.meshMaterials[*m_MaterialSlot] = material;
+            else
+                collider.material = material;
+            PushStateChange("Assign physics material", {StateEdit{UuidOf(m_MaterialTarget), std::move(before)}});
+            break;
+        }
         case DialogPurpose::AssignLevel:
             if (m_Ctx.scene.GetRegistry().Valid(m_LevelTarget) && m_Ctx.scene.GetRegistry().Has<LevelStreamingVolume>(m_LevelTarget)) {
                 const std::string before = SnapshotEntityState(m_Ctx.scene, m_LevelTarget);

@@ -10,6 +10,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -153,7 +154,7 @@ struct RigidBody {
 enum class ColliderShape : std::uint8_t { Box, Sphere, Capsule, Mesh };
 
 // Collision shape in the entity's local space, scaled by its world scale (box and mesh per axis,
-// sphere and capsule by the largest axis). Capsules are Y-up. Mesh uses the triangles of the
+// sphere and capsule by the largest axis). Capsules are Y-up before `rotation`. Mesh uses the triangles of the
 // entity's MeshRenderer and is static or kinematic only (dynamic falls back to static).
 struct Collider {
     ColliderShape shape = ColliderShape::Box;
@@ -161,10 +162,16 @@ struct Collider {
     float         radius     = 0.5f;  // sphere, capsule
     float         halfHeight = 0.5f;  // capsule: half the cylinder part
     glm::vec3     center{0.0f};       // offset in local space
+    glm::quat     rotation{1.0f, 0.0f, 0.0f, 0.0f}; // shape orientation in local space (e.g. a capsule along X)
     float         friction    = 0.5f;
     float         restitution = 0.0f;
     bool          trigger     = false; // sensor: reports CollisionEvents, no collision response
     std::uint8_t  layer       = 0;     // collision layer 0..15 (PhysicsSettings::layerCollision)
+    // Physics material (.uphysmat, absolute path in memory, relative to the scene in files): its
+    // friction / restitution replace the two above and its surface is reported in hits and contacts.
+    std::string material{};
+    // Mesh colliders: material per glTF material of the mesh (name -> .uphysmat); others use `material`.
+    FlatMap<std::string, std::string> meshMaterials{};
 
     bool operator==(const Collider&) const = default;
 };
@@ -172,14 +179,92 @@ struct Collider {
 // Kinematic character (capsule, feet at the entity's position) moved by PhysicsWorld::SetCharacterInput:
 // walks up steps and ramps up to maxSlope, sticks to the floor, jumps, pushes dynamic bodies.
 // Takes precedence over RigidBody / Collider on the same entity.
+// How the physics turns a character about its up axis (yaw only):
+//   None: never (scripts / the editor rotate it), Movement: towards the horizontal move input,
+//   Camera: towards the primary camera's yaw (ignored when the camera is the character's descendant),
+//   Script: towards the yaw set by PhysicsWorld::SetCharacterYaw (Blueprint "Set Character Yaw").
+enum class CharacterRotation : std::uint8_t { None, Movement, Camera, Script };
+
 struct CharacterController {
     float radius     = 0.3f;
     float height     = 1.8f;  // total, incl. the hemispheres
     float maxSlope   = 0.87266463f; // radians (50 degrees)
     float stepHeight = 0.35f;
     float jumpSpeed  = 5.0f;  // m/s
+    CharacterRotation rotation  = CharacterRotation::None;
+    float             turnSpeed = 720.0f; // degrees per second (0: turn at once)
+    float crouchHeight      = 1.0f;  // total height while crouching (stands up only with room above)
+    float mass              = 70.0f; // kg: how hard it pushes dynamic bodies
+    float pushStrength      = 100.0f; // N: maximum force on dynamic bodies it walks into
+    bool  slideOnSteepSlopes = true; // slopes steeper than maxSlope: slide down (false: stand still)
+    bool  movingPlatforms    = true; // inherits the velocity (and turn) of what it stands on
 
     bool operator==(const CharacterController&) const = default;
+};
+
+// --- Joints (constraints between two bodies, simulated by PhysicsWorld) ---
+
+enum class JointType : std::uint8_t { Fixed, Hinge, Slider, Ball, Distance, Cone, SwingTwist, SixDof };
+enum class JointMotorMode : std::uint8_t { Off, Velocity, Position };
+enum class JointAxisMode : std::uint8_t { Free, Limited, Locked }; // 6DOF axes
+
+// Hinge / slider: drives the angle (rad) or position (m); swing-twist: the twist angle.
+struct JointMotor {
+    JointMotorMode mode      = JointMotorMode::Off;
+    float          target    = 0.0f;    // velocity (rad/s, m/s) or position (rad, m)
+    float          maxForce  = 1000.0f; // N or N*m
+    float          frequency = 2.0f;    // position mode: spring frequency (Hz)
+    float          damping   = 1.0f;    // position mode: damping ratio
+
+    bool operator==(const JointMotor&) const = default;
+};
+
+// Joins body A (this entity, or ownerBody) to body B (connectedBody, 0: the world). The joint frame
+// is this entity's world transform times the anchor: its X axis is the hinge / slider / twist axis,
+// its Y axis the reference normal. Bodies keep the relative pose they have when the joint is made.
+struct Joint {
+    JointType     type          = JointType::Hinge;
+    std::uint64_t connectedBody = 0; // UUID of body B (0: the world)
+    std::uint64_t ownerBody     = 0; // UUID of body A (0: this entity)
+    glm::vec3     anchor{0.0f};      // joint frame in this entity's local space
+    glm::quat     anchorRotation{1.0f, 0.0f, 0.0f, 0.0f};
+    bool          limits      = true;
+    float         minLimit    = -glm::quarter_pi<float>(); // hinge / twist angle (rad), slider / distance (m)
+    float         maxLimit    = glm::quarter_pi<float>();
+    float         coneAngle   = glm::quarter_pi<float>(); // cone, swing-twist: half angle about the normal (rad)
+    float         planeAngle  = glm::quarter_pi<float>(); // swing-twist: half angle about the plane axis (rad)
+    float         limitSpring = 0.0f; // soft limits: spring frequency (Hz, 0: hard)
+    float         limitDamping = 0.0f;
+    float         friction    = 0.0f; // hinge / slider / swing-twist: friction force (N) or torque (N*m)
+    JointMotor    motor{};
+    // 6DOF: translation X Y Z, rotation X Y Z (rotation limits: X = twist, Y/Z = swing half angles).
+    std::array<JointAxisMode, 6> axes{JointAxisMode::Locked, JointAxisMode::Locked, JointAxisMode::Locked,
+                                      JointAxisMode::Free,   JointAxisMode::Free,   JointAxisMode::Free};
+    std::array<float, 6>         axisMin{-0.1f, -0.1f, -0.1f, -glm::quarter_pi<float>(), -glm::quarter_pi<float>(),
+                                 -glm::quarter_pi<float>()};
+    std::array<float, 6>         axisMax{0.1f, 0.1f, 0.1f, glm::quarter_pi<float>(), glm::quarter_pi<float>(),
+                                 glm::quarter_pi<float>()};
+    float breakForce  = 0.0f; // N; 0: unbreakable (a broken joint is disabled: enabled = false)
+    float breakTorque = 0.0f; // N*m; 0: unbreakable
+    bool  collideConnected = false; // the two bodies collide with each other
+    bool  enabled          = true;
+
+    bool operator==(const Joint&) const = default;
+};
+
+// Bone of a ragdoll (CreateRagdoll): its body is kinematic or dynamic as the Ragdoll above says.
+struct RagdollBone {
+    bool operator==(const RagdollBone&) const = default;
+};
+
+// Ragdoll of an instantiated, skinned model (on its root; bones carry RigidBody + Collider + Joint,
+// see CreateRagdoll). simulate: the bones are dynamic and the animation pauses; otherwise they are
+// kinematic and follow the animation (they still push dynamic bodies).
+struct Ragdoll {
+    bool  simulate = false;
+    float mass     = 70.0f; // kg, spread over the bones by volume
+
+    bool operator==(const Ragdoll&) const = default;
 };
 
 // Game camera: UnginePlayer renders through the first primary one (looking down local -Z).

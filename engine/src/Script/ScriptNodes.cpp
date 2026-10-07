@@ -4,6 +4,7 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Physics/Ragdoll.h"
 #include "Engine/Core/GameOptions.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Scene/Components.h"
@@ -455,10 +456,26 @@ std::vector<NodeDesc> BuildRegistry()
     add(Event("Event.Construction", "Construction Script",  {},
               "Runs in the editor after changes and when play starts (before BeginPlay); entities it creates are rebuilt "
               "each time and not saved. No latent nodes, timers or timelines"));
-    add(Event("Event.CollisionBegin", "On Collision Begin", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
-              "This entity starts touching another body (physics)"));
-    add(Event("Event.CollisionEnd", "On Collision End", {Out("Other", P::Entity), Out("Is Trigger", P::Bool)},
-              "This entity stops touching another body"));
+    const auto contactOutputs = [] {
+        return std::vector<PinInfo>{Out("Other", P::Entity),   Out("Is Trigger", P::Bool), Out("Point", P::Vec3),
+                                    Out("Normal", P::Vec3),    Out("Impulse", P::Float),   Out("Surface", P::String),
+                                    Out("Other Surface", P::String)};
+    };
+    add(Event("Event.CollisionBegin", "On Collision Begin", contactOutputs(),
+              "This entity starts touching another body (physics). Normal: towards the other body; Impulse: "
+              "estimated (N*s); Surface: physics material surfaces"));
+    add(Event("Event.CollisionEnd", "On Collision End", contactOutputs(),
+              "This entity stops touching another body (the last contact seen)"));
+    add(Event("Event.CollisionStay", "On Collision Stay", contactOutputs(),
+              "Every physics step while this entity touches another body (Physics settings: Persist events)"));
+    add(WithParam(Event("Event.Hit", "On Hit",
+                        {Out("Other", P::Entity), Out("Point", P::Vec3), Out("Normal", P::Vec3), Out("Impulse", P::Float),
+                         Out("Surface", P::String), Out("Other Surface", P::String)},
+                        "This entity started touching a solid body at least this hard (impact sounds, damage)"),
+                  ParamKind::Text, "Min Impulse", "1"));
+    add(Event("Event.JointBroken", "On Joint Broken",
+              {Out("Joint", P::Entity), Out("Body A", P::Entity), Out("Body B", P::Entity)},
+              "A joint on this entity (or connecting it) exceeded its break force / torque"));
     add(Event("Event.LevelLoaded", "On Level Loaded", {Out("Level", P::String)},
               "A streamed level was added to the scene (Level: its file, relative to the project)"));
     add(Event("Event.LevelUnloaded", "On Level Unloaded", {Out("Level", P::String)},
@@ -1024,7 +1041,8 @@ std::vector<NodeDesc> BuildRegistry()
              }));
     add(WithDefaults(Action("Physics.Raycast", "Raycast", "Physics",
                {In("Start", P::Vec3), In("Direction", P::Vec3), In("Distance", P::Float), In("Ignore", P::Entity),
-                Out("Hit", P::Bool), Out("Hit Entity", P::Entity), Out("Hit Point", P::Vec3), Out("Hit Normal", P::Vec3)},
+                Out("Hit", P::Bool), Out("Hit Entity", P::Entity), Out("Hit Point", P::Vec3), Out("Hit Normal", P::Vec3),
+                Out("Surface", P::String)},
                [](ScriptContext& c) {
                    const float distance = c.InFloat(4);
                    std::optional<PhysicsHit> hit;
@@ -1034,13 +1052,119 @@ std::vector<NodeDesc> BuildRegistry()
                    c.Out(7, hit ? hit->entity : NullEntity);
                    c.Out(8, hit ? hit->point : glm::vec3(0.0f));
                    c.Out(9, hit ? hit->normal : glm::vec3(0.0f));
-               }, "Closest body hit (Ignore: self when unconnected)"),
+                   c.Out(10, hit ? hit->surface : std::string());
+               }, "Closest body hit (Ignore: self when unconnected); Surface: its physics material"),
                      {{"Direction", glm::vec3(0.0f, -1.0f, 0.0f)}, {"Distance", 1000.0f}}));
     add(Action("Physics.CharacterInput", "Set Character Input", "Physics",
                {In("Target", P::Entity), In("Move", P::Vec3), In("Jump", P::Bool)}, [](ScriptContext& c) {
                    if (const auto e = Target(c, 2); e && c.Physics())
                        c.Physics()->SetCharacterInput(*e, c.InVec3(3), c.InBool(4));
                }, "Character Controller: horizontal velocity (m/s) and jump"));
+    add(Action("Physics.CharacterCrouch", "Set Character Crouch", "Physics", {In("Target", P::Entity), In("Crouch", P::Bool)},
+               [](ScriptContext& c) {
+                   if (const auto e = Target(c, 2); e && c.Physics())
+                       c.Physics()->SetCharacterCrouch(*e, c.InBool(3));
+               }, "Crouch, or stand up as soon as there is room above"));
+    add(Action("Physics.CharacterYaw", "Set Character Yaw", "Physics", {In("Target", P::Entity), In("Yaw", P::Float)},
+               [](ScriptContext& c) {
+                   if (const auto e = Target(c, 2); e && c.Physics())
+                       c.Physics()->SetCharacterYaw(*e, glm::radians(c.InFloat(3)));
+               }, "Heading in degrees (0: looking along -Z) for the Script rotation mode; turns at the turn speed"));
+    add(Pure("Physics.CharacterState", "Get Character State", "Physics",
+             {In("Target", P::Entity), Out("On Ground", P::Bool), Out("Ground", P::String), Out("Velocity", P::Vec3),
+              Out("Ground Velocity", P::Vec3), Out("Ground Entity", P::Entity), Out("Crouching", P::Bool), Out("Yaw", P::Float)},
+             [](ScriptContext& c) {
+                 const auto e = Target(c, 0);
+                 const std::optional<CharacterState> state = e && c.Physics() ? c.Physics()->GetCharacterState(*e) : std::nullopt;
+                 static constexpr const char* kGround[] = {"OnGround", "OnSteepGround", "NotSupported", "InAir"};
+                 c.Out(1, state && state->onGround);
+                 c.Out(2, std::string(state ? kGround[static_cast<int>(state->ground)] : "None"));
+                 c.Out(3, state ? state->velocity : glm::vec3(0.0f));
+                 c.Out(4, state ? state->groundVelocity : glm::vec3(0.0f));
+                 c.Out(5, state ? state->groundEntity : NullEntity);
+                 c.Out(6, state && state->crouching);
+                 c.Out(7, state ? glm::degrees(state->yaw) : 0.0f);
+             }, "Ground: OnGround, OnSteepGround, NotSupported, InAir (None: no character)"));
+
+    // Joints and ragdolls (edit the components; the physics follows on its next step).
+    const auto jointOf = [](ScriptContext& c, int pin) -> Joint* {
+        const auto e = Target(c, pin);
+        Joint* joint = e ? c.GetScene().GetRegistry().TryGet<Joint>(*e) : nullptr;
+        if (e && !joint)
+            c.Error("Target has no Joint");
+        return joint;
+    };
+    add(Action("Joint.SetEnabled", "Set Joint Enabled", "Physics", {In("Target", P::Entity), In("Enabled", P::Bool)},
+               [jointOf](ScriptContext& c) {
+                   if (Joint* joint = jointOf(c, 2))
+                       joint->enabled = c.InBool(3);
+               }, "Removes / restores a joint (also re-enables a broken one)"));
+    add(Action("Joint.Connect", "Connect Joint", "Physics", {In("Target", P::Entity), In("Other", P::Entity)},
+               [jointOf](ScriptContext& c) {
+                   Joint* joint = jointOf(c, 2);
+                   if (!joint)
+                       return;
+                   const Entity    other    = c.InEntity(3);
+                   const Registry& registry = c.GetScene().GetRegistry();
+                   joint->connectedBody = other != NullEntity && registry.Valid(other) ? registry.Get<Uuid>(other).value : 0;
+               }, "Joins the target's joint to another body (unconnected / none: the world), from the current poses"));
+    add(WithParam(WithDefaults(Action("Joint.SetMotor", "Set Joint Motor", "Physics",
+                                      {In("Target", P::Entity), In("Value", P::Float), In("Max Force", P::Float)},
+                                      [jointOf](ScriptContext& c) {
+                                          Joint* joint = jointOf(c, 2);
+                                          if (!joint)
+                                              return;
+                                          const std::string& mode = c.Param();
+                                          joint->motor.mode = mode == "velocity" ? JointMotorMode::Velocity
+                                                              : mode == "position" ? JointMotorMode::Position
+                                                                                   : JointMotorMode::Off;
+                                          // Angles in degrees for hinges and twists, metres for sliders.
+                                          const bool angular = joint->type != JointType::Slider;
+                                          joint->motor.target   = angular ? glm::radians(c.InFloat(3)) : c.InFloat(3);
+                                          joint->motor.maxForce = std::max(c.InFloat(4), 0.0f);
+                                      }, "Hinge / swing-twist: angle (deg) or speed (deg/s); slider: position (m) or speed (m/s)"),
+                               {{"Max Force", 1000.0f}}),
+                  ParamKind::Choice, "Mode", "velocity", {"off", "velocity", "position"}));
+    add(Pure("Joint.GetState", "Get Joint State", "Physics",
+             {In("Target", P::Entity), Out("Active", P::Bool), Out("Angle", P::Float), Out("Position", P::Float),
+              Out("Force", P::Float), Out("Torque", P::Float)},
+             [](ScriptContext& c) {
+                 const auto       e     = Target(c, 0);
+                 const JointState state = e && c.Physics() ? c.Physics()->GetJointState(*e) : JointState{};
+                 c.Out(1, state.active);
+                 c.Out(2, glm::degrees(state.angle));
+                 c.Out(3, state.position);
+                 c.Out(4, glm::length(state.force));
+                 c.Out(5, glm::length(state.torque));
+             }, "Hinge angle (deg), slider / distance position (m), last step's force (N) and torque (N*m)"));
+    add(WithDefaults(Action("Ragdoll.Create", "Create Ragdoll", "Physics",
+                            {In("Target", P::Entity), In("Mass", P::Float), Out("Bones", P::Int)},
+                            [](ScriptContext& c) {
+                                const auto e = Target(c, 2);
+                                std::size_t bones = 0;
+                                if (e && c.Assets())
+                                    if (const auto* instance = c.GetScene().GetRegistry().TryGet<ModelInstance>(*e))
+                                        if (const Model* model = c.Assets()->Get(instance->model))
+                                            bones = CreateRagdoll(c.GetScene(), *e, *model, {.mass = std::max(c.InFloat(3), 0.01f)});
+                                if (e && bones == 0)
+                                    c.Error("Target is not a ready, skinned model instance");
+                                c.Out(4, static_cast<std::int32_t>(bones));
+                            }, "Bodies + joints for the skeleton of a model instance (kinematic until simulated)"),
+                     {{"Mass", 70.0f}}));
+    add(Action("Ragdoll.SetSimulating", "Set Ragdoll Simulating", "Physics", {In("Target", P::Entity), In("Simulate", P::Bool)},
+               [](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   if (e && !c.GetScene().GetRegistry().Has<Ragdoll>(*e))
+                       return c.Error("Target has no Ragdoll");
+                   if (e)
+                       SetRagdollSimulating(c.GetScene(), *e, c.InBool(3));
+               }, "Simulate: the bones fall (the animation pauses); off: they follow the animation again"));
+    add(Pure("Ragdoll.IsSimulating", "Is Ragdoll Simulating", "Physics", {In("Target", P::Entity), Out("Simulating", P::Bool)},
+             [](ScriptContext& c) {
+                 const auto     e       = Target(c, 0);
+                 const Ragdoll* ragdoll = e ? c.GetScene().GetRegistry().TryGet<Ragdoll>(*e) : nullptr;
+                 c.Out(1, ragdoll && ragdoll->simulate);
+             }));
 
     // Lights.
     add(Action("Light.SetColor", "Set Light Color", "Light", {In("Target", P::Entity), In("Color", P::Vec3)}, [](ScriptContext& c) {
