@@ -819,6 +819,7 @@ Technical details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)".
 - Editor: inspector sections, joint overlay + "Anchor" gizmo mode, PHYS content type + Physics material window.
 - Fixes during development: GroupFilter created before Jolt's allocator was registered (ctor crash); slider/6DOF limits inverted (body order).
 - Tests: CPU `tests/PhysicsToolsTests.cpp` (7 cases), GPU `Physics_TriangleMaterialsAndEditorTools`.
+- Verification: CTest 18/18 with sync validation, ASan/UBSan clean (known llvmpipe leak only). MSVC lesson: C4458 also fires for locals in a nested `Impl` that hide members of the enclosing class (e.g. `PhysicsWorld::settings`); Clang `-Wshadow-all` does not catch this - avoid local names equal to outer-class members.
 
 ## 19. Important CI lesson
 
