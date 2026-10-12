@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace Engine {
 
@@ -19,21 +20,48 @@ class Scene;
 class ThreadPool;
 
 struct PhysicsHit {
-    Entity    entity = NullEntity;
-    glm::vec3 point{0.0f};
-    glm::vec3 normal{0.0f}; // surface normal at the hit, facing the query
-    float     distance = 0.0f;
+    Entity      entity = NullEntity;
+    glm::vec3   point{0.0f};
+    glm::vec3   normal{0.0f}; // surface normal at the hit, facing the query
+    float       distance = 0.0f;
+    std::string surface;      // physics material surface of the hit triangle / shape ("" without material)
+};
+
+// Where and how hard two bodies touch (the deepest contact of the pair in that step).
+struct ContactInfo {
+    glm::vec3   point{0.0f};
+    glm::vec3   normal{0.0f, 1.0f, 0.0f}; // from a towards b
+    glm::vec3   relativeVelocity{0.0f};   // velocity of b's surface relative to a's at the point
+    float       approachSpeed = 0.0f;     // m/s along the normal (0: separating)
+    float       impulse       = 0.0f;     // N*s, estimated: effective mass * approach speed * (1 + restitution)
+    std::string surfaceA, surfaceB;       // physics material surfaces ("" without material)
 };
 
 // Published on the EventBus (EventBus::Publish, main thread) at the end of PhysicsWorld::Step
 // when two bodies start / stop touching. One Begin and one End per pair, however many shapes touch.
 // End is also sent when a body is removed; its entity may already be destroyed then. Characters
-// report their contacts too (a = the character).
+// report their contacts too (a = the character). End carries the last contact seen.
 struct CollisionEvent {
-    Entity a       = NullEntity;
-    Entity b       = NullEntity;
-    bool   begin   = true;
-    bool   trigger = false; // one of them is a trigger (sensor)
+    Entity      a       = NullEntity;
+    Entity      b       = NullEntity;
+    bool        begin   = true;
+    bool        trigger = false; // one of them is a trigger (sensor)
+    ContactInfo contact;
+};
+
+// Every step two bodies keep touching (PhysicsSettings::persistEvents), after Begin.
+struct CollisionPersistEvent {
+    Entity      a       = NullEntity;
+    Entity      b       = NullEntity;
+    bool        trigger = false;
+    ContactInfo contact;
+};
+
+// A joint exceeded its break force / torque: the physics removed it and set Joint::enabled = false.
+struct JointBrokenEvent {
+    Entity joint = NullEntity; // the entity with the Joint component
+    Entity a     = NullEntity;
+    Entity b     = NullEntity; // NullEntity: the world
 };
 
 enum class BodyActivity : std::uint8_t { None, Static, Kinematic, Active, Sleeping, Character };
@@ -47,6 +75,7 @@ struct PhysicsSettings {
     // Interpolate(): shown poses of moving bodies blend between the last two steps (smooth motion
     // when the frame rate differs from the fixed step).
     bool interpolate = true;
+    bool persistEvents = true; // CollisionPersistEvent every step for touching pairs
     // Bit b of layerCollision[a]: layer a collides with layer b (kept symmetric by SetLayerCollision).
     std::array<std::uint16_t, kPhysicsLayers> layerCollision = MakeAllLayersCollide();
 
@@ -80,6 +109,8 @@ private:
 
 struct PhysicsStats {
     std::uint32_t bodies       = 0;
+    std::uint32_t joints       = 0; // active constraints
+    std::uint32_t pendingJoints = 0; // waiting for a body (loading mesh, other level)
     std::uint32_t activeBodies = 0;
     std::uint32_t characters   = 0;
     std::uint32_t contactPairs = 0; // touching body pairs
@@ -90,10 +121,35 @@ struct PhysicsStats {
     double        stepMs = 0.0;     // last Step: characters + simulation + write-back + events
 };
 
+enum class GroundState : std::uint8_t { OnGround, OnSteepGround, NotSupported, InAir };
+
 struct CharacterState {
-    bool      onGround = false;
-    glm::vec3 velocity{0.0f};
-    glm::vec3 groundNormal{0.0f, 1.0f, 0.0f};
+    bool        onGround = false;
+    GroundState ground   = GroundState::InAir;
+    glm::vec3   velocity{0.0f};
+    glm::vec3   groundNormal{0.0f, 1.0f, 0.0f};
+    glm::vec3   groundVelocity{0.0f}; // of what it stands on (moving platforms)
+    Entity      groundEntity = NullEntity;
+    bool        crouching    = false;
+    float       yaw          = 0.0f; // radians about +Y (rotation modes other than None)
+};
+
+// A joint's current state (hinge angle, slider position, distance between the anchors).
+struct JointState {
+    bool      active   = false; // constraint exists (bodies present, enabled, not broken)
+    float     angle    = 0.0f;  // hinge: rad
+    float     position = 0.0f;  // slider: m, distance: m
+    glm::vec3 force{0.0f};      // last step's constraint force (N) and torque (N*m)
+    glm::vec3 torque{0.0f};
+};
+
+// World-space joint for debug drawing: frames on both bodies (equal while the joint holds).
+struct JointDebugShape {
+    Entity    entity = NullEntity;
+    JointType type   = JointType::Hinge;
+    glm::mat4 frameA{1.0f}, frameB{1.0f}; // rotation + position (X = joint axis)
+    Entity    a = NullEntity, b = NullEntity;
+    bool      active = false;
 };
 
 // World-space collider for debug drawing. transform: rotation + position of the shape center
@@ -101,7 +157,7 @@ struct CharacterState {
 struct ColliderDebugShape {
     Entity        entity = NullEntity;
     ColliderShape shape  = ColliderShape::Box;
-    glm::mat4     transform{1.0f};
+    glm::mat4     transform{1.0f};   // includes Collider::rotation
     glm::vec3     halfExtents{0.0f}; // box, mesh bounds
     float         radius     = 0.0f; // sphere, capsule
     float         halfHeight = 0.0f; // capsule
@@ -159,7 +215,15 @@ public:
     // Desired horizontal velocity (world units/s); jump is taken when the character stands.
     // Applies to the following Steps until changed.
     void SetCharacterInput(Entity entity, const glm::vec3& moveVelocity, bool jump);
+    // Crouch (true) / stand up (false: as soon as there is room above). Applies until changed.
+    void SetCharacterCrouch(Entity entity, bool crouch);
+    // Target yaw (radians about +Y) for CharacterRotation::Script.
+    void SetCharacterYaw(Entity entity, float yaw);
     [[nodiscard]] std::optional<CharacterState> GetCharacterState(Entity entity) const;
+
+    // Joints (Joint components): current state; motor targets set on the component apply live.
+    [[nodiscard]] JointState GetJointState(Entity jointEntity) const;
+    void ForEachJoint(const std::function<void(const JointDebugShape&)>& fn) const;
 
     [[nodiscard]] BodyActivity Activity(Entity entity) const;
     [[nodiscard]] bool         HasBody(Entity entity) const; // body or character

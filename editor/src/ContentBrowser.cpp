@@ -10,6 +10,7 @@
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
+#include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
 #include "Engine/Scene/Scene.h"
@@ -73,11 +74,12 @@ ImVec4 KindColor(int kind)
     case 5: return {0.85f, 0.45f, 0.85f, 1.0f}; // texture
     case 6: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
     case 7: return {0.55f, 0.85f, 0.55f, 1.0f}; // enum / struct / interface
+    case 8: return {0.80f, 0.70f, 0.50f, 1.0f}; // physics material
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -482,6 +484,16 @@ void Editor::OpenAsset(const fs::path& file)
         }
     } else if (IsTypeFile(name)) {
         OpenTypeFile(file);
+    } else if (EndsWith(name, std::string(kPhysicsMaterialExtension))) {
+        std::string error;
+        if (const auto material = LoadPhysicsMaterial(file, &error)) {
+            m_PhysicsMaterialFile  = file;
+            m_PhysicsMaterialEdit  = *material;
+            m_PhysicsMaterialDirty = false;
+            m_ShowPhysicsMaterial  = true;
+        } else {
+            m_Status = error;
+        }
     } else if (EndsWith(name, ".uprefab")) { // double-click: an instance in front of the camera
         if (m_PlayState == PlayState::Edit)
             PlacePrefab(file, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -559,6 +571,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::Sound;
         else if (IsTypeFile(lower))
             item.kind = ContentItem::Kind::Type;
+        else if (EndsWith(lower, std::string(kPhysicsMaterialExtension)))
+            item.kind = ContentItem::Kind::PhysicsMaterial;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -1112,6 +1126,16 @@ void Editor::DrawContentBrowser()
         if (ImGui::MenuItem("Scene")) {
             std::ofstream(UniquePath(m_ContentDir, "NewScene", ".scene.json")) << "{\n  \"version\": 1,\n  \"entities\": []\n}\n";
             RefreshContent();
+        }
+        if (ImGui::MenuItem("Physics material")) {
+            const fs::path file = UniquePath(m_ContentDir, "NewPhysicsMaterial", std::string(kPhysicsMaterialExtension));
+            std::string    error;
+            if (SavePhysicsMaterial(file, PhysicsMaterialData{}, &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
         }
         ImGui::EndPopup();
     }
@@ -1926,6 +1950,42 @@ void Editor::DrawBlueprintTypes()
             ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.35f, 1.0f), "%s", problem.c_str());
     }
     ImGui::EndChild();
+    ImGui::End();
+}
+
+void Editor::DrawPhysicsMaterial()
+{
+    ImGui::SetNextWindowSize(ImVec2(360.0f, 200.0f), ImGuiCond_FirstUseEver);
+    const std::string title = "Physics Material" + std::string(m_PhysicsMaterialDirty ? " *" : "") + "###physicsmaterial";
+    if (!ImGui::Begin(title.c_str(), &m_ShowPhysicsMaterial)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextDisabled("%s", PathToUtf8(m_PhysicsMaterialFile.filename()).c_str());
+    PhysicsMaterialData& m = m_PhysicsMaterialEdit;
+    bool changed = false;
+    changed |= ImGui::InputText("Surface", &m.surface);
+    changed |= ImGui::DragFloat("Friction", &m.friction, 0.005f, 0.0f, 10.0f, "%.3f");
+    changed |= ImGui::DragFloat("Restitution", &m.restitution, 0.005f, 0.0f, 1.0f, "%.3f");
+    m_PhysicsMaterialDirty = m_PhysicsMaterialDirty || changed;
+    ImGui::TextDisabled("Contacts: friction sqrt(a * b), restitution max(a, b).");
+    ImGui::BeginDisabled(!m_PhysicsMaterialDirty);
+    if (ImGui::Button("Save")) {
+        std::string error;
+        if (SavePhysicsMaterial(m_PhysicsMaterialFile, m, &error)) {
+            m_PhysicsMaterialDirty = false;
+            m_Status               = "Saved " + PathToUtf8(m_PhysicsMaterialFile.filename()); // the physics reloads it
+        } else {
+            m_Status = error;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Revert"))
+        if (const auto saved = LoadPhysicsMaterial(m_PhysicsMaterialFile)) {
+            m                      = *saved;
+            m_PhysicsMaterialDirty = false;
+        }
+    ImGui::EndDisabled();
     ImGui::End();
 }
 

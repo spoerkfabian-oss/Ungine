@@ -15,7 +15,9 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Physics/Ragdoll.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
@@ -3214,6 +3216,169 @@ TEST_CASE(Streaming_LevelLoaderSwitch)
     }, 600));
     CHECK(!loader.Error().empty());
     loader.Cancel();
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Physics_TriangleMaterialsAndEditorTools)
+{
+    // A two-material mesh (Grass at x = 0, Rock at x = 4): the mesh collider maps each glTF
+    // material to its physics material, raycasts report the surface per triangle.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_physmat_{}", std::random_device{}());
+    fs::create_directories(dir);
+    CHECK(SavePhysicsMaterial(dir / "Grass.uphysmat", PhysicsMaterialData{.friction = 0.8f, .restitution = 0.0f, .surface = "Grass"}));
+    CHECK(SavePhysicsMaterial(dir / "Rock.uphysmat", PhysicsMaterialData{.friction = 0.6f, .restitution = 0.2f, .surface = "Rock"}));
+
+    ModelData       data = MakePlane("Terrain", 4.0f, MaterialData{.name = "Grass"});
+    const ModelData rock = MakePlane("Rock", 4.0f, MaterialData{.name = "Rock"});
+    Submesh         second = rock.meshes[0].submeshes[0];
+    second.vertexOffset    = static_cast<std::int32_t>(data.vertices.size());
+    second.firstIndex      = static_cast<std::uint32_t>(data.indices.size());
+    second.material        = 1;
+    second.lods[0]         = {.firstIndex = second.firstIndex, .indexCount = second.indexCount};
+    second.boundsMin.x += 4.0f;
+    second.boundsMax.x += 4.0f;
+    for (Vertex v : rock.vertices) {
+        v.position.x += 4.0f;
+        data.vertices.push_back(v);
+    }
+    data.indices.insert(data.indices.end(), rock.indices.begin(), rock.indices.end());
+    data.materials.push_back(rock.materials[0]);
+    data.meshes[0].submeshes.push_back(second);
+    data.boundsMax.x += 4.0f;
+    const ModelHandle terrain = F().assets->CreateModel(std::move(data));
+    CHECK(F().Pump([&] { return Settled(terrain); }));
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    const Entity ground = scene.CreateEntity("Terrain");
+    r.Emplace<MeshRenderer>(ground, MeshRenderer{.model = terrain, .meshIndex = 0});
+    r.Emplace<RigidBody>(ground, RigidBody{.type = BodyType::Static});
+    Collider meshCollider{.shape = ColliderShape::Mesh};
+    meshCollider.meshMaterials.insert_or_assign("Grass", PathToUtf8(dir / "Grass.uphysmat"));
+    meshCollider.meshMaterials.insert_or_assign("Rock", PathToUtf8(dir / "Rock.uphysmat"));
+    r.Emplace<Collider>(ground, meshCollider);
+    physics.Sync(scene);
+    CHECK(physics.HasBody(ground));
+    const auto grass = physics.Raycast({0.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 20.0f);
+    const auto rockHit = physics.Raycast({4.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 20.0f);
+    CHECK(grass && grass->entity == ground && grass->surface == "Grass");
+    CHECK(rockHit && rockHit->entity == ground && rockHit->surface == "Rock");
+
+    // Unassigned glTF material -> the collider's material, else none ("").
+    r.Get<Collider>(ground).meshMaterials.erase("Rock");
+    physics.Sync(scene);
+    const auto plain = physics.Raycast({4.0f, 5.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 20.0f);
+    CHECK(plain && plain->surface.empty());
+
+    // Contacts on the mesh carry the triangle's surface.
+    const Entity ball = scene.CreateEntity("Ball");
+    scene.EditTransform(ball).position = {0.0f, 1.0f, 0.0f};
+    r.Emplace<RigidBody>(ball);
+    r.Emplace<Collider>(ball, Collider{.shape = ColliderShape::Sphere, .radius = 0.25f});
+    std::string        groundSurface;
+    const Subscription sub = F().events.Subscribe<CollisionEvent>([&](const CollisionEvent& e) {
+        if (e.begin && (e.a == ground || e.b == ground))
+            groundSurface = e.a == ground ? e.contact.surfaceA : e.contact.surfaceB;
+        return false;
+    });
+    for (int i = 0; i < 90 && groundSurface.empty(); ++i) {
+        physics.Step(scene, 1.0f / 60.0f);
+        F().events.Flush();
+    }
+    CHECK(groundSurface == "Grass");
+
+    // Editor: inspector with collider materials, joint, character and ragdoll; joint overlay;
+    // the physics material window; a simulated ragdoll in Play.
+    const ModelHandle banner = F().assets->LoadModel(TemplateDirectory() / "Basic" / "Content" / "Models" / "AnimatedBanner.gltf");
+    CHECK(F().Pump([&] { return Settled(banner); }));
+    const Model* bannerModel = F().assets->Get(banner);
+    CHECK(bannerModel != nullptr);
+    if (!bannerModel) {
+        F().assets->Release(terrain);
+        F().assets->Release(banner);
+        return;
+    }
+    const Entity bannerRoot = InstantiateModel(scene, banner, *bannerModel);
+    scene.EditTransform(bannerRoot).position = {2.0f, 2.0f, 0.0f};
+    CHECK(CreateRagdoll(scene, bannerRoot, *bannerModel) == 2);
+    SetRagdollSimulating(scene, bannerRoot, true);
+    const std::vector<Entity> bones = RagdollBones(scene, bannerRoot);
+    CHECK(bones.size() == 2);
+
+    const Entity door = scene.CreateEntity("Door");
+    scene.EditTransform(door).position = {-2.0f, 1.0f, 0.0f};
+    r.Emplace<RigidBody>(door);
+    r.Emplace<Collider>(door, Collider{.shape = ColliderShape::Box, .halfExtents = {0.5f, 1.0f, 0.05f}});
+    Joint hinge;
+    hinge.type    = JointType::Hinge;
+    hinge.anchor  = {-0.5f, 0.0f, 0.0f};
+    hinge.limits  = true;
+    hinge.minLimit = -1.0f;
+    hinge.maxLimit = 1.0f;
+    hinge.motor.mode   = JointMotorMode::Velocity;
+    hinge.motor.target = 1.0f;
+    r.Emplace<Joint>(door, hinge);
+    const Entity hero = scene.CreateEntity("Hero");
+    scene.EditTransform(hero).position = {0.0f, 0.1f, 1.5f};
+    r.Emplace<CharacterController>(hero, CharacterController{.rotation = CharacterRotation::Movement});
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 3.0f, 8.0f};
+    camera.LookAt({0.0f, 1.0f, 0.0f});
+    const auto runFrames = [&](int count, int stepsPerFrame) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            for (int s = 0; s < stepsPerFrame; ++s)
+                editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    for (const Entity e : {ground, door, hero, bannerRoot, bones[0], bones[1]}) {
+        editor.Select(e);
+        runFrames(2, 1);
+    }
+    CHECK(physics.Stats().joints == 2); // door hinge + ragdoll swing-twist (edit mode syncs)
+    editor.OpenAsset(dir / "Rock.uphysmat");
+    runFrames(2, 1);
+
+    const std::uint64_t boneUuid = r.Get<Uuid>(bones[0]).value;
+    const glm::vec3     bonePos  = glm::vec3(r.Get<WorldTransform>(bones[0]).matrix[3]);
+    editor.Play();
+    runFrames(15, 4); // 1 s: the dynamic ragdoll falls, the animation is paused
+    const Entity playBone = scene.FindByUuid(boneUuid);
+    CHECK(playBone != NullEntity && glm::vec3(r.Get<WorldTransform>(playBone).matrix[3]).y < bonePos.y - 0.5f);
+    editor.Stop();
+    runFrames(2, 1);
+    const Entity restored = scene.FindByUuid(boneUuid);
+    CHECK(restored != NullEntity && glm::distance(glm::vec3(r.Get<WorldTransform>(restored).matrix[3]), bonePos) < 1e-4f);
+    CHECK(scene.CountStaleTransforms() == 0);
+
+    for (ModelHandle ref : modelRefs)
+        F().assets->Release(ref);
+    F().assets->Release(banner);
+    F().assets->Release(terrain);
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
