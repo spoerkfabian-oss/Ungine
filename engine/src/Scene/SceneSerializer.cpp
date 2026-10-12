@@ -380,7 +380,8 @@ json AudioSourceToJson(const AudioSource& a, const std::string& sound)
             {"maxDistance", a.maxDistance},
             {"rolloff", a.rolloff},
             {"doppler", a.doppler},
-            {"occlusion", a.occlusion}};
+            {"occlusion", a.occlusion},
+            {"priority", a.priority}};
 }
 
 AudioSource AudioSourceFromJson(const json& j)
@@ -405,6 +406,9 @@ AudioSource AudioSourceFromJson(const json& j)
     Read(j, "rolloff", a.rolloff);
     Read(j, "doppler", a.doppler);
     Read(j, "occlusion", a.occlusion);
+    int priority = a.priority;
+    Read(j, "priority", priority);
+    a.priority = static_cast<std::uint8_t>(std::clamp(priority, 0, 255));
     a.volume      = std::max(a.volume, 0.0f);
     a.pitch       = std::clamp(a.pitch, 0.01f, 16.0f);
     a.minDistance = std::max(a.minDistance, 0.01f);

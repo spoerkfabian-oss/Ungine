@@ -16,6 +16,7 @@ struct PhysicsMaterialData {
     float       friction    = 0.5f;
     float       restitution = 0.0f;
     std::string surface     = "Default";
+    float       absorption  = 0.6f; // sound: share of the energy a path through this surface loses (occlusion)
 
     bool operator==(const PhysicsMaterialData&) const = default;
 };

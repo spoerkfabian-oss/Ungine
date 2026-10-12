@@ -1193,7 +1193,8 @@ std::vector<NodeDesc> BuildRegistry()
                      c.Out(1, light->intensity);
              }));
 
-    // Audio. Sound paths: absolute or relative to the working directory (the project root).
+    // Audio. Sound paths: absolute or relative to the working directory (the project root); a sound
+    // cue (.ucue) works wherever a sound does.
     const auto busParam = [](NodeDesc desc, const char* fallback) {
         return WithParam(std::move(desc), ParamKind::Choice, "Bus", fallback, {"world", "music", "ui", "ambient"});
     };
@@ -1258,6 +1259,24 @@ std::vector<NodeDesc> BuildRegistry()
                                      }, "Mixer bus volume until play stops (options menus, ducking)"),
                               {{"Volume", 1.0f}}),
                  "music"));
+    add(WithDefaults(Action("Audio.ActivateSnapshot", "Activate Audio Snapshot", "Audio",
+                            {In("Snapshot", P::String), In("Fade", P::Float)},
+                            [](ScriptContext& c) {
+                                if (!c.Audio())
+                                    return c.Error("No audio system");
+                                if (!c.Audio()->ActivateSnapshot(c.InString(2), c.InFloat(3)))
+                                    c.Error("No audio snapshot '" + c.InString(2) + "' (Project Settings > Audio)");
+                            }, "Fades a project mix snapshot in (Fade < 0: the snapshot's own fade time)"),
+                     {{"Fade", -1.0f}}));
+    add(WithDefaults(Action("Audio.DeactivateSnapshot", "Deactivate Audio Snapshot", "Audio",
+                            {In("Snapshot", P::String), In("Fade", P::Float)},
+                            [](ScriptContext& c) {
+                                if (c.Audio())
+                                    c.Audio()->DeactivateSnapshot(c.InString(2), c.InFloat(3));
+                            }, "Fades a snapshot out (Fade < 0: the snapshot's own fade time)"),
+                     {{"Fade", -1.0f}}));
+    add(Pure("Audio.SnapshotWeight", "Get Audio Snapshot Weight", "Audio", {In("Snapshot", P::String), Out("Weight", P::Float)},
+             [](ScriptContext& c) { c.Out(1, c.Audio() ? c.Audio()->SnapshotWeight(c.InString(0)) : 0.0f); }));
 
     // Functions (created by the editor's function list; their nodes are not in the palette).
     {

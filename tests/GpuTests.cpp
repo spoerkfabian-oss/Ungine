@@ -10,6 +10,7 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Audio/SoundCue.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
@@ -3380,6 +3381,96 @@ TEST_CASE(Physics_TriangleMaterialsAndEditorTools)
     F().assets->Release(banner);
     F().assets->Release(terrain);
     std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_AudioCuesMixerUi)
+{
+    // Sound cue window, mixer sections (snapshots, ducking, voice limits), Audio Source with a cue
+    // and its occlusion readout, physics material absorption - drawn in edit and play mode.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_cues_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    WriteWav(dir / "low.wav", MakeTone(300.0f, 0.5f, 48000, 0.5f));
+    WriteWav(dir / "high.wav", MakeTone(900.0f, 0.5f, 48000, 0.5f));
+    SoundCue cue;
+    cue.variants = {{.sound = PathToUtf8(dir / "low.wav")}, {.sound = PathToUtf8(dir / "high.wav"), .weight = 2.0f}};
+    cue.maxInstances = 4;
+    CHECK(SaveSoundCue(dir / "Blip.ucue", cue));
+    CHECK(SavePhysicsMaterial(dir / "Felt.uphysmat", {.surface = "Felt", .absorption = 0.8f}));
+
+    Scene        scene;
+    Registry&    r = scene.GetRegistry();
+    PhysicsWorld physics(*F().jobs, F().events, F().assets.get());
+    AudioEngine  engine(AudioEngineDesc{.device = false});
+    AudioSystem  audio(engine, F().assets.get(), &physics);
+    AudioSettings settings;
+    settings.snapshots.push_back({.name = "Pause", .volume = {1.0f, 0.3f, 0.5f, 1.0f, 0.3f}});
+    settings.ducking.push_back({});
+    settings.voiceLimit[static_cast<std::size_t>(AudioBus::World)] = 16;
+    audio.Apply(settings);
+    const Entity speaker = scene.CreateEntity("Speaker");
+    scene.EditTransform(speaker).position = {0.0f, 1.0f, -4.0f};
+    r.Emplace<AudioSource>(speaker, AudioSource{.sound = PathToUtf8(dir / "Blip.ucue"), .loop = true});
+    r.Emplace<AudioListener>(scene.CreateEntity("Ears"));
+    const Entity wall = scene.CreateEntity("Wall");
+    scene.EditTransform(wall).position = {0.0f, 1.0f, -2.0f};
+    r.Emplace<RigidBody>(wall, RigidBody{.type = BodyType::Static});
+    Collider felt{.halfExtents = {3.0f, 3.0f, 0.1f}};
+    felt.material = PathToUtf8(dir / "Felt.uphysmat");
+    r.Emplace<Collider>(wall, felt);
+
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .audio         = &audio,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 2.0f, 6.0f};
+    std::vector<float> mix(800 * 2);
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            engine.Render(mix);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    editor.Select(speaker);
+    editor.ExpandAudioMixer();
+    editor.OpenAsset(dir / "Blip.ucue");
+    runFrames(3);
+    editor.OpenAsset(dir / "Felt.uphysmat");
+    runFrames(2);
+
+    editor.Play();
+    for (int i = 0; i < 200 && !audio.IsPlaying(speaker); ++i)
+        runFrames(1);
+    runFrames(4);
+    CHECK(audio.IsPlaying(speaker) && audio.Stats().cues == 1);
+    CHECK(audio.Occlusion(speaker) > 0.7f && audio.Occlusion(speaker) < 0.85f); // felt absorbs 0.8
+    CHECK(audio.ActivateSnapshot("Pause", 0.0f) && engine.BusMix(AudioBus::Music) == 0.5f);
+    editor.ExpandAudioMixer(); // snapshot weights / duck gains drawn live
+    runFrames(2);
+    editor.Stop();
+    runFrames(2);
+    CHECK(!audio.Running() && engine.BusMix(AudioBus::Music) == 1.0f && engine.Stats().voices == 0);
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

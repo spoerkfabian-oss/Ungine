@@ -47,6 +47,7 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Sound-Cues mit gewichteten Variationen, Zufall, Random-Pitch und Loop-Regeln.
 - Voice-Priorisierung, damit wichtige Sounds bei Voice-Limit nicht verworfen werden.
 - Bus-Snapshots/Ducking und räumliche Verbesserungen (mehrere Occlusion-Strahlen/Materialabsorption); HRTF als optionale, messbare Ausbaustufe.
+- Fortschritt (2026-10-12): umgesetzt und lokal verifiziert – Sound-Cues (`.ucue`, gewichtete Varianten, Zufall, No-Repeat, Priorität, Instanz-Limit), Voice-Priorität mit Verdrängung und Limits pro Cue/Bus, Snapshots mit Überblendung, Sidechain-Ducking, Multi-Ray-Occlusion mit Absorption aus Physik-Materialien, Blueprint-/Editor-Werkzeuge. HRTF nach Rücksprache weggelassen. Grenzen in CLAUDE.md, Offene Punkte 15.
 
 ## Arbeitsregeln
 - Pro Phase erst bestehende Schnittstellen prüfen, dann vertikal implementieren (Datenformat → Laufzeit → Editor/Player → Dokumentation).

@@ -118,6 +118,13 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Kapseln und Gelenken; *Simulate* (oder Blueprint *Set Ragdoll Simulating*) lässt es fallen.
     Character Controller: Drehmodus (Bewegung/Kamera/Script), Ducken, bewegte Plattformen,
     Rutschen an steilen Hängen.
+17. **Audio-Mixer & Sound-Cues**: *Content → + New → Sound cue* legt ein `.ucue` an: Varianten (Sounds
+    per „…“ oder aus dem Content-Browser hineinziehen) mit Gewicht, Zufalls-Lautstärke/-Tonhöhe,
+    ohne direkte Wiederholung, Priorität und Instanz-Limit. Ein Cue funktioniert überall wie ein
+    Sound (Audio Source, *Play Sound*-Knoten). Im Renderer-Panel unter *Audio*: Voice-Limits pro
+    Bus, **Snapshots** (benannte Bus-Mixe, per Blueprint *Activate/Deactivate Audio Snapshot*
+    überblendet) und **Ducking** (z. B. UI senkt Musik). Occlusion nutzt mehrere Strahlen pro
+    Quelle; Wände dämpfen nach der *Sound absorption* ihres Physik-Materials.
 
 
 ## Entwicklung

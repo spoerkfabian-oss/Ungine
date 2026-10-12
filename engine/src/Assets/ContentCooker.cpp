@@ -1,4 +1,5 @@
 #include "Engine/Assets/ContentCooker.h"
+#include "Engine/Audio/SoundCue.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
@@ -539,6 +540,28 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 replaced.insert(dependency.lexically_normal());
         } catch (const std::exception& e) {
             report.errors.push_back(std::format("'{}': {}", entryPath(file), e.what()));
+        }
+    }
+
+    // Sound cues: their variants must be packaged too.
+    for (const fs::path& file : files) {
+        if (!IsSoundCueFile(file))
+            continue;
+        std::string error;
+        const auto  cue = LoadSoundCue(file, &error);
+        if (!cue) {
+            report.warnings.push_back(error);
+            continue;
+        }
+        for (const SoundCueVariant& variant : cue->variants) {
+            if (variant.sound.empty())
+                continue;
+            const fs::path  target = PathFromUtf8(variant.sound);
+            std::error_code ec;
+            if (!fs::is_regular_file(target, ec))
+                report.warnings.push_back(std::format("'{}': missing sound '{}'", entryPath(file), variant.sound));
+            else if (!inContent(target))
+                report.warnings.push_back(std::format("'{}': '{}' is outside Content/ and not packaged", entryPath(file), variant.sound));
         }
     }
 

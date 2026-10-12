@@ -25,6 +25,7 @@ struct PhysicsHit {
     glm::vec3   normal{0.0f}; // surface normal at the hit, facing the query
     float       distance = 0.0f;
     std::string surface;      // physics material surface of the hit triangle / shape ("" without material)
+    float       absorption = 1.0f; // sound absorption of that material (1 without material: blocks fully)
 };
 
 // Where and how hard two bodies touch (the deepest contact of the pair in that step).

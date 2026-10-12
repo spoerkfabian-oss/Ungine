@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-12 (Phase 26 merged as PR #16; Phase 27 next, questions pending)
+- Last updated: 2026-10-12 (Phase 27 implemented on `branch`, PR pending; next the C phases after the merge)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -623,10 +623,10 @@ Testing:
 
 Known limitations:
 - no HRTF/binaural
-- simple binary/single-ray occlusion
+- ray-based occlusion (several rays, material absorption) without diffraction/portals
 - one global Freeverb-style reverb path
-- no sound-cue/randomization subsystem
-- limited voice prioritization
+- sound cues (.ucue) without nesting/sequences; loop repeats the chosen variant
+- voice stealing by estimated loudness, no virtual voices; no HRTF (deliberately)
 - raw audio packaging
 
 ## 16. Editor
@@ -821,6 +821,14 @@ Technical details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)".
 - Tests: CPU `tests/PhysicsToolsTests.cpp` (7 cases), GPU `Physics_TriangleMaterialsAndEditorTools`.
 - Verification: CTest 18/18 with sync validation, ASan/UBSan clean (known llvmpipe leak only). MSVC lesson: C4458 also fires for locals in a nested `Impl` that hide members of the enclosing class (e.g. `PhysicsWorld::settings`); Clang `-Wshadow-all` does not catch this - avoid local names equal to outer-class members.
 
+### Phase 27 audio expansion (2026-10-12)
+Technical details: CLAUDE.md "Audio-Ausbau (Phase 27)".
+
+- New `Audio/SoundCue.h` (.ucue), AudioEngine bus nodes (`BusNode`: volume x snapshot mix, RMS level, ducking envelopes, continuous processing), voice priority/stealing/limits (`Admit`), AudioSystem cues/snapshots/multi-ray occlusion, `PhysicsMaterialData::absorption`, `PhysicsHit::absorption`.
+- Editor: Sound Cue window, CUE content type, mixer sections (limits, snapshots, ducking), reference repair for `.ucue` and collider material paths.
+- Found by the new GPU UI test: a `PropertyRow` without `PopID` in the Audio Source inspector (ImGui ID-stack assert) - always pair PropertyRow with PopID.
+- Tests: CPU `tests/AudioMixTests.cpp` (6 cases), GPU `Editor_AudioCuesMixerUi`.
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -964,7 +972,7 @@ User-approved work plan (2026-10-05, after PR #12 merged the build repair; main 
 
 Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
 
-Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 merged (PR #15, merge 4c58715); `branch` fast-forwarded to main. Phase 26 merged (PR #16, 2026-10-12); `branch` restarted from main. Next Phase 27 (sound cues, voice priority, snapshots/ducking, multi-ray occlusion; ask the user first). Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – decisions (user, 2026-10-06): joints as a component with Fixed/Hinge/Slider/Ball/Distance/Cone + generic 6DOF and ragdoll creation from skeletons (limits, motors, break force, editor gizmo, Blueprint nodes); per-triangle collision materials as physics material assets (`.uphysmat`: friction, restitution, surface tag) assigned per glTF material of a mesh collider, surface reported in raycasts and contacts; contact events with point, normal, impulse, relative velocity, surfaces + Hit event with threshold + per-frame Persist events; character: rotation modes (none/movement/camera yaw/script, turn speed), moving platforms (ground velocity), crouch with headroom check, steep-slope sliding and push strength. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
+Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 merged (PR #15, merge 4c58715); `branch` fast-forwarded to main. Phase 26 merged (PR #16, 2026-10-12); `branch` restarted from main. Phase 27 implemented on `branch` (2026-10-12), PR pending; decisions (user "Mach es" = recommendation): sound cues as `.ucue` assets accepted wherever a sound path is, priority 0-255 with stealing + per-cue and per-bus limits, snapshots + sidechain ducking, multiple occlusion rays with absorption from `.uphysmat`, no diffraction, no HRTF. Afterwards the C phases (28+), ask first. Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – decisions (user, 2026-10-06): joints as a component with Fixed/Hinge/Slider/Ball/Distance/Cone + generic 6DOF and ragdoll creation from skeletons (limits, motors, break force, editor gizmo, Blueprint nodes); per-triangle collision materials as physics material assets (`.uphysmat`: friction, restitution, surface tag) assigned per glTF material of a mesh collider, surface reported in raycasts and contacts; contact events with point, normal, impulse, relative velocity, surfaces + Hit event with threshold + per-frame Persist events; character: rotation modes (none/movement/camera yaw/script, turn speed), moving platforms (ground velocity), crouch with headroom check, steep-slope sliding and push strength. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
 
 For every concrete issue:
 - patch branch
@@ -987,3 +995,4 @@ If an audit finds no concrete defect:
 - Phase 24 (level/area streaming) merged as PR #14.
 - Phase 25 (cooked builds, savegame versions, options/remapping) merged as PR #15 (merge 4c58715, 2026-10-06).
 - Phase 26 (physics materials, contact data, joints, ragdolls, character tools) merged as PR #16 (2026-10-12).
+- Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) implemented on `branch` (2026-10-12), PR pending.

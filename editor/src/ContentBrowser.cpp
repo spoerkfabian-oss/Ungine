@@ -75,11 +75,12 @@ ImVec4 KindColor(int kind)
     case 6: return {0.35f, 0.85f, 0.85f, 1.0f}; // sound
     case 7: return {0.55f, 0.85f, 0.55f, 1.0f}; // enum / struct / interface
     case 8: return {0.80f, 0.70f, 0.50f, 1.0f}; // physics material
+    case 9: return {0.30f, 0.95f, 0.70f, 1.0f}; // sound cue
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -144,14 +145,35 @@ struct StoredReferenceFile {
     bool installed = false;
 };
 
+// The collider with its physics material paths moved (nullopt: none of them pointed there).
+std::optional<Collider> RelocatedCollider(const Collider* collider, const fs::path& from, const fs::path& to, bool directory)
+{
+    if (!collider)
+        return std::nullopt;
+    Collider moved = *collider;
+    bool     any   = false;
+    if (const auto path = RelocateReference(moved.material, from, to, directory)) {
+        moved.material = PathToUtf8(*path);
+        any            = true;
+    }
+    for (auto& [name, file] : moved.meshMaterials)
+        if (const auto path = RelocateReference(file, from, to, directory)) {
+            file = PathToUtf8(*path);
+            any  = true;
+        }
+    return any ? std::optional<Collider>(std::move(moved)) : std::nullopt;
+}
+
 void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                         const fs::path& from, const fs::path& to, bool directory, std::size_t& count,
-                        const fs::path& oldOwnerDirectory = {})
+                        const fs::path& oldOwnerDirectory = {}, bool pathValues = false)
 {
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
-            if (it.value().is_string() && (it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
-                                          it.key() == "file" || it.key() == "uri" || it.key() == "level")) {
+            // pathValues: every string of the object is a path (a collider's meshMaterials).
+            if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
+                                          it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
+                                          it.key() == "material")) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -179,7 +201,8 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                     ++count;
                 }
             } else {
-                RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory);
+                RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory,
+                                   it.key() == "meshMaterials");
             }
         }
     } else if (value.is_array()) {
@@ -207,7 +230,7 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
         const std::string name = Lower(PathToUtf8(it->path().filename()));
         const bool legacyScene = EndsWith(name, ".json") && Lower(PathToUtf8(it->path().parent_path().filename())) == "scenes";
         if (!(EndsWith(name, ".scene.json") || EndsWith(name, ".uprefab") || EndsWith(name, ".ugraph") ||
-              EndsWith(name, ".gltf") || legacyScene))
+              EndsWith(name, ".gltf") || EndsWith(name, std::string(kSoundCueExtension)) || legacyScene))
             continue;
 
         std::ifstream input(it->path(), std::ios::binary);
@@ -494,6 +517,16 @@ void Editor::OpenAsset(const fs::path& file)
         } else {
             m_Status = error;
         }
+    } else if (IsSoundCueFile(file)) {
+        std::string error;
+        if (const auto cue = LoadSoundCue(file, &error)) {
+            m_SoundCueFile  = file;
+            m_SoundCueEdit  = *cue;
+            m_SoundCueDirty = false;
+            m_ShowSoundCue  = true;
+        } else {
+            m_Status = error;
+        }
     } else if (EndsWith(name, ".uprefab")) { // double-click: an instance in front of the camera
         if (m_PlayState == PlayState::Edit)
             PlacePrefab(file, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -573,6 +606,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::Type;
         else if (EndsWith(lower, std::string(kPhysicsMaterialExtension)))
             item.kind = ContentItem::Kind::PhysicsMaterial;
+        else if (IsSoundCueFile(path))
+            item.kind = ContentItem::Kind::SoundCue;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -996,7 +1031,8 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
                                        : std::optional<fs::path>{};
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
-        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !imagePath && !prefabPath && !levelPath)
+        const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
+        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !imagePath && !prefabPath && !levelPath && !colliderMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -1006,6 +1042,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (imagePath) widget->image = PathToUtf8(*imagePath);
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
         if (levelPath) volume->level = PathToUtf8(*levelPath);
+        if (colliderMoved) registry.Get<Collider>(entity) = *colliderMoved;
         m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
@@ -1127,6 +1164,16 @@ void Editor::DrawContentBrowser()
             std::ofstream(UniquePath(m_ContentDir, "NewScene", ".scene.json")) << "{\n  \"version\": 1,\n  \"entities\": []\n}\n";
             RefreshContent();
         }
+        if (ImGui::MenuItem("Sound cue")) {
+            const fs::path file = UniquePath(m_ContentDir, "NewSoundCue", std::string(kSoundCueExtension));
+            std::string    error;
+            if (SaveSoundCue(file, SoundCue{}, &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
+        }
         if (ImGui::MenuItem("Physics material")) {
             const fs::path file = UniquePath(m_ContentDir, "NewPhysicsMaterial", std::string(kPhysicsMaterialExtension));
             std::string    error;
@@ -1205,9 +1252,13 @@ void Editor::DrawContentBrowser()
                     if (item.kind == ContentItem::Kind::Blueprint && Selected() != NullEntity &&
                         ImGui::MenuItem("Assign to selection"))
                         AssignScript(Selected(), item.path);
-                    if (item.kind == ContentItem::Kind::Sound) {
-                        if (m_Ctx.audio && ImGui::MenuItem(m_Ctx.audio->Previewing() ? "Stop preview" : "Preview"))
-                            OpenAsset(item.path);
+                    if (item.kind == ContentItem::Kind::Sound || item.kind == ContentItem::Kind::SoundCue) {
+                        if (m_Ctx.audio && ImGui::MenuItem(m_Ctx.audio->Previewing() ? "Stop preview" : "Preview")) {
+                            if (m_Ctx.audio->Previewing())
+                                m_Ctx.audio->StopPreview();
+                            else
+                                m_Ctx.audio->Preview(item.path);
+                        }
                         if (ImGui::MenuItem("Place audio source"))
                             CreateAudioEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
                         if (Selected() != NullEntity && ImGui::MenuItem("Assign to selection"))
@@ -1482,7 +1533,9 @@ void Editor::DrawContentBrowser()
                         const bool movePrefab = prefabPath.has_value();
                         const auto levelPath = volume ? RelocateReference(volume->level, previous, target, wasDirectory)
                                                       : std::optional<fs::path>{};
-                        if (!moveScript && !moveAudio && !moveImage && !movePrefab && !levelPath && !meshModel && !instanceModel)
+                        const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), previous, target, wasDirectory);
+                        if (!moveScript && !moveAudio && !moveImage && !movePrefab && !levelPath && !meshModel && !instanceModel &&
+                            !colliderMoved)
                             return;
                         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
                         if (moveScript)
@@ -1495,6 +1548,8 @@ void Editor::DrawContentBrowser()
                             prefab->prefab = PathToUtf8(*prefabPath);
                         if (levelPath)
                             volume->level = PathToUtf8(*levelPath);
+                        if (colliderMoved)
+                            registry.Get<Collider>(entity) = *colliderMoved;
                         if (meshModel)
                             mesh->model = *meshModel;
                         if (instanceModel)
@@ -1967,6 +2022,9 @@ void Editor::DrawPhysicsMaterial()
     changed |= ImGui::InputText("Surface", &m.surface);
     changed |= ImGui::DragFloat("Friction", &m.friction, 0.005f, 0.0f, 10.0f, "%.3f");
     changed |= ImGui::DragFloat("Restitution", &m.restitution, 0.005f, 0.0f, 1.0f, "%.3f");
+    changed |= ImGui::SliderFloat("Sound absorption", &m.absorption, 0.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Share of a sound a path through this surface loses (audio occlusion)");
     m_PhysicsMaterialDirty = m_PhysicsMaterialDirty || changed;
     ImGui::TextDisabled("Contacts: friction sqrt(a * b), restitution max(a, b).");
     ImGui::BeginDisabled(!m_PhysicsMaterialDirty);
@@ -1986,6 +2044,136 @@ void Editor::DrawPhysicsMaterial()
             m_PhysicsMaterialDirty = false;
         }
     ImGui::EndDisabled();
+    ImGui::End();
+}
+
+void Editor::DrawSoundCue()
+{
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 380.0f), ImGuiCond_FirstUseEver);
+    const std::string title = "Sound Cue" + std::string(m_SoundCueDirty ? " *" : "") + "###soundcue";
+    if (!ImGui::Begin(title.c_str(), &m_ShowSoundCue)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextDisabled("%s", PathToUtf8(m_SoundCueFile.filename()).c_str());
+    SoundCue& cue     = m_SoundCueEdit;
+    bool      changed = false;
+    constexpr ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp;
+    if (ImGui::BeginTable("variants", 5, flags)) {
+        ImGui::TableSetupColumn("Sound", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Weight");
+        ImGui::TableSetupColumn("Volume");
+        ImGui::TableSetupColumn("Pitch");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+        ImGui::TableHeadersRow();
+        std::optional<std::size_t> remove;
+        for (std::size_t i = 0; i < cue.variants.size(); ++i) {
+            SoundCueVariant& v = cue.variants[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("...")) {
+                m_SoundCueVariant = i;
+                m_DialogPurpose   = DialogPurpose::AssignCueSound;
+                m_FileDialog->Open("Choose sound", FileDialog::Mode::Open,
+                                   v.sound.empty() ? m_SoundCueFile.parent_path() : PathFromUtf8(v.sound).parent_path(),
+                                   {".wav", ".ogg", ".mp3", ".flac"});
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(v.sound.empty() ? "(none)" : PathToUtf8(PathFromUtf8(v.sound).filename()).c_str());
+            if (ImGui::IsItemHovered() && !v.sound.empty())
+                ImGui::SetTooltip("%s", v.sound.c_str());
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= ImGui::DragFloat("##w", &v.weight, 0.01f, 0.0f, 100.0f, "%.2f");
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= ImGui::DragFloat("##v", &v.volume, 0.005f, 0.0f, 4.0f, "%.2f");
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= ImGui::DragFloat("##p", &v.pitch, 0.005f, 0.01f, 16.0f, "%.2f");
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("x"))
+                remove = i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (remove) {
+            cue.variants.erase(cue.variants.begin() + static_cast<std::ptrdiff_t>(*remove));
+            changed = true;
+        }
+    }
+    if (ImGui::Button("+ Add variant")) {
+        cue.variants.push_back({});
+        changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(or drop sounds from the Content browser here)");
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kContentPayload)) {
+            const fs::path file = PathFromUtf8(static_cast<const char*>(payload->Data));
+            if (IsSoundFile(file)) {
+                cue.variants.push_back({.sound = PathToUtf8(file.lexically_normal())});
+                changed = true;
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+    ImGui::Separator();
+    changed |= ImGui::DragFloatRange2("Random volume", &cue.volumeMin, &cue.volumeMax, 0.005f, 0.0f, 4.0f, "%.2f", "%.2f",
+                                      ImGuiSliderFlags_AlwaysClamp);
+    changed |= ImGui::DragFloatRange2("Random pitch", &cue.pitchMin, &cue.pitchMax, 0.005f, 0.01f, 4.0f, "%.2f", "%.2f",
+                                      ImGuiSliderFlags_AlwaysClamp);
+    changed |= ImGui::Checkbox("No repeat", &cue.noRepeat);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("With two or more variants, never the same one twice in a row");
+    int priority = cue.priority;
+    if (ImGui::SliderInt("Priority", &priority, 0, 255)) {
+        cue.priority = static_cast<std::uint8_t>(priority);
+        changed      = true;
+    }
+    int instances = static_cast<int>(cue.maxInstances);
+    if (ImGui::DragInt("Max instances", &instances, 0.1f, 0, 1024, instances == 0 ? "unlimited" : "%d")) {
+        cue.maxInstances = static_cast<std::uint32_t>(std::max(instances, 0));
+        changed          = true;
+    }
+    int mode = cue.limitMode == VoiceLimitMode::Reject ? 1 : 0;
+    if (ImGui::Combo("When full", &mode, "Steal the least important\0Reject the new one\0")) {
+        cue.limitMode = mode == 1 ? VoiceLimitMode::Reject : VoiceLimitMode::Steal;
+        changed       = true;
+    }
+    m_SoundCueDirty = m_SoundCueDirty || changed;
+    ImGui::Separator();
+    ImGui::BeginDisabled(!m_SoundCueDirty);
+    if (ImGui::Button("Save")) {
+        std::string error;
+        if (SaveSoundCue(m_SoundCueFile, cue, &error)) {
+            m_SoundCueDirty = false;
+            m_Status        = "Saved " + PathToUtf8(m_SoundCueFile.filename()); // the audio system reloads it
+        } else {
+            m_Status = error;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Revert"))
+        if (const auto saved = LoadSoundCue(m_SoundCueFile)) {
+            cue             = *saved;
+            m_SoundCueDirty = false;
+        }
+    ImGui::EndDisabled();
+    if (m_Ctx.audio) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(m_SoundCueDirty);
+        if (ImGui::Button(m_Ctx.audio->Previewing() ? "Stop" : "Play")) {
+            if (m_Ctx.audio->Previewing())
+                m_Ctx.audio->StopPreview();
+            else
+                m_Ctx.audio->Preview(m_SoundCueFile); // a new variant each time
+        }
+        ImGui::EndDisabled();
+        if (m_SoundCueDirty && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Save first: the preview plays the saved cue");
+    }
     ImGui::End();
 }
 

@@ -194,6 +194,116 @@ void SetNodeVolume(VoiceNode& node, float volume, float rampSeconds)
     node.volumeVersion.fetch_add(1, std::memory_order_release);
 }
 
+// A mixer bus' gain stage: volume ramps (user volume x snapshot mix), level measurement (RMS of
+// each block, for ducking and meters) and sidechain ducking (gain reduction while another bus is
+// loud). Runs even without input so the level drops to 0 and ducking releases.
+struct BusNode {
+    struct DuckSlot { // one per possible source bus
+        std::atomic<float> depth{0.0f}; // 0: no rule
+        std::atomic<float> threshold{0.01f}, attack{0.05f}, release{0.5f};
+        float              envelope = 1.0f; // audio thread
+    };
+
+    ma_node_base  base; // must be first
+    std::uint32_t channels   = 2;
+    float         sampleRate = 48000.0f;
+    const std::array<BusNode, kAudioBusCount>* buses = nullptr; // for the sources' levels
+
+    std::atomic<float>         targetVolume{1.0f};
+    std::atomic<std::uint32_t> rampFrames{0};
+    std::atomic<std::uint32_t> volumeVersion{0};
+    std::array<DuckSlot, kAudioBusCount> ducks;
+    std::atomic<float> level{0.0f};    // audio thread → main thread
+    std::atomic<float> duckGain{1.0f};
+
+    // Audio thread.
+    std::uint32_t seenVersion = 0;
+    float         volume      = 1.0f;
+    float         volumeStep  = 0.0f;
+    std::uint32_t stepsLeft   = 0;
+    float         duck        = 1.0f; // applied at the end of the last block
+
+    static void Process(ma_node* node, const float** in, ma_uint32* frameCountIn, float** out, ma_uint32* frameCountOut)
+    {
+        auto&           self   = *static_cast<BusNode*>(node);
+        const ma_uint32 frames = *frameCountOut;
+        if (frameCountIn)
+            *frameCountIn = frames;
+        const float* src = (in && in[0]) ? in[0] : nullptr;
+        float*       dst = out[0];
+        const std::uint32_t version = self.volumeVersion.load(std::memory_order_acquire);
+        if (version != self.seenVersion) {
+            self.seenVersion       = version;
+            const float         to = self.targetVolume.load(std::memory_order_relaxed);
+            const std::uint32_t n  = self.rampFrames.load(std::memory_order_relaxed);
+            self.stepsLeft  = n;
+            self.volumeStep = n ? (to - self.volume) / static_cast<float>(n) : 0.0f;
+            if (!n)
+                self.volume = to;
+        }
+        // Ducking: the strongest reduction of the rules, envelope per block (attack / release).
+        float reduction = 1.0f;
+        for (std::size_t i = 0; i < self.ducks.size(); ++i) {
+            DuckSlot&   slot  = self.ducks[i];
+            const float depth = slot.depth.load(std::memory_order_relaxed);
+            if (depth <= 0.0f || !self.buses) {
+                slot.envelope = 1.0f;
+                continue;
+            }
+            const float sourceLevel = (*self.buses)[i].level.load(std::memory_order_relaxed);
+            const float target      = sourceLevel > slot.threshold.load(std::memory_order_relaxed) ? 1.0f - depth : 1.0f;
+            const float time        = target < slot.envelope ? slot.attack.load(std::memory_order_relaxed)
+                                                             : slot.release.load(std::memory_order_relaxed);
+            const float k = 1.0f - std::exp(-static_cast<float>(frames) / (std::max(time, 1e-3f) * self.sampleRate));
+            slot.envelope += (target - slot.envelope) * k;
+            reduction = std::min(reduction, slot.envelope);
+        }
+        const float duckStep = frames ? (reduction - self.duck) / static_cast<float>(frames) : 0.0f;
+        double      sum      = 0.0;
+        for (ma_uint32 f = 0; f < frames; ++f) {
+            if (self.stepsLeft) {
+                self.volume += self.volumeStep;
+                if (--self.stepsLeft == 0)
+                    self.volume = self.targetVolume.load(std::memory_order_relaxed);
+            }
+            const float gain = self.volume * (self.duck + duckStep * static_cast<float>(f + 1));
+            for (std::uint32_t c = 0; c < self.channels; ++c) {
+                const std::size_t i = static_cast<std::size_t>(f) * self.channels + c;
+                const float       y = src ? src[i] * gain : 0.0f;
+                dst[i]              = y;
+                sum += static_cast<double>(y) * y;
+            }
+        }
+        self.duck = reduction;
+        const double samples = static_cast<double>(frames) * self.channels;
+        self.level.store(samples > 0.0 ? static_cast<float>(std::sqrt(sum / samples)) : 0.0f, std::memory_order_relaxed);
+        self.duckGain.store(reduction, std::memory_order_relaxed);
+    }
+};
+
+ma_node_vtable g_BusNodeVTable = {BusNode::Process, nullptr, 1, 1,
+                                  MA_NODE_FLAG_CONTINUOUS_PROCESSING | MA_NODE_FLAG_ALLOW_NULL_INPUT};
+
+ma_result InitBusNode(ma_engine& engine, BusNode& node, const std::array<BusNode, kAudioBusCount>* buses)
+{
+    const ma_uint32 channels = ma_engine_get_channels(&engine);
+    ma_node_config  config   = ma_node_config_init();
+    config.vtable            = &g_BusNodeVTable;
+    config.pInputChannels    = &channels;
+    config.pOutputChannels   = &channels;
+    node.channels   = channels;
+    node.sampleRate = static_cast<float>(ma_engine_get_sample_rate(&engine));
+    node.buses      = buses;
+    return ma_node_init(ma_engine_get_node_graph(&engine), &config, nullptr, &node);
+}
+
+void SetBusNodeVolume(BusNode& node, float volume, float rampSeconds)
+{
+    node.targetVolume.store(std::max(volume, 0.0f), std::memory_order_relaxed);
+    node.rampFrames.store(static_cast<std::uint32_t>(std::max(rampSeconds, 0.0f) * node.sampleRate), std::memory_order_relaxed);
+    node.volumeVersion.fetch_add(1, std::memory_order_release);
+}
+
 // Freeverb (verblib) on the World bus. Keeps running without input so the tail decays.
 struct ReverbNode {
     ma_node_base  base; // must be first
@@ -266,6 +376,15 @@ struct AudioEngine::Impl {
         bool                             stopping = false;
         bool                             paused   = false;
         float                            occlusion = 0.0f;
+        // Limits: who is least important.
+        AudioBus      bus      = AudioBus::World;
+        std::uint8_t  priority = kDefaultVoicePriority;
+        std::uint64_t group    = 0;
+        float         volume   = 1.0f;
+        bool          spatial  = false;
+        glm::vec3     position{0.0f};
+        Attenuation   attenuation = Attenuation::Inverse;
+        float         minDistance = 1.0f, maxDistance = 50.0f, rolloff = 1.0f;
 
         ~Voice()
         {
@@ -288,10 +407,14 @@ struct AudioEngine::Impl {
     // Bus i: group (voices attach here) -> gain node (volume / mute) -> parent.
     std::array<ma_sound_group, kAudioBusCount> groups{};
     std::array<bool, kAudioBusCount>           groupInit{};
-    std::array<VoiceNode, kAudioBusCount>      busNodes;
+    std::array<BusNode, kAudioBusCount>        busNodes;
     std::array<bool, kAudioBusCount>           busNodeInit{};
     std::array<float, kAudioBusCount>          busVolume{};
     std::array<bool, kAudioBusCount>           busMuted{};
+    std::array<float, kAudioBusCount>          busMix{};
+    std::array<std::uint32_t, kAudioBusCount>  busLimit{};
+    std::array<VoiceLimitMode, kAudioBusCount> busLimitMode{};
+    glm::vec3                                  listener{0.0f};
     ReverbNode      reverb;
     bool            reverbInit = false;
     ReverbParams    reverbParams;
@@ -327,12 +450,103 @@ struct AudioEngine::Impl {
 
     ma_sound_group& Group(AudioBus bus) { return groups[static_cast<std::size_t>(bus)]; }
 
-    void ApplyBusVolume(AudioBus bus)
+    void ApplyBusVolume(AudioBus bus, float rampSeconds = 0.01f) // 10 ms: no clicks
     {
         const auto i = static_cast<std::size_t>(bus);
-        if (busNodeInit[i]) // 10 ms ramp: no clicks
-            SetNodeVolume(busNodes[i], busMuted[i] ? 0.0f : busVolume[i], 0.01f);
+        if (busNodeInit[i])
+            SetBusNodeVolume(busNodes[i], busMuted[i] ? 0.0f : busVolume[i] * busMix[i], std::max(rampSeconds, 0.01f));
     }
+
+    // Rough loudness at the listener (distance model + occlusion), to choose whom to steal.
+    float Audibility(const Voice& v) const
+    {
+        float gain = v.volume * (1.0f - 0.75f * v.occlusion);
+        if (v.spatial) {
+            const float minD = std::max(v.minDistance, 0.01f), maxD = std::max(v.maxDistance, minD);
+            const float d    = std::clamp(glm::length(v.position - listener), minD, maxD);
+            switch (v.attenuation) {
+            case Attenuation::Inverse:     gain *= minD / (minD + v.rolloff * (d - minD)); break;
+            case Attenuation::Linear:      gain *= maxD > minD ? std::max(0.0f, 1.0f - v.rolloff * (d - minD) / (maxD - minD)) : 1.0f; break;
+            case Attenuation::Exponential: gain *= std::pow(d / minD, -v.rolloff); break;
+            }
+        }
+        return gain;
+    }
+
+    // Least important active voice passing `filter` (lowest priority, then quietest, then oldest).
+    template <class Filter>
+    VoiceId Weakest(Filter&& filter) const
+    {
+        VoiceId best = 0;
+        float   bestLoudness = 0.0f;
+        std::uint8_t bestPriority = 0;
+        for (const auto& [id, voice] : voices) {
+            if (voice->stopping || !filter(*voice))
+                continue;
+            const float loud = Audibility(*voice);
+            if (!best || voice->priority < bestPriority || (voice->priority == bestPriority &&
+                                                            (loud < bestLoudness || (loud == bestLoudness && id < best)))) {
+                best         = id;
+                bestLoudness = loud;
+                bestPriority = voice->priority;
+            }
+        }
+        return best;
+    }
+
+    template <class Filter>
+    std::size_t CountActive(Filter&& filter) const
+    {
+        std::size_t n = 0;
+        for (const auto& [id, voice] : voices)
+            n += !voice->stopping && filter(*voice) ? 1u : 0u;
+        return n;
+    }
+
+    void Steal(VoiceId id)
+    {
+        if (Voice* v = Find(id)) {
+            ++stats.stolen;
+            if (v->paused || !ma_sound_is_playing(&v->sound)) {
+                voices.erase(id);
+                return;
+            }
+            v->stopping = true; // a short fade, no click
+            ma_sound_stop_with_fade_in_milliseconds(&v->sound, 15);
+        }
+    }
+
+    // Makes room for a new voice (group, bus, engine limits). False: refused.
+    bool Admit(const VoiceDesc& request, AudioBus bus)
+    {
+        if (request.group && request.groupLimit &&
+            CountActive([&](const Voice& v) { return v.group == request.group; }) >= request.groupLimit) {
+            const VoiceId victim = request.groupLimitMode == VoiceLimitMode::Steal
+                                       ? Weakest([&](const Voice& v) { return v.group == request.group; })
+                                       : 0;
+            if (!victim)
+                return false;
+            Steal(victim);
+        }
+        const auto b = static_cast<std::size_t>(bus);
+        if (busLimit[b] && CountActive([&](const Voice& v) { return v.bus == bus; }) >= busLimit[b]) {
+            const VoiceId victim = busLimitMode[b] == VoiceLimitMode::Steal
+                                       ? Weakest([&](const Voice& v) { return v.bus == bus && v.priority <= request.priority; })
+                                       : 0;
+            if (!victim)
+                return false;
+            Steal(victim);
+        }
+        if (CountActive([](const Voice&) { return true; }) >= desc.maxVoices) {
+            const VoiceId victim = Weakest([&](const Voice& v) { return v.priority < request.priority; });
+            if (!victim)
+                return false;
+            Steal(victim);
+        }
+        // Fading (stolen) voices still mix for a moment: a hard cap keeps them bounded.
+        return voices.size() < desc.maxVoices + 64;
+    }
+
 };
 
 AudioEngine::AudioEngine(const AudioEngineDesc& desc) : m_Impl(std::make_unique<Impl>())
@@ -379,8 +593,9 @@ AudioEngine::AudioEngine(const AudioEngineDesc& desc) : m_Impl(std::make_unique<
     };
 
     // Master: group -> gain -> endpoint.
+    s.busMix.fill(1.0f);
     for (std::size_t i = 0; i < kAudioBusCount; ++i) {
-        check(InitVoiceNode(s.engine, s.busNodes[i], 1.0f, 0.0f), "bus gain");
+        check(InitBusNode(s.engine, s.busNodes[i], &s.busNodes), "bus gain");
         s.busNodeInit[i] = true;
     }
     ma_node_attach_output_bus(&s.busNodes[0], 0, ma_engine_get_endpoint(&s.engine), 0);
@@ -427,7 +642,8 @@ VoiceId AudioEngine::Play(std::shared_ptr<const SoundData> sound, const VoiceDes
     Impl& s = *m_Impl;
     if (!sound || (!sound->Streamed() && (sound->samples.empty() || sound->channels == 0)))
         return 0;
-    if (s.voices.size() >= s.desc.maxVoices) {
+    const AudioBus bus = desc.bus == AudioBus::Master || desc.bus == AudioBus::Count ? AudioBus::World : desc.bus;
+    if (!s.Admit(desc, bus)) {
         ++s.stats.dropped;
         return 0;
     }
@@ -456,7 +672,6 @@ VoiceId AudioEngine::Play(std::shared_ptr<const SoundData> sound, const VoiceDes
     if (InitVoiceNode(s.engine, v.node, std::max(desc.volume, 0.0f), std::max(desc.fadeInSeconds, 0.0f)) != MA_SUCCESS)
         return 0;
     v.nodeInit = true;
-    const AudioBus bus = desc.bus == AudioBus::Master || desc.bus == AudioBus::Count ? AudioBus::World : desc.bus;
     ma_node_attach_output_bus(&v.node, 0, &s.Group(bus), 0);
 
     ma_sound_config config    = ma_sound_config_init_2(&s.engine);
@@ -479,7 +694,17 @@ VoiceId AudioEngine::Play(std::shared_ptr<const SoundData> sound, const VoiceDes
         ma_sound_set_position(&v.sound, desc.position.x, desc.position.y, desc.position.z);
         ma_sound_set_velocity(&v.sound, desc.velocity.x, desc.velocity.y, desc.velocity.z);
     }
-    v.paused = desc.paused;
+    v.paused      = desc.paused;
+    v.bus         = bus;
+    v.priority    = desc.priority;
+    v.group       = desc.group;
+    v.volume      = std::max(desc.volume, 0.0f);
+    v.spatial     = desc.spatial;
+    v.position    = desc.position;
+    v.attenuation = desc.attenuation;
+    v.minDistance = desc.minDistance;
+    v.maxDistance = desc.maxDistance;
+    v.rolloff     = desc.rolloff;
     if (!desc.paused)
         ma_sound_start(&v.sound);
 
@@ -520,8 +745,10 @@ bool AudioEngine::IsPlaying(VoiceId id) const
 
 void AudioEngine::SetVolume(VoiceId id, float volume, float fadeSeconds)
 {
-    if (Impl::Voice* v = m_Impl->Find(id))
+    if (Impl::Voice* v = m_Impl->Find(id)) {
+        v->volume = std::max(volume, 0.0f);
         SetNodeVolume(v->node, volume, fadeSeconds);
+    }
 }
 
 void AudioEngine::SetPitch(VoiceId id, float pitch)
@@ -551,6 +778,7 @@ void AudioEngine::SetLooping(VoiceId id, bool loop)
 void AudioEngine::SetTransform(VoiceId id, const glm::vec3& position, const glm::vec3& velocity)
 {
     if (Impl::Voice* v = m_Impl->Find(id)) {
+        v->position = position;
         ma_sound_set_position(&v->sound, position.x, position.y, position.z);
         ma_sound_set_velocity(&v->sound, velocity.x, velocity.y, velocity.z);
     }
@@ -559,6 +787,9 @@ void AudioEngine::SetTransform(VoiceId id, const glm::vec3& position, const glm:
 void AudioEngine::SetSpatialRange(VoiceId id, float minDistance, float maxDistance, float rolloff)
 {
     if (Impl::Voice* v = m_Impl->Find(id)) {
+        v->minDistance = minDistance;
+        v->maxDistance = maxDistance;
+        v->rolloff     = rolloff;
         ma_sound_set_min_distance(&v->sound, std::max(minDistance, 0.01f));
         ma_sound_set_max_distance(&v->sound, std::max(maxDistance, minDistance));
         ma_sound_set_rolloff(&v->sound, std::max(rolloff, 0.0f));
@@ -590,6 +821,7 @@ void AudioEngine::SetListener(const glm::vec3& position, const glm::vec3& forwar
     glm::vec3 f = glm::length(forward) > 1e-6f ? glm::normalize(forward) : glm::vec3(0.0f, 0.0f, -1.0f);
     if (std::abs(f.y) > 0.999f && glm::length(up) > 1e-6f)
         f = glm::normalize(f + glm::normalize(up) * 0.02f);
+    m_Impl->listener = position;
     ma_engine& e = m_Impl->engine;
     ma_engine_listener_set_position(&e, 0, position.x, position.y, position.z);
     ma_engine_listener_set_direction(&e, 0, f.x, f.y, f.z);
@@ -620,6 +852,59 @@ void AudioEngine::SetBusMuted(AudioBus bus, bool muted)
 bool AudioEngine::BusMuted(AudioBus bus) const
 {
     return bus != AudioBus::Count && m_Impl->busMuted[static_cast<std::size_t>(bus)];
+}
+
+void AudioEngine::SetBusMix(AudioBus bus, float gain, float fadeSeconds)
+{
+    if (bus == AudioBus::Count)
+        return;
+    const float g = std::isfinite(gain) ? std::max(gain, 0.0f) : 1.0f;
+    float&      mix = m_Impl->busMix[static_cast<std::size_t>(bus)];
+    if (mix == g)
+        return;
+    mix = g;
+    m_Impl->ApplyBusVolume(bus, fadeSeconds);
+}
+
+float AudioEngine::BusMix(AudioBus bus) const
+{
+    return bus == AudioBus::Count ? 1.0f : m_Impl->busMix[static_cast<std::size_t>(bus)];
+}
+
+void AudioEngine::SetBusVoiceLimit(AudioBus bus, std::uint32_t limit, VoiceLimitMode mode)
+{
+    if (bus == AudioBus::Count || bus == AudioBus::Master)
+        return;
+    m_Impl->busLimit[static_cast<std::size_t>(bus)]     = limit;
+    m_Impl->busLimitMode[static_cast<std::size_t>(bus)] = mode;
+}
+
+void AudioEngine::SetDucking(const std::vector<DuckingRule>& rules)
+{
+    Impl& s = *m_Impl;
+    std::array<std::array<const DuckingRule*, kAudioBusCount>, kAudioBusCount> table{}; // [target][source]
+    for (const DuckingRule& r : rules)
+        if (r.source != r.target && r.source != AudioBus::Count && r.target != AudioBus::Count && r.target != AudioBus::Master)
+            table[static_cast<std::size_t>(r.target)][static_cast<std::size_t>(r.source)] = &r; // the last one wins
+    for (std::size_t t = 0; t < kAudioBusCount; ++t)
+        for (std::size_t src = 0; src < kAudioBusCount; ++src) {
+            BusNode::DuckSlot& slot = s.busNodes[t].ducks[src];
+            const DuckingRule* r    = table[t][src];
+            slot.threshold.store(r ? std::max(r->threshold, 0.0f) : 0.01f, std::memory_order_relaxed);
+            slot.attack.store(r ? std::max(r->attack, 0.0f) : 0.05f, std::memory_order_relaxed);
+            slot.release.store(r ? std::max(r->release, 0.0f) : 0.5f, std::memory_order_relaxed);
+            slot.depth.store(r ? std::clamp(r->depth, 0.0f, 1.0f) : 0.0f, std::memory_order_relaxed);
+        }
+}
+
+float AudioEngine::BusLevel(AudioBus bus) const
+{
+    return bus == AudioBus::Count ? 0.0f : m_Impl->busNodes[static_cast<std::size_t>(bus)].level.load(std::memory_order_relaxed);
+}
+
+float AudioEngine::BusDuckGain(AudioBus bus) const
+{
+    return bus == AudioBus::Count ? 1.0f : m_Impl->busNodes[static_cast<std::size_t>(bus)].duckGain.load(std::memory_order_relaxed);
 }
 
 void AudioEngine::SetReverb(const ReverbParams& params)

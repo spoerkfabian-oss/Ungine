@@ -309,6 +309,7 @@ struct Tags {
 // Sound emitter played by AudioSystem while playing (play mode, player). sound: file path like
 // ScriptComponent::graph. Spatial sources follow the entity (doppler from its motion) and are
 // low-passed when physics geometry blocks the line to the listener (occlusion).
+// `sound`: a sound file or a sound cue (.ucue), absolute in memory, relative in scene files.
 struct AudioSource {
     std::string sound;
     AudioBus    bus         = AudioBus::World;
@@ -325,6 +326,7 @@ struct AudioSource {
     float       rolloff     = 1.0f;
     float       doppler     = 1.0f;
     bool        occlusion   = true;
+    std::uint8_t priority   = kDefaultVoicePriority; // plain sounds; a cue (.ucue) brings its own
 
     bool operator==(const AudioSource&) const = default;
 };

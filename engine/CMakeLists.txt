@@ -5,6 +5,7 @@ add_library(Engine STATIC
     src/Audio/AudioEngine.cpp
     src/Audio/AudioSystem.cpp
     src/Audio/Sound.cpp
+    src/Audio/SoundCue.cpp
     src/Assets/GltfLoader.cpp
     src/Assets/Model.cpp
     src/Assets/Primitives.cpp

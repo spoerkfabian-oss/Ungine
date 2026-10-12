@@ -1,5 +1,7 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Audio/SoundCue.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -8,6 +10,11 @@
 #include "Engine/Scene/Scene.h"
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
+#include <numbers>
+#include <optional>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -19,6 +26,8 @@ constexpr float  kMaxDopplerSpeed   = 150.0f; // m/s: teleports must not scream
 constexpr float  kRestartFade       = 0.03f;  // seconds, when a source's sound changes
 constexpr double kOneShotMaxWait    = 1.0;    // seconds a one-shot may wait for its sound
 constexpr float  kOcclusionMargin   = 0.5f;   // hits this close to the listener do not count
+constexpr int    kMaxOccluders      = 6;      // walls counted per ray
+constexpr double kCueCheckSeconds   = 1.0;    // cue hot reload polling
 
 struct Pose {
     glm::vec3 position{0.0f};
@@ -66,6 +75,30 @@ VoiceDesc DescFor(const AudioSource& a, const glm::vec3& position)
 } // namespace
 
 struct AudioSystem::Impl {
+    // What one play of a sound path resolves to (a cue picks a variant).
+    struct Pick {
+        std::string    sound;
+        float          volume   = 1.0f; // multipliers on top of the caller's
+        float          pitch    = 1.0f;
+        std::uint8_t   priority = kDefaultVoicePriority;
+        std::uint64_t  group    = 0;
+        std::uint32_t  groupLimit = 0;
+        VoiceLimitMode limitMode  = VoiceLimitMode::Steal;
+    };
+
+    struct CueRef {
+        std::shared_ptr<const SoundCue> cue;
+        std::filesystem::file_time_type time{};
+        bool                            failed = false;
+        std::optional<std::size_t>      last; // variant played last (noRepeat)
+        std::uint64_t                   group = 0;
+    };
+
+    struct ActiveSnapshot {
+        std::string name;
+        float       weight = 0.0f, target = 1.0f, fade = 0.5f;
+    };
+
     struct SoundRef {
         SoundHandle                      handle; // with an AssetManager
         std::shared_ptr<const SoundData> data;   // without
@@ -79,6 +112,7 @@ struct AudioSystem::Impl {
         bool        hasPose  = false;
         glm::vec3   position{0.0f};
         float       occlusion = 0.0f;
+        std::optional<Pick> pick; // chosen for the current / next play
     };
 
     struct OneShot {
@@ -103,7 +137,12 @@ struct AudioSystem::Impl {
     std::vector<VoiceId>                      oneShots;
     VoiceId                                   preview = 0;
     std::string                               pendingPreview;
+    VoiceDesc                                 previewDesc;
     std::size_t                               rayCursor = 0;
+    std::unordered_map<std::string, CueRef>   cues;
+    std::mt19937                              random{std::random_device{}()};
+    double                                    nextCueCheck = 0.0;
+    std::vector<ActiveSnapshot>               snapshots;
 
     bool      hasListener = false;
     glm::vec3 listenerPosition{0.0f};
@@ -176,17 +215,96 @@ struct AudioSystem::Impl {
         return ref.data;
     }
 
-    std::shared_ptr<const SoundData> ResolveSource(const AudioSource& a, bool& failed)
+    // --- Cues ---
+
+    void LoadCue(const std::string& path, CueRef& ref)
     {
-        Acquire(a.sound, a.stream);
-        return Resolve(Key(a.sound, a.stream), failed);
+        const std::filesystem::path file = PathFromUtf8(path);
+        ref.time = Vfs::ModifiedTime(file);
+        std::string error;
+        if (auto cue = LoadSoundCue(file, &error)) {
+            ref.cue    = std::make_shared<const SoundCue>(std::move(*cue));
+            ref.failed = false;
+            ref.last.reset();
+            for (const SoundCueVariant& v : ref.cue->variants) // preload: picks are ready at once
+                if (!v.sound.empty())
+                    Acquire(v.sound, false);
+        } else {
+            if (!ref.failed)
+                ENGINE_WARN("Audio: cue {}", error);
+            ref.failed = true; // a broken edit keeps the last good cue
+        }
+    }
+
+    CueRef* FindCue(const std::string& path)
+    {
+        auto [it, inserted] = cues.try_emplace(path);
+        if (inserted) {
+            it->second.group = std::max<std::uint64_t>(std::hash<std::string>{}(path), 1);
+            LoadCue(path, it->second);
+        }
+        return it->second.cue ? &it->second : nullptr;
+    }
+
+    void CheckCues()
+    {
+        if (time < nextCueCheck)
+            return;
+        nextCueCheck = time + kCueCheckSeconds;
+        for (auto& [path, ref] : cues)
+            if (Vfs::ModifiedTime(PathFromUtf8(path)) != ref.time)
+                LoadCue(path, ref);
+    }
+
+    // A plain sound plays as it is; a cue picks a variant. nullopt: nothing playable.
+    std::optional<Pick> PickSound(const std::string& path, std::uint8_t priority)
+    {
+        if (!IsSoundCueFile(PathFromUtf8(path))) {
+            Pick pick;
+            pick.sound    = path;
+            pick.priority = priority;
+            return pick;
+        }
+        CueRef* ref = FindCue(path);
+        if (!ref)
+            return std::nullopt;
+        const SoundCue& cue   = *ref->cue;
+        const auto      index = PickCueVariant(cue, random, ref->last);
+        if (!index)
+            return std::nullopt;
+        ref->last                      = index;
+        const SoundCueVariant& variant = cue.variants[*index];
+        const auto range = [&](float lo, float hi) { return hi > lo ? std::uniform_real_distribution<float>(lo, hi)(random) : lo; };
+        Pick pick;
+        pick.sound      = variant.sound;
+        pick.volume     = variant.volume * range(cue.volumeMin, cue.volumeMax);
+        pick.pitch      = variant.pitch * range(cue.pitchMin, cue.pitchMax);
+        pick.priority   = cue.priority;
+        pick.group      = ref->group;
+        pick.groupLimit = cue.maxInstances;
+        pick.limitMode  = cue.limitMode;
+        return pick;
+    }
+
+    static void ApplyPick(VoiceDesc& desc, const Pick& pick)
+    {
+        desc.volume *= pick.volume;
+        desc.pitch *= pick.pitch;
+        desc.priority       = pick.priority;
+        desc.group          = pick.group;
+        desc.groupLimit     = pick.groupLimit;
+        desc.groupLimitMode = pick.limitMode;
     }
 
     bool QueueOneShot(const std::string& path, VoiceDesc desc)
     {
+        const std::optional<Pick> pick = PickSound(path, desc.priority);
+        if (!pick)
+            return false;
+        ApplyPick(desc, *pick);
         desc.paused = paused;
-        Acquire(path, false);
-        const std::string key    = Key(path, false);
+        Acquire(pick->sound, false);
+        const std::string key    = Key(pick->sound, false);
         bool              failed = false;
         if (auto data = Resolve(key, failed)) {
             const VoiceId v = engine.Play(std::move(data), desc);
@@ -202,18 +320,58 @@ struct AudioSystem::Impl {
 
     void StartSource(Source& s, const glm::vec3& position)
     {
+        if (!s.pick) {
+            s.pick = PickSound(s.config.sound, s.config.priority);
+            if (!s.pick) {
+                s.wantPlay = false; // missing / empty cue (logged)
+                return;
+            }
+        }
+        Acquire(s.pick->sound, s.config.stream);
         bool failed = false;
-        auto data   = ResolveSource(s.config, failed);
+        auto data   = Resolve(Key(s.pick->sound, s.config.stream), failed);
         if (!data) {
-            if (failed)
+            if (failed) {
                 s.wantPlay = false; // the AssetManager logged why
+                s.pick.reset();
+            }
             return;
         }
-        s.wantPlay       = false;
-        VoiceDesc desc   = DescFor(s.config, position);
-        desc.paused      = paused;
-        s.voice          = engine.Play(std::move(data), desc);
+        s.wantPlay     = false;
+        VoiceDesc desc = DescFor(s.config, position);
+        ApplyPick(desc, *s.pick);
+        desc.paused = paused;
+        s.voice     = engine.Play(std::move(data), desc);
         engine.SetOcclusion(s.voice, s.occlusion);
+    }
+
+    // --- Snapshots ---
+
+    const AudioSnapshot* FindSnapshot(const std::string& name) const
+    {
+        for (const AudioSnapshot& snap : settings.snapshots)
+            if (snap.name == name)
+                return &snap;
+        return nullptr;
+    }
+
+    void UpdateSnapshots(float dt)
+    {
+        for (ActiveSnapshot& a : snapshots) {
+            const float step = a.fade > 0.0f ? dt / a.fade : 1.0f;
+            a.weight = a.target > a.weight ? std::min(a.target, a.weight + step) : std::max(a.target, a.weight - step);
+        }
+        std::erase_if(snapshots, [&](const ActiveSnapshot& a) {
+            return (a.target == 0.0f && a.weight == 0.0f) || !FindSnapshot(a.name);
+        });
+        std::array<float, kAudioBusCount> mix;
+        mix.fill(1.0f);
+        for (const ActiveSnapshot& a : snapshots)
+            if (const AudioSnapshot* snap = FindSnapshot(a.name))
+                for (std::size_t b = 0; b < kAudioBusCount; ++b)
+                    mix[b] *= 1.0f + (std::max(snap->volume[b], 0.0f) - 1.0f) * a.weight;
+        for (std::size_t b = 0; b < kAudioBusCount; ++b)
+            engine.SetBusMix(static_cast<AudioBus>(b), mix[b], 0.05f);
     }
 
     void UpdateListener(Scene& scene, float dt, const CameraData* view)
@@ -265,10 +423,11 @@ struct AudioSystem::Impl {
                 if (restart) {
                     engine.Stop(s.voice, kRestartFade);
                     s.voice    = 0;
+                    s.pick.reset();
                     s.wantPlay = s.wantPlay || active;
                 } else if (s.voice) {
-                    engine.SetVolume(s.voice, config.volume, 0.05f);
-                    engine.SetPitch(s.voice, config.pitch);
+                    engine.SetVolume(s.voice, config.volume * (s.pick ? s.pick->volume : 1.0f), 0.05f);
+                    engine.SetPitch(s.voice, config.pitch * (s.pick ? s.pick->pitch : 1.0f));
                     engine.SetLooping(s.voice, config.loop);
                     engine.SetSpatialRange(s.voice, config.minDistance, config.maxDistance, config.rolloff);
                 }
@@ -298,6 +457,68 @@ struct AudioSystem::Impl {
         });
     }
 
+    // Share of the sound that reaches the listener along one path (walls multiply 1 - absorption).
+    float PathTransmission(Scene& scene, Entity source, const glm::vec3& from)
+    {
+        const glm::vec3 toListener = listenerPosition - from;
+        const float     distance   = glm::length(toListener);
+        if (distance <= kOcclusionMargin)
+            return 1.0f;
+        // From the source towards the listener: a character capsule around the listener is
+        // reached last and ignored by the margin.
+        const glm::vec3 dir          = toListener / distance;
+        glm::vec3       origin       = from;
+        float           range        = distance;
+        Entity          ignore       = source;
+        float           transmission = 1.0f;
+        bool            first        = true;
+        for (int walls = 0; walls < kMaxOccluders && transmission > 0.01f;) {
+            ++stats.rays;
+            const auto hit = physics->Raycast(origin, dir, range, ignore);
+            if (!hit || hit->distance > range - kOcclusionMargin)
+                break;
+            if (first && hit->entity != NullEntity && scene.IsAncestor(hit->entity, source)) {
+                // Started inside the body the source is attached to: step out of it.
+                origin += dir * kOcclusionMargin;
+                range -= kOcclusionMargin;
+                first = false;
+                continue;
+            }
+            first = false;
+            transmission *= 1.0f - std::clamp(hit->absorption, 0.0f, 1.0f);
+            ++walls;
+            const float advance = hit->distance + 0.01f; // continue behind this body
+            origin += dir * advance;
+            range -= advance;
+            ignore = hit->entity;
+            if (range <= kOcclusionMargin)
+                break;
+        }
+        return transmission;
+    }
+
+    // 0 (free) .. 1 (blocked): the straight path plus rays from points around the source (a wall
+    // edge between source and listener blocks only some of them).
+    float SourceOcclusion(Scene& scene, Entity e, const glm::vec3& position, std::uint32_t rays)
+    {
+        float     sum = PathTransmission(scene, e, position);
+        glm::vec3 dir = listenerPosition - position;
+        if (rays > 1 && glm::dot(dir, dir) > 1e-6f) {
+            dir                    = glm::normalize(dir);
+            const glm::vec3 helper = std::abs(dir.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+            const glm::vec3 right  = glm::normalize(glm::cross(dir, helper));
+            const glm::vec3 up     = glm::cross(right, dir);
+            const float     spread = std::max(settings.occlusionSpread, 0.0f);
+            for (std::uint32_t i = 1; i < rays; ++i) {
+                const float angle = 2.0f * std::numbers::pi_v<float> * static_cast<float>(i - 1) / static_cast<float>(rays - 1);
+                sum += PathTransmission(scene, e, position + (right * std::cos(angle) + up * std::sin(angle)) * spread);
+            }
+        } else {
+            rays = 1;
+        }
+        return 1.0f - sum / static_cast<float>(rays);
+    }
+
     void UpdateOcclusion(Scene& scene)
     {
         stats.rays = 0;
@@ -316,41 +537,21 @@ struct AudioSystem::Impl {
         if (candidates.empty())
             return;
         std::ranges::sort(candidates); // stable round-robin order
-        const std::size_t count = std::min<std::size_t>(candidates.size(), settings.occlusionRays);
-        for (std::size_t i = 0; i < count; ++i) {
-            const Entity e = candidates[(rayCursor + i) % candidates.size()];
-            Source&      s = sources[e];
-            // From the source towards the listener: a character capsule around the listener is
-            // reached last and ignored by the margin.
-            const glm::vec3 toListener = listenerPosition - s.position;
-            const float     distance   = glm::length(toListener);
-            bool            blocked    = false;
-            if (distance > kOcclusionMargin) {
-                const glm::vec3 dir    = toListener / distance;
-                glm::vec3       origin = s.position;
-                float           range  = distance;
-                for (int attempt = 0; attempt < 2; ++attempt) {
-                    ++stats.rays;
-                    const auto hit = physics->Raycast(origin, dir, range, e);
-                    if (!hit || hit->distance > range - kOcclusionMargin)
-                        break;
-                    if (hit->entity != NullEntity && scene.IsAncestor(hit->entity, e) && attempt == 0) {
-                        // Started inside the body the source is attached to: step out of it.
-                        origin += dir * kOcclusionMargin;
-                        range -= kOcclusionMargin;
-                        continue;
-                    }
-                    blocked = true;
-                    break;
-                }
-            }
-            const float target = blocked ? std::clamp(settings.occlusionStrength, 0.0f, 1.0f) : 0.0f;
-            if (target != s.occlusion) {
+        const std::uint32_t perSource = std::clamp(settings.occlusionRaysPerSource, 1u, 16u);
+        const std::size_t   budget    = std::max<std::size_t>(settings.occlusionRays, perSource);
+        std::size_t         done      = 0;
+        // At least one source per frame; the budget counts raycasts (several per wall crossed).
+        while (done < candidates.size() && (done == 0 || stats.rays + perSource <= budget)) {
+            const Entity e = candidates[(rayCursor + done) % candidates.size()];
+            ++done;
+            Source&     s      = sources[e];
+            const float target = SourceOcclusion(scene, e, s.position, perSource) * std::clamp(settings.occlusionStrength, 0.0f, 1.0f);
+            if (std::abs(target - s.occlusion) > 1e-3f) {
                 s.occlusion = target;
                 engine.SetOcclusion(s.voice, target);
             }
         }
-        rayCursor = (rayCursor + count) % candidates.size();
+        rayCursor = (rayCursor + done) % candidates.size();
     }
 
     void UpdateReverb(Scene& scene)
@@ -405,9 +606,7 @@ struct AudioSystem::Impl {
         if (!pendingPreview.empty()) {
             bool failed = false;
             if (auto data = Resolve(Key(pendingPreview, false), failed)) {
-                VoiceDesc desc;
-                desc.bus = AudioBus::Ui;
-                preview  = engine.Play(std::move(data), desc);
+                preview = engine.Play(std::move(data), previewDesc);
                 pendingPreview.clear();
             } else if (failed) {
                 pendingPreview.clear();
@@ -441,6 +640,8 @@ void AudioSystem::Update(Scene& scene, float dt, const CameraData* view)
 {
     Impl& s = *m_Impl;
     s.time += dt;
+    s.CheckCues();
+    s.UpdateSnapshots(dt);
     s.UpdateListener(scene, dt, view);
     if (s.running) {
         s.UpdateSources(scene, dt);
@@ -463,7 +664,9 @@ void AudioSystem::Update(Scene& scene, float dt, const CameraData* view)
         st.waiting += source.wantPlay && !source.voice ? 1u : 0u;
         st.occluded += source.voice && source.occlusion > 0.0f ? 1u : 0u;
     }
-    st.oneShots = static_cast<std::uint32_t>(s.oneShots.size());
+    st.oneShots  = static_cast<std::uint32_t>(s.oneShots.size());
+    st.cues      = static_cast<std::uint32_t>(std::ranges::count_if(s.cues, [](const auto& c) { return c.second.cue != nullptr; }));
+    st.snapshots = static_cast<std::uint32_t>(s.snapshots.size());
     st.listener = s.listenerPosition;
 }
 
@@ -478,6 +681,8 @@ void AudioSystem::End(Scene& /*scene*/)
     s.oneShots.clear();
     s.pendingOneShots.clear();
     s.engine.SetReverb({});
+    s.snapshots.clear(); // the mix returns to the user's volumes
+    s.UpdateSnapshots(0.0f);
     s.engine.Update();
     s.running = false;
     s.activeScene = nullptr;
@@ -521,6 +726,7 @@ bool AudioSystem::Play(Entity entity)
     s.engine.Stop(source.voice, kRestartFade);
     source.voice = 0;
     source.wantPlay = true;
+    source.pick.reset(); // a cue picks again
     s.StartSource(source, source.position);
     return true;
 }
@@ -541,6 +747,12 @@ bool AudioSystem::IsPlaying(Entity entity) const
     const Impl& s  = *m_Impl;
     const auto  it = s.sources.find(entity);
     return it != s.sources.end() && (it->second.wantPlay || (it->second.voice && s.engine.IsPlaying(it->second.voice)));
+}
+
+float AudioSystem::Occlusion(Entity entity) const
+{
+    const auto it = m_Impl->sources.find(entity);
+    return it == m_Impl->sources.end() ? 0.0f : it->second.occlusion;
 }
 
 bool AudioSystem::PlayAt(const std::string& sound, const glm::vec3& position, float volume, float pitch, AudioBus bus)
@@ -566,9 +778,17 @@ void AudioSystem::Preview(const std::filesystem::path& sound)
 {
     Impl& s = *m_Impl;
     StopPreview();
-    const std::string path = PathToUtf8(sound);
-    s.Acquire(path, false);
-    s.pendingPreview = path;
+    s.nextCueCheck = 0.0; // a just saved cue plays as saved
+    s.CheckCues();
+    const auto pick = s.PickSound(PathToUtf8(sound), kDefaultVoicePriority);
+    if (!pick)
+        return;
+    s.previewDesc     = {};
+    s.previewDesc.bus = AudioBus::Ui;
+    Impl::ApplyPick(s.previewDesc, *pick);
+    s.previewDesc.group = 0; // previews ignore the cue's instance limit
+    s.Acquire(pick->sound, false);
+    s.pendingPreview = pick->sound;
     s.UpdateOneShots(); // starts at once if already loaded
 }
 
@@ -593,8 +813,69 @@ void AudioSystem::Apply(const AudioSettings& settings)
     for (std::size_t i = 0; i < kAudioBusCount; ++i) {
         s.engine.SetBusVolume(static_cast<AudioBus>(i), settings.volume[i]);
         s.engine.SetBusMuted(static_cast<AudioBus>(i), settings.muted[i]);
+        s.engine.SetBusVoiceLimit(static_cast<AudioBus>(i), settings.voiceLimit[i], settings.voiceLimitMode);
     }
+    s.engine.SetDucking(settings.ducking);
 }
+
+bool AudioSystem::ActivateSnapshot(const std::string& name, float fadeSeconds)
+{
+    Impl&                s    = *m_Impl;
+    const AudioSnapshot* snap = s.FindSnapshot(name);
+    if (!snap)
+        return false;
+    auto it = std::ranges::find(s.snapshots, name, &Impl::ActiveSnapshot::name);
+    if (it == s.snapshots.end())
+        it = s.snapshots.insert(s.snapshots.end(), Impl::ActiveSnapshot{.name = name});
+    it->target = 1.0f;
+    it->fade   = fadeSeconds >= 0.0f ? fadeSeconds : snap->fadeSeconds;
+    if (it->fade <= 0.0f)
+        s.UpdateSnapshots(0.0f);
+    return true;
+}
+
+void AudioSystem::DeactivateSnapshot(const std::string& name, float fadeSeconds)
+{
+    Impl& s  = *m_Impl;
+    auto  it = std::ranges::find(s.snapshots, name, &Impl::ActiveSnapshot::name);
+    if (it == s.snapshots.end())
+        return;
+    const AudioSnapshot* snap = s.FindSnapshot(name);
+    it->target = 0.0f;
+    it->fade   = fadeSeconds >= 0.0f ? fadeSeconds : (snap ? snap->fadeSeconds : 0.0f);
+    if (it->fade <= 0.0f)
+        s.UpdateSnapshots(0.0f);
+}
+
+void AudioSystem::DeactivateAllSnapshots(float fadeSeconds)
+{
+    for (const std::string& name : ActiveSnapshots())
+        DeactivateSnapshot(name, fadeSeconds);
+}
+
+float AudioSystem::SnapshotWeight(const std::string& name) const
+{
+    const auto& list = m_Impl->snapshots;
+    const auto  it   = std::ranges::find(list, name, &Impl::ActiveSnapshot::name);
+    return it == list.end() ? 0.0f : it->weight;
+}
+
+std::vector<std::string> AudioSystem::ActiveSnapshots() const
+{
+    std::vector<std::string> names;
+    for (const Impl::ActiveSnapshot& a : m_Impl->snapshots)
+        if (a.target > 0.0f)
+            names.push_back(a.name);
+    return names;
+}
+
+std::shared_ptr<const SoundCue> AudioSystem::Cue(const std::string& path)
+{
+    const Impl::CueRef* ref = m_Impl->FindCue(path);
+    return ref ? ref->cue : nullptr;
+}
+
+void AudioSystem::SetRandomSeed(std::uint32_t seed) { m_Impl->random.seed(seed); }
 
 const AudioSettings&    AudioSystem::Settings() const { return m_Impl->settings; }
 const AudioSystemStats& AudioSystem::Stats() const { return m_Impl->stats; }

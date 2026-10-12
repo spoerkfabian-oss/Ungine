@@ -30,10 +30,12 @@ std::optional<PhysicsMaterialData> LoadPhysicsMaterial(const fs::path& file, std
         m.friction    = root.value("friction", m.friction);
         m.restitution = root.value("restitution", m.restitution);
         m.surface     = root.value("surface", m.surface);
-        if (!std::isfinite(m.friction) || !std::isfinite(m.restitution))
-            return fail("friction / restitution are not finite");
+        m.absorption  = root.value("absorption", m.absorption);
+        if (!std::isfinite(m.friction) || !std::isfinite(m.restitution) || !std::isfinite(m.absorption))
+            return fail("friction / restitution / absorption are not finite");
         m.friction    = std::max(m.friction, 0.0f);
         m.restitution = std::clamp(m.restitution, 0.0f, 1.0f);
+        m.absorption  = std::clamp(m.absorption, 0.0f, 1.0f);
         return m;
     } catch (const std::exception& e) {
         return fail(e.what());
@@ -42,7 +44,7 @@ std::optional<PhysicsMaterialData> LoadPhysicsMaterial(const fs::path& file, std
 
 bool SavePhysicsMaterial(const fs::path& file, const PhysicsMaterialData& m, std::string* error)
 {
-    const json root{{"version", 1}, {"friction", m.friction}, {"restitution", m.restitution}, {"surface", m.surface}};
+    const json root{{"version", 1}, {"friction", m.friction}, {"restitution", m.restitution}, {"surface", m.surface}, {"absorption", m.absorption}};
     std::error_code ec;
     if (file.has_parent_path())
         fs::create_directories(file.parent_path(), ec);
