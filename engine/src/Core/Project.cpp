@@ -123,6 +123,34 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
             s.audio.occlusion         = a->value("occlusion", s.audio.occlusion);
             s.audio.occlusionStrength = std::clamp(a->value("occlusionStrength", s.audio.occlusionStrength), 0.0f, 1.0f);
             s.audio.occlusionRays     = std::min(a->value("occlusionRays", s.audio.occlusionRays), 4096u);
+            s.audio.occlusionRaysPerSource = std::clamp(a->value("occlusionRaysPerSource", s.audio.occlusionRaysPerSource), 1u, 16u);
+            s.audio.occlusionSpread        = std::clamp(a->value("occlusionSpread", s.audio.occlusionSpread), 0.0f, 10.0f);
+            s.audio.voiceLimitMode =
+                VoiceLimitModeFromString(a->value("voiceLimitMode", std::string("steal"))).value_or(VoiceLimitMode::Steal);
+            if (const auto buses = a->find("buses"); buses != a->end() && buses->is_object())
+                for (std::size_t i = 0; i < kAudioBusCount; ++i)
+                    if (const auto b = buses->find(ToString(static_cast<AudioBus>(i))); b != buses->end())
+                        s.audio.voiceLimit[i] = std::min(b->value("voiceLimit", 0u), 4096u);
+            for (const json& snap : a->value("snapshots", json::array())) {
+                AudioSnapshot snapshot;
+                snapshot.name        = snap.value("name", std::string());
+                snapshot.fadeSeconds = std::max(snap.value("fade", snapshot.fadeSeconds), 0.0f);
+                if (const auto v = snap.find("volume"); v != snap.end() && v->is_object())
+                    for (std::size_t i = 0; i < kAudioBusCount; ++i)
+                        snapshot.volume[i] = std::clamp(v->value(ToString(static_cast<AudioBus>(i)), 1.0f), 0.0f, 4.0f);
+                if (!snapshot.name.empty())
+                    s.audio.snapshots.push_back(std::move(snapshot));
+            }
+            for (const json& d : a->value("ducking", json::array())) {
+                DuckingRule rule;
+                rule.source    = AudioBusFromString(d.value("source", std::string())).value_or(rule.source);
+                rule.target    = AudioBusFromString(d.value("target", std::string())).value_or(rule.target);
+                rule.depth     = std::clamp(d.value("depth", rule.depth), 0.0f, 1.0f);
+                rule.threshold = std::max(d.value("threshold", rule.threshold), 0.0f);
+                rule.attack    = std::max(d.value("attack", rule.attack), 0.0f);
+                rule.release   = std::max(d.value("release", rule.release), 0.0f);
+                s.audio.ducking.push_back(rule);
+            }
         }
         if (const auto in = root->find("input"); in != root->end() && in->is_object()) {
             for (const json& a : in->value("actions", json::array()))
@@ -145,7 +173,19 @@ bool Project::Save(std::string* error) const
 {
     json buses = json::object();
     for (std::size_t i = 0; i < kAudioBusCount; ++i)
-        buses[ToString(static_cast<AudioBus>(i))] = {{"volume", settings.audio.volume[i]}, {"muted", settings.audio.muted[i]}};
+        buses[ToString(static_cast<AudioBus>(i))] = {{"volume", settings.audio.volume[i]},
+                                                      {"muted", settings.audio.muted[i]},
+                                                      {"voiceLimit", settings.audio.voiceLimit[i]}};
+    json snapshots = json::array(), ducking = json::array();
+    for (const AudioSnapshot& snap : settings.audio.snapshots) {
+        json volume = json::object();
+        for (std::size_t i = 0; i < kAudioBusCount; ++i)
+            volume[ToString(static_cast<AudioBus>(i))] = snap.volume[i];
+        snapshots.push_back({{"name", snap.name}, {"fade", snap.fadeSeconds}, {"volume", std::move(volume)}});
+    }
+    for (const DuckingRule& d : settings.audio.ducking)
+        ducking.push_back({{"source", ToString(d.source)}, {"target", ToString(d.target)}, {"depth", d.depth},
+                           {"threshold", d.threshold}, {"attack", d.attack}, {"release", d.release}});
     json actions = json::array(), axes = json::array();
     for (const InputActionBinding& a : settings.input.actions)
         actions.push_back({{"name", a.name}, {"keys", a.keys}});
@@ -170,7 +210,12 @@ bool Project::Save(std::string* error) const
                      {{"buses", std::move(buses)},
                       {"occlusion", settings.audio.occlusion},
                       {"occlusionStrength", settings.audio.occlusionStrength},
-                      {"occlusionRays", settings.audio.occlusionRays}}},
+                      {"occlusionRays", settings.audio.occlusionRays},
+                      {"occlusionRaysPerSource", settings.audio.occlusionRaysPerSource},
+                      {"occlusionSpread", settings.audio.occlusionSpread},
+                      {"voiceLimitMode", ToString(settings.audio.voiceLimitMode)},
+                      {"snapshots", std::move(snapshots)},
+                      {"ducking", std::move(ducking)}}},
                     {"input", {{"actions", std::move(actions)}, {"axes", std::move(axes)}}}};
     return WriteText(m_File, root.dump(2), error);
 }

@@ -2,6 +2,7 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
+#include "Engine/Audio/SoundCue.h"
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
@@ -136,6 +137,7 @@ public:
     void SimulateKey(std::string_view key, bool down);
     void SimulateText(std::string_view utf8);
     void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
+    void ExpandAudioMixer() { m_ExpandAudioMixer = true; } // opens the Renderer panel's Audio sections once (UI tests)
     // The scene image of the viewport in window pixels (x, y, width, height); zero while hidden.
     [[nodiscard]] glm::vec4 ViewportRect() const { return m_ViewportRect; }
 
@@ -251,6 +253,7 @@ private:
     void DrawPackageReport();
     void DrawBlueprintTypes();
     void DrawPhysicsMaterial();
+    void DrawSoundCue();
     void OpenTypeFile(const std::filesystem::path& file);
     void RefreshContent();
     void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
@@ -306,6 +309,7 @@ private:
     bool          m_ViewportHovered = false;
     bool          m_ViewportVisible = false; // drawn this frame (else the scene render is skipped)
     int           m_FocusViewport   = 0; // frames until the viewport tab is brought to front (default layout)
+    bool          m_ExpandAudioMixer = false;
     bool          m_ViewportFocused = false;
     bool          m_PickAdditive    = false; // a pick request is pending: Ctrl was held
     // Left button pressed in the viewport: click (pick on release) or box selection (dragged).
@@ -369,6 +373,11 @@ private:
     std::filesystem::path m_PhysicsMaterialFile;
     PhysicsMaterialData   m_PhysicsMaterialEdit;
     bool                  m_PhysicsMaterialDirty = false;
+    bool                  m_ShowSoundCue = false; // sound cue (.ucue) editor
+    std::filesystem::path m_SoundCueFile;
+    SoundCue              m_SoundCueEdit;
+    bool                  m_SoundCueDirty   = false;
+    std::size_t           m_SoundCueVariant = 0; // variant whose sound the file dialog chooses
     bool m_ShowLevels          = true;  // Levels window (with a level streamer)
     bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
     struct TypeEdit;                    // the enum / struct / interface edited there
@@ -380,7 +389,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -417,7 +426,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging

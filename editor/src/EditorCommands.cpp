@@ -461,6 +461,13 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
+        case DialogPurpose::AssignCueSound:
+            if (m_ShowSoundCue && m_SoundCueVariant < m_SoundCueEdit.variants.size()) {
+                std::error_code ec;
+                m_SoundCueEdit.variants[m_SoundCueVariant].sound = PathToUtf8(std::filesystem::absolute(*path, ec).lexically_normal());
+                m_SoundCueDirty = true;
+            }
+            break;
         case DialogPurpose::AssignPhysicsMaterial: {
             Registry& r = m_Ctx.scene.GetRegistry();
             if (!r.Valid(m_MaterialTarget) || !r.Has<Collider>(m_MaterialTarget) || IsStreamed(m_MaterialTarget))

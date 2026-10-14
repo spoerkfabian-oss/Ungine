@@ -1099,7 +1099,7 @@ void Editor::DrawInspector()
         if (ImGui::Button("Browse...##sound")) {
             m_SoundTarget   = e;
             m_DialogPurpose = DialogPurpose::AssignSound;
-            m_FileDialog->Open("Choose sound", FileDialog::Mode::Open, dir, {".wav", ".ogg", ".mp3", ".flac"});
+            m_FileDialog->Open("Choose sound or cue", FileDialog::Mode::Open, dir, {".wav", ".ogg", ".mp3", ".flac", ".ucue"});
         }
         if (m_Ctx.audio) {
             ImGui::SameLine();
@@ -1130,9 +1130,20 @@ void Editor::DrawInspector()
                 DragFloatRow("Doppler", &audio->doppler, 0.01f, 0.0f, 10.0f);
                 CheckboxRow("Occlusion", &audio->occlusion);
             }
+            if (IsSoundCueFile(PathFromUtf8(audio->sound))) {
+                PropertyRow("Priority");
+                ImGui::TextDisabled("from the cue");
+                ImGui::PopID();
+            } else {
+                std::uint32_t priority = audio->priority;
+                if (SliderUintRow("Priority", &priority, 0, 255))
+                    audio->priority = static_cast<std::uint8_t>(priority);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("When voices run out, lower priorities make room first");
+            }
             if (m_Ctx.audio && m_Ctx.audio->Running()) {
                 PropertyRow("State");
-                ImGui::TextUnformatted(m_Ctx.audio->IsPlaying(e) ? "playing" : "stopped");
+                ImGui::Text("%s, occlusion %.2f", m_Ctx.audio->IsPlaying(e) ? "playing" : "stopped", m_Ctx.audio->Occlusion(e));
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -1849,11 +1860,12 @@ void Editor::DrawStats()
             const AudioSystemStats& as = m_Ctx.audio->Stats();
             const AudioStats&       es = m_Ctx.audio->Engine().Stats();
             ImGui::SeparatorText("Audio");
-            ImGui::Text("Voices         %u  (%u streamed, %u dropped)", es.voices, es.streamed, es.dropped);
+            ImGui::Text("Voices         %u  (%u streamed, %u dropped, %u stolen)", es.voices, es.streamed, es.dropped, es.stolen);
             ImGui::Text("Sources        %u  (%u playing, %u loading)", as.sources, as.playing, as.waiting);
             ImGui::Text("One-shots      %u", as.oneShots);
             ImGui::Text("Occlusion      %u rays, %u occluded", as.rays, as.occluded);
             ImGui::Text("Reverb         %u zone(s), wet %.2f, room %.2f", as.zones, as.reverb.wet, as.reverb.roomSize);
+            ImGui::Text("Cues           %u, snapshots %u active", as.cues, as.snapshots);
         }
 
         ImGui::SeparatorText("Memory");
@@ -2036,6 +2048,12 @@ void Editor::DrawSoundAssets()
 
 void Editor::DrawAudioSettings()
 {
+    const bool expand = std::exchange(m_ExpandAudioMixer, false);
+    const auto open   = [&] {
+        if (expand)
+            ImGui::SetNextItemOpen(true);
+    };
+    open();
     if (!m_Ctx.audio || !ImGui::CollapsingHeader("Audio"))
         return;
     AudioSettings settings = m_Ctx.audio->Settings();
@@ -2056,7 +2074,104 @@ void Editor::DrawAudioSettings()
         changed |= CheckboxRow("Occlusion", &settings.occlusion);
         changed |= SliderFloatRow("Occlusion strength", &settings.occlusionStrength, 0.0f, 1.0f);
         changed |= SliderUintRow("Rays per frame", &settings.occlusionRays, 1, 256);
+        changed |= SliderUintRow("Rays per source", &settings.occlusionRaysPerSource, 1, 16);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("1: the straight path; more: rays from points around the source (partial occlusion at edges)");
+        changed |= SliderFloatRow("Ray spread", &settings.occlusionSpread, 0.0f, 3.0f, "%.2f m");
         ImGui::EndTable();
+    }
+    open();
+    if (ImGui::TreeNode("Voice limits")) {
+        if (BeginProperties("limits")) {
+            for (std::size_t i = 1; i < kAudioBusCount; ++i)
+                changed |= SliderUintRow(ToString(static_cast<AudioBus>(i)), &settings.voiceLimit[i], 0, 256);
+            int mode = settings.voiceLimitMode == VoiceLimitMode::Reject ? 1 : 0;
+            PropertyRow("When full");
+            if (ImGui::Combo("##mode", &mode, "Steal\0Reject\0")) {
+                settings.voiceLimitMode = mode == 1 ? VoiceLimitMode::Reject : VoiceLimitMode::Steal;
+                changed                 = true;
+            }
+            ImGui::PopID();
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("0 = only the engine limit. Steal: equal or lower priority makes room.");
+        ImGui::TreePop();
+    }
+    open();
+    if (ImGui::TreeNode("Snapshots")) {
+        std::optional<std::size_t> remove;
+        for (std::size_t s = 0; s < settings.snapshots.size(); ++s) {
+            AudioSnapshot& snap = settings.snapshots[s];
+            ImGui::PushID(static_cast<int>(s));
+            open();
+            const bool expanded = ImGui::TreeNode("##snap", "%s", snap.name.empty() ? "(unnamed)" : snap.name.c_str());
+            ImGui::SameLine();
+            const float weight = m_Ctx.audio->SnapshotWeight(snap.name);
+            if (ImGui::SmallButton(weight > 0.0f ? "Deactivate" : "Activate")) {
+                if (weight > 0.0f)
+                    m_Ctx.audio->DeactivateSnapshot(snap.name);
+                else
+                    m_Ctx.audio->ActivateSnapshot(snap.name);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x"))
+                remove = s;
+            if (expanded) {
+                changed |= ImGui::InputText("Name", &snap.name);
+                changed |= ImGui::DragFloat("Fade", &snap.fadeSeconds, 0.01f, 0.0f, 30.0f, "%.2f s");
+                for (std::size_t b = 0; b < kAudioBusCount; ++b)
+                    changed |= ImGui::SliderFloat(ToString(static_cast<AudioBus>(b)), &snap.volume[b], 0.0f, 2.0f, "%.2f");
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (remove) {
+            settings.snapshots.erase(settings.snapshots.begin() + static_cast<std::ptrdiff_t>(*remove));
+            changed = true;
+        }
+        if (ImGui::Button("+ Add snapshot")) {
+            settings.snapshots.push_back({.name = "Snapshot" + std::to_string(settings.snapshots.size() + 1)});
+            changed = true;
+        }
+        ImGui::TextDisabled("Blueprints: Activate / Deactivate Audio Snapshot");
+        ImGui::TreePop();
+    }
+    open();
+    if (ImGui::TreeNode("Ducking")) {
+        std::optional<std::size_t> remove;
+        for (std::size_t d = 0; d < settings.ducking.size(); ++d) {
+            DuckingRule& rule = settings.ducking[d];
+            ImGui::PushID(static_cast<int>(d));
+            ImGui::SeparatorText((std::string(ToString(rule.source)) + " ducks " + ToString(rule.target)).c_str());
+            int source = static_cast<int>(rule.source), target = static_cast<int>(rule.target);
+            const char* buses = "Master\0World\0Music\0UI\0Ambient\0";
+            if (ImGui::Combo("Source", &source, buses)) {
+                rule.source = static_cast<AudioBus>(source);
+                changed     = true;
+            }
+            if (ImGui::Combo("Target", &target, buses)) {
+                rule.target = static_cast<AudioBus>(target);
+                changed     = true;
+            }
+            changed |= ImGui::SliderFloat("Depth", &rule.depth, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::DragFloat("Threshold", &rule.threshold, 0.001f, 0.0f, 1.0f, "%.3f RMS");
+            changed |= ImGui::DragFloat("Attack", &rule.attack, 0.005f, 0.0f, 5.0f, "%.3f s");
+            changed |= ImGui::DragFloat("Release", &rule.release, 0.01f, 0.0f, 10.0f, "%.2f s");
+            ImGui::TextDisabled("now: target gain %.2f, source level %.3f", m_Ctx.audio->Engine().BusDuckGain(rule.target),
+                                m_Ctx.audio->Engine().BusLevel(rule.source));
+            if (ImGui::SmallButton("Remove rule"))
+                remove = d;
+            ImGui::PopID();
+        }
+        if (remove) {
+            settings.ducking.erase(settings.ducking.begin() + static_cast<std::ptrdiff_t>(*remove));
+            changed = true;
+        }
+        if (ImGui::Button("+ Add ducking rule")) {
+            settings.ducking.push_back({});
+            changed = true;
+        }
+        ImGui::TreePop();
     }
     if (changed) {
         m_Ctx.audio->Apply(settings);

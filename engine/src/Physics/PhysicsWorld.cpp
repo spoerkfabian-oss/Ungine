@@ -240,6 +240,7 @@ public:
     float       friction    = 0.5f;
     float       restitution = 0.0f;
     std::string surface;
+    float       absorption = 0.6f;
 
     const char* GetDebugName() const override { return surface.c_str(); }
 };
@@ -672,6 +673,7 @@ struct PhysicsWorld::Impl {
         entry.material->friction    = data->friction;
         entry.material->restitution = data->restitution;
         entry.material->surface     = data->surface;
+        entry.material->absorption  = data->absorption;
     }
 
     // Hot reload: changed files once a second (values change in place; a material that failed
@@ -2007,7 +2009,9 @@ std::optional<PhysicsHit> PhysicsWorld::Raycast(const glm::vec3& origin, const g
         hit.normal = ToGlm(lock.GetBody().GetWorldSpaceSurfaceNormal(result.mSubShapeID2, JPH::RVec3(ToJolt(hit.point))));
         if (glm::dot(hit.normal, direction) > 0.0f) // back face of a mesh
             hit.normal = -hit.normal;
-        hit.surface = SurfaceName(lock.GetBody().GetShape()->GetMaterial(result.mSubShapeID2));
+        const SurfaceMaterial* material = AsSurface(lock.GetBody().GetShape()->GetMaterial(result.mSubShapeID2));
+        hit.surface    = material ? material->surface : std::string();
+        hit.absorption = material ? material->absorption : 1.0f;
     }
     return hit;
 }
@@ -2042,7 +2046,10 @@ std::optional<PhysicsHit> PhysicsWorld::SphereCast(const glm::vec3& origin, floa
     hit.normal   = axis.LengthSq() > 0.0f ? -ToGlm(axis.Normalized()) : -direction;
     JPH::BodyLockRead lock(w.system->GetBodyLockInterfaceNoLock(), r.mBodyID2);
     if (lock.Succeeded())
-        hit.surface = SurfaceName(lock.GetBody().GetShape()->GetMaterial(r.mSubShapeID2));
+        if (const SurfaceMaterial* material = AsSurface(lock.GetBody().GetShape()->GetMaterial(r.mSubShapeID2))) {
+            hit.surface    = material->surface;
+            hit.absorption = material->absorption;
+        }
     return hit;
 }
 

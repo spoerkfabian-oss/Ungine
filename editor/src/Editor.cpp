@@ -219,6 +219,8 @@ void Editor::Update(float dt)
         DrawBlueprintTypes();
     if (m_ShowPhysicsMaterial)
         DrawPhysicsMaterial();
+    if (m_ShowSoundCue)
+        DrawSoundCue();
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
     if (m_ShowStats)
@@ -547,7 +549,7 @@ void Editor::DrawViewport()
                     PlacePrefab(file, target);
                 else
                     m_Status = "Stop playing to place prefabs";
-            } else if (IsSoundFile(file)) { // a new audio source where the cursor points
+            } else if (IsSoundFile(file) || IsSoundCueFile(file)) { // a new audio source where the cursor points
                 const ImVec2     mouse = ImGui::GetIO().MousePos;
                 const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
                                      1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
