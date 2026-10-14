@@ -358,8 +358,8 @@ void ParticleEditor::Close()
     if (m_Ctx.sceneParticles)
         m_Ctx.sceneParticles->Provide(PathToUtf8(m_File), nullptr); // back to the file
     m_Open = false;
-    if (m_Renderer)
-        m_Renderer->particles = nullptr;
+    m_Renderer.reset(); // GPU resources: deferred until the frames in flight are done
+    ReleaseTarget();
     m_Preview.reset();
     m_Scene.reset();
     if (m_Ground) {

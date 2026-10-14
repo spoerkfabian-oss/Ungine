@@ -120,7 +120,7 @@ TEST_CASE(Particle_CurvesFilesAndValidation)
     effect.emitters.push_back(all);
     ParticleEmitter child = MakeDefaultParticleEmitter("Child");
     child.render.type     = ParticleRenderType::Mesh;
-    child.render.mesh     = "/elsewhere/rock.glb";
+    child.render.mesh     = PathToUtf8((dir.root_path() / "elsewhere" / "rock.glb").lexically_normal()); // "../../.." on disk
     effect.emitters.push_back(child);
     const fs::path file = dir / "Effects" / "Test.uparticle";
     std::string    error;

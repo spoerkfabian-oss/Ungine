@@ -525,7 +525,12 @@ void Editor::OpenAsset(const fs::path& file)
             m_Status = error;
         }
     } else if (IsParticleEffectFile(file)) {
-        m_ParticleEditor->Open(file);
+        std::error_code ec;
+        const fs::path  absolute = fs::absolute(file, ec).lexically_normal();
+        if (m_ParticleEditor->Dirty() && m_ParticleEditor->File() != absolute) // one effect at a time: keep the edits
+            m_Status = "Save or revert " + PathToUtf8(m_ParticleEditor->File().filename()) + " first";
+        else if (!m_ParticleEditor->IsOpen() || m_ParticleEditor->File() != absolute)
+            m_ParticleEditor->Open(absolute);
         ImGui::SetWindowFocus("###particleeditor");
     } else if (IsSoundCueFile(file)) {
         std::string error;

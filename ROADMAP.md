@@ -49,6 +49,13 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Bus-Snapshots/Ducking und räumliche Verbesserungen (mehrere Occlusion-Strahlen/Materialabsorption); HRTF als optionale, messbare Ausbaustufe.
 - Fortschritt (2026-10-12): umgesetzt und lokal verifiziert – Sound-Cues (`.ucue`, gewichtete Varianten, Zufall, No-Repeat, Priorität, Instanz-Limit), Voice-Priorität mit Verdrängung und Limits pro Cue/Bus, Snapshots mit Überblendung, Sidechain-Ducking, Multi-Ray-Occlusion mit Absorption aus Physik-Materialien, Blueprint-/Editor-Werkzeuge. HRTF nach Rücksprache weggelassen. Grenzen in CLAUDE.md, Offene Punkte 15.
 
+### Phase 28 – Partikel (C)
+- Modulare Emitter (Niagara-artige Stacks), CPU-Simulation mit Jobs, Sprites/Mesh-Partikel/Ribbons, Sub-Emitter, Kollision, Partikel-Editor mit Vorschau.
+- Fortschritt (2026-10-14): umgesetzt und lokal verifiziert – `.uparticle` mit 22 Modulen in vier Stufen, Kurven/Gradienten, deterministische CPU-Simulation auf dem ThreadPool, Kollision per Physik-Raycast, Sub-Emitter (Spawn/Death/Collision/Trail), Sprites (Billboard-Modi, Flipbook, Soft Particles), Mesh-Partikel, Ribbons, Komponente + Blueprint-Knoten + Cooker, Partikel-Editor (Undo, Live-Vorschau, Live-Übernahme in die Szene), Template-Effekte. Grenzen in CLAUDE.md, Offene Punkte 20.
+
+### Phasen 29–34 (C, Reihenfolge vom Nutzer bestätigt)
+- 29 Navmesh (Recast/Detour, gekachelt, Laufzeit-Rebake), 30 Animation-State-Machine/IK, 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
+
 ## Arbeitsregeln
 - Pro Phase erst bestehende Schnittstellen prüfen, dann vertikal implementieren (Datenformat → Laufzeit → Editor/Player → Dokumentation).
 - Bestehende Projektvorgabe: pro Phase ein Git-Commit; Branch `codex/feature-roadmap-and-phases`; nicht auf andere Branches pushen.
