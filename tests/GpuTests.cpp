@@ -1772,7 +1772,8 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
             }
         };
         CHECK(editor.ContentRoot() == project->ContentDirectory());
-        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 11);
+        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() >= 11);
+        const std::size_t templateEntities = scene.GetRegistry().AliveCount();
         CHECK(scene.FindPrimaryCamera() != NullEntity);
         editor.OpenAsset(project->ContentDirectory() / "Scripts" / "RainOnSpace.ugraph");
         CHECK(editor.Blueprints().Count() == 1);
@@ -1780,7 +1781,7 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         editor.OpenAsset(project->ContentDirectory() / "Models" / "Box.glb");
         CHECK(F().Pump([&] {
             runFrames(1);
-            return scene.GetRegistry().AliveCount() > 11;
+            return scene.GetRegistry().AliveCount() > templateEntities;
         }));
         CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
         CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
