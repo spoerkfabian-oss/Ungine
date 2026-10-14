@@ -416,6 +416,40 @@ AudioSource AudioSourceFromJson(const json& j)
     return a;
 }
 
+json ParticleSystemToJson(const ParticleSystem& p, const std::string& effect)
+{
+    return {{"effect", effect},
+            {"autoPlay", p.autoPlay},
+            {"speed", p.speed},
+            {"seed", p.seed},
+            {"spawnScale", p.spawnScale},
+            {"sizeScale", p.sizeScale},
+            {"velocityScale", p.velocityScale},
+            {"lifetimeScale", p.lifetimeScale},
+            {"tint", ToJson(p.tint)}};
+}
+
+ParticleSystem ParticleSystemFromJson(const json& j)
+{
+    ParticleSystem p;
+    Read(j, "effect", p.effect);
+    Read(j, "autoPlay", p.autoPlay);
+    Read(j, "speed", p.speed);
+    Read(j, "seed", p.seed);
+    Read(j, "spawnScale", p.spawnScale);
+    Read(j, "sizeScale", p.sizeScale);
+    Read(j, "velocityScale", p.velocityScale);
+    Read(j, "lifetimeScale", p.lifetimeScale);
+    Read(j, "tint", p.tint);
+    p.speed         = std::clamp(p.speed, 0.0f, 100.0f);
+    p.spawnScale    = std::max(p.spawnScale, 0.0f);
+    p.sizeScale     = std::max(p.sizeScale, 0.0f);
+    p.velocityScale = std::max(p.velocityScale, 0.0f);
+    p.lifetimeScale = std::max(p.lifetimeScale, 0.0f);
+    p.tint          = glm::max(p.tint, glm::vec4(0.0f));
+    return p;
+}
+
 json ReverbToJson(const ReverbParams& p)
 {
     return {{"roomSize", p.roomSize}, {"damping", p.damping}, {"wet", p.wet}, {"width", p.width}};
@@ -667,6 +701,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioSource"] = AudioSourceToJson(*source, models.WritePath(source->sound));
     if (r.Has<AudioListener>(e))
         j["audioListener"] = json::object();
+    if (const auto* particles = r.TryGet<ParticleSystem>(e))
+        j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* zone = r.TryGet<ReverbZone>(e))
         j["reverbZone"] = ReverbZoneToJson(*zone);
     if (const auto* volume = r.TryGet<LevelStreamingVolume>(e))
@@ -848,6 +884,11 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         return source;
     });
     ApplyOptional<AudioListener>(r, e, j, "audioListener", [](const json&) { return AudioListener{}; });
+    ApplyOptional<ParticleSystem>(r, e, j, "particleSystem", [&](const json& p) {
+        ParticleSystem particles = ParticleSystemFromJson(p);
+        particles.effect         = models.ReadPath(particles.effect);
+        return particles;
+    });
     ApplyOptional<ReverbZone>(r, e, j, "reverbZone", ReverbZoneFromJson);
     ApplyOptional<LevelStreamingVolume>(r, e, j, "levelStreamingVolume", [&](const json& v) {
         LevelStreamingVolume volume;

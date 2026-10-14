@@ -4,6 +4,7 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Physics/Ragdoll.h"
 #include "Engine/Core/GameOptions.h"
 #include "Engine/Core/Platform.h"
@@ -1277,6 +1278,69 @@ std::vector<NodeDesc> BuildRegistry()
                      {{"Fade", -1.0f}}));
     add(Pure("Audio.SnapshotWeight", "Get Audio Snapshot Weight", "Audio", {In("Snapshot", P::String), Out("Weight", P::Float)},
              [](ScriptContext& c) { c.Out(1, c.Audio() ? c.Audio()->SnapshotWeight(c.InString(0)) : 0.0f); }));
+
+    // Particles. Effect paths: absolute or relative to the working directory (the project root).
+    add(WithDefaults(Action("Particles.SpawnAt", "Spawn Emitter at Location", "Particles",
+                            {In("Effect", P::String), In("Location", P::Vec3), In("Rotation", P::Vec3), In("Scale", P::Float),
+                             Out("Handle", P::Int)},
+                            [](ScriptContext& c) {
+                                if (!c.Particles())
+                                    return c.Error("No particle system");
+                                const glm::quat rotation(glm::radians(c.InVec3(4)));
+                                const std::uint32_t id = c.Particles()->SpawnAt(c.InString(2), c.InVec3(3), rotation, c.InFloat(5));
+                                if (id == 0)
+                                    c.Error("Cannot load particle effect '" + c.InString(2) + "'");
+                                c.Out(6, static_cast<std::int32_t>(id));
+                            }, "Fire-and-forget effect (removed once finished). Rotation in degrees."),
+                     {{"Scale", 1.0f}}));
+    add(Action("Particles.StopSpawned", "Stop Spawned Emitter", "Particles", {In("Handle", P::Int), In("Immediate", P::Bool)},
+               [](ScriptContext& c) {
+                   if (c.Particles())
+                       c.Particles()->StopOneShot(static_cast<std::uint32_t>(std::max(c.InInt(2), 0)), c.InBool(3));
+               }, "Stops a looping effect from Spawn Emitter at Location"));
+    add(Action("Particles.Play", "Play Particles", "Particles", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        const auto e = Target(c, 2);
+        if (!e || !c.Particles())
+            return c.Error("No particle system");
+        if (!c.GetScene().GetRegistry().Has<ParticleSystem>(*e))
+            return c.Error("Target has no Particle System");
+        c.Particles()->Play(*e);
+    }, "(Re)starts the entity's Particle System"));
+    add(Action("Particles.Stop", "Stop Particles", "Particles", {In("Target", P::Entity), In("Immediate", P::Bool)},
+               [](ScriptContext& c) {
+                   if (const auto e = Target(c, 2); e && c.Particles())
+                       c.Particles()->Stop(*e, c.InBool(3));
+               }, "Stops spawning (Immediate: removes the particles too)"));
+    add(Pure("Particles.IsActive", "Is Particles Active", "Particles", {In("Target", P::Entity), Out("Active", P::Bool), Out("Count", P::Int)},
+             [](ScriptContext& c) {
+                 const auto e = Target(c, 0);
+                 c.Out(1, e && c.Particles() && c.Particles()->IsActive(*e));
+                 c.Out(2, e && c.Particles() ? static_cast<std::int32_t>(c.Particles()->ParticleCount(*e)) : 0);
+             }));
+    add(WithParam(Action("Particles.SetScale", "Set Particle Scale", "Particles", {In("Target", P::Entity), In("Scale", P::Float)},
+                         [](ScriptContext& c) {
+                             const auto e = Target(c, 2);
+                             ParticleSystem* p = e ? c.GetScene().GetRegistry().TryGet<ParticleSystem>(*e) : nullptr;
+                             if (!p)
+                                 return c.Error("Target has no Particle System");
+                             const float value = std::max(c.InFloat(3), 0.0f);
+                             const std::string& which = c.Param();
+                             (which == "size" ? p->sizeScale : which == "velocity" ? p->velocityScale
+                                                : which == "lifetime"             ? p->lifetimeScale
+                                                : which == "speed"                ? p->speed
+                                                                                  : p->spawnScale) = value;
+                         }, "Live multiplier of the running effect"),
+                  ParamKind::Choice, "Scale", "spawn", {"spawn", "size", "velocity", "lifetime", "speed"}));
+    add(WithDefaults(Action("Particles.SetTint", "Set Particle Tint", "Particles",
+                            {In("Target", P::Entity), In("Color", P::Vec3), In("Alpha", P::Float)},
+                            [](ScriptContext& c) {
+                                const auto e = Target(c, 2);
+                                ParticleSystem* p = e ? c.GetScene().GetRegistry().TryGet<ParticleSystem>(*e) : nullptr;
+                                if (!p)
+                                    return c.Error("Target has no Particle System");
+                                p->tint = glm::vec4(glm::max(c.InVec3(3), glm::vec3(0.0f)), std::max(c.InFloat(4), 0.0f));
+                            }, "Multiplies every particle's color (HDR: > 1 glows)"),
+                     {{"Color", glm::vec3(1.0f)}, {"Alpha", 1.0f}}));
 
     // Functions (created by the editor's function list; their nodes are not in the palette).
     {

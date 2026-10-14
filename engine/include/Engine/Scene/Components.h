@@ -346,6 +346,22 @@ struct ReverbZone {
     bool operator==(const ReverbZone&) const = default;
 };
 
+// Plays a particle effect (.uparticle) at the entity (ParticleWorld). `effect`: absolute in memory,
+// relative in scene files. The scales / tint apply live to the running effect.
+struct ParticleSystem {
+    std::string   effect{};
+    bool          autoPlay = true;
+    float         speed    = 1.0f; // simulation rate
+    std::uint32_t seed     = 0;    // 0: random per start
+    float         spawnScale    = 1.0f;
+    float         sizeScale     = 1.0f;
+    float         velocityScale = 1.0f;
+    float         lifetimeScale = 1.0f;
+    glm::vec4     tint{1.0f};
+
+    bool operator==(const ParticleSystem&) const = default;
+};
+
 // Illuminance below which a light without explicit range is cut off (lights need a finite range
 // for clustering).
 inline constexpr float kLightCutoffIlluminance = 0.005f;

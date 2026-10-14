@@ -1,5 +1,6 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Audio/SoundCue.h"
+#include "Engine/Particles/ParticleEffect.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
@@ -563,6 +564,44 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             else if (!inContent(target))
                 report.warnings.push_back(std::format("'{}': '{}' is outside Content/ and not packaged", entryPath(file), variant.sound));
         }
+    }
+
+    // Particle effects: sprite textures are color textures; textures and meshes must be packaged.
+    for (const fs::path& file : files) {
+        if (!IsParticleEffectFile(file))
+            continue;
+        std::string error;
+        const auto  effect = LoadParticleEffect(file, &error);
+        if (!effect) {
+            report.warnings.push_back(error);
+            continue;
+        }
+        for (const ParticleEmitter& emitter : effect->emitters) {
+            const auto check = [&](const std::string& path, const char* what) -> bool {
+                if (path.empty())
+                    return false;
+                const fs::path  target = PathFromUtf8(path).lexically_normal();
+                std::error_code ec;
+                if (!fs::is_regular_file(target, ec)) {
+                    report.warnings.push_back(std::format("'{}': missing {} '{}'", entryPath(file), what, path));
+                    return false;
+                }
+                if (!inContent(target))
+                    report.warnings.push_back(std::format("'{}': {} '{}' is outside Content/ and not packaged", entryPath(file), what, path));
+                return true;
+            };
+            if (check(emitter.render.texture, "texture")) {
+                const fs::path image = PathFromUtf8(emitter.render.texture).lexically_normal();
+                if (const auto bytes = readShared(image)) {
+                    usedImages.insert(PathToUtf8(image));
+                    addTexture(bytes, TextureKind::Color, PathToUtf8(image.filename()));
+                }
+            }
+            if (emitter.render.type == ParticleRenderType::Mesh)
+                check(emitter.render.mesh, "mesh");
+        }
+        for (const std::string& problem : ValidateParticleEffect(*effect))
+            report.warnings.push_back(std::format("'{}': {}", entryPath(file), problem));
     }
 
     // Scenes and prefabs: UI images are color textures; references to missing files are reported.

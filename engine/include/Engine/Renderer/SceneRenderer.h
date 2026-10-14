@@ -24,6 +24,8 @@ class AssetManager;
 class Frustum;
 class GpuCulling;
 class GpuScene;
+class ParticleRenderer;
+class ParticleWorld;
 class Scene;
 
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
@@ -171,6 +173,9 @@ struct SceneRenderStats {
     std::uint32_t lodDraws        = 0; // camera draws with a LOD > 0 or cross-fading (GPU: counter, CPU: this frame)
     std::uint32_t transparentDraws = 0; // alpha-blended draws (sorted CPU pass, both paths)
     std::uint32_t shadowOccluded  = 0; // GPU: cascade casters culled against the camera Hi-Z
+    std::uint32_t particleBatches   = 0; // emitter instances drawn (after frustum culling)
+    std::uint32_t particlesDrawn    = 0; // sprites + mesh instances + ribbon points
+    std::uint32_t particleDrawCalls = 0;
     std::uint32_t geometryVertices = 0, geometryVertexCapacity = 0; // geometry pool use
     std::uint32_t geometryIndices  = 0, geometryIndexCapacity  = 0;
     float         exposure         = 1.0f; // applied exposure (auto exposure: a few frames old)
@@ -222,6 +227,8 @@ public:
     LocalShadowSettings                   localShadows;
     SelectionOverlay                      overlay;
     CullingSettings                       culling;
+    // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
+    const ParticleWorld*                  particles = nullptr;
 
     // Picking (overlay.picking): the entity under pixel (x, y) of the output, top-left origin.
     // The answer arrives kFramesInFlight frames later: poll TakePickResult() every frame.
@@ -275,7 +282,7 @@ private:
     void ReadPick(const Scene& scene, std::uint32_t frameIndex);
     [[nodiscard]] std::pair<VkDeviceAddress, std::uint32_t> PushOutlineBits(); // address, word count
     void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
-    void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
+    void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress, std::uint32_t frameIndex);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
@@ -325,6 +332,7 @@ private:
     SpatialIndex                m_Spatial;
     std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
     std::unique_ptr<GpuCulling> m_GpuCulling;
+    std::unique_ptr<ParticleRenderer> m_Particles;
     bool                        m_ShadowOcclusion = false; // this frame: cascades culled against the Hi-Z
     glm::vec4                   m_LodCamera{0.0f}; // this frame's LOD selection (see SelectLod)
     std::uint32_t               m_LodForced = 0;

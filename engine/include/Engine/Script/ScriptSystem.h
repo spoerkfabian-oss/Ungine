@@ -16,6 +16,7 @@ namespace Engine {
 class AssetManager;
 class AudioSystem;
 class LevelStreamer;
+class ParticleWorld;
 class GameOptions;
 struct UiEvent;
 class EventBus;
@@ -157,6 +158,8 @@ public:
     // Level Loaded / Unloaded events and entity references into streamed levels follow its
     // LevelStreamedEvents on the EventBus.
     void SetLevelStreamer(LevelStreamer* streamer);
+    // Particle effects (Spawn Emitter at Location, Play / Stop Particles, ...); null: those nodes report errors.
+    void SetParticleWorld(ParticleWorld* particles);
     // Ends the scripts in these subtrees (EndPlay) before they are destroyed (level unload).
     void EndPlayFor(Scene& scene, std::span<const Entity> roots);
 
