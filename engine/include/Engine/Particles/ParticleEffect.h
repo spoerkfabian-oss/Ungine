@@ -312,7 +312,7 @@ struct ParticleEffect {
 [[nodiscard]] std::optional<ParticleEffect> ParseParticleEffect(std::string_view json,
                                                                 const std::filesystem::path& folder,
                                                                 std::string* error = nullptr);
-// Atomic write; paths below the effect's folder are stored relative.
+// Atomic write; paths are stored relative to the effect's folder (absolute only without a relative path).
 bool SaveParticleEffect(const std::filesystem::path& file, const ParticleEffect& effect, std::string* error = nullptr);
 [[nodiscard]] std::string ParticleEffectToJson(const ParticleEffect& effect, const std::filesystem::path& folder);
 // Problems an author should know about: sub-emitter targets that do not exist / cycles, mesh

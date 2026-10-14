@@ -344,15 +344,18 @@ struct Reader {
     }
 };
 
+// Relative to the effect file (also "../Textures/x.png", like scene files: the project moves and
+// packages as a whole); absolute only when there is no relative path (another drive).
 std::string StorePath(const std::string& path, const fs::path& folder)
 {
     if (path.empty())
         return path;
     const fs::path absolute = PathFromUtf8(path).lexically_normal();
     const fs::path relative = absolute.lexically_relative(folder);
-    if (absolute.is_absolute() && !relative.empty() && *relative.begin() != "..")
-        return relative.generic_string();
-    return path;
+    if (!absolute.is_absolute() || relative.empty())
+        return path;
+    const std::u8string generic = relative.generic_u8string();
+    return {generic.begin(), generic.end()};
 }
 
 std::string LoadPath(const std::string& path, const fs::path& folder)

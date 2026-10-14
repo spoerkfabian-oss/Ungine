@@ -126,7 +126,7 @@ TEST_CASE(Particle_CurvesFilesAndValidation)
     std::string    error;
     CHECK(SaveParticleEffect(file, effect, &error));
     const std::string text = ParticleEffectToJson(effect, file.parent_path());
-    CHECK(text.find("\"../Textures/spark.png\"") == std::string::npos); // outside the effect's folder: absolute
+    CHECK(text.find("\"../Textures/spark.png\"") != std::string::npos); // relative, also outside the effect's folder
     const auto loaded = LoadParticleEffect(file, &error);
     CHECK(loaded.has_value());
     if (loaded)

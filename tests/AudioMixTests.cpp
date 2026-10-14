@@ -87,7 +87,8 @@ TEST_CASE(Audio_SoundCueFileAndPicks)
     cue.variants = {{.sound = PathToUtf8(dir / "a.wav"), .weight = 3.0f, .volume = 0.5f, .pitch = 1.0f},
                     {.sound = PathToUtf8(dir / "Sub" / "b.wav"), .weight = 1.0f, .volume = 1.0f, .pitch = 1.5f},
                     {.sound = "", .weight = 5.0f},                                    // no sound: never picked
-                    {.sound = PathToUtf8(dir / "c.wav"), .weight = 0.0f}};            // weight 0: never picked
+                    {.sound = PathToUtf8(dir / "c.wav"), .weight = 0.0f},             // weight 0: never picked
+                    {.sound = PathToUtf8(dir.parent_path() / "Shared" / "d.wav"), .weight = 0.0f}}; // another folder
     cue.volumeMin    = 0.8f;
     cue.volumeMax    = 1.0f;
     cue.pitchMin     = 0.9f;
@@ -103,6 +104,7 @@ TEST_CASE(Audio_SoundCueFileAndPicks)
     std::ifstream     in(file);
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     CHECK(text.find("\"Sub/b.wav\"") != std::string::npos); // relative to the cue on disk
+    CHECK(text.find("\"../Shared/d.wav\"") != std::string::npos); // also outside its folder (packaged games)
     const auto loaded = LoadSoundCue(file, &error);
     CHECK(loaded && *loaded == cue); // absolute again in memory
     std::ofstream(dir / "broken.ucue") << "{ not json";
