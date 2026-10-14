@@ -8,6 +8,7 @@ add_library(Editor STATIC
     src/Levels.cpp
     src/ImGuiLayer.cpp
     src/Panels.cpp
+    src/ParticleEditor.cpp
     src/ProjectLauncher.cpp
     src/ScriptGraphEditor.cpp)
 target_include_directories(Editor PUBLIC include PRIVATE src)

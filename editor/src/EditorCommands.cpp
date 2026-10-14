@@ -1,5 +1,6 @@
 // Editor operations that change the scene (all undoable) and scene files.
 #include "Editor/Editor.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Editor/FileDialog.h"
 #include "Editor/History.h"
 
@@ -374,6 +375,8 @@ void Editor::NewScene()
     if (m_Ctx.streaming)
         m_Ctx.streaming->Reset(); // previews go with the scene
     m_Ctx.scene.Clear();
+    if (m_Ctx.particles)
+        m_Ctx.particles->Reset();
     ReleaseModelRefs();
     m_History->Clear();
     m_Selection.clear();
@@ -461,6 +464,7 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
+        case DialogPurpose::AssignEffect: AssignEffect(m_EffectTarget, *path); break;
         case DialogPurpose::AssignCueSound:
             if (m_ShowSoundCue && m_SoundCueVariant < m_SoundCueEdit.variants.size()) {
                 std::error_code ec;
@@ -646,6 +650,32 @@ Entity Editor::CreateAudioEntity(const std::filesystem::path& sound, const glm::
     return e;
 }
 
+void Editor::AssignEffect(Entity entity, const std::filesystem::path& effect)
+{
+    Registry& r = m_Ctx.scene.GetRegistry();
+    if (!r.Valid(entity) || IsStreamed(entity))
+        return;
+    std::error_code ec;
+    std::string     before = SnapshotEntityState(m_Ctx.scene, entity);
+    ParticleSystem  system = r.Has<ParticleSystem>(entity) ? r.Get<ParticleSystem>(entity) : ParticleSystem{};
+    system.effect          = PathToUtf8(std::filesystem::absolute(effect, ec).lexically_normal());
+    r.EmplaceOrReplace<ParticleSystem>(entity, system);
+    PushStateChange("Assign particle effect", {StateEdit{UuidOf(entity), std::move(before)}});
+}
+
+Entity Editor::CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position)
+{
+    std::error_code ec;
+    const Entity    e = m_Ctx.scene.CreateEntity(effect.empty() ? std::string("Particle System") : PathToUtf8(effect.stem()));
+    m_Ctx.scene.EditTransform(e).position = position;
+    m_Ctx.scene.GetRegistry().Emplace<ParticleSystem>(
+        e, ParticleSystem{.effect = effect.empty() ? std::string() : PathToUtf8(std::filesystem::absolute(effect, ec).lexically_normal())});
+    const Entity roots[] = {e};
+    PushCreated("Create particle system", roots);
+    Select(e);
+    return e;
+}
+
 void Editor::Play()
 {
     if (!m_Ctx.physics && !m_Ctx.scripts && !m_Ctx.audio)
@@ -682,6 +712,8 @@ void Editor::Play()
         m_Ctx.audio->StopPreview();
         m_Ctx.audio->Begin(m_Ctx.scene); // before BeginPlay: scripts may play sources right away
     }
+    if (m_Ctx.particles)
+        m_Ctx.particles->Reset(); // effects start over with the game
     if (m_Ctx.scripts) {
         m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
         if (m_Ctx.project) {
@@ -728,6 +760,8 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
         m_Ctx.streaming->Reset(); // streamed levels went with the scene
     if (m_Ctx.physics)
         m_Ctx.physics->Reset();
+    if (m_Ctx.particles)
+        m_Ctx.particles->Reset();
     m_Selection.clear();
     m_GizmoEdit.reset();
     m_InspectorEdit.reset();
@@ -796,6 +830,8 @@ void Editor::Stop()
     m_Ctx.scene.UpdateTransforms();
     if (m_Ctx.physics)
         m_Ctx.physics->Reset();
+    if (m_Ctx.particles)
+        m_Ctx.particles->Reset(); // spawned one-shots go, the edit scene's effects restart
     for (ModelHandle h : std::exchange(m_PlayModels, {}))
         m_Ctx.assets.Release(h);
 

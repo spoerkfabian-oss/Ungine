@@ -1,4 +1,6 @@
 #include "Editor/Editor.h"
+#include "Editor/ParticleEditor.h"
+#include "Engine/Particles/ParticleEffect.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
 #include "Editor/ImGuiLayer.h"
@@ -76,11 +78,12 @@ ImVec4 KindColor(int kind)
     case 7: return {0.55f, 0.85f, 0.55f, 1.0f}; // enum / struct / interface
     case 8: return {0.80f, 0.70f, 0.50f, 1.0f}; // physics material
     case 9: return {0.30f, 0.95f, 0.70f, 1.0f}; // sound cue
+    case 10: return {1.00f, 0.55f, 0.25f, 1.0f}; // particle effect
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -173,7 +176,8 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
             // pathValues: every string of the object is a path (a collider's meshMaterials).
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
-                                          it.key() == "material")) {
+                                          it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
+                                          it.key() == "mesh")) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -230,7 +234,8 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
         const std::string name = Lower(PathToUtf8(it->path().filename()));
         const bool legacyScene = EndsWith(name, ".json") && Lower(PathToUtf8(it->path().parent_path().filename())) == "scenes";
         if (!(EndsWith(name, ".scene.json") || EndsWith(name, ".uprefab") || EndsWith(name, ".ugraph") ||
-              EndsWith(name, ".gltf") || EndsWith(name, std::string(kSoundCueExtension)) || legacyScene))
+              EndsWith(name, ".gltf") || EndsWith(name, std::string(kSoundCueExtension)) ||
+              EndsWith(name, std::string(kParticleEffectExtension)) || legacyScene))
             continue;
 
         std::ifstream input(it->path(), std::ios::binary);
@@ -375,6 +380,8 @@ bool Editor::SaveAll()
     if (!m_ScenePath.empty() && m_PlayState == PlayState::Edit)
         ok = SaveScene(m_ScenePath) && ok;
     ok = m_Graphs->SaveAll() && ok;
+    if (m_ParticleEditor->Dirty())
+        ok = m_ParticleEditor->Save() && ok;
     if (m_Ctx.project && m_ProjectDirty) {
         std::string error;
         if (m_Ctx.project->Save(&error))
@@ -389,7 +396,7 @@ bool Editor::SaveAll()
 
 bool Editor::ConfirmQuit()
 {
-    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty))
+    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty && !m_ParticleEditor->Dirty()))
         return true;
     m_AskQuit = true;
     return false;
@@ -517,6 +524,9 @@ void Editor::OpenAsset(const fs::path& file)
         } else {
             m_Status = error;
         }
+    } else if (IsParticleEffectFile(file)) {
+        m_ParticleEditor->Open(file);
+        ImGui::SetWindowFocus("###particleeditor");
     } else if (IsSoundCueFile(file)) {
         std::string error;
         if (const auto cue = LoadSoundCue(file, &error)) {
@@ -608,6 +618,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::PhysicsMaterial;
         else if (IsSoundCueFile(path))
             item.kind = ContentItem::Kind::SoundCue;
+        else if (IsParticleEffectFile(path))
+            item.kind = ContentItem::Kind::ParticleEffect;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -1014,6 +1026,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
             return;
         ScriptComponent* script = registry.TryGet<ScriptComponent>(entity);
         AudioSource* audio = registry.TryGet<AudioSource>(entity);
+        ParticleSystem* particles = registry.TryGet<ParticleSystem>(entity);
         UiWidget* widget = registry.TryGet<UiWidget>(entity);
         PrefabInstance* prefab = registry.TryGet<PrefabInstance>(entity);
         LevelStreamingVolume* volume = registry.TryGet<LevelStreamingVolume>(entity);
@@ -1025,6 +1038,8 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
                                         : std::optional<fs::path>{};
         const auto audioPath = audio ? RelocateReference(audio->sound, source, target, wasDirectory)
                                      : std::optional<fs::path>{};
+        const auto effectPath = particles ? RelocateReference(particles->effect, source, target, wasDirectory)
+                                          : std::optional<fs::path>{};
         const auto imagePath = widget ? RelocateReference(widget->image, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto prefabPath = prefab ? RelocateReference(prefab->prefab, source, target, wasDirectory)
@@ -1032,13 +1047,14 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
-        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !imagePath && !prefabPath && !levelPath && !colliderMoved)
+        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !imagePath && !prefabPath && !levelPath && !colliderMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
         if (instanceModel) instance->model = *instanceModel;
         if (scriptPath) script->graph = PathToUtf8(*scriptPath);
         if (audioPath) audio->sound = PathToUtf8(*audioPath);
+        if (effectPath) particles->effect = PathToUtf8(*effectPath);
         if (imagePath) widget->image = PathToUtf8(*imagePath);
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
         if (levelPath) volume->level = PathToUtf8(*levelPath);
@@ -1174,6 +1190,16 @@ void Editor::DrawContentBrowser()
                 m_Status = error;
             }
         }
+        if (ImGui::MenuItem("Particle effect")) {
+            const fs::path file = UniquePath(m_ContentDir, "NewParticleEffect", std::string(kParticleEffectExtension));
+            std::string    error;
+            if (SaveParticleEffect(file, MakeDefaultParticleEffect(), &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
+        }
         if (ImGui::MenuItem("Physics material")) {
             const fs::path file = UniquePath(m_ContentDir, "NewPhysicsMaterial", std::string(kPhysicsMaterialExtension));
             std::string    error;
@@ -1263,6 +1289,12 @@ void Editor::DrawContentBrowser()
                             CreateAudioEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
                         if (Selected() != NullEntity && ImGui::MenuItem("Assign to selection"))
                             AssignSound(Selected(), item.path);
+                    }
+                    if (item.kind == ContentItem::Kind::ParticleEffect) {
+                        if (ImGui::MenuItem("Place particle system"))
+                            CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+                        if (Selected() != NullEntity && ImGui::MenuItem("Assign to selection"))
+                            AssignEffect(Selected(), item.path);
                     }
                     if (ImGui::MenuItem("Rename...")) {
                         m_RenameTarget = item.path;

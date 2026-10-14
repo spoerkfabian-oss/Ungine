@@ -841,14 +841,17 @@ struct ParticleWorld::Impl {
         ref.time = Vfs::ModifiedTime(file);
         std::string error;
         if (auto effect = LoadParticleEffect(file, &error)) {
-            ref.effect = std::make_shared<const ParticleEffect>(std::move(*effect));
             ref.failed = false;
+            if (ref.effect && *ref.effect == *effect)
+                return; // touched, not changed (e.g. saved from the editor): nothing restarts
+            ref.effect = std::make_shared<const ParticleEffect>(std::move(*effect));
+            if (!ref.provided) // an editor version overrides the file: what plays did not change
+                ++ref.version;
         } else {
             if (!ref.failed)
                 ENGINE_WARN("Particles: {}", error);
             ref.failed = true; // a broken edit keeps the last good version
         }
-        ++ref.version;
     }
 
     EffectRef* Find(const std::string& key)
@@ -1192,8 +1195,12 @@ void ParticleWorld::Provide(const std::string& path, std::shared_ptr<const Parti
     auto [it, inserted] = m_Impl->effects.try_emplace(key);
     if (inserted) // the file may not exist yet (new, unsaved effect)
         it->second.time = Vfs::ModifiedTime(PathFromUtf8(key));
+    const bool same = effect && it->second.provided ? *effect == *it->second.provided
+                    : !effect && it->second.provided && it->second.effect ? *it->second.provided == *it->second.effect
+                                                                            : false;
     it->second.provided = std::move(effect);
-    ++it->second.version;
+    if (!same)
+        ++it->second.version;
 }
 
 void ParticleWorld::SetRandomSeed(std::uint32_t seed) { m_Impl->seedCounter = seed; }
