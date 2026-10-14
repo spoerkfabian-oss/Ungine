@@ -562,7 +562,9 @@ TEST_CASE(Particle_ComponentsJobsFilesAndDeterminism)
     CHECK(LoadSceneFile(sceneFile, reloaded, nullptr).empty());
     bool found = false;
     reloaded.GetRegistry().ViewOf<ParticleSystem>().Each([&](Entity, ParticleSystem& s) {
-        found = s.effect == path && s.speed == 2.0f && s.tint == expected.tint && !s.autoPlay;
+        std::error_code ec; // Windows: loader yields the long, canonical form of a short temp path
+        found = fs::equivalent(PathFromUtf8(s.effect), file, ec) && s.speed == 2.0f && s.tint == expected.tint &&
+                !s.autoPlay;
     });
     CHECK(found);
 }
