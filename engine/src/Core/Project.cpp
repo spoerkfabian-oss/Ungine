@@ -2,6 +2,7 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
+#include "Navigation/NavJson.h"
 
 #include <nlohmann/json.hpp>
 
@@ -162,6 +163,8 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
                 s.input.axes.push_back(std::move(axis));
             }
         }
+        if (const auto nav = root->find("navigation"); nav != root->end() && nav->is_object())
+            NavSettingsFromJson(*nav, s.navigation);
         return project;
     } catch (const json::exception& e) {
         SetError(error, "'" + PathToUtf8(file) + "': " + e.what());
@@ -216,7 +219,8 @@ bool Project::Save(std::string* error) const
                       {"voiceLimitMode", ToString(settings.audio.voiceLimitMode)},
                       {"snapshots", std::move(snapshots)},
                       {"ducking", std::move(ducking)}}},
-                    {"input", {{"actions", std::move(actions)}, {"axes", std::move(axes)}}}};
+                    {"input", {{"actions", std::move(actions)}, {"axes", std::move(axes)}}},
+                    {"navigation", NavSettingsToJson(settings.navigation)}};
     return WriteText(m_File, root.dump(2), error);
 }
 

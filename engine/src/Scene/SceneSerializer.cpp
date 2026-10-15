@@ -416,6 +416,94 @@ AudioSource AudioSourceFromJson(const json& j)
     return a;
 }
 
+constexpr const char* kNavObstacleShapes[] = {"box", "cylinder"};
+constexpr const char* kNavAvoidance[]      = {"off", "low", "medium", "high"};
+
+json NavAreaToJson(const NavArea& a) { return {{"halfExtents", ToJson(a.halfExtents)}, {"area", a.area}}; }
+
+NavArea NavAreaFromJson(const json& j)
+{
+    NavArea a;
+    Read(j, "halfExtents", a.halfExtents);
+    Read(j, "area", a.area);
+    a.halfExtents = glm::max(a.halfExtents, glm::vec3(0.0f));
+    return a;
+}
+
+json NavLinkToJson(const NavLink& l)
+{
+    return {{"start", ToJson(l.start)},     {"end", ToJson(l.end)}, {"radius", l.radius},
+            {"bidirectional", l.bidirectional}, {"area", l.area},  {"profiles", l.profiles}};
+}
+
+NavLink NavLinkFromJson(const json& j)
+{
+    NavLink l;
+    Read(j, "start", l.start);
+    Read(j, "end", l.end);
+    Read(j, "radius", l.radius);
+    Read(j, "bidirectional", l.bidirectional);
+    Read(j, "area", l.area);
+    Read(j, "profiles", l.profiles);
+    l.radius = std::max(l.radius, 0.0f);
+    return l;
+}
+
+json NavObstacleToJson(const NavObstacle& o)
+{
+    return {{"shape", EnumToJson(o.shape, kNavObstacleShapes)},
+            {"halfExtents", ToJson(o.halfExtents)},
+            {"radius", o.radius},
+            {"height", o.height},
+            {"enabled", o.enabled}};
+}
+
+NavObstacle NavObstacleFromJson(const json& j)
+{
+    NavObstacle o;
+    ReadEnum(j, "shape", o.shape, kNavObstacleShapes);
+    Read(j, "halfExtents", o.halfExtents);
+    Read(j, "radius", o.radius);
+    Read(j, "height", o.height);
+    Read(j, "enabled", o.enabled);
+    o.halfExtents = glm::max(o.halfExtents, glm::vec3(0.0f));
+    o.radius      = std::max(o.radius, 0.0f);
+    o.height      = std::max(o.height, 0.0f);
+    return o;
+}
+
+json NavAgentToJson(const NavAgent& a)
+{
+    return {{"profile", a.profile},
+            {"maxSpeed", a.maxSpeed},
+            {"acceleration", a.acceleration},
+            {"stoppingDistance", a.stoppingDistance},
+            {"separationWeight", a.separationWeight},
+            {"avoidance", EnumToJson(a.avoidance, kNavAvoidance)},
+            {"faceMovement", a.faceMovement},
+            {"driveCharacter", a.driveCharacter},
+            {"areaMask", a.areaMask}};
+}
+
+NavAgent NavAgentFromJson(const json& j)
+{
+    NavAgent a;
+    Read(j, "profile", a.profile);
+    Read(j, "maxSpeed", a.maxSpeed);
+    Read(j, "acceleration", a.acceleration);
+    Read(j, "stoppingDistance", a.stoppingDistance);
+    Read(j, "separationWeight", a.separationWeight);
+    ReadEnum(j, "avoidance", a.avoidance, kNavAvoidance);
+    Read(j, "faceMovement", a.faceMovement);
+    Read(j, "driveCharacter", a.driveCharacter);
+    Read(j, "areaMask", a.areaMask);
+    a.maxSpeed         = std::max(a.maxSpeed, 0.0f);
+    a.acceleration     = std::max(a.acceleration, 0.0f);
+    a.stoppingDistance = std::max(a.stoppingDistance, 0.0f);
+    a.separationWeight = std::max(a.separationWeight, 0.0f);
+    return a;
+}
+
 json ParticleSystemToJson(const ParticleSystem& p, const std::string& effect)
 {
     return {{"effect", effect},
@@ -705,6 +793,16 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* zone = r.TryGet<ReverbZone>(e))
         j["reverbZone"] = ReverbZoneToJson(*zone);
+    if (const auto* navBounds = r.TryGet<NavMeshBounds>(e))
+        j["navMeshBounds"] = {{"halfExtents", ToJson(navBounds->halfExtents)}};
+    if (const auto* navArea = r.TryGet<NavArea>(e))
+        j["navArea"] = NavAreaToJson(*navArea);
+    if (const auto* navLink = r.TryGet<NavLink>(e))
+        j["navLink"] = NavLinkToJson(*navLink);
+    if (const auto* navObstacle = r.TryGet<NavObstacle>(e))
+        j["navObstacle"] = NavObstacleToJson(*navObstacle);
+    if (const auto* navAgent = r.TryGet<NavAgent>(e))
+        j["navAgent"] = NavAgentToJson(*navAgent);
     if (const auto* volume = r.TryGet<LevelStreamingVolume>(e))
         j["levelStreamingVolume"] = {{"level", models.WritePath(volume->level)},
                                      {"halfExtents", ToJson(volume->halfExtents)},
@@ -890,6 +988,16 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         return particles;
     });
     ApplyOptional<ReverbZone>(r, e, j, "reverbZone", ReverbZoneFromJson);
+    ApplyOptional<NavMeshBounds>(r, e, j, "navMeshBounds", [](const json& b) {
+        NavMeshBounds bounds;
+        Read(b, "halfExtents", bounds.halfExtents);
+        bounds.halfExtents = glm::max(bounds.halfExtents, glm::vec3(0.0f));
+        return bounds;
+    });
+    ApplyOptional<NavArea>(r, e, j, "navArea", NavAreaFromJson);
+    ApplyOptional<NavLink>(r, e, j, "navLink", NavLinkFromJson);
+    ApplyOptional<NavObstacle>(r, e, j, "navObstacle", NavObstacleFromJson);
+    ApplyOptional<NavAgent>(r, e, j, "navAgent", NavAgentFromJson);
     ApplyOptional<LevelStreamingVolume>(r, e, j, "levelStreamingVolume", [&](const json& v) {
         LevelStreamingVolume volume;
         Read(v, "level", volume.level);

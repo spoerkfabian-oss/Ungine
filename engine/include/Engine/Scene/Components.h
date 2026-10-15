@@ -362,6 +362,72 @@ struct ParticleSystem {
     bool operator==(const ParticleSystem&) const = default;
 };
 
+// --- Navigation (NavigationWorld, Recast/Detour). Geometry: colliders (not triggers) of static
+// bodies or without a RigidBody. Area / profile names refer to NavSettings (project). ---
+
+// The navmesh is built inside the union of these boxes (entity space, world-axis-aligned bounds).
+struct NavMeshBounds {
+    glm::vec3 halfExtents{20.0f, 5.0f, 20.0f};
+
+    bool operator==(const NavMeshBounds&) const = default;
+};
+
+// Marks the walkable surface inside a box (entity space) with an area type: path costs and agent
+// filters per area (NavSettings::areas). kNavAreaBlocked removes the surface.
+struct NavArea {
+    glm::vec3   halfExtents{1.0f};
+    std::string area = "Default";
+
+    bool operator==(const NavArea&) const = default;
+};
+
+// Off-mesh link (jump, ladder, gap) from `start` to `end` (entity space; both must lie near the
+// navmesh). Agents of the profiles in `profiles` (bit per NavSettings::profiles) may use it.
+struct NavLink {
+    glm::vec3     start{0.0f};
+    glm::vec3     end{0.0f, 0.0f, 2.0f};
+    float         radius        = 0.5f; // snapping distance of the end points to the mesh
+    bool          bidirectional = true;
+    std::string   area          = "Default";
+    std::uint32_t profiles      = 0xFFFFFFFFu;
+
+    bool operator==(const NavLink&) const = default;
+};
+
+// Moving obstacle cut out of the navmesh at runtime (tile cache), e.g. crates or doors: follows the
+// entity (box: yaw only). Cheaper than rebuilding tiles from geometry.
+enum class NavObstacleShape : std::uint8_t { Box, Cylinder };
+
+struct NavObstacle {
+    NavObstacleShape shape = NavObstacleShape::Box;
+    glm::vec3        halfExtents{0.5f}; // box, scaled by the entity
+    float            radius  = 0.5f;    // cylinder (base at the entity), scaled by the largest XZ axis
+    float            height  = 1.0f;
+    bool             enabled = true;
+
+    bool operator==(const NavObstacle&) const = default;
+};
+
+// Crowd agent (DetourCrowd): moves along the navmesh of its profile towards a target
+// (NavigationWorld::MoveTo, Blueprint "AI Move To"), avoiding other agents. With a
+// CharacterController (and driveCharacter) the velocity goes to the character, else the
+// navigation moves the entity itself.
+enum class NavAvoidance : std::uint8_t { Off, Low, Medium, High };
+
+struct NavAgent {
+    std::string   profile = "Default";
+    float         maxSpeed          = 3.5f;  // m/s
+    float         acceleration      = 10.0f; // m/s^2
+    float         stoppingDistance  = 0.2f;  // arrives within this distance of the target
+    float         separationWeight  = 2.0f;
+    NavAvoidance  avoidance         = NavAvoidance::Medium;
+    bool          faceMovement      = true;  // turns the entity (yaw) towards its velocity
+    bool          driveCharacter    = true;
+    std::uint32_t areaMask          = 0xFFFFFFFFu; // bit per NavSettings::areas the agent may walk on
+
+    bool operator==(const NavAgent&) const = default;
+};
+
 // Illuminance below which a light without explicit range is cut off (lights need a finite range
 // for clustering).
 inline constexpr float kLightCutoffIlluminance = 0.005f;
