@@ -53,8 +53,12 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Modulare Emitter (Niagara-artige Stacks), CPU-Simulation mit Jobs, Sprites/Mesh-Partikel/Ribbons, Sub-Emitter, Kollision, Partikel-Editor mit Vorschau.
 - Fortschritt (2026-10-14): umgesetzt und lokal verifiziert – `.uparticle` mit 22 Modulen in vier Stufen, Kurven/Gradienten, deterministische CPU-Simulation auf dem ThreadPool, Kollision per Physik-Raycast, Sub-Emitter (Spawn/Death/Collision/Trail), Sprites (Billboard-Modi, Flipbook, Soft Particles), Mesh-Partikel, Ribbons, Komponente + Blueprint-Knoten + Cooker, Partikel-Editor (Undo, Live-Vorschau, Live-Übernahme in die Szene), Template-Effekte. Grenzen in CLAUDE.md, Offene Punkte 20.
 
-### Phasen 29–34 (C, Reihenfolge vom Nutzer bestätigt)
-- 29 Navmesh (Recast/Detour, gekachelt, Laufzeit-Rebake), 30 Animation-State-Machine/IK, 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
+### Phase 29 – Navigation (C)
+- Recast/Detour gekachelt mit Laufzeit-Rebake, DetourCrowd, mehrere Agenten-Profile, Areas/Kosten, Off-Mesh-Links, dynamische Hindernisse, gebackene Datei, vollständige Editor-Werkzeuge.
+- Fortschritt (2026-10-15): umgesetzt und lokal verifiziert – TileCache-Navmesh pro Profil aus statischen Collidern in NavMeshBounds, Hintergrund-Neubau geänderter Kacheln, `.unav` neben der Szene (beim Laden nur geänderte Kacheln neu), Areas/Blocked, Links, Hindernisse, Crowd-Agenten (direkt oder über den CharacterController), Abfragen, Blueprint-Knoten (AI Move To, Find Path, …), Editor (Navigation-Fenster, Overlay, Testpfad, Inspector, Project Settings), Physics-Template-Wanderer. Grenzen in CLAUDE.md, Offene Punkte 21.
+
+### Phasen 30–34 (C, Reihenfolge vom Nutzer bestätigt)
+- 30 Animation-State-Machine/IK, 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
 
 ## Arbeitsregeln
 - Pro Phase erst bestehende Schnittstellen prüfen, dann vertikal implementieren (Datenformat → Laufzeit → Editor/Player → Dokumentation).

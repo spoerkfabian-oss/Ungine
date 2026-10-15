@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-14 (Phase 28 particles merged via PR #18 (merge fde7c2f, 2026-10-15), `branch` restarted from main; next Phase 29 navmesh after the merge, ask first)
+- Last updated: 2026-10-15 (Phase 28 merged (PR #18); Phase 29 navigation implemented on `branch`, PR pending; next Phase 30 animation state machine / IK after the merge, ask first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -837,6 +837,14 @@ Technical details: CLAUDE.md "Partikel (Phase 28)".
 - Found by the new cook test: effect texture paths and (Phase 27!) sound-cue variant paths outside their own folder ("../Textures/x.png") were stored absolute - packaged games on another machine would not find them. Both now store relative paths across folders like scene files (absolute only without a relative path).
 - Tests: CPU `tests/ParticleTests.cpp` (6 cases) + `Cook_ParticleEffectReferences`, GPU `Render_ParticlesSpritesRibbonsMeshes`, `Editor_ParticleEditorAndPreview`.
 
+### Phase 29 navigation (2026-10-15)
+Technical details: CLAUDE.md "Navigation (Phase 29)".
+
+- New dependency recastnavigation v1.6.0 (static lib `recastnav` from Recast/Detour/DetourCrowd/DetourTileCache sources, engine-private, -O2). New `engine/include/Engine/Navigation/` (`NavTypes.h` settings/profiles/areas/path types, `NavigationWorld.h`), private `src/Navigation/NavJson` (project settings JSON), components NavMeshBounds/NavArea/NavLink/NavObstacle/NavAgent, `ScriptContext::Navigation()` / `ScriptSystem::SetNavigationWorld`, AI blueprint nodes, `EditorContext::navigation`, editor `Navigation.cpp` window + overlay + inspector, Project Settings "Navigation", Physics template Wander.ugraph + agent + box obstacles.
+- Design: one tile cache + navmesh + query + crowd per profile; tiles rasterized in ThreadPool jobs (generation per tile drops stale results); sources diffed every Update by signature (UUID-keyed); baked `.unav` stores tiles + source signatures so loading rebuilds only changed tiles; Flush() for saving.
+- Found while testing: Detour's findRandomPointAroundCircle returns points far outside the radius (random point on a big polygon) → retry until inside; character agents on off-mesh links never crossed (npos overwritten by the character every frame) → while OFFMESH the entity is placed directly (test with a real gap, red without the fix); tiles rebuilt while a baked mesh collider was still loading would keep the hole → `missed` flag rebuilds them; replaced cache tiles lose their obstacles (touched refs) → obstacles re-added after a tile rebuild.
+- Tests: CPU `tests/NavigationTests.cpp` (6 cases), GPU `Editor_NavigationBakeOverlayAndPlay`.
+
 ## 19. Important CI lesson
 
 A previous failure showed that syntax-only checking was insufficient.
@@ -895,6 +903,12 @@ Particles:
 - no GPU-side flipbook blending between frames, no motion vectors, no light emission, no vector fields / skeletal mesh sampling
 - effects restart on file changes (no state carry-over); one-shots from scripts are not stopped by ScriptSystem::End (Play/Stop and level changes reset the world)
 - a SceneRenderer must not render twice per frame (per-frame particle buffers are overwritten)
+
+Navigation:
+- geometry only from colliders (static / without RigidBody), no render meshes; dynamic objects need NavObstacle; no detail meshes (heights from polygons); tiles stored uncompressed
+- off-mesh links only between neighboring tiles (< tile size 9.6 m by default), traversed linearly (characters teleported along); obstacles box-with-yaw / cylinder only
+- baked file only for the main scene; source signatures miss model file changes with identical index counts / bounds
+- sources diffed every Update (O(colliders) per frame)
 
 Audio:
 - no HRTF
@@ -1012,3 +1026,4 @@ If an audit finds no concrete defect:
 - Phase 26 (physics materials, contact data, joints, ragdolls, character tools) merged as PR #16 (2026-10-12).
 - Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) merged (PR #17, 2026-10-14).
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
+- Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) implemented on `branch` (2026-10-15), PR pending.

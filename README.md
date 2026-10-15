@@ -134,6 +134,14 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     bzw. Drag & Drop in den Viewport (Komponente *Particle System*); Blueprint-Knoten *Spawn Emitter
     at Location*, *Play/Stop Particles*, *Set Particle Scale/Tint*. Beispiele: Lagerfeuer (Basic),
     Funkenbrunnen mit Kollision und Spuren (Physics).
+19. **Navigation (KI)**: Hierarchy → *+ Add* → *Nav Mesh Bounds* um den begehbaren Bereich legen –
+    das Navmesh entsteht aus den statischen Collidern darin und folgt jeder Änderung (Fenster
+    *Navigation*: Overlay, *Bake*, Testpfad per *Pick start/end* + Klick im Viewport). Gespeichert
+    wird es als `.unav` neben der Szene. *Nav Area* markiert Flächen (Kosten, *Blocked*), *Nav Link*
+    verbindet Punkte (Sprünge, Leitern), *Nav Obstacle* schneidet bewegliche Objekte heraus.
+    Figuren bekommen die Komponente *Nav Agent* und laufen per Blueprint *AI Move To* (weichen
+    einander aus; mit Character Controller über die Physik). Agenten-Profile (Radius/Höhe) und
+    Area-Typen: *File → Project settings → Navigation*. Beispiel: der Wanderer im Physics-Template.
 
 
 ## Entwicklung

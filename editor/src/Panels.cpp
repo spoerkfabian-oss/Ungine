@@ -295,12 +295,12 @@ void Editor::DrawHierarchy()
         }
         ImGui::Separator();
         const auto navEntity = [&](const char* name, auto component) {
-            const Entity e = m_Ctx.scene.CreateEntity(name);
-            m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
-            registry.Emplace<decltype(component)>(e, component);
-            const Entity roots[] = {e};
-            PushCreated(std::string("Create ") + name, roots);
-            Select(e);
+            const Entity created = m_Ctx.scene.CreateEntity(name);
+            m_Ctx.scene.EditTransform(created).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<decltype(component)>(created, component);
+            const Entity createdRoots[] = {created};
+            PushCreated(std::string("Create ") + name, createdRoots);
+            Select(created);
         };
         if (ImGui::MenuItem("Nav Mesh Bounds"))
             navEntity("Nav Mesh Bounds", NavMeshBounds{});

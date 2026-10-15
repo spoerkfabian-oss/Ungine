@@ -254,6 +254,7 @@ struct SourceRecord {
     Box                    bounds;
     std::vector<glm::vec3> triangles; // 3 per triangle
     bool                   hasTriangles = false; // false: loaded from a baked file, filled on the next collect
+    bool                   missed       = false; // a tile was built without its triangles (mesh still loading)
     bool                   seen         = false;
 };
 
@@ -359,9 +360,7 @@ struct MeshProcess final : dtTileCacheMeshProcess {
         for (int i = 0; i < params->polyCount; ++i) {
             if (polyAreas[i] == DT_TILECACHE_WALKABLE_AREA)
                 polyAreas[i] = 1;
-            polyFlags[i] = polyAreas[i] > 0 && polyAreas[i] <= 16
-                               ? static_cast<unsigned short>(1u << (polyAreas[i] - 1))
-                               : 0;
+            polyFlags[i] = static_cast<unsigned short>(polyAreas[i] > 0 && polyAreas[i] <= 16 ? 1u << (polyAreas[i] - 1) : 0u);
         }
         params->buildBvTree = true;
         if (!linkAreas.empty()) {
@@ -470,7 +469,8 @@ TileOutput BuildTileLayers(const TileInput& in)
                         inside = true;
                         break;
                     }
-                chf.areas[i] = inside ? (chf.areas[i] == RC_WALKABLE_AREA ? 1 : chf.areas[i]) : RC_NULL_AREA;
+                chf.areas[i] = static_cast<unsigned char>(
+                    inside ? (chf.areas[i] == RC_WALKABLE_AREA ? 1 : chf.areas[i]) : RC_NULL_AREA);
             }
         }
     for (const AreaRecord& area : in.areas) {
@@ -883,10 +883,11 @@ struct NavigationWorld::Impl {
             Box box;
             for (const glm::vec3& p : *tris)
                 box.Add(p);
-            if (record.signature != signature) {
+            if (record.signature != signature || record.missed) {
                 MarkDirty(record.bounds);
                 MarkDirty(box);
             }
+            record.missed       = false;
             record.signature    = signature;
             record.bounds       = box;
             record.triangles    = std::move(*tris);
@@ -1052,7 +1053,7 @@ struct NavigationWorld::Impl {
                     continue;
                 mp.linkVerts.insert(mp.linkVerts.end(), {l->start.x, l->start.y, l->start.z, l->end.x, l->end.y, l->end.z});
                 mp.linkRadii.push_back(l->radius);
-                mp.linkDirs.push_back(l->bidirectional ? DT_OFFMESH_CON_BIDIR : 0);
+                mp.linkDirs.push_back(static_cast<unsigned char>(l->bidirectional ? DT_OFFMESH_CON_BIDIR : 0u));
                 mp.linkAreas.push_back(l->areaId);
                 mp.linkFlags.push_back(static_cast<unsigned short>(1u << (l->areaId - 1)));
                 mp.linkIds.push_back(static_cast<unsigned int>(l->uuid & 0xFFFFFFFFu));
@@ -1187,9 +1188,10 @@ struct NavigationWorld::Impl {
         Box clip  = rect;
         clip.min.y = ymin - 1.0f;
         clip.max.y = c.bmax[1] + 1.0f;
-        for (const auto& [uuid, s] : sources) {
+        for (auto& [uuid, s] : sources) {
             if (!s.bounds.Overlaps(clip))
                 continue;
+            s.missed = s.missed || !s.hasTriangles; // rebuilt once its triangles are there
             for (std::size_t t = 0; t + 2 < s.triangles.size(); t += 3) {
                 Box tri;
                 tri.Add(s.triangles[t]), tri.Add(s.triangles[t + 1]), tri.Add(s.triangles[t + 2]);
@@ -1424,7 +1426,8 @@ struct NavigationWorld::Impl {
                 const dtCrowdAgentParams ap = AgentParams(*p, config);
                 p->crowd->updateAgentParameters(a.index, &ap);
             }
-            if (a.character) // the character controller moved it: follow
+            // The character controller moved it: follow (not while the crowd carries it over a link).
+            if (a.character && p->crowd->getAgent(a.index)->state != DT_CROWDAGENT_STATE_OFFMESH)
                 dtVcopy(p->crowd->getEditableAgent(a.index)->npos, glm::value_ptr(position));
             if (const auto move = pendingMoves.find(id); move != pendingMoves.end()) {
                 a.target                     = move->second.target;
@@ -1490,10 +1493,13 @@ struct NavigationWorld::Impl {
                     a.status = NavMoveStatus::Failed;
                 }
             }
-            if (a.character) {
+            const bool offMesh = ag->state == DT_CROWDAGENT_STATE_OFFMESH;
+            if (a.character && !offMesh) {
                 physics->SetCharacterInput(e, glm::vec3(velocity.x, 0.0f, velocity.z), false);
                 continue;
             }
+            if (a.character) // over a link (jump, ladder): placed directly, the physics takes it as a teleport
+                physics->SetCharacterInput(e, glm::vec3(0.0f), false);
             // Direct movement: world position (and yaw) -> local transform.
             glm::mat4 parentWorld(1.0f);
             if (const Hierarchy* h = reg.TryGet<Hierarchy>(e); h && h->parent != NullEntity)

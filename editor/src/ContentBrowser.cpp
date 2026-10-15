@@ -1855,9 +1855,9 @@ void Editor::DrawProjectSettings()
             changed |= ImGui::InputText("##name", &p.name);
             ImGui::SameLine();
             ImGui::SetNextItemWidth(200.0f);
-            float size[2] = {p.radius, p.height};
-            if (ImGui::DragFloat2("radius / height", size, 0.01f, 0.05f, 50.0f, "%.2f")) {
-                p.radius = size[0], p.height = size[1];
+            float shape[2] = {p.radius, p.height};
+            if (ImGui::DragFloat2("radius / height", shape, 0.01f, 0.05f, 50.0f, "%.2f")) {
+                p.radius = shape[0], p.height = shape[1];
                 changed  = true;
             }
             ImGui::SetNextItemWidth(110.0f);

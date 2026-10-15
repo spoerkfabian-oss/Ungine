@@ -318,6 +318,36 @@ TEST_CASE(Navigation_AgentDrivesCharacterController)
     const glm::vec3 end = scene.GetRegistry().Get<Transform>(walker).position;
     CHECK(glm::distance(glm::vec2(end.x, end.z), glm::vec2(5.0f, 0.0f)) < 0.5f && Near(end.y, 0.0f, 0.1f));
     CHECK(maxZ > 1.0f); // around the pillar, moved by the physics
+
+    // Over a link: two platforms with a 2 m gap (z in [4, 6]) the character cannot walk across;
+    // the crowd carries it over the link and it walks on to the target.
+    Scene gapScene;
+    for (const float z : {-1.0f, 11.0f}) {
+        const Entity platform = Box(gapScene, "Platform", {0.0f, -0.5f, z}, {6.0f, 0.5f, 5.0f});
+        gapScene.GetRegistry().Emplace<RigidBody>(platform, RigidBody{.type = BodyType::Static});
+    }
+    const Entity gapBounds = gapScene.CreateEntity("Bounds");
+    gapScene.GetRegistry().Emplace<NavMeshBounds>(gapBounds, NavMeshBounds{.halfExtents = {8.0f, 4.0f, 18.0f}});
+    const Entity link = gapScene.CreateEntity("Link");
+    gapScene.GetRegistry().Emplace<NavLink>(link, NavLink{.start = {0.0f, 0.0f, 3.5f}, .end = {0.0f, 0.0f, 6.5f}});
+    PhysicsWorld    gapPhysics(pool, bus);
+    NavigationWorld gapNav(&pool, nullptr, &gapPhysics);
+    gapNav.Build(gapScene);
+    const Entity jumper = gapScene.CreateEntity("Jumper");
+    gapScene.EditTransform(jumper).position = {0.0f, 0.0f, 0.0f};
+    gapScene.GetRegistry().Emplace<CharacterController>(jumper, CharacterController{.radius = 0.3f, .height = 1.8f});
+    gapScene.GetRegistry().Emplace<NavAgent>(jumper);
+    gapPhysics.Sync(gapScene);
+    gapNav.MoveTo(jumper, {0.0f, 0.0f, 10.0f});
+    float minY = 0.0f;
+    for (int i = 0; i < 900 && gapNav.MoveStatus(jumper) == NavMoveStatus::Moving; ++i) {
+        gapNav.Update(gapScene, 1.0f / 60.0f);
+        gapPhysics.Step(gapScene, 1.0f / 60.0f);
+        minY = std::min(minY, gapScene.GetRegistry().Get<Transform>(jumper).position.y);
+    }
+    CHECK(gapNav.MoveStatus(jumper) == NavMoveStatus::Arrived);
+    const glm::vec3 landed = gapScene.GetRegistry().Get<Transform>(jumper).position;
+    CHECK(landed.z > 9.0f && Near(landed.y, 0.0f, 0.1f) && minY > -0.5f); // never fell into the gap
 }
 
 TEST_CASE(Navigation_BlueprintNodesAndSerialization)

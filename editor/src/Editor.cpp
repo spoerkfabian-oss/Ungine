@@ -673,23 +673,23 @@ void Editor::DrawViewport()
         DrawNavigationOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     // Navigation test path: a click places its start / end on the surface under the cursor.
     if (m_Ctx.navigation && m_NavPick != NavPick::None && clicked && !iconHit) {
-        const ImVec2     mouse = ImGui::GetIO().MousePos;
-        const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
-                             1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
-        const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
-        const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
-        const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
-        std::optional<glm::vec3> point;
+        const ImVec2     cursor = ImGui::GetIO().MousePos;
+        const glm::vec2  cursorNdc((cursor.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                   1.0f - (cursor.y - origin.y) / static_cast<float>(height) * 2.0f);
+        const CameraData view = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+        const glm::vec4  farPoint = glm::inverse(view.projection * view.view) * glm::vec4(cursorNdc, 0.5f, 1.0f);
+        const glm::vec3  ray      = glm::normalize(glm::vec3(farPoint) / farPoint.w - view.position);
+        std::optional<glm::vec3> picked;
         if (m_Ctx.physics)
-            if (const auto hit = m_Ctx.physics->Raycast(cam.position, dir, 10000.0f))
-                point = hit->point;
-        if (!point)
-            if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
-                point = cam.position + dir * hit->distance;
-        if (!point && dir.y < -1e-3f)
-            point = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
-        if (point) {
-            const glm::vec3 snapped = m_Ctx.navigation->ProjectPoint(*point, m_NavProfile).value_or(*point);
+            if (const auto physicsHit = m_Ctx.physics->Raycast(view.position, ray, 10000.0f))
+                picked = physicsHit->point;
+        if (!picked)
+            if (const auto boundsHit = m_Ctx.sceneRenderer.Spatial().Raycast(view.position, ray, 10000.0f))
+                picked = view.position + ray * boundsHit->distance;
+        if (!picked && ray.y < -1e-3f)
+            picked = view.position + ray * (-view.position.y / ray.y); // ground plane y = 0
+        if (picked) {
+            const glm::vec3 snapped = m_Ctx.navigation->ProjectPoint(*picked, m_NavProfile).value_or(*picked);
             (m_NavPick == NavPick::Start ? m_NavStart : m_NavEnd) = snapped;
             m_NavPick = m_NavPick == NavPick::Start && !m_NavEnd ? NavPick::End : NavPick::None;
             UpdateNavigationTestPath();
