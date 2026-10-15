@@ -106,8 +106,9 @@ public:
 
     // --- Agents (entities with NavAgent) ---
     // Starts moving to target (projected onto the navmesh). Before the agent joined the crowd the
-    // request waits for the next Update. Status Moving -> Arrived / Failed.
-    void MoveTo(Entity entity, const glm::vec3& target);
+    // request waits for the next Update. Status Moving -> Arrived / Failed. acceptanceRadius < 0:
+    // the agent's stoppingDistance.
+    void MoveTo(Entity entity, const glm::vec3& target, float acceptanceRadius = -1.0f);
     void StopMovement(Entity entity);
     [[nodiscard]] NavMoveStatus MoveStatus(Entity entity) const;
     [[nodiscard]] glm::vec3     AgentVelocity(Entity entity) const;

@@ -572,6 +572,7 @@ struct NavigationWorld::Impl {
         NavMoveStatus status  = NavMoveStatus::Idle;
         glm::vec3     target{0.0f};
         glm::vec3     written{0.0f}; // last position written to the entity (direct movement)
+        float         acceptance = -1.0f; // of the current move (< 0: params.stoppingDistance)
         bool          character = false;
         bool          seen      = false;
     };
@@ -592,7 +593,11 @@ struct NavigationWorld::Impl {
     bool                                              everythingDirty = false;
     bool                                              linksChanged    = false;
     std::unordered_map<std::uint64_t, Agent>          agents; // by entity id
-    std::unordered_map<std::uint64_t, glm::vec3>      pendingMoves;
+    struct MoveRequest {
+        glm::vec3 target{0.0f};
+        float     acceptance = -1.0f;
+    };
+    std::unordered_map<std::uint64_t, MoveRequest>    pendingMoves;
     std::unordered_map<std::uint64_t, NavMoveStatus>  orphanMoves; // requests of entities that never became agents
     std::mt19937_64                                   random{static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count())};
@@ -1315,11 +1320,19 @@ struct NavigationWorld::Impl {
 
     // --- Agents ---
 
+    void RemoveAgent(std::uint64_t id, Agent& a)
+    {
+        if (Profile* p = GetProfile(a.profile); p && a.index >= 0)
+            p->crowd->removeAgent(a.index);
+        if (a.character && physics) // the character would keep walking with the last input
+            physics->SetCharacterInput(static_cast<Entity>(id), glm::vec3(0.0f), false);
+        a.index = -1;
+    }
+
     void DropAgents()
     {
         for (auto& [id, a] : agents)
-            if (Profile* p = GetProfile(a.profile); p && a.index >= 0)
-                p->crowd->removeAgent(a.index);
+            RemoveAgent(id, a);
         agents.clear();
     }
 
@@ -1392,7 +1405,7 @@ struct NavigationWorld::Impl {
                 GetProfile(a.profile)->crowd->removeAgent(a.index);
                 a.index = -1;
                 if (a.status == NavMoveStatus::Moving)
-                    pendingMoves.emplace(id, a.target);
+                    pendingMoves.emplace(id, MoveRequest{a.target, a.acceptance});
             }
             if (a.index < 0) {
                 const glm::vec3 extents(p->config.radius * 2.0f, p->config.height, p->config.radius * 2.0f);
@@ -1414,9 +1427,10 @@ struct NavigationWorld::Impl {
             if (a.character) // the character controller moved it: follow
                 dtVcopy(p->crowd->getEditableAgent(a.index)->npos, glm::value_ptr(position));
             if (const auto move = pendingMoves.find(id); move != pendingMoves.end()) {
-                a.target                     = move->second;
+                a.target                     = move->second.target;
+                a.acceptance                 = move->second.acceptance;
                 const dtQueryFilter& filter  = *p->crowd->getFilter(p->crowd->getAgent(a.index)->params.queryFilterType);
-                const auto           target  = Nearest(*p, move->second, glm::vec3(2.0f, 4.0f, 2.0f), filter);
+                const auto           target  = Nearest(*p, move->second.target, glm::vec3(2.0f, 4.0f, 2.0f), filter);
                 if (target && p->crowd->requestMoveTarget(a.index, target->first, glm::value_ptr(target->second))) {
                     a.target = target->second;
                     a.status = NavMoveStatus::Moving;
@@ -1428,8 +1442,7 @@ struct NavigationWorld::Impl {
         });
         for (auto it = agents.begin(); it != agents.end();) {
             if (!it->second.seen) {
-                if (Profile* p = GetProfile(it->second.profile); p && it->second.index >= 0)
-                    p->crowd->removeAgent(it->second.index);
+                RemoveAgent(it->first, it->second);
                 pendingMoves.erase(it->first);
                 it = agents.erase(it);
             } else {
@@ -1463,7 +1476,7 @@ struct NavigationWorld::Impl {
             const glm::vec3 position = V3(ag->npos);
             if (a.status == NavMoveStatus::Moving) {
                 const glm::vec3 delta = a.target - position;
-                const float     reach = std::max(a.params.stoppingDistance, 0.05f);
+                const float     reach = std::max(a.acceptance >= 0.0f ? a.acceptance : a.params.stoppingDistance, 0.05f);
                 if (glm::length(glm::vec2(delta.x, delta.z)) <= reach && std::abs(delta.y) < p.config.height) {
                     p.crowd->resetMoveTarget(a.index);
                     a.status = NavMoveStatus::Arrived;
@@ -1958,10 +1971,10 @@ void NavigationWorld::SetRandomSeed(std::uint64_t seed) { m_Impl->random.seed(se
 
 // --- Agents ---
 
-void NavigationWorld::MoveTo(Entity entity, const glm::vec3& target)
+void NavigationWorld::MoveTo(Entity entity, const glm::vec3& target, float acceptanceRadius)
 {
     const std::uint64_t id = static_cast<std::uint64_t>(entity);
-    m_Impl->pendingMoves[id] = target;
+    m_Impl->pendingMoves[id] = Impl::MoveRequest{target, acceptanceRadius};
     m_Impl->orphanMoves.erase(id);
     if (const auto it = m_Impl->agents.find(id); it != m_Impl->agents.end())
         it->second.status = NavMoveStatus::Moving;

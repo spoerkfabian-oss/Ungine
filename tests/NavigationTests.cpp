@@ -2,9 +2,14 @@
 
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
+#include "Engine/Events/EventBus.h"
 #include "Engine/Navigation/NavigationWorld.h"
+#include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Script/ScriptGraph.h"
+#include "Engine/Script/ScriptSystem.h"
 
 #include <glm/gtc/quaternion.hpp>
 
@@ -203,4 +208,229 @@ TEST_CASE(Navigation_AreasObstaclesLinksAndBakedFiles)
     other.SetSettings(coarse);
     CHECK(!other.LoadBaked(file, &error) && !error.empty());
     CHECK(!other.LoadBaked(dir / "missing.unav", &error));
+}
+
+TEST_CASE(Navigation_CrowdAgentsMoveAvoidAndDriveCharacters)
+{
+    ThreadPool pool{2};
+    Scene      scene;
+    Ground(scene);
+    Box(scene, "Wall", {0.0f, 1.0f, 0.0f}, {0.25f, 1.0f, 6.0f});
+
+    // Tiles built in jobs equal the synchronous build.
+    NavigationWorld sync;
+    sync.Build(scene);
+    NavigationWorld nav(&pool);
+    nav.Build(scene);
+    CHECK(nav.Stats().tiles == sync.Stats().tiles && nav.Stats().polygons == sync.Stats().polygons);
+    CHECK(Near(nav.FindPath({-5, 0, 0}, {5, 0, 0}).Length(), sync.FindPath({-5, 0, 0}, {5, 0, 0}).Length(), 1e-4f));
+
+    // Two agents swap sides around the wall's end, avoiding each other.
+    const auto agent = [&](const char* name, const glm::vec3& at) {
+        const Entity e = scene.CreateEntity(name);
+        scene.EditTransform(e).position = at;
+        scene.GetRegistry().Emplace<NavAgent>(e, NavAgent{.maxSpeed = 4.0f});
+        return e;
+    };
+    const Entity left  = agent("Left", {-5.0f, 0.0f, 0.0f});
+    const Entity right = agent("Right", {5.0f, 0.0f, 0.0f});
+    nav.MoveTo(left, {5.0f, 0.0f, 0.0f});
+    nav.MoveTo(right, {-5.0f, 0.0f, 0.0f});
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Moving);
+    float maxZ = 0.0f, minGap = 1e9f;
+    for (int i = 0; i < 600 && (nav.MoveStatus(left) == NavMoveStatus::Moving ||
+                                nav.MoveStatus(right) == NavMoveStatus::Moving); ++i) {
+        nav.Update(scene, 1.0f / 30.0f);
+        const glm::vec3 l = scene.GetRegistry().Get<Transform>(left).position;
+        const glm::vec3 r = scene.GetRegistry().Get<Transform>(right).position;
+        maxZ   = std::max(maxZ, std::abs(l.z));
+        minGap = std::min(minGap, glm::distance(l, r));
+    }
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Arrived && nav.MoveStatus(right) == NavMoveStatus::Arrived);
+    CHECK(glm::distance(scene.GetRegistry().Get<Transform>(left).position, glm::vec3(5.0f, 0.0f, 0.0f)) < 0.4f);
+    CHECK(maxZ > 5.5f);       // went around the wall
+    CHECK(minGap > 0.5f);     // never ran through each other (radius 0.4 each)
+    CHECK(nav.Stats().agents == 2);
+    // Facing its movement: the left agent ended up walking +X (forward = -Z rotated to +X).
+    const glm::vec3 forward = scene.GetRegistry().Get<Transform>(left).rotation * glm::vec3(0.0f, 0.0f, -1.0f);
+    CHECK(forward.x > 0.5f);
+
+    // Unreachable / off-mesh target: Failed. Stop: Idle.
+    nav.MoveTo(left, {50.0f, 0.0f, 0.0f});
+    nav.Update(scene, 1.0f / 30.0f);
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Failed);
+    nav.MoveTo(left, {-5.0f, 0.0f, 8.0f});
+    nav.Update(scene, 1.0f / 30.0f);
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Moving);
+    nav.StopMovement(left);
+    for (int i = 0; i < 30; ++i)
+        nav.Update(scene, 1.0f / 30.0f);
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Idle && glm::length(nav.AgentVelocity(left)) < 0.05f);
+    // A request for an entity without NavAgent fails.
+    const Entity plain = scene.CreateEntity("Plain");
+    nav.MoveTo(plain, {0.0f, 0.0f, 8.0f});
+    nav.Update(scene, 1.0f / 30.0f);
+    CHECK(nav.MoveStatus(plain) == NavMoveStatus::Failed);
+    // Removing the component removes the agent; teleporting re-places it.
+    scene.GetRegistry().Remove<NavAgent>(right);
+    nav.Update(scene, 1.0f / 30.0f);
+    CHECK(!nav.HasAgent(right) && nav.Stats().agents == 1);
+    scene.EditTransform(left).position = {-6.0f, 0.0f, -6.0f};
+    nav.MoveTo(left, {-6.0f, 0.0f, 6.0f});
+    for (int i = 0; i < 300 && nav.MoveStatus(left) == NavMoveStatus::Moving; ++i)
+        nav.Update(scene, 1.0f / 30.0f);
+    CHECK(nav.MoveStatus(left) == NavMoveStatus::Arrived);
+    // Edit mode (no simulation): agents leave the crowd and stay put.
+    nav.Update(scene, 1.0f / 30.0f, false);
+    CHECK(!nav.HasAgent(left));
+}
+
+TEST_CASE(Navigation_AgentDrivesCharacterController)
+{
+    ThreadPool pool{2};
+    EventBus   bus;
+    Scene      scene;
+    const Entity ground = Box(scene, "Ground", {0.0f, -0.5f, 0.0f}, {10.0f, 0.5f, 10.0f});
+    scene.GetRegistry().Emplace<RigidBody>(ground, RigidBody{.type = BodyType::Static});
+    const Entity bounds = scene.CreateEntity("Bounds");
+    scene.GetRegistry().Emplace<NavMeshBounds>(bounds, NavMeshBounds{.halfExtents = {12.0f, 4.0f, 12.0f}});
+    const Entity pillar = Box(scene, "Pillar", {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f});
+    scene.GetRegistry().Emplace<RigidBody>(pillar, RigidBody{.type = BodyType::Static});
+
+    PhysicsWorld    physics(pool, bus);
+    NavigationWorld nav(&pool, nullptr, &physics);
+    nav.Build(scene);
+    CHECK(nav.Stats().sources == 2);
+
+    const Entity walker = scene.CreateEntity("Walker");
+    scene.EditTransform(walker).position = {-5.0f, 0.0f, 0.0f};
+    scene.GetRegistry().Emplace<CharacterController>(walker, CharacterController{.radius = 0.3f, .height = 1.8f});
+    scene.GetRegistry().Emplace<NavAgent>(walker);
+    physics.Sync(scene);
+    nav.MoveTo(walker, {5.0f, 0.0f, 0.0f});
+    float maxZ = 0.0f;
+    for (int i = 0; i < 600 && nav.MoveStatus(walker) == NavMoveStatus::Moving; ++i) {
+        nav.Update(scene, 1.0f / 60.0f);
+        physics.Step(scene, 1.0f / 60.0f);
+        maxZ = std::max(maxZ, std::abs(scene.GetRegistry().Get<Transform>(walker).position.z));
+    }
+    CHECK(nav.MoveStatus(walker) == NavMoveStatus::Arrived);
+    const glm::vec3 end = scene.GetRegistry().Get<Transform>(walker).position;
+    CHECK(glm::distance(glm::vec2(end.x, end.z), glm::vec2(5.0f, 0.0f)) < 0.5f && Near(end.y, 0.0f, 0.1f));
+    CHECK(maxZ > 1.0f); // around the pillar, moved by the physics
+}
+
+TEST_CASE(Navigation_BlueprintNodesAndSerialization)
+{
+    Scene scene;
+    Ground(scene);
+    Box(scene, "Wall", {0.0f, 1.0f, 0.0f}, {0.25f, 1.0f, 6.0f});
+    NavigationWorld nav;
+    nav.Build(scene);
+
+    EventBus     events;
+    ScriptSystem scripts(events);
+    scripts.SetNavigationWorld(&nav);
+    ScriptGraph graph;
+    const auto  node = [&](const char* type) { return graph.AddNode(type, {}, {}); };
+    const auto  link = [&](std::uint32_t a, const char* pa, std::uint32_t b, const char* pb) {
+        CHECK(graph.Connect(a, pa, b, pb).empty());
+    };
+    // BeginPlay: print the path length, move to (5, 0, 0); on Success move to an unreachable point;
+    // on its Failed print "failed".
+    const std::uint32_t begin = node("Event.BeginPlay");
+    const std::uint32_t path  = node("AI.FindPath");
+    graph.FindNode(path)->defaults["Start"] = glm::vec3(-5.0f, 0.0f, 0.0f);
+    graph.FindNode(path)->defaults["End"]   = glm::vec3(5.0f, 0.0f, 0.0f);
+    const std::uint32_t printLength = node("Debug.Print");
+    const std::uint32_t move        = node("AI.MoveTo");
+    graph.FindNode(move)->defaults["Location"] = glm::vec3(5.0f, 0.0f, 0.0f);
+    const std::uint32_t arrived = node("Debug.Print");
+    graph.FindNode(arrived)->defaults["Text"] = std::string("arrived");
+    const std::uint32_t away = node("AI.MoveTo");
+    graph.FindNode(away)->defaults["Location"] = glm::vec3(50.0f, 0.0f, 0.0f);
+    const std::uint32_t failed = node("Debug.Print");
+    graph.FindNode(failed)->defaults["Text"] = std::string("failed");
+    link(begin, "Out", printLength, "In");
+    link(path, "Length", printLength, "Text");
+    link(printLength, "Then", move, "In");
+    link(move, "Success", arrived, "In");
+    link(arrived, "Then", away, "In");
+    link(away, "Failed", failed, "In");
+    // Pure queries on Tick: raycast hits the wall, random point found.
+    const std::uint32_t tick = node("Event.Tick");
+    const std::uint32_t ray  = node("AI.Raycast");
+    graph.FindNode(ray)->defaults["Start"] = glm::vec3(-5.0f, 0.0f, 3.0f);
+    graph.FindNode(ray)->defaults["End"]   = glm::vec3(5.0f, 0.0f, 3.0f);
+    const std::uint32_t random = node("AI.RandomPoint");
+    const std::uint32_t both   = node("Logic.And");
+    const std::uint32_t check  = node("Flow.Branch");
+    const std::uint32_t ok     = node("Debug.Print");
+    graph.FindNode(ok)->defaults["Text"] = std::string("queries ok");
+    link(ray, "Hit", both, "A");
+    link(random, "Found", both, "B");
+    link(tick, "Out", check, "In");
+    link(both, "Result", check, "Condition");
+    link(check, "True", ok, "In");
+    CHECK(ValidateScriptGraph(graph).empty());
+
+    const Entity actor = scene.CreateEntity("Actor");
+    scene.EditTransform(actor).position = {-5.0f, 0.0f, 0.0f};
+    scene.GetRegistry().Emplace<NavAgent>(actor, NavAgent{.maxSpeed = 5.0f});
+    scene.GetRegistry().Emplace<ScriptComponent>(actor, ScriptComponent{"ai.ugraph"});
+    scripts.Provide("ai.ugraph", graph);
+    scripts.Begin(scene);
+    CHECK(scripts.Stats().errors == 0);
+    CHECK(!scripts.Messages().empty() && std::stof(scripts.Messages().front().text) > 14.0f);
+    bool sawArrived = false, sawFailed = false, sawQueries = false;
+    for (int i = 0; i < 600 && !sawFailed; ++i) {
+        nav.Update(scene, 1.0f / 30.0f);
+        scripts.Update(scene, 1.0f / 30.0f);
+        for (const auto& m : scripts.Messages()) {
+            sawArrived = sawArrived || m.text == "arrived";
+            sawFailed  = sawFailed || m.text == "failed";
+            sawQueries = sawQueries || m.text == "queries ok";
+        }
+    }
+    CHECK(sawArrived && sawFailed && sawQueries);
+    CHECK(glm::distance(scene.GetRegistry().Get<Transform>(actor).position, glm::vec3(5.0f, 0.0f, 0.0f)) < 0.5f);
+    scripts.End(scene);
+
+    // Components round-trip through scene files and entity state.
+    const fs::path dir   = NavTempDir("navigation_scene");
+    const Entity   extra = scene.CreateEntity("Extras");
+    scene.GetRegistry().Emplace<NavArea>(extra, NavArea{.halfExtents = {1.0f, 2.0f, 3.0f}, .area = "Water"});
+    scene.GetRegistry().Emplace<NavLink>(extra, NavLink{.start = {1, 0, 0}, .end = {4, 1, 0}, .radius = 0.3f,
+                                                         .bidirectional = false, .area = "Rough", .profiles = 2u});
+    scene.GetRegistry().Emplace<NavObstacle>(extra, NavObstacle{.shape = NavObstacleShape::Cylinder, .radius = 0.7f,
+                                                                .height = 2.0f, .enabled = false});
+    scene.GetRegistry().Get<NavAgent>(actor) =
+        NavAgent{.profile = "Big", .maxSpeed = 2.0f, .avoidance = NavAvoidance::High, .faceMovement = false,
+                 .areaMask = 5u};
+    SaveSceneFile(dir / "Nav.scene.json", scene, nullptr);
+    Scene loaded;
+    (void)LoadSceneFile(dir / "Nav.scene.json", loaded, nullptr);
+    const Entity actor2 = loaded.FindByUuid(scene.GetRegistry().Get<Uuid>(actor).value);
+    const Entity extra2 = loaded.FindByUuid(scene.GetRegistry().Get<Uuid>(extra).value);
+    CHECK(loaded.GetRegistry().Get<NavAgent>(actor2) == scene.GetRegistry().Get<NavAgent>(actor));
+    CHECK(loaded.GetRegistry().Get<NavArea>(extra2) == scene.GetRegistry().Get<NavArea>(extra));
+    CHECK(loaded.GetRegistry().Get<NavLink>(extra2) == scene.GetRegistry().Get<NavLink>(extra));
+    CHECK(loaded.GetRegistry().Get<NavObstacle>(extra2) == scene.GetRegistry().Get<NavObstacle>(extra));
+    bool hasBounds = false;
+    loaded.GetRegistry().ViewOf<NavMeshBounds>().Each([&](Entity, NavMeshBounds& b) {
+        hasBounds = b.halfExtents == glm::vec3(12.0f, 4.0f, 12.0f);
+    });
+    CHECK(hasBounds);
+    const std::string state = SnapshotEntityState(scene, extra);
+    scene.GetRegistry().Remove<NavLink>(extra);
+    ApplyEntityState(scene, extra, state);
+    CHECK(scene.GetRegistry().Has<NavLink>(extra));
+
+    // Settings sanitizing: names unique, "Default" area first, values clamped.
+    NavSettings settings;
+    settings.profiles = {NavAgentProfile{.name = "A", .radius = -1.0f}, NavAgentProfile{.name = "A"}};
+    settings.areas    = {NavAreaType{.name = "Mud", .cost = 0.5f}, NavAreaType{.name = std::string(kNavAreaBlocked)}};
+    SanitizeNavSettings(settings);
+    CHECK(settings.profiles[0].radius > 0.0f && settings.profiles[1].name == "A 2");
+    CHECK(settings.areas.size() == 2 && settings.areas[0].name == "Default" && settings.areas[1].cost == 1.0f);
 }

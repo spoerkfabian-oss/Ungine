@@ -17,6 +17,7 @@ class AssetManager;
 class AudioSystem;
 class LevelStreamer;
 class ParticleWorld;
+class NavigationWorld;
 class GameOptions;
 struct UiEvent;
 class EventBus;
@@ -160,6 +161,8 @@ public:
     void SetLevelStreamer(LevelStreamer* streamer);
     // Particle effects (Spawn Emitter at Location, Play / Stop Particles, ...); null: those nodes report errors.
     void SetParticleWorld(ParticleWorld* particles);
+    // Navigation (AI Move To, Find Path, ...); null: those nodes report errors.
+    void SetNavigationWorld(NavigationWorld* navigation);
     // Ends the scripts in these subtrees (EndPlay) before they are destroyed (level unload).
     void EndPlayFor(Scene& scene, std::span<const Entity> roots);
 
