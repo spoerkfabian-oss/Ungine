@@ -1,5 +1,6 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
 #include "Editor/History.h"
@@ -272,6 +273,8 @@ void Editor::DrawHierarchy()
         ImGui::Separator();
         if (ImGui::MenuItem("Audio Source"))
             CreateAudioEntity({}, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
+        if (ImGui::MenuItem("Particle System"))
+            CreateParticleEntity({}, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
         if (ImGui::MenuItem("Reverb Zone")) {
             const Entity e = m_Ctx.scene.CreateEntity("Reverb Zone");
             m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
@@ -1160,6 +1163,54 @@ void Editor::DrawInspector()
             registry.Remove<AudioSource>(e);
     }
 
+    if (ParticleSystem* particles = registry.TryGet<ParticleSystem>(e);
+        particles && ImGui::CollapsingHeader("Particle System", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##effect", "path/to/effect.uparticle", &particles->effect);
+        if (ImGui::Button("Browse...##effect")) {
+            m_EffectTarget  = e;
+            m_DialogPurpose = DialogPurpose::AssignEffect;
+            m_FileDialog->Open("Choose particle effect", FileDialog::Mode::Open,
+                               particles->effect.empty() ? ContentRoot() : PathFromUtf8(particles->effect).parent_path(),
+                               {std::string(kParticleEffectExtension)});
+        }
+        if (!particles->effect.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Edit##effect"))
+                OpenAsset(PathFromUtf8(particles->effect));
+        }
+        if (BeginProperties("particles")) {
+            CheckboxRow("Auto play", &particles->autoPlay);
+            DragFloatRow("Speed", &particles->speed, 0.01f, 0.0f, 10.0f, "%.2fx");
+            std::uint32_t seed = particles->seed;
+            if (SliderUintRow("Seed (0 = random)", &seed, 0, 100000))
+                particles->seed = seed;
+            DragFloatRow("Spawn scale", &particles->spawnScale, 0.01f, 0.0f, 100.0f);
+            DragFloatRow("Size scale", &particles->sizeScale, 0.01f, 0.0f, 100.0f);
+            DragFloatRow("Velocity scale", &particles->velocityScale, 0.01f, 0.0f, 100.0f);
+            DragFloatRow("Lifetime scale", &particles->lifetimeScale, 0.01f, 0.0f, 100.0f);
+            PropertyRow("Tint");
+            ImGui::ColorEdit4("##tint", &particles->tint.x, ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+            ImGui::PopID();
+            if (m_Ctx.particles) {
+                PropertyRow("State");
+                ImGui::Text("%s, %u particles", m_Ctx.particles->IsActive(e) ? "active" : "stopped", m_Ctx.particles->ParticleCount(e));
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (m_Ctx.particles) {
+            if (ImGui::Button("Restart"))
+                m_Ctx.particles->Play(e);
+            ImGui::SameLine();
+            if (ImGui::Button("Stop##particles"))
+                m_Ctx.particles->Stop(e);
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Remove particle system"))
+            registry.Remove<ParticleSystem>(e);
+    }
+
     if (registry.Has<AudioListener>(e) && ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("The scene is heard from here (else from the primary camera).");
         if (ImGui::Button("Remove listener"))
@@ -1297,6 +1348,9 @@ void Editor::DrawInspector()
             registry.Emplace<AudioListener>(e);
         if (ImGui::MenuItem("Reverb Zone", nullptr, false, !registry.Has<ReverbZone>(e)))
             registry.Emplace<ReverbZone>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Particle System", nullptr, false, !registry.Has<ParticleSystem>(e)))
+            registry.Emplace<ParticleSystem>(e);
         ImGui::Separator();
         if (ImGui::MenuItem("Level Streaming Volume", nullptr, false, !registry.Has<LevelStreamingVolume>(e)))
             registry.Emplace<LevelStreamingVolume>(e);
@@ -1866,6 +1920,15 @@ void Editor::DrawStats()
             ImGui::Text("Occlusion      %u rays, %u occluded", as.rays, as.occluded);
             ImGui::Text("Reverb         %u zone(s), wet %.2f, room %.2f", as.zones, as.reverb.wet, as.reverb.roomSize);
             ImGui::Text("Cues           %u, snapshots %u active", as.cues, as.snapshots);
+        }
+        if (m_Ctx.particles) {
+            const ParticleWorldStats& ps = m_Ctx.particles->Stats();
+            const SceneRenderStats&   rs = m_Ctx.sceneRenderer.Stats();
+            ImGui::SeparatorText("Particles");
+            ImGui::Text("Effects        %u playing (%u one-shots), %u emitters", ps.instances, ps.oneShots, ps.emitters);
+            ImGui::Text("Particles      %u  (+%u / -%u last frame)", ps.particles, ps.spawned, ps.died);
+            ImGui::Text("Simulation     %.2f ms, %u collision rays", ps.simulateMs, ps.collisionRays);
+            ImGui::Text("Drawn          %u in %u batches, %u draw calls", rs.particlesDrawn, rs.particleBatches, rs.particleDrawCalls);
         }
 
         ImGui::SeparatorText("Memory");

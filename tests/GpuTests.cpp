@@ -4,6 +4,7 @@
 #include "Editor/Editor.h"
 #include "Editor/ProjectLauncher.h"
 #include "Editor/ScriptGraphEditor.h"
+#include "Editor/ParticleEditor.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Animation.h"
@@ -11,6 +12,7 @@
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Audio/SoundCue.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Core/Window.h"
@@ -1770,7 +1772,8 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
             }
         };
         CHECK(editor.ContentRoot() == project->ContentDirectory());
-        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() == 11);
+        CHECK(editor.OpenScene(project->StartScene()) && scene.GetRegistry().AliveCount() >= 11);
+        const std::size_t templateEntities = scene.GetRegistry().AliveCount();
         CHECK(scene.FindPrimaryCamera() != NullEntity);
         editor.OpenAsset(project->ContentDirectory() / "Scripts" / "RainOnSpace.ugraph");
         CHECK(editor.Blueprints().Count() == 1);
@@ -1778,7 +1781,7 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         editor.OpenAsset(project->ContentDirectory() / "Models" / "Box.glb");
         CHECK(F().Pump([&] {
             runFrames(1);
-            return scene.GetRegistry().AliveCount() > 11;
+            return scene.GetRegistry().AliveCount() > templateEntities;
         }));
         CHECK(editor.HasUnsavedChanges() && !editor.ConfirmQuit()); // asks first
         CHECK(editor.SaveAll() && !editor.HasUnsavedChanges() && editor.ConfirmQuit());
@@ -3471,6 +3474,240 @@ TEST_CASE(Editor_AudioCuesMixerUi)
     editor.Stop();
     runFrames(2);
     CHECK(!audio.Running() && engine.BusMix(AudioBus::Music) == 1.0f && engine.Stats().voices == 0);
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+namespace {
+template <class M>
+void AddModule(ParticleEmitter& e, M module)
+{
+    ParticleModule m;
+    m.params = std::move(module);
+    e.modules.push_back(std::move(m));
+}
+} // namespace
+
+TEST_CASE(Render_ParticlesSpritesRibbonsMeshes)
+{
+    // Additive red sprites left, a green ribbon right, blue box meshes at the bottom, a soft alpha
+    // cloud intersecting a wall in the middle: each shows up where it is, against a render without.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle   wall = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f, .baseColor = {0.1f, 0.1f, 0.1f, 1.0f}});
+    const ModelHandle   box  = F().assets->LoadModel(kBox); // mesh particles: through the particle world's own reference
+    CHECK(F().Pump([&] { return Settled(wall) && Settled(box); }));
+
+    ParticleEffect  effect;
+    ParticleEmitter sprites;
+    sprites.name = "Sprites";
+    sprites.render.blend = ParticleBlend::Additive;
+    AddModule(sprites, SpawnBurstModule{.time = 0.0f, .count = 40});
+    AddModule(sprites, ShapeModule{.shape = ParticleShape::Sphere, .radius = 0.08f, .offset = {-1.2f, 0.0f, 0.0f}});
+    AddModule(sprites, LifetimeModule{.seconds = {100.0f, 100.0f}});
+    AddModule(sprites, SizeModule{.size = {0.3f, 0.3f}});
+    AddModule(sprites, ColorModule{.colorA = {1.0f, 0.02f, 0.02f, 1.0f}, .colorB = {1.0f, 0.02f, 0.02f, 1.0f}, .intensity = 0.08f});
+    effect.emitters.push_back(sprites);
+    ParticleEmitter ribbon;
+    ribbon.name = "Ribbon";
+    ribbon.render.type = ParticleRenderType::Ribbon;
+    ribbon.render.blend = ParticleBlend::Alpha;
+    AddModule(ribbon, SpawnRateModule{.rate = 60.0f});
+    AddModule(ribbon, ShapeModule{.shape = ParticleShape::Point, .offset = {1.2f, -1.0f, 0.0f}});
+    AddModule(ribbon, VelocityModule{.direction = {0.0f, 1.0f, 0.0f}, .spread = 0.0f, .speed = {1.0f, 1.0f}});
+    AddModule(ribbon, LifetimeModule{.seconds = {2.0f, 2.0f}});
+    AddModule(ribbon, SizeModule{.size = {0.25f, 0.25f}});
+    AddModule(ribbon, ColorModule{.colorA = {0.05f, 1.0f, 0.05f, 1.0f}, .colorB = {0.05f, 1.0f, 0.05f, 1.0f}, .intensity = 3.0f});
+    effect.emitters.push_back(ribbon);
+    ParticleEmitter meshes;
+    meshes.name = "Meshes";
+    meshes.render.type = ParticleRenderType::Mesh;
+    meshes.render.mesh = PathToUtf8(kBox);
+    meshes.render.shade = false;
+    AddModule(meshes, SpawnBurstModule{.time = 0.0f, .count = 3});
+    AddModule(meshes, ShapeModule{.shape = ParticleShape::Box, .halfExtents = {0.3f, 0.0f, 0.0f}, .offset = {0.0f, -1.1f, 0.0f}});
+    AddModule(meshes, LifetimeModule{.seconds = {100.0f, 100.0f}});
+    AddModule(meshes, SizeModule{.size = {0.4f, 0.4f}});
+    AddModule(meshes, ColorModule{.colorA = {0.1f, 0.2f, 3.0f, 1.0f}, .colorB = {0.1f, 0.2f, 3.0f, 1.0f}});
+    effect.emitters.push_back(meshes);
+    ParticleEmitter cloud;
+    cloud.name = "Cloud";
+    cloud.render.softness = 0.5f;
+    AddModule(cloud, SpawnBurstModule{.time = 0.0f, .count = 30});
+    AddModule(cloud, ShapeModule{.shape = ParticleShape::Sphere, .radius = 0.1f, .offset = {0.0f, 0.6f, -0.5f}});
+    AddModule(cloud, LifetimeModule{.seconds = {100.0f, 100.0f}});
+    AddModule(cloud, SizeModule{.size = {0.8f, 0.8f}});
+    AddModule(cloud, ColorModule{.colorA = {0.9f, 0.9f, 0.9f, 0.5f}, .colorB = {0.9f, 0.9f, 0.9f, 0.5f}});
+    effect.emitters.push_back(cloud);
+    CHECK(ValidateParticleEffect(effect).empty());
+
+    Scene         scene;
+    ParticleWorld world(F().jobs.get(), F().assets.get());
+    world.Provide("test.uparticle", std::make_shared<const ParticleEffect>(effect));
+    const Entity backdrop = scene.CreateEntity("Wall");
+    scene.EditTransform(backdrop).position = {0.0f, 0.6f, -0.5f};
+    scene.EditTransform(backdrop).scale    = {0.6f, 0.6f, 0.05f};
+    scene.GetRegistry().Emplace<MeshRenderer>(backdrop, MeshRenderer{.model = wall});
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.shadows.resolution = 512;
+    const CameraData camera  = FrontCamera(3.0f);
+    const auto       without = RenderImage(renderer, scene, camera, 3);
+
+    const Entity fx = scene.CreateEntity("Effect");
+    scene.GetRegistry().Emplace<ParticleSystem>(fx, ParticleSystem{.effect = "test.uparticle", .seed = 3});
+    scene.UpdateTransforms();
+    for (int i = 0; i < 90; ++i) // 1.5 s: the ribbon reaches the middle
+        world.Update(scene, 1.0f / 60.0f);
+    // The mesh model is the world's own reference: wait until it is ready.
+    CHECK(F().Pump([&] { return F().assets->Get(world.RenderData().batches.empty() ? ModelHandle{} : [&] {
+        for (const ParticleBatch& b : world.RenderData().batches)
+            if (b.mesh)
+                return b.mesh;
+        return ModelHandle{};
+    }()) != nullptr; }, 2000));
+    renderer.particles = &world;
+    const auto with = RenderImage(renderer, scene, camera, 3);
+    const SceneRenderStats& stats = renderer.Stats();
+    CHECK(stats.particleBatches == 4 && stats.particleDrawCalls >= 4 && stats.particlesDrawn > 100);
+
+    const auto at = [](const std::vector<std::uint8_t>& image, glm::vec3 p) { // world -> pixel
+        const glm::vec4 clip = FrontCamera(3.0f).projection * FrontCamera(3.0f).view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return PixelAt(image, static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const glm::ivec3 red = at(with, {-1.2f, 0.0f, 0.0f}), redBefore = at(without, {-1.2f, 0.0f, 0.0f});
+    CHECK(red.r - redBefore.r > 40 && red.r - redBefore.r > red.g - redBefore.g + 30);
+    const glm::ivec3 green = at(with, {1.2f, 0.0f, 0.0f}), greenBefore = at(without, {1.2f, 0.0f, 0.0f});
+    CHECK(green.g > greenBefore.g + 60 && green.g > green.r + 40);
+    const glm::ivec3 blue = at(with, {0.0f, -1.1f, 0.2f}), blueBefore = at(without, {0.0f, -1.1f, 0.2f});
+    CHECK(blue.b > blueBefore.b + 60 && blue.b > blue.r + 40);
+    // The cloud is in front of the wall's center (lighter) but fades into it at the intersection.
+    const glm::ivec3 cloudCenter = at(with, {0.0f, 0.6f, -0.2f}), wallBefore = at(without, {0.0f, 0.6f, -0.2f});
+    CHECK(cloudCenter.r > wallBefore.r + 20);
+
+    if (const char* shot = std::getenv("UNGINE_TEST_SCREENSHOT")) {
+        const auto png = EncodePng(with, 160, 120);
+        std::ofstream(std::string(shot) + ".particles.png", std::ios::binary).write(reinterpret_cast<const char*>(png.data()),
+                                                                                      static_cast<std::streamsize>(png.size()));
+    }
+    renderer.particles = nullptr;
+    F().context->WaitIdle();
+    F().assets->Release(wall);
+    F().assets->Release(box);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_ParticleEditorAndPreview)
+{
+    // The effect window with its preview, live edits reaching the scene, undo / redo, save; the
+    // inspector, stats and FX icons drawn; Play / Stop restart the effects.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_particles_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    const fs::path file = dir / "Fire.uparticle";
+    CHECK(SaveParticleEffect(file, MakeDefaultParticleEffect()));
+
+    Scene         scene;
+    PhysicsWorld  physics(*F().jobs, F().events, F().assets.get());
+    ParticleWorld particles(F().jobs.get(), F().assets.get(), &physics);
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    sceneRenderer.particles          = &particles;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .particles     = &particles,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 1.5f, 5.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(10);
+    }
+    const Entity fx = scene.CreateEntity("Fire");
+    scene.GetRegistry().Emplace<ParticleSystem>(fx, ParticleSystem{.effect = PathToUtf8(file)});
+    editor.Select(fx);
+    runFrames(30); // edit mode simulates
+    CHECK(particles.IsActive(fx) && particles.ParticleCount(fx) > 0);
+
+    // The window + preview.
+    editor.OpenAsset(file);
+    ParticleEditor& pe = editor.Particles();
+    CHECK(pe.IsOpen() && !pe.Dirty() && pe.Problems().empty());
+    runFrames(30);
+    CHECK(pe.Preview().Stats().particles > 0);
+
+    // A live edit: no spawning -> the scene's instance restarts with the unsaved effect.
+    std::get<SpawnRateModule>(pe.Effect().emitters[0].modules[0].params).rate = 0.0f;
+    pe.Effect().emitters[0].modules.push_back(MakeParticleModule(ParticleModuleType::SpawnBurst));
+    pe.Commit();
+    CHECK(pe.Dirty());
+    runFrames(5);
+    CHECK(particles.ParticleCount(fx) == 10); // the default burst
+    // A second emitter + a broken sub emitter: reported.
+    pe.Effect().emitters.push_back(MakeDefaultParticleEmitter("Smoke"));
+    ParticleModule sub = MakeParticleModule(ParticleModuleType::SubEmitter);
+    std::get<SubEmitterModule>(sub.params).emitter = "Nobody";
+    pe.Effect().emitters[1].modules.push_back(sub);
+    pe.SelectEmitter(1);
+    pe.Commit();
+    runFrames(3);
+    CHECK(pe.Problems().size() == 1);
+    CHECK(pe.Undo() && pe.Effect().emitters.size() == 1 && pe.Redo() && pe.Effect().emitters.size() == 2);
+    CHECK(pe.Undo());
+    CHECK(pe.Save() && !pe.Dirty());
+    const auto saved = LoadParticleEffect(file);
+    CHECK(saved && saved->emitters.size() == 1 && saved->emitters[0].modules.size() == 9);
+    if (screenshot) {
+        runFrames(40);
+        (void)std::system((std::string("import -window root ") + std::getenv("UNGINE_TEST_SCREENSHOT")).c_str());
+    }
+
+    // Play / Stop: effects restart (one-shots from scripts would go).
+    const std::uint32_t oneShot = particles.SpawnAt(PathToUtf8(file), glm::vec3(2.0f, 0.0f, 0.0f));
+    CHECK(oneShot != 0);
+    editor.Play();
+    runFrames(3);
+    CHECK(!particles.IsOneShotActive(oneShot) && particles.IsActive(fx));
+    editor.Pause();
+    const std::uint32_t paused = particles.ParticleCount(fx);
+    runFrames(5);
+    CHECK(particles.ParticleCount(fx) == paused);
+    const std::uint64_t uuid = scene.GetRegistry().Get<Uuid>(fx).value;
+    editor.Stop(); // the scene is restored: new entity handles
+    runFrames(3);
+    CHECK(particles.IsActive(scene.FindByUuid(uuid)) && sceneRenderer.Stats().particleBatches >= 1);
+
+    pe.Close();
+    runFrames(2);
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(3);
+    }
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

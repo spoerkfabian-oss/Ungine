@@ -333,6 +333,13 @@
         "loadMargin": 0.0,
         "unloadMargin": 4.0
       }
+    },
+    {
+      "uuid": 1013,
+      "parent": 0,
+      "name": "Campfire",
+      "transform": {"position": [-3.2, 0, 1.2], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "particleSystem": {"effect": "../Effects/Campfire.uparticle", "autoPlay": true}
     }
   ],
   "camera": {

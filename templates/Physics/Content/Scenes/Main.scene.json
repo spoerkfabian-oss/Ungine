@@ -513,6 +513,13 @@
           0.4
         ]
       }
+    },
+    {
+      "uuid": 1040,
+      "parent": 0,
+      "name": "Spark Fountain",
+      "transform": {"position": [-1.0, 0.05, 1.5], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "particleSystem": {"effect": "../Effects/SparkFountain.uparticle", "autoPlay": true}
     }
   ],
   "camera": {

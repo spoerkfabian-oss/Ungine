@@ -1,0 +1,411 @@
+{
+  "version": 1,
+  "warmup": 0.0,
+  "emitters": [
+    {
+      "name": "Sparks",
+      "enabled": true,
+      "maxParticles": 200,
+      "localSpace": false,
+      "duration": 0.0,
+      "loop": true,
+      "delay": 0.0,
+      "modules": [
+        {
+          "type": "SpawnBurst",
+          "time": 0.0,
+          "count": 12,
+          "countMax": 18,
+          "cycles": 0,
+          "interval": 1.5
+        },
+        {
+          "type": "Shape",
+          "shape": "point",
+          "radius": 0.1,
+          "halfExtents": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "angle": 25.0,
+          "surface": false,
+          "offset": [
+            0,
+            0.1,
+            0
+          ]
+        },
+        {
+          "type": "Velocity",
+          "direction": [
+            0,
+            1,
+            0
+          ],
+          "spread": 40.0,
+          "speed": [
+            3.0,
+            5.0
+          ],
+          "radial": [
+            0,
+            0
+          ],
+          "inheritVelocity": 0.0
+        },
+        {
+          "type": "Lifetime",
+          "seconds": [
+            2.0,
+            2.5
+          ]
+        },
+        {
+          "type": "Size",
+          "size": [
+            0.06,
+            0.08
+          ],
+          "perAxis": false,
+          "axisMin": [
+            0.1,
+            0.1,
+            0.1
+          ],
+          "axisMax": [
+            0.2,
+            0.2,
+            0.2
+          ]
+        },
+        {
+          "type": "Color",
+          "colorA": [
+            0.4,
+            0.8,
+            1.0,
+            1.0
+          ],
+          "colorB": [
+            0.6,
+            0.9,
+            1.0,
+            1.0
+          ],
+          "intensity": 5.0
+        },
+        {
+          "type": "Gravity",
+          "acceleration": [
+            0,
+            -9.81,
+            0
+          ]
+        },
+        {
+          "type": "Collision",
+          "radiusScale": 0.5,
+          "restitution": 0.45,
+          "friction": 0.2,
+          "kill": false,
+          "maxHits": 3,
+          "layerMask": 65535
+        },
+        {
+          "type": "ColorOverLife",
+          "gradient": [
+            [
+              0,
+              1,
+              1,
+              1,
+              1
+            ],
+            [
+              0.8,
+              1,
+              1,
+              1,
+              1
+            ],
+            [
+              1,
+              1,
+              1,
+              1,
+              0
+            ]
+          ]
+        },
+        {
+          "type": "SubEmitter",
+          "event": "trail",
+          "emitter": "Trails",
+          "count": 40,
+          "inheritVelocity": 0.0
+        },
+        {
+          "type": "SubEmitter",
+          "event": "collision",
+          "emitter": "Flash",
+          "count": 6,
+          "inheritVelocity": 0.2
+        }
+      ],
+      "render": {
+        "type": "sprite",
+        "blend": "additive",
+        "texture": "",
+        "columns": 1,
+        "rows": 1,
+        "facing": "camera",
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "stretch": 0.1,
+        "softness": 0.0,
+        "cameraFade": 0.0,
+        "sort": true,
+        "mesh": "",
+        "meshIndex": 0,
+        "alignToVelocity": false,
+        "shade": true,
+        "ribbonUv": "stretch",
+        "ribbonTile": 1.0
+      }
+    },
+    {
+      "name": "Trails",
+      "enabled": true,
+      "maxParticles": 3000,
+      "localSpace": false,
+      "duration": 0.0,
+      "loop": true,
+      "delay": 0.0,
+      "modules": [
+        {
+          "type": "Lifetime",
+          "seconds": [
+            0.35,
+            0.35
+          ]
+        },
+        {
+          "type": "Size",
+          "size": [
+            0.05,
+            0.05
+          ],
+          "perAxis": false,
+          "axisMin": [
+            0.1,
+            0.1,
+            0.1
+          ],
+          "axisMax": [
+            0.2,
+            0.2,
+            0.2
+          ]
+        },
+        {
+          "type": "Color",
+          "colorA": [
+            0.4,
+            0.8,
+            1.0,
+            1.0
+          ],
+          "colorB": [
+            0.4,
+            0.8,
+            1.0,
+            1.0
+          ],
+          "intensity": 2.5
+        },
+        {
+          "type": "ColorOverLife",
+          "gradient": [
+            [
+              0,
+              1,
+              1,
+              1,
+              1
+            ],
+            [
+              1,
+              1,
+              1,
+              1,
+              0
+            ]
+          ]
+        },
+        {
+          "type": "SizeOverLife",
+          "curve": {
+            "interp": "linear",
+            "keys": [
+              [
+                0,
+                1
+              ],
+              [
+                1,
+                0.2
+              ]
+            ]
+          }
+        }
+      ],
+      "render": {
+        "type": "ribbon",
+        "blend": "additive",
+        "texture": "",
+        "columns": 1,
+        "rows": 1,
+        "facing": "camera",
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "stretch": 0.1,
+        "softness": 0.0,
+        "cameraFade": 0.0,
+        "sort": true,
+        "mesh": "",
+        "meshIndex": 0,
+        "alignToVelocity": false,
+        "shade": true,
+        "ribbonUv": "stretch",
+        "ribbonTile": 1.0
+      }
+    },
+    {
+      "name": "Flash",
+      "enabled": true,
+      "maxParticles": 400,
+      "localSpace": false,
+      "duration": 0.0,
+      "loop": true,
+      "delay": 0.0,
+      "modules": [
+        {
+          "type": "Velocity",
+          "direction": [
+            0,
+            1,
+            0
+          ],
+          "spread": 80.0,
+          "speed": [
+            0.5,
+            1.5
+          ],
+          "radial": [
+            0,
+            0
+          ],
+          "inheritVelocity": 0.0
+        },
+        {
+          "type": "Lifetime",
+          "seconds": [
+            0.2,
+            0.4
+          ]
+        },
+        {
+          "type": "Size",
+          "size": [
+            0.04,
+            0.07
+          ],
+          "perAxis": false,
+          "axisMin": [
+            0.1,
+            0.1,
+            0.1
+          ],
+          "axisMax": [
+            0.2,
+            0.2,
+            0.2
+          ]
+        },
+        {
+          "type": "Color",
+          "colorA": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "colorB": [
+            0.7,
+            0.9,
+            1.0,
+            1.0
+          ],
+          "intensity": 4.0
+        },
+        {
+          "type": "Gravity",
+          "acceleration": [
+            0,
+            -9.81,
+            0
+          ]
+        },
+        {
+          "type": "ColorOverLife",
+          "gradient": [
+            [
+              0,
+              1,
+              1,
+              1,
+              1
+            ],
+            [
+              1,
+              1,
+              1,
+              1,
+              0
+            ]
+          ]
+        }
+      ],
+      "render": {
+        "type": "sprite",
+        "blend": "additive",
+        "texture": "",
+        "columns": 1,
+        "rows": 1,
+        "facing": "velocity",
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "stretch": 0.05,
+        "softness": 0.0,
+        "cameraFade": 0.0,
+        "sort": true,
+        "mesh": "",
+        "meshIndex": 0,
+        "alignToVelocity": false,
+        "shade": true,
+        "ribbonUv": "stretch",
+        "ribbonTile": 1.0
+      }
+    }
+  ]
+}

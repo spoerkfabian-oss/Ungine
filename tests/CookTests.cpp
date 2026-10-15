@@ -3,6 +3,8 @@
 #include "BlueprintTestUtil.h"
 #include "Test.h"
 
+#include "Engine/Particles/ParticleEffect.h"
+
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Assets/TextureCooker.h"
@@ -365,6 +367,58 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
     CHECK(PackageProject(*project, fakePlayer, dir / "Package", &error, &packaged) && packaged.Ok());
     CHECK(fs::exists(dir / "Package" / "Content.upak") && fs::exists(dir / "Package" / "BuildReport.txt") &&
           !fs::exists(dir / "Package" / "Content"));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST_CASE(Cook_ParticleEffectReferences)
+{
+    // Effect textures are cooked as color textures; missing / outside meshes and textures are reported;
+    // the packaged game reads the effect from the pak.
+    const fs::path dir = TempDir("cook_particles");
+    std::string    error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir, "FxGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    WriteBytes(content / "Textures" / "spark.png", SolidPng(250, 200, 60));
+    WriteBytes(dir / "outside.png", SolidPng(10, 10, 10));
+    ParticleEffect effect = MakeDefaultParticleEffect();
+    effect.emitters[0].render.texture = PathToUtf8(content / "Textures" / "spark.png");
+    ParticleEmitter rocks = MakeDefaultParticleEmitter("Rocks");
+    rocks.render.type     = ParticleRenderType::Mesh;
+    rocks.render.mesh     = PathToUtf8(content / "Models" / "rock.glb");
+    effect.emitters.push_back(rocks);
+    ParticleEmitter dark = MakeDefaultParticleEmitter("Dark");
+    dark.render.texture  = PathToUtf8(dir / "outside.png");
+    effect.emitters.push_back(dark);
+    CHECK(SaveParticleEffect(content / "Effects" / "Fire.uparticle", effect));
+
+    const fs::path   out = dir / "Out";
+    CookOptions      options;
+    options.threads      = 2;
+    const CookReport report = CookProjectContent(*project, out / "Content.upak", options);
+    const auto warned = [&](std::string_view text) {
+        return std::ranges::any_of(report.warnings, [&](const std::string& w) { return w.find(text) != std::string::npos; });
+    };
+    CHECK(report.Ok() && report.cookedTextures == 2); // spark + outside (cooked, but not packaged)
+    CHECK(warned("missing mesh") && warned("outside.png' is outside Content/") && !warned("spark.png"));
+
+    const auto pak = PakFile::Open(out / "Content.upak");
+    Vfs::Mount(pak, out);
+    const auto packed = LoadParticleEffect(out / "Content" / "Effects" / "Fire.uparticle", &error);
+    CHECK(packed && packed->emitters.size() == 3 &&
+          packed->emitters[0].render.texture == PathToUtf8((out / "Content" / "Textures" / "spark.png").lexically_normal()));
+    TextureCookSettings runtime{.compress = true, .cacheDirectory = {}, .quality = 0};
+    if (const auto spark = Vfs::Read(out / "Content" / "Textures" / "spark.png"))
+        CHECK(CookTexture(*spark, TextureKind::Color, runtime).packed);
+    else
+        CHECK(false);
+    Vfs::UnmountAll();
     std::error_code ec;
     fs::remove_all(dir, ec);
 }

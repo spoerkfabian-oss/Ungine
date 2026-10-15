@@ -5,6 +5,7 @@
 // the background behind a loading screen; streaming volumes / Load Stream Level add sub-levels.
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Core/GameOptions.h"
@@ -82,6 +83,9 @@ protected:
         m_Streamer = std::make_unique<LevelStreamer>(GetJobs(), &GetAssets(), &GetEvents());
         m_Streamer->SetUnloadHook([this](Scene& scene, std::span<const Entity> roots) { m_Scripts->EndPlayFor(scene, roots); });
         m_Scripts->SetLevelStreamer(m_Streamer.get());
+        m_Particles = std::make_unique<ParticleWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
+        m_Scripts->SetParticleWorld(m_Particles.get());
+        m_SceneRenderer->particles = m_Particles.get();
         m_Loader = std::make_unique<LevelLoader>(GetJobs(), &GetAssets());
         LoadLoadingScreen();
 
@@ -162,6 +166,7 @@ protected:
         m_Scene.Clear();
         m_Streamer->Reset(); // the streamed levels went with the scene
         m_Physics->Reset();
+        m_Particles->Reset();
         const std::vector<ModelHandle> previous = std::exchange(m_Models, {}); // released after the new level holds its models
         try {
             (void)InstantiatePreparedScene(*result->scene, m_Scene, &GetAssets(), result->models,
@@ -277,6 +282,9 @@ protected:
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
         const CameraData view = m_FallbackCamera.GetData(1.0f);
         m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
+        // Particles after physics / scripts / animation moved things (paused menu: frozen).
+        m_Particles->SetPaused(m_Paused);
+        m_Particles->Update(m_Scene, static_cast<float>(dt));
         if (m_ExitAfterFrames > 0 && ++m_Frames >= m_ExitAfterFrames) // smoke tests
             GetWindow().RequestClose();
     }
@@ -321,6 +329,11 @@ protected:
                     GetAudio().HasDevice() ? GetAudio().DeviceName() : std::string("no device"));
         m_Audio->End(m_Scene);
         m_Audio.reset(); // releases its sounds
+        const ParticleWorldStats& particles = m_Particles->Stats();
+        ENGINE_INFO("Particles: {} effect(s), {} particle(s)", particles.instances, particles.particles);
+        m_SceneRenderer->particles = nullptr;
+        m_Scripts->SetParticleWorld(nullptr);
+        m_Particles.reset(); // releases its textures / meshes
         m_Scene.Clear();
         m_Streamer->Reset();
         m_Loader->Cancel();
@@ -478,6 +491,7 @@ private:
     std::unique_ptr<AudioSystem>   m_Audio;
     std::unique_ptr<ScriptSystem>  m_Scripts;
     std::unique_ptr<LevelStreamer> m_Streamer;
+    std::unique_ptr<ParticleWorld> m_Particles;
     std::unique_ptr<LevelLoader>   m_Loader;
     std::string                    m_LoadingName;
     Scene                          m_LoadingScene; // the project's loading screen (UI)

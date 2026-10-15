@@ -1,4 +1,6 @@
 #include "Editor/Editor.h"
+#include "Editor/ParticleEditor.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
 #include "Editor/History.h"
@@ -67,7 +69,9 @@ Editor::Editor(const EditorContext& context)
       m_UiOverlay(std::make_unique<TextOverlay>(context.renderer)),
       m_History(std::make_unique<History>()),
       m_FileDialog(std::make_unique<FileDialog>()),
-      m_Graphs(std::make_unique<ScriptGraphEditor>())
+      m_Graphs(std::make_unique<ScriptGraphEditor>()),
+      m_ParticleEditor(std::make_unique<ParticleEditor>(
+          ParticleEditor::Context{context.renderer, context.assets, *m_ImGui, context.particles}))
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
@@ -155,6 +159,7 @@ Editor::~Editor()
         m_Ctx.renderer.DeferRelease(std::move(m_ViewportImage));
     }
     ReleaseTexturePreviews(true);
+    m_ParticleEditor.reset(); // its preview texture belongs to the ImGui layer
     m_ImGui.reset(); // waits for the device, frees pending textures, shuts the backends down
 }
 
@@ -221,6 +226,7 @@ void Editor::Update(float dt)
         DrawPhysicsMaterial();
     if (m_ShowSoundCue)
         DrawSoundCue();
+    m_ParticleEditor->Draw(dt);
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
     if (m_ShowStats)
@@ -280,6 +286,11 @@ void Editor::Update(float dt)
         const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
     }
+    // Particles run in edit mode too; pause / breakpoints hold them.
+    if (m_Ctx.particles) {
+        m_Ctx.particles->SetPaused(m_PlayState == PlayState::Paused || (m_Ctx.scripts && m_Ctx.scripts->DebugPaused()));
+        m_Ctx.particles->Update(m_Ctx.scene, dt);
+    }
     // Edit mode: construction scripts follow every edit (History change, New / Open, Stop).
     // While a widget is dragged at most 4 times a second, then once more when it is let go.
     if (m_PlayState == PlayState::Edit && m_Ctx.scripts &&
@@ -334,6 +345,8 @@ void Editor::Render(const FrameContext& frame, float physicsAlpha)
                               .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT});
     }
+
+    m_ParticleEditor->Render(frame); // preview of the particle effect window
 
     GpuScope scope(&m_Ctx.renderer.Profiler(), cmd, "Editor UI");
     m_ImGui->Render(cmd, frame.view, frame.extent);
@@ -549,6 +562,22 @@ void Editor::DrawViewport()
                     PlacePrefab(file, target);
                 else
                     m_Status = "Stop playing to place prefabs";
+            } else if (IsParticleEffectFile(file)) { // a new particle system on the surface under the cursor
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                    target = cam.position + dir * hit->distance;
+                else if (dir.y < -1e-3f)
+                    target = cam.position + dir * (-cam.position.y / dir.y);
+                if (m_PlayState == PlayState::Edit)
+                    CreateParticleEntity(file, target);
+                else
+                    m_Status = "Stop playing to place particle systems";
             } else if (IsSoundFile(file) || IsSoundCueFile(file)) { // a new audio source where the cursor points
                 const ImVec2     mouse = ImGui::GetIO().MousePos;
                 const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
@@ -616,6 +645,8 @@ void Editor::DrawViewport()
     bool iconHit = DrawLightOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked);
     if (m_ShowAudio)
         iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
+    if (m_ShowParticles)
+        iconHit = DrawParticleOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics) {
@@ -713,6 +744,10 @@ void Editor::DrawViewport()
     }
     if (toolButton("Audio", m_ShowAudio))
         m_ShowAudio = !m_ShowAudio;
+    if (toolButton("FX", m_ShowParticles))
+        m_ShowParticles = !m_ShowParticles;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Particle system icons");
     if (toolButton("Volumes", m_ShowVolumes))
         m_ShowVolumes = !m_ShowVolumes;
     if (toolButton("Game cam", m_GameCamera))
@@ -981,6 +1016,46 @@ bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool 
                 projector.Circle(list, pos, {1, 0, 0}, {0, 0, 1}, radius, color);
                 projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, radius, color);
             }
+    });
+    if (clicked && hit != NullEntity)
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
+    list->PopClipRect();
+    return clicked && hit != NullEntity;
+}
+
+bool Editor::DrawParticleOverlay(float x, float y, float width, float height, bool clicked)
+{
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    constexpr float kIcon       = 7.0f;
+    const ImVec2    mouse       = ImGui::GetIO().MousePos;
+    Entity          hit         = NullEntity;
+    float           hitDistance = kIcon + 3.0f;
+    registry.ViewOf<ParticleSystem, WorldTransform>().Each([&](Entity e, ParticleSystem&, WorldTransform& world) {
+        ImVec2 p;
+        if (!projector.Project(glm::vec3(world.matrix[3]), p))
+            return;
+        const bool  selected = IsSelected(e);
+        const bool  active   = m_Ctx.particles && m_Ctx.particles->IsActive(e);
+        const ImU32 fill     = active ? IM_COL32(255, 160, 60, 240) : IM_COL32(170, 140, 110, 220);
+        // Spark: four-pointed star.
+        list->AddQuadFilled(ImVec2(p.x, p.y - kIcon), ImVec2(p.x + kIcon * 0.3f, p.y), ImVec2(p.x, p.y + kIcon),
+                            ImVec2(p.x - kIcon * 0.3f, p.y), fill);
+        list->AddQuadFilled(ImVec2(p.x - kIcon, p.y), ImVec2(p.x, p.y - kIcon * 0.3f), ImVec2(p.x + kIcon, p.y),
+                            ImVec2(p.x, p.y + kIcon * 0.3f), fill);
+        list->AddCircle(p, kIcon + 3.0f, selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(0, 0, 0, 200), 0, selected ? 2.5f : 1.0f);
+        if (selected && m_Ctx.particles) {
+            const std::string count = std::to_string(m_Ctx.particles->ParticleCount(e));
+            list->AddText(ImVec2(p.x + kIcon + 4.0f, p.y - kIcon), IM_COL32(230, 230, 230, 220), count.c_str());
+        }
+        const float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+        if (d < hitDistance) {
+            hitDistance = d;
+            hit         = e;
+        }
     });
     if (clicked && hit != NullEntity)
         SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
@@ -1388,6 +1463,11 @@ void Editor::SelectInRect(glm::vec2 min, glm::vec2 max, bool additive)
         });
     if (m_ShowAudio)
         registry.ViewOf<AudioSource, WorldTransform>().Each([&](Entity e, AudioSource&, WorldTransform& world) {
+            if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
+                hits.push_back(e);
+        });
+    if (m_ShowParticles)
+        registry.ViewOf<ParticleSystem, WorldTransform>().Each([&](Entity e, ParticleSystem&, WorldTransform& world) {
             if (inside(glm::vec3(world.matrix[3])) && std::ranges::find(hits, e) == hits.end())
                 hits.push_back(e);
         });

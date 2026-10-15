@@ -42,7 +42,8 @@ struct SoundCue {
 [[nodiscard]] bool IsSoundCueFile(const std::filesystem::path& file); // by extension
 // Reads through the VFS; variant paths come back absolute (normalized).
 [[nodiscard]] std::optional<SoundCue> LoadSoundCue(const std::filesystem::path& file, std::string* error = nullptr);
-// Writes atomically (.tmp + rename); variant paths below the cue's folder are stored relative.
+// Writes atomically (.tmp + rename); variant paths are stored relative to the cue's folder (absolute
+// only without a relative path, e.g. another drive).
 bool SaveSoundCue(const std::filesystem::path& file, const SoundCue& cue, std::string* error = nullptr);
 
 // Variant index by weight (none: nullopt). `last` (if any) is skipped when noRepeat applies.

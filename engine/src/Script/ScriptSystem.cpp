@@ -402,6 +402,7 @@ struct ScriptSystem::Impl {
         AssetManager*      Assets() override { return m_Impl.assets; }
         AudioSystem*       Audio() override { return m_Impl.audio; }
         LevelStreamer*     Streaming() override { return m_Impl.streamer; }
+        ParticleWorld*     Particles() override { return m_Impl.particles; }
         GameOptions*       Options() override { return m_Impl.options; }
         const Input*       GetInput() override { return m_Impl.acceptInput ? m_Impl.input : nullptr; }
         ScriptViewport     Viewport() const override { return m_Impl.viewport; }
@@ -1510,6 +1511,7 @@ struct ScriptSystem::Impl {
     std::vector<JointBrokenEvent> brokenJoints; // since the last update
     Subscription  levelSub;
     LevelStreamer*                  streamer = nullptr;
+    ParticleWorld*                  particles = nullptr;
     GameOptions*                    options  = nullptr;
     std::vector<LevelStreamedEvent> levelEvents; // since the last update
 
@@ -1976,6 +1978,7 @@ std::optional<ScriptLevelRequest> ScriptSystem::TakeLevelRequest() { return std:
 void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = std::move(scene); }
 
 void ScriptSystem::SetLevelStreamer(LevelStreamer* streamer) { m_Impl->streamer = streamer; }
+void ScriptSystem::SetParticleWorld(ParticleWorld* particles) { m_Impl->particles = particles; }
 void ScriptSystem::SetGameOptions(GameOptions* options) { m_Impl->options = options; }
 
 void ScriptSystem::EndPlayFor(Scene& scene, std::span<const Entity> roots)

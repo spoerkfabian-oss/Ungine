@@ -38,6 +38,8 @@ class FileDialog;
 class FlyCamera;
 class History;
 class LevelStreamer;
+class ParticleEditor;
+class ParticleWorld;
 class GameOptions;
 struct CookReport;
 class ImGuiLayer;
@@ -75,6 +77,9 @@ struct EditorContext {
     // Optional: level streaming. Edit mode: sub-levels previewed from the Levels panel (not saved,
     // read-only); play mode: streaming volumes and Load Stream Level as in the player.
     LevelStreamer* streaming = nullptr;
+    // Optional: particle effects. Simulated every frame (edit mode too, like a live viewport),
+    // restarted on Play / Stop; the particle effect window edits them live.
+    ParticleWorld* particles = nullptr;
     // ImGui layout file (empty: not saved).
     std::filesystem::path layoutFile = "editor.ini";
 };
@@ -153,6 +158,8 @@ public:
 
     // Blueprint (visual script) editor window.
     [[nodiscard]] ScriptGraphEditor& Blueprints() { return *m_Graphs; }
+    // Particle effect window (.uparticle).
+    [[nodiscard]] ParticleEditor& Particles() { return *m_ParticleEditor; }
 
     // Project: Content browser root (the project's Content/, else the working directory), Build &
     // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
@@ -280,6 +287,10 @@ private:
     void   AssignScript(Entity entity, const std::filesystem::path& graph);  // Script component, + undo
     void   AssignSound(Entity entity, const std::filesystem::path& sound);   // Audio Source (added if missing), + undo
     Entity CreateAudioEntity(const std::filesystem::path& sound, const glm::vec3& position); // + undo
+    void   AssignEffect(Entity entity, const std::filesystem::path& effect); // Particle System (added if missing), + undo
+    Entity CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position); // + undo
+    // Particle system icons (click selects), bounds of the selected one's particles.
+    bool DrawParticleOverlay(float x, float y, float width, float height, bool clicked);
     void   DestroyByUuids(std::span<const std::uint64_t> uuids);
     [[nodiscard]] std::uint64_t UuidOf(Entity entity) const;
 
@@ -295,6 +306,7 @@ private:
     std::unique_ptr<History>    m_History;
     std::unique_ptr<FileDialog> m_FileDialog;
     std::unique_ptr<ScriptGraphEditor> m_Graphs;
+    std::unique_ptr<ParticleEditor>    m_ParticleEditor;
 
     // Viewport render target (RGBA8 sRGB, sampled by ImGui).
     Image         m_ViewportImage;
@@ -341,6 +353,7 @@ private:
     bool                m_ShowColliders   = true;
     bool                m_EditJointAnchor = false; // the gizmo moves the selected joint's anchor
     bool                m_ShowAudio       = true; // audio source icons / ranges, reverb zones
+    bool                m_ShowParticles   = true; // particle system icons / bounds
     bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
     // Play mode
@@ -389,7 +402,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -426,7 +439,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
@@ -436,6 +449,7 @@ private:
     std::optional<std::string>  m_MaterialSlot;                // its glTF material (nullopt: the collider's)
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills
+    Entity                      m_EffectTarget = NullEntity; // entity whose Particle System the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";
 };
 

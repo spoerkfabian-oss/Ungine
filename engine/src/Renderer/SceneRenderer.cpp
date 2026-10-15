@@ -1,6 +1,8 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "GpuCulling.h"
 #include "GpuScene.h"
+#include "ParticleRenderer.h"
+#include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
 #include "Engine/Renderer/ShadowAtlas.h"
@@ -248,6 +250,7 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                          .debugName = "ExposureReadback"});
     m_GpuScene   = std::make_unique<GpuScene>(renderer);
     m_GpuCulling = std::make_unique<GpuCulling>(renderer);
+    m_Particles  = std::make_unique<ParticleRenderer>(renderer, assets, kHdrFormat, kDepthFormat);
 }
 
 void SceneRenderer::CreatePipelines()
@@ -380,6 +383,7 @@ void SceneRenderer::RebuildPipelines()
         m_Environment.RebuildPipelines();
         m_GpuScene->RebuildPipelines();
         m_GpuCulling->RebuildPipelines();
+        m_Particles->CreatePipelines();
         ENGINE_INFO("Scene renderer: pipelines rebuilt (shader generation {})", m_Renderer.ShaderGeneration());
     } catch (const std::exception& e) {
         ENGINE_ERROR("Scene renderer: pipeline rebuild failed, keeping the old ones: {}", e.what());
@@ -390,6 +394,7 @@ SceneRenderer::~SceneRenderer()
 {
     m_GpuCulling.reset();
     m_GpuScene.reset();
+    m_Particles.reset();
     ReleaseTargets();
     ReleaseShadowMap();
     ReleaseShadowAtlas();
@@ -865,6 +870,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     if (m_GpuScene->BlendDraws() > 0) // both paths: blending needs a CPU sort
         GatherDraws(frustum, glm::vec4(0.0f), m_TransparentDraws, Gather::Transparent);
     CollectLights(scene, frustum);
+    {
+        static const ParticleRenderData kNoParticles;
+        m_Particles->Prepare(particles ? particles->RenderData() : kNoParticles, frustum, camera.position, frame.frameIndex);
+    }
     m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
     const auto pushArray = [&]<class T>(const std::vector<T>& values) -> VkDeviceAddress {
@@ -960,7 +969,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     }
     {
         GpuScope scope(profiler, cmd, "Lighting + sky");
-        RenderMain(cmd, extent, frameAddress);
+        RenderMain(cmd, extent, frameAddress, frame.frameIndex);
     }
 
     // HDR -> sampled by bloom (compute) and tone mapping (fragment).
@@ -1705,7 +1714,8 @@ void SceneRenderer::RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D exten
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
 
-void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress)
+void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress,
+                               std::uint32_t frameIndex)
 {
     const auto&            bindless = m_Renderer.GetBindless();
     const VkPipelineLayout layout   = bindless.PipelineLayout();
@@ -1743,6 +1753,12 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceA
     vkCmdDraw(cmd, 3, 1, 0, 0);
     // Transparent surfaces last, over opaque geometry and sky (depth tested, not written).
     DrawTransparent(cmd, m_TransparentDraws, frameAddress, lodTint);
+    // Particles after everything else (unlit, sorted per emitter and between emitters).
+    m_Particles->Draw(cmd, frameAddress, m_DepthSlot, frameIndex);
+    const ParticleRenderStats& particleStats = m_Particles->Stats();
+    m_Stats.particleBatches   = particleStats.batches;
+    m_Stats.particlesDrawn    = particleStats.particles + particleStats.ribbonPoints;
+    m_Stats.particleDrawCalls = particleStats.drawCalls;
     vkCmdEndRendering(cmd);
 }
 

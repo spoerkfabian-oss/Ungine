@@ -85,11 +85,13 @@ bool SaveSoundCue(const fs::path& file, const SoundCue& cue, std::string* error)
     json           variants = json::array();
     for (const SoundCueVariant& v : cue.variants) {
         std::string sound = v.sound;
-        if (!sound.empty()) {
+        if (!sound.empty()) { // relative also across folders ("../Sounds/x.wav"), like scene files
             const fs::path path     = PathFromUtf8(sound).lexically_normal();
             const fs::path relative = path.lexically_relative(folder);
-            if (path.is_absolute() && !relative.empty() && *relative.begin() != "..")
-                sound = relative.generic_string();
+            if (path.is_absolute() && !relative.empty()) {
+                const std::u8string generic = relative.generic_u8string();
+                sound.assign(generic.begin(), generic.end());
+            }
         }
         variants.push_back({{"sound", sound}, {"weight", v.weight}, {"volume", v.volume}, {"pitch", v.pitch}});
     }

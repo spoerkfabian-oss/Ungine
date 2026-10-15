@@ -25,6 +25,7 @@ add_library(Engine STATIC
     src/Renderer/GpuCulling.cpp
     src/Renderer/GpuProfiler.cpp
     src/Renderer/GpuScene.cpp
+    src/Renderer/ParticleRenderer.cpp
     src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
@@ -51,6 +52,8 @@ add_library(Engine STATIC
     src/Scene/SpatialIndex.cpp
     src/UI/UiLayout.cpp
     src/UI/UiSystem.cpp
+    src/Particles/ParticleEffect.cpp
+    src/Particles/ParticleWorld.cpp
     src/Physics/PhysicsMaterial.cpp
     src/Physics/PhysicsWorld.cpp
     src/Physics/Ragdoll.cpp
@@ -104,6 +107,7 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/ibl_common.glsl
     shaders/include/mesh_common.glsl
     shaders/include/mesh_shading.glsl
+    shaders/include/particle.glsl
     shaders/include/pbr.glsl
     shaders/include/scene_common.glsl
     shaders/include/shadow.glsl
@@ -132,6 +136,11 @@ engine_add_shaders(Engine SOURCES
     shaders/mesh.frag
     shaders/mesh_blend.frag
     shaders/mesh.vert
+    shaders/particle.frag
+    shaders/particle.vert
+    shaders/particle_mesh.frag
+    shaders/particle_mesh.vert
+    shaders/particle_ribbon.vert
     shaders/scatter.comp
     shaders/shadow.vert
     shaders/shadow_mask.frag

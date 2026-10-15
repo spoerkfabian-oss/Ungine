@@ -125,6 +125,15 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Bus, **Snapshots** (benannte Bus-Mixe, per Blueprint *Activate/Deactivate Audio Snapshot*
     überblendet) und **Ducking** (z. B. UI senkt Musik). Occlusion nutzt mehrere Strahlen pro
     Quelle; Wände dämpfen nach der *Sound absorption* ihres Physik-Materials.
+18. **Partikel**: *Content → + New → Particle effect* legt ein `.uparticle` an und öffnet den
+    Partikel-Editor: Emitter mit Modul-Stacks (Spawn, Initialize, Update, Events – z. B. Spawn Rate,
+    Shape, Velocity, Gravity, Curl Noise, Color/Size over Life als Gradient/Kurve, Collision,
+    Sub Emitter) und Render-Einstellungen (Sprite mit Sprite-Sheet und weichen Kanten, Mesh, Ribbon
+    für Spuren; Alpha oder Additiv). Die Vorschau rechts zeigt jede Änderung sofort; die Szene
+    übernimmt sie ebenfalls, gespeichert wird mit *Save*. Platziert wird ein Effekt per Doppelklick
+    bzw. Drag & Drop in den Viewport (Komponente *Particle System*); Blueprint-Knoten *Spawn Emitter
+    at Location*, *Play/Stop Particles*, *Set Particle Scale/Tint*. Beispiele: Lagerfeuer (Basic),
+    Funkenbrunnen mit Kollision und Spuren (Physics).
 
 
 ## Entwicklung
