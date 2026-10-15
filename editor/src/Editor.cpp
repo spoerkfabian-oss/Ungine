@@ -1,5 +1,6 @@
 #include "Editor/Editor.h"
 #include "Editor/ParticleEditor.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
@@ -229,6 +230,8 @@ void Editor::Update(float dt)
     m_ParticleEditor->Draw(dt);
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
+    if (m_ShowNavigation && m_Ctx.navigation)
+        DrawNavigation();
     if (m_ShowStats)
         DrawStats();
     if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
@@ -285,6 +288,14 @@ void Editor::Update(float dt)
     if (m_Ctx.audio) {
         const CameraData view = m_Ctx.camera.GetData(ViewportAspect());
         m_Ctx.audio->Update(m_Ctx.scene, dt, &view);
+    }
+    // Navigation: edit mode keeps the tiles up to date (no agents); playing moves the crowd;
+    // pause / breakpoints hold it.
+    if (m_Ctx.navigation) {
+        if (m_PlayState == PlayState::Edit)
+            m_Ctx.navigation->Update(m_Ctx.scene, dt, false);
+        else if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
+            m_Ctx.navigation->Update(m_Ctx.scene, dt, true);
     }
     // Particles run in edit mode too; pause / breakpoints hold them.
     if (m_Ctx.particles) {
@@ -392,6 +403,7 @@ void Editor::BuildDefaultLayout(ImGuiID dockspace)
     ImGui::DockBuilderDockWindow("Stats", bottom);
     ImGui::DockBuilderDockWindow("Assets", bottom);
     ImGui::DockBuilderDockWindow("Levels", left);
+    ImGui::DockBuilderDockWindow("Navigation", rightBottom);
     ImGui::DockBuilderFinish(dockspace);
 }
 
@@ -476,6 +488,8 @@ void Editor::DrawMenuBar()
         ImGui::MenuItem("Blueprint types", nullptr, &m_ShowTypes);
         if (m_Ctx.streaming)
             ImGui::MenuItem("Levels", nullptr, &m_ShowLevels);
+        if (m_Ctx.navigation)
+            ImGui::MenuItem("Navigation", nullptr, &m_ShowNavigation);
         if (ImGui::MenuItem("Find in Blueprints", "Ctrl+F (Blueprint)")) {
             m_ShowBlueprint = true;
             m_Graphs->OpenSearch({});
@@ -655,6 +669,33 @@ void Editor::DrawViewport()
     }
     if (m_ShowVolumes)
         DrawStreamingOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    if (m_Ctx.navigation && m_ShowNavMesh)
+        DrawNavigationOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
+    // Navigation test path: a click places its start / end on the surface under the cursor.
+    if (m_Ctx.navigation && m_NavPick != NavPick::None && clicked && !iconHit) {
+        const ImVec2     mouse = ImGui::GetIO().MousePos;
+        const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                             1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+        const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+        const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+        const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+        std::optional<glm::vec3> point;
+        if (m_Ctx.physics)
+            if (const auto hit = m_Ctx.physics->Raycast(cam.position, dir, 10000.0f))
+                point = hit->point;
+        if (!point)
+            if (const auto hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f))
+                point = cam.position + dir * hit->distance;
+        if (!point && dir.y < -1e-3f)
+            point = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
+        if (point) {
+            const glm::vec3 snapped = m_Ctx.navigation->ProjectPoint(*point, m_NavProfile).value_or(*point);
+            (m_NavPick == NavPick::Start ? m_NavStart : m_NavEnd) = snapped;
+            m_NavPick = m_NavPick == NavPick::Start && !m_NavEnd ? NavPick::End : NavPick::None;
+            UpdateNavigationTestPath();
+        }
+        iconHit = true; // no selection
+    }
     // Script prints (like UE's on-screen debug messages), newest at the top.
     if (m_Ctx.scripts && m_Ctx.scripts->Running()) {
         const auto  messages = m_Ctx.scripts->Messages();
@@ -750,6 +791,12 @@ void Editor::DrawViewport()
         ImGui::SetTooltip("Particle system icons");
     if (toolButton("Volumes", m_ShowVolumes))
         m_ShowVolumes = !m_ShowVolumes;
+    if (m_Ctx.navigation) {
+        if (toolButton("Nav", m_ShowNavMesh))
+            m_ShowNavMesh = !m_ShowNavMesh;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Navmesh (areas colored), links, obstacles, agents and the test path");
+    }
     if (toolButton("Game cam", m_GameCamera))
         m_GameCamera = !m_GameCamera;
     if (ImGui::IsItemHovered())
@@ -867,6 +914,12 @@ struct ViewportProjector {
         else if (cb.w <= kMinW)
             cb = glm::mix(cb, ca, (kMinW - cb.w) / (ca.w - cb.w));
         list->AddLine(ToScreen(ca), ToScreen(cb), color, 1.5f);
+    }
+    void Triangle(ImDrawList* list, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, ImU32 color) const
+    {
+        ImVec2 pa, pb, pc;
+        if (Project(a, pa) && Project(b, pb) && Project(c, pc))
+            list->AddTriangleFilled(pa, pb, pc, color);
     }
     // Circle of `radius` around `center` in the plane spanned by u and v (unit vectors).
     void Circle(ImDrawList* list, const glm::vec3& center, const glm::vec3& u, const glm::vec3& v, float radius,
@@ -1101,6 +1154,124 @@ void Editor::DrawStreamingOverlay(float x, float y, float width, float height)
                 list->AddText(ImVec2(p.x - size.x * 0.5f, p.y - size.y - 2.0f), color, label.c_str());
             }
         });
+    list->PopClipRect();
+}
+
+void Editor::DrawNavigationOverlay(float x, float y, float width, float height)
+{
+    NavigationWorld&        nav      = *m_Ctx.navigation;
+    const NavSettings&      settings = nav.Settings();
+    Registry&               registry = m_Ctx.scene.GetRegistry();
+    const CameraData        camera   = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    const glm::vec3 lift(0.0f, 0.03f, 0.0f); // above the floor it lies on
+    const auto      areaColor = [&](std::uint32_t area, float alpha) {
+        const glm::vec3 c = area < settings.areas.size() ? settings.areas[area].color : glm::vec3(1.0f, 0.0f, 1.0f);
+        return ImGui::GetColorU32(ImVec4(c.r, c.g, c.b, alpha));
+    };
+    const auto box = [&](const glm::mat4& m, const glm::vec3& h, ImU32 color) {
+        glm::vec3 c[8];
+        for (int i = 0; i < 8; ++i)
+            c[i] = glm::vec3(m * glm::vec4((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z, 1.0f));
+        static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                              {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        for (const auto& edge : kEdges)
+            projector.Line(list, c[edge[0]], c[edge[1]], color);
+    };
+
+    // The navmesh of the shown profile: polygons in their area's color, walls darker.
+    std::uint32_t triangles = 0;
+    nav.ForEachTriangle(m_NavProfile, [&](const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, std::uint32_t area) {
+        if (++triangles <= 40000)
+            projector.Triangle(list, a + lift, b + lift, c + lift, areaColor(area, 0.28f));
+    });
+    nav.ForEachBoundaryEdge(m_NavProfile, [&](const glm::vec3& a, const glm::vec3& b) {
+        projector.Line(list, a + lift, b + lift, IM_COL32(20, 60, 110, 220));
+    });
+    if (m_NavShowTiles)
+        nav.ForEachTile(m_NavProfile, [&](const glm::vec3& min, const glm::vec3& max) {
+            const glm::vec3 c[4] = {{min.x, min.y, min.z}, {max.x, min.y, min.z}, {max.x, min.y, max.z}, {min.x, min.y, max.z}};
+            for (int i = 0; i < 4; ++i)
+                projector.Line(list, c[i], c[(i + 1) % 4], IM_COL32(255, 255, 255, 60));
+        });
+
+    // Volumes: bounds green, areas in their color (blocked red).
+    registry.ViewOf<NavMeshBounds, WorldTransform>().Each([&](Entity e, NavMeshBounds& b, WorldTransform& w) {
+        box(w.matrix, b.halfExtents, IsSelected(e) ? IM_COL32(120, 255, 140, 255) : IM_COL32(80, 200, 100, 140));
+    });
+    registry.ViewOf<NavArea, WorldTransform>().Each([&](Entity e, NavArea& a, WorldTransform& w) {
+        const auto  index = settings.Area(a.area);
+        const ImU32 color = a.area == kNavAreaBlocked ? IM_COL32(230, 60, 60, 220)
+                            : index               ? areaColor(static_cast<std::uint32_t>(*index), IsSelected(e) ? 1.0f : 0.7f)
+                                                  : IM_COL32(255, 0, 255, 200);
+        box(w.matrix, a.halfExtents, color);
+    });
+    // Links: arcs from start to end (an arrow head at the end of one-way links).
+    registry.ViewOf<NavLink, WorldTransform>().Each([&](Entity e, NavLink& l, WorldTransform& w) {
+        const glm::vec3 a = glm::vec3(w.matrix * glm::vec4(l.start, 1.0f));
+        const glm::vec3 b = glm::vec3(w.matrix * glm::vec4(l.end, 1.0f));
+        const ImU32     color = IsSelected(e) ? IM_COL32(255, 230, 120, 255) : IM_COL32(240, 200, 60, 200);
+        const float     arc   = glm::distance(a, b) * 0.25f + 0.25f;
+        glm::vec3       prev  = a;
+        for (int i = 1; i <= 16; ++i) {
+            const float     t    = static_cast<float>(i) / 16.0f;
+            const glm::vec3 next = glm::mix(a, b, t) + glm::vec3(0.0f, arc * 4.0f * t * (1.0f - t), 0.0f);
+            projector.Line(list, prev, next, color);
+            prev = next;
+        }
+        projector.Circle(list, a + lift, glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), l.radius, color);
+        projector.Circle(list, b + lift, glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), l.radius, color);
+        if (!l.bidirectional) {
+            const glm::vec3 dir  = glm::normalize(glm::vec3(b.x - a.x, 0.0f, b.z - a.z) + glm::vec3(1e-6f));
+            const glm::vec3 side = glm::cross(dir, glm::vec3(0, 1, 0)) * 0.2f;
+            projector.Line(list, b + lift, b + lift - dir * 0.35f + side, color);
+            projector.Line(list, b + lift, b + lift - dir * 0.35f - side, color);
+        }
+    });
+    // Obstacles: boxes / cylinders, dimmed while disabled.
+    registry.ViewOf<NavObstacle, WorldTransform>().Each([&](Entity e, NavObstacle& o, WorldTransform& w) {
+        const ImU32 color = !o.enabled ? IM_COL32(200, 120, 60, 80) : IsSelected(e) ? IM_COL32(255, 160, 80, 255) : IM_COL32(240, 130, 50, 200);
+        if (o.shape == NavObstacleShape::Box) {
+            box(w.matrix, o.halfExtents, color);
+        } else {
+            const glm::vec3 p(w.matrix[3]);
+            const float     s = std::max(glm::length(glm::vec3(w.matrix[0])), glm::length(glm::vec3(w.matrix[2])));
+            const float     h = o.height * glm::length(glm::vec3(w.matrix[1]));
+            projector.Circle(list, p, glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), o.radius * s, color);
+            projector.Circle(list, p + glm::vec3(0, h, 0), glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), o.radius * s, color);
+        }
+    });
+    // Agents (playing): body circle, velocity, next corners, target.
+    nav.ForEachAgent([&](const NavAgentDebug& a) {
+        const ImU32 color = a.status == NavMoveStatus::Failed ? IM_COL32(255, 90, 90, 230) : IM_COL32(90, 220, 255, 230);
+        projector.Circle(list, a.position + lift, glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), a.radius, color);
+        projector.Line(list, a.position + lift, a.position + lift + a.velocity * 0.5f, color);
+        glm::vec3 prev = a.position;
+        for (const glm::vec3& c : a.corners) {
+            projector.Line(list, prev + lift, c + lift, IM_COL32(90, 220, 255, 120));
+            prev = c;
+        }
+        if (a.status == NavMoveStatus::Moving) {
+            projector.Line(list, a.target + glm::vec3(-0.2f, 0.05f, 0.0f), a.target + glm::vec3(0.2f, 0.05f, 0.0f), color);
+            projector.Line(list, a.target + glm::vec3(0.0f, 0.05f, -0.2f), a.target + glm::vec3(0.0f, 0.05f, 0.2f), color);
+        }
+    });
+    // Test path.
+    const ImU32 pathColor = m_NavPath.status == NavPathStatus::Complete ? IM_COL32(255, 235, 80, 255) : IM_COL32(255, 140, 60, 255);
+    for (std::size_t i = 1; i < m_NavPath.points.size(); ++i) {
+        ImVec2 a, b;
+        if (projector.Project(m_NavPath.points[i - 1] + lift * 3.0f, a) && projector.Project(m_NavPath.points[i] + lift * 3.0f, b))
+            list->AddLine(a, b, pathColor, 3.0f);
+    }
+    for (const auto& [point, label] : {std::pair{m_NavStart, "start"}, std::pair{m_NavEnd, "end"}}) {
+        ImVec2 p;
+        if (point && projector.Project(*point, p)) {
+            list->AddCircleFilled(p, 5.0f, pathColor);
+            list->AddText(ImVec2(p.x + 7.0f, p.y - 7.0f), pathColor, label);
+        }
+    }
     list->PopClipRect();
 }
 

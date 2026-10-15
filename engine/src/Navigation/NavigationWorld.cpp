@@ -1617,6 +1617,24 @@ void NavigationWorld::Build(Scene& scene)
     I.UpdateStats();
 }
 
+void NavigationWorld::Flush(Scene& scene)
+{
+    Impl& I = *m_Impl;
+    scene.UpdateTransforms();
+    I.Collect(scene);
+    if (autoRebuild)
+        I.PropagateDirty();
+    else
+        I.dirtyRegions.clear();
+    while (I.IsBuilding()) {
+        I.LaunchBuilds(true);
+        I.ApplyOutputs(true);
+    }
+    I.RebuildLinkTiles();
+    I.SyncObstacles();
+    I.UpdateStats();
+}
+
 bool NavigationWorld::IsBuilding() const { return m_Impl->IsBuilding(); }
 
 void NavigationWorld::Reset()

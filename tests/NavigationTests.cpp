@@ -434,3 +434,43 @@ TEST_CASE(Navigation_BlueprintNodesAndSerialization)
     CHECK(settings.profiles[0].radius > 0.0f && settings.profiles[1].name == "A 2");
     CHECK(settings.areas.size() == 2 && settings.areas[0].name == "Default" && settings.areas[1].cost == 1.0f);
 }
+
+TEST_CASE(Navigation_PhysicsTemplateWanderer)
+{
+    // The Physics template: a navmesh over the ground (ramp included), box obstacles, a Nav Agent
+    // with Wander.ugraph walking between random reachable points.
+    const fs::path root = fs::path(ENGINE_TEST_SOURCE_DIR) / "templates" / "Physics";
+    Scene          scene;
+    (void)LoadSceneFile(root / "Content" / "Scenes" / "Main.scene.json", scene, nullptr);
+    NavigationWorld nav;
+    nav.Build(scene);
+    CHECK(nav.Stats().tiles > 0 && nav.Stats().obstacles == 3);
+
+    EventBus     events;
+    ScriptSystem scripts(events);
+    scripts.SetNavigationWorld(&nav);
+    nav.SetRandomSeed(3);
+    std::error_code ec;
+    const fs::path  previous = fs::current_path(ec);
+    fs::current_path(root, ec); // script paths are relative to the project root
+    scripts.Begin(scene);
+    CHECK(scripts.Stats().errors == 0 && scripts.Stats().instances == 3);
+    Entity wanderer = NullEntity;
+    scene.GetRegistry().ViewOf<NavAgent>().Each([&](Entity e, NavAgent&) { wanderer = e; });
+    CHECK(wanderer != NullEntity);
+    const glm::vec3 start    = scene.GetRegistry().Get<Transform>(wanderer).position;
+    float           traveled = 0.0f;
+    glm::vec3       last     = start;
+    for (int i = 0; i < 300; ++i) {
+        nav.Update(scene, 1.0f / 30.0f);
+        scripts.Update(scene, 1.0f / 30.0f);
+        const glm::vec3 p = scene.GetRegistry().Get<Transform>(wanderer).position;
+        traveled += glm::distance(p, last);
+        last = p;
+        CHECK(std::abs(p.x) < 10.5f && std::abs(p.z) < 10.5f); // stays on the ground
+    }
+    scripts.End(scene);
+    fs::current_path(previous, ec);
+    CHECK(scripts.Stats().errors == 0);
+    CHECK(traveled > 5.0f);
+}

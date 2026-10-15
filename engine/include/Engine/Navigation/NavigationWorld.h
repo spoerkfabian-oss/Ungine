@@ -76,6 +76,9 @@ public:
     void Update(Scene& scene, float dt, bool simulate = true);
     // Every tile of every profile from the current scene, now (blocking; tiles still in jobs).
     void Build(Scene& scene);
+    // Applies what changed in the scene since the last Update now (blocking): changed tiles are
+    // rebuilt, links / obstacles applied. Agents are not moved.
+    void Flush(Scene& scene);
     // Tiles dirty or building.
     [[nodiscard]] bool IsBuilding() const;
     // Forgets the scene (agents, sources, tiles, obstacles); settings stay.
