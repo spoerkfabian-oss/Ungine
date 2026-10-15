@@ -297,7 +297,7 @@ A. Härtung (PR #13): GPU-Tests für Skinning/Laufzeit-UI/Import, randomisierte 
 20. **Partikel:** CPU-Simulation (keine GPU-Compute-Variante), Kollision = ein Physik-Raycast pro Partikel und Frame (teuer bei vielen), keine Tiefenpuffer-Kollision; nur unbeleuchtet + emissiv (Mesh-Partikel einfache Sonnen-/Himmelstönung), keine Schatten; Partikel nach transparenten Meshes gezeichnet (keine gemeinsame Sortierung), Alpha-Sortierung pro Emitter und zwischen Emittern nach Bounds-Mitte, Mesh-Partikel ohne Tiefen-Writes; keine Flipbook-Überblendung, keine Motion Vectors/Licht-Emission/Vektorfelder/Skelett-Sampling; Datei-Änderungen starten Instanzen neu (kein Zustandsübertrag); per Script gespawnte One-Shots überleben `ScriptSystem::End` (Play/Stop und Level-Wechsel setzen die Welt zurück); ein SceneRenderer darf pro Frame nur einmal rendern (Partikel-Buffer pro Frame-Slot); Vorschau im Partikel-Editor ohne Physik (Kollision dort wirkungslos); Delay nur im ersten Durchlauf.
 
 ## Nächste Schritte (Vorschlag)
-- Phase 27 gemergt (PR #17, 2026-10-14). Phase 28 per PR (CI inkl. GPU-Suite + MSVC grün), Merge durch den Nutzer. Branch-Schutz mit erforderlichen CI-Checks empfohlen.
+- Phase 27 gemergt (PR #17, 2026-10-14). Phase 28 gemergt (PR #18, 2026-10-15). Branch-Schutz mit erforderlichen CI-Checks empfohlen.
 - Danach Phase 29: Navmesh (Recast/Detour, gekachelt + Laufzeit-Rebake/dynamische Hindernisse) – vorher Details erfragen.
 - **Danach gemäß [ROADMAP.md](ROADMAP.md):** C (Partikel, Navmesh, Animation-State-Machine/IK, TAA/Decals/SSR/Nebel/Terrain, Material-Editor, verschachtelte Prefabs, Settings-Undo).
 - Weitere spätere Render-/Scripting-Ideen: Meshlets/Cluster-Culling, Hi-Z für Schatten-Views, Deferred-Variante, Mip-Streaming und Blueprint-Vererbung.
