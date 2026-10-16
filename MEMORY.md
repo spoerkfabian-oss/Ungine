@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-15 (Phase 28 merged (PR #18); Phase 29 navigation implemented on `branch`, PR pending; next Phase 30 animation state machine / IK after the merge, ask first)
+- Last updated: 2026-10-16 (Phase 28 merged (PR #18); Phase 29 navigation verified (CTest 19/19, ASan, Clang) on `branch`, PR open; next Phase 30 animation state machine / IK after the merge, ask first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
