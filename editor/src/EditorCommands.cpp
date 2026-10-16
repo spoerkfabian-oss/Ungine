@@ -383,6 +383,7 @@ void Editor::NewScene()
     m_GizmoEdit.reset();
     m_InspectorEdit.reset();
     m_ScenePath.clear();
+    LoadNavigation({});
     m_Status = "New scene";
 }
 
@@ -417,6 +418,7 @@ bool Editor::OpenScene(const std::filesystem::path& file)
     if (!loaded)
         return false;
     m_ScenePath = file;
+    LoadNavigation(file); // its baked navmesh (tiles of later changes are rebuilt)
     m_Status    = "Opened " + file.filename().string();
     m_Ctx.scene.UpdateTransforms();
     ENGINE_INFO("Opened scene '{}'", file.string());
@@ -445,6 +447,7 @@ bool Editor::SaveScene(const std::filesystem::path& file)
     }
     RunConstructionScripts();
     m_ScenePath = file;
+    SaveNavigation(file); // baked next to the scene (with what the construction scripts built)
     m_History->MarkSaved();
     m_Status = "Saved " + file.filename().string();
     ENGINE_INFO("Saved scene '{}'", file.string());
@@ -779,6 +782,10 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
     m_Ctx.scene.UpdateTransforms();
     if (m_Ctx.physics)
         m_Ctx.physics->Sync(m_Ctx.scene);
+    if (m_Ctx.navigation) { // the level's navmesh until Stop
+        LoadNavigation(file);
+        m_NavOtherLevel = true;
+    }
     if (m_Ctx.audio)
         m_Ctx.audio->Begin(m_Ctx.scene);
     if (m_Ctx.scripts) {
@@ -832,6 +839,8 @@ void Editor::Stop()
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // spawned one-shots go, the edit scene's effects restart
+    if (std::exchange(m_NavOtherLevel, false))
+        LoadNavigation(m_ScenePath); // back to the edit scene's navmesh
     for (ModelHandle h : std::exchange(m_PlayModels, {}))
         m_Ctx.assets.Release(h);
 

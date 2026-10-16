@@ -117,9 +117,29 @@ if(UNIX AND NOT APPLE)
 endif()
 set_target_properties(miniaudio PROPERTIES FOLDER "ThirdParty")
 
-# Texture encoding and mesh simplification run on asset workers even in Debug builds: optimize
-# them (GCC / Clang; MSVC Debug keeps /RTC1, which /O2 conflicts with).
-foreach(target bc7enc meshoptimizer miniaudio)
+# --- recastnavigation (navmesh generation, path queries, crowd simulation; zlib license) ---
+# Recast + Detour + DetourCrowd + DetourTileCache as one engine-private static library.
+FetchContent_Declare(recastnavigation
+    GIT_REPOSITORY https://github.com/recastnavigation/recastnavigation.git
+    GIT_TAG        v1.6.0
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _none) # its CMakeLists builds the demo / tests
+FetchContent_MakeAvailable(recastnavigation)
+set(RECAST_MODULES Recast Detour DetourCrowd DetourTileCache)
+set(RECAST_SOURCES)
+set(RECAST_INCLUDES)
+foreach(module ${RECAST_MODULES})
+    file(GLOB module_sources CONFIGURE_DEPENDS "${recastnavigation_SOURCE_DIR}/${module}/Source/*.cpp")
+    list(APPEND RECAST_SOURCES ${module_sources})
+    list(APPEND RECAST_INCLUDES "${recastnavigation_SOURCE_DIR}/${module}/Include")
+endforeach()
+add_library(recastnav STATIC ${RECAST_SOURCES})
+target_include_directories(recastnav SYSTEM PUBLIC ${RECAST_INCLUDES})
+set_target_properties(recastnav PROPERTIES FOLDER "ThirdParty")
+
+# Texture encoding, mesh simplification and navmesh tiles run on workers even in Debug builds:
+# optimize them (GCC / Clang; MSVC Debug keeps /RTC1, which /O2 conflicts with).
+foreach(target bc7enc meshoptimizer miniaudio recastnav)
     if(NOT MSVC)
         target_compile_options(${target} PRIVATE -O2 -w)
     endif()

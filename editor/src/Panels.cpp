@@ -1,5 +1,6 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
@@ -292,6 +293,23 @@ void Editor::DrawHierarchy()
             PushCreated("Create streaming volume", roots);
             Select(e);
         }
+        ImGui::Separator();
+        const auto navEntity = [&](const char* name, auto component) {
+            const Entity created = m_Ctx.scene.CreateEntity(name);
+            m_Ctx.scene.EditTransform(created).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<decltype(component)>(created, component);
+            const Entity createdRoots[] = {created};
+            PushCreated(std::string("Create ") + name, createdRoots);
+            Select(created);
+        };
+        if (ImGui::MenuItem("Nav Mesh Bounds"))
+            navEntity("Nav Mesh Bounds", NavMeshBounds{});
+        if (ImGui::MenuItem("Nav Area"))
+            navEntity("Nav Area", NavArea{});
+        if (ImGui::MenuItem("Nav Link"))
+            navEntity("Nav Link", NavLink{});
+        if (ImGui::MenuItem("Nav Obstacle"))
+            navEntity("Nav Obstacle", NavObstacle{});
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -1274,6 +1292,8 @@ void Editor::DrawInspector()
             registry.Remove<StreamingSource>(e);
     }
 
+    DrawNavigationInspector(e);
+
     ImGui::Separator();
     if (ImGui::Button("Add component"))
         ImGui::OpenPopup("add component");
@@ -1356,6 +1376,17 @@ void Editor::DrawInspector()
             registry.Emplace<LevelStreamingVolume>(e);
         if (ImGui::MenuItem("Streaming Source", nullptr, false, !registry.Has<StreamingSource>(e)))
             registry.Emplace<StreamingSource>(e);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Nav Agent", nullptr, false, !registry.Has<NavAgent>(e)))
+            registry.Emplace<NavAgent>(e);
+        if (ImGui::MenuItem("Nav Mesh Bounds", nullptr, false, !registry.Has<NavMeshBounds>(e)))
+            registry.Emplace<NavMeshBounds>(e);
+        if (ImGui::MenuItem("Nav Area", nullptr, false, !registry.Has<NavArea>(e)))
+            registry.Emplace<NavArea>(e);
+        if (ImGui::MenuItem("Nav Link", nullptr, false, !registry.Has<NavLink>(e)))
+            registry.Emplace<NavLink>(e);
+        if (ImGui::MenuItem("Nav Obstacle", nullptr, false, !registry.Has<NavObstacle>(e)))
+            registry.Emplace<NavObstacle>(e);
         ImGui::EndPopup();
     }
 
@@ -1930,6 +1961,14 @@ void Editor::DrawStats()
             ImGui::Text("Simulation     %.2f ms, %u collision rays", ps.simulateMs, ps.collisionRays);
             ImGui::Text("Drawn          %u in %u batches, %u draw calls", rs.particlesDrawn, rs.particleBatches, rs.particleDrawCalls);
         }
+        if (m_Ctx.navigation) {
+            const NavStats& ns = m_Ctx.navigation->Stats();
+            ImGui::SeparatorText("Navigation");
+            ImGui::Text("Navmesh        %u tile(s), %u polygon(s), %u profile(s)", ns.tiles, ns.polygons, ns.profiles);
+            ImGui::Text("Sources        %u colliders, %u areas, %u links, %u obstacles", ns.sources, ns.areas, ns.links, ns.obstacles);
+            ImGui::Text("Building       %u tile(s) pending, %llu built", ns.pendingTiles, static_cast<unsigned long long>(ns.tilesBuilt));
+            ImGui::Text("Agents         %u, update %.2f ms", ns.agents, ns.updateMs);
+        }
 
         ImGui::SeparatorText("Memory");
         const VkPhysicalDeviceMemoryProperties* memory = nullptr;
@@ -2438,5 +2477,140 @@ void Editor::ReleaseTexturePreviews(bool all)
         return stale;
     });
 }
+
+void Editor::DrawNavigationInspector(Entity e)
+{
+    Registry&         registry = m_Ctx.scene.GetRegistry();
+    const NavSettings fallback{};
+    const NavSettings& settings = m_Ctx.navigation ? m_Ctx.navigation->Settings()
+                                  : m_Ctx.project  ? m_Ctx.project->settings.navigation
+                                                   : fallback;
+    // Combo of names (plus extras such as "Blocked"); unknown values stay and show in red.
+    const auto nameCombo = [](const char* label, std::string* value, const std::vector<std::string>& names) {
+        PropertyRow(label);
+        const bool known = std::ranges::find(names, *value) != names.end();
+        if (!known)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.35f, 1.0f));
+        if (ImGui::BeginCombo("##v", value->c_str())) {
+            if (!known)
+                ImGui::PopStyleColor();
+            for (const std::string& name : names)
+                if (ImGui::Selectable(name.c_str(), name == *value))
+                    *value = name;
+            ImGui::EndCombo();
+        } else if (!known) {
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopID();
+    };
+    const auto maskRow = [](const char* label, std::uint32_t* mask, const std::vector<std::string>& names) {
+        PropertyRow(label);
+        std::string preview;
+        for (std::size_t i = 0; i < names.size(); ++i)
+            if (*mask & (1u << i))
+                preview += (preview.empty() ? "" : ", ") + names[i];
+        if (ImGui::BeginCombo("##v", preview.empty() ? "(none)" : preview.c_str())) {
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                bool on = (*mask & (1u << i)) != 0;
+                if (ImGui::Checkbox(names[i].c_str(), &on))
+                    *mask = on ? (*mask | (1u << i)) : (*mask & ~(1u << i));
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopID();
+    };
+    std::vector<std::string> areaNames, profileNames;
+    for (const NavAreaType& a : settings.areas)
+        areaNames.push_back(a.name);
+    for (const NavAgentProfile& p : settings.profiles)
+        profileNames.push_back(p.name);
+
+    if (NavAgent* agent = registry.TryGet<NavAgent>(e); agent && ImGui::CollapsingHeader("Nav Agent", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("navagent")) {
+            nameCombo("Profile", &agent->profile, profileNames);
+            DragFloatRow("Max speed", &agent->maxSpeed, 0.05f, 0.0f, 100.0f, "%.2f m/s");
+            DragFloatRow("Acceleration", &agent->acceleration, 0.1f, 0.0f, 1000.0f, "%.1f m/s2");
+            DragFloatRow("Stopping distance", &agent->stoppingDistance, 0.01f, 0.0f, 100.0f, "%.2f m");
+            DragFloatRow("Separation", &agent->separationWeight, 0.05f, 0.0f, 20.0f);
+            static constexpr const char* kAvoidance[] = {"Off", "Low", "Medium", "High"};
+            ComboRow("Avoidance", &agent->avoidance, kAvoidance);
+            CheckboxRow("Face movement", &agent->faceMovement);
+            CheckboxRow("Drive character", &agent->driveCharacter);
+            maskRow("Walkable areas", &agent->areaMask, areaNames);
+            if (m_Ctx.navigation && m_PlayState != PlayState::Edit) {
+                static constexpr const char* kStatus[] = {"Idle", "Moving", "Arrived", "Failed"};
+                PropertyRow("State");
+                const glm::vec3 v = m_Ctx.navigation->AgentVelocity(e);
+                ImGui::Text("%s, %.2f m/s%s", kStatus[static_cast<int>(m_Ctx.navigation->MoveStatus(e))], glm::length(v),
+                            m_Ctx.navigation->HasAgent(e) ? "" : " (not on the navmesh)");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Moved by AI Move To; with a Character Controller through the physics.");
+        if (ImGui::Button("Remove nav agent"))
+            registry.Remove<NavAgent>(e);
+    }
+    if (NavMeshBounds* bounds = registry.TryGet<NavMeshBounds>(e);
+        bounds && ImGui::CollapsingHeader("Nav Mesh Bounds", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("navbounds")) {
+            Vec3Row("Half extents", &bounds->halfExtents, 0.05f, 20.0f);
+            bounds->halfExtents = glm::max(bounds->halfExtents, glm::vec3(0.0f));
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("The navmesh is built from static colliders inside these boxes.");
+        if (m_Ctx.navigation && ImGui::Button("Bake navigation"))
+            BakeNavigation();
+        if (ImGui::Button("Remove nav mesh bounds"))
+            registry.Remove<NavMeshBounds>(e);
+    }
+    if (NavArea* area = registry.TryGet<NavArea>(e); area && ImGui::CollapsingHeader("Nav Area", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("navarea")) {
+            std::vector<std::string> names = areaNames;
+            names.emplace_back(kNavAreaBlocked);
+            nameCombo("Area", &area->area, names);
+            Vec3Row("Half extents", &area->halfExtents, 0.05f, 1.0f);
+            area->halfExtents = glm::max(area->halfExtents, glm::vec3(0.0f));
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Marks the walkable surface inside the box (costs: Project Settings).");
+        if (ImGui::Button("Remove nav area"))
+            registry.Remove<NavArea>(e);
+    }
+    if (NavLink* link = registry.TryGet<NavLink>(e); link && ImGui::CollapsingHeader("Nav Link", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("navlink")) {
+            Vec3Row("Start", &link->start, 0.02f, 0.0f);
+            Vec3Row("End", &link->end, 0.02f, 0.0f);
+            DragFloatRow("Radius", &link->radius, 0.01f, 0.05f, 10.0f, "%.2f m");
+            CheckboxRow("Both ways", &link->bidirectional);
+            nameCombo("Area", &link->area, areaNames);
+            maskRow("Profiles", &link->profiles, profileNames);
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Jump / ladder between two navmesh points (entity space, within one tile apart).");
+        if (ImGui::Button("Remove nav link"))
+            registry.Remove<NavLink>(e);
+    }
+    if (NavObstacle* obstacle = registry.TryGet<NavObstacle>(e);
+        obstacle && ImGui::CollapsingHeader("Nav Obstacle", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("navobstacle")) {
+            static constexpr const char* kShapes[] = {"Box", "Cylinder"};
+            ComboRow("Shape", &obstacle->shape, kShapes);
+            if (obstacle->shape == NavObstacleShape::Box) {
+                Vec3Row("Half extents", &obstacle->halfExtents, 0.02f, 0.5f);
+                obstacle->halfExtents = glm::max(obstacle->halfExtents, glm::vec3(0.0f));
+            } else {
+                DragFloatRow("Radius", &obstacle->radius, 0.01f, 0.0f, 100.0f, "%.2f m");
+                DragFloatRow("Height", &obstacle->height, 0.01f, 0.0f, 100.0f, "%.2f m");
+            }
+            CheckboxRow("Enabled", &obstacle->enabled);
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Cut out of the navmesh while enabled; follows the entity (box: yaw only).");
+        if (ImGui::Button("Remove nav obstacle"))
+            registry.Remove<NavObstacle>(e);
+    }
+}
+
 
 } // namespace Engine

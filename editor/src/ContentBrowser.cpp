@@ -12,6 +12,7 @@
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/Project.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
@@ -599,7 +600,7 @@ void Editor::RefreshContent()
         const fs::path&   path  = it->path();
         const std::string label = PathToUtf8(path.filename());
         const std::string lower = Lower(label);
-        if (label.starts_with('.') || EndsWith(lower, ".tmp"))
+        if (label.starts_with('.') || EndsWith(lower, ".tmp") || EndsWith(lower, ".unav")) // .unav: a scene's baked navmesh
             continue;
         ContentItem item{path, label, ContentItem::Kind::Other};
         std::error_code typeError;
@@ -973,6 +974,12 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         m_Status = rollbackError ? "Relocation completed but reference repair and rollback failed: " + referenceError
                                  : "Relocation cancelled because references could not be repaired: " + referenceError;
         return false;
+    }
+    // A scene's baked navmesh goes along (best effort: it is rebuilt from the scene otherwise).
+    if (!wasDirectory && EndsWith(Lower(PathToUtf8(source.filename())), ".json")) {
+        std::error_code navError;
+        if (const fs::path baked = NavMeshFileFor(source); fs::exists(baked, navError))
+            fs::rename(baked, NavMeshFileFor(target), navError);
     }
     m_Status = "Moved " + PathToUtf8(source.filename()) + " to " + PathToUtf8(target.parent_path().filename());
     if (storedReferences > 0)
@@ -1618,6 +1625,10 @@ void Editor::DrawContentBrowser()
         if (ImGui::Button("Delete")) {
             const fs::path deleted = m_DeleteTarget;
             fs::remove_all(m_DeleteTarget, ec);
+            if (!ec && EndsWith(Lower(PathToUtf8(deleted.filename())), ".json")) { // a scene's baked navmesh
+                std::error_code navError;
+                fs::remove(NavMeshFileFor(deleted), navError);
+            }
             m_Status = ec ? "Delete failed: " + ec.message() : "Deleted " + PathToUtf8(m_DeleteTarget.filename());
             if (!ec && m_Ctx.project) {
                 const fs::path start = m_Ctx.project->StartScene();
@@ -1813,6 +1824,111 @@ void Editor::DrawProjectSettings()
         ImGui::TextDisabled("Right-click a key of an action to remove it. Used from the next Play.");
         m_ProjectDirty |= changed;
     }
+    // Navigation: voxel / tile settings, agent profiles (one navmesh each), area types.
+    if (ImGui::CollapsingHeader("Navigation")) {
+        NavSettings& nav     = s.navigation;
+        bool         changed = false;
+        ImGui::PushID("navigation");
+        changed |= ImGui::DragFloat("Cell size", &nav.cellSize, 0.005f, 0.02f, 4.0f, "%.3f m");
+        changed |= ImGui::DragFloat("Cell height", &nav.cellHeight, 0.005f, 0.01f, 4.0f, "%.3f m");
+        int tileSize = static_cast<int>(nav.tileSize);
+        if (ImGui::SliderInt("Tile size", &tileSize, 16, 255, "%d cells")) {
+            nav.tileSize = static_cast<std::uint32_t>(tileSize);
+            changed      = true;
+        }
+        changed |= ImGui::DragFloat("Edge max length", &nav.edgeMaxLength, 0.1f, 0.0f, 1000.0f, "%.1f m");
+        changed |= ImGui::DragFloat("Edge max error", &nav.edgeMaxError, 0.01f, 0.1f, 10.0f, "%.2f cells");
+        changed |= ImGui::DragFloat("Region min size", &nav.regionMinSize, 0.1f, 0.0f, 150.0f, "%.1f cells");
+        changed |= ImGui::DragFloat("Region merge size", &nav.regionMergeSize, 0.1f, 0.0f, 150.0f, "%.1f cells");
+        int limits[3] = {static_cast<int>(nav.maxTiles), static_cast<int>(nav.maxObstacles), static_cast<int>(nav.maxAgents)};
+        if (ImGui::InputInt3("Max tiles / obstacles / agents", limits)) {
+            nav.maxTiles     = static_cast<std::uint32_t>(std::max(limits[0], 0));
+            nav.maxObstacles = static_cast<std::uint32_t>(std::max(limits[1], 0));
+            nav.maxAgents    = static_cast<std::uint32_t>(std::max(limits[2], 0));
+            changed          = true;
+        }
+        ImGui::SeparatorText("Agent profiles");
+        for (std::size_t i = 0; i < nav.profiles.size(); ++i) {
+            NavAgentProfile& p = nav.profiles[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::SetNextItemWidth(110.0f);
+            changed |= ImGui::InputText("##name", &p.name);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0f);
+            float shape[2] = {p.radius, p.height};
+            if (ImGui::DragFloat2("radius / height", shape, 0.01f, 0.05f, 50.0f, "%.2f")) {
+                p.radius = shape[0], p.height = shape[1];
+                changed  = true;
+            }
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::Dummy(ImVec2(110.0f, 0.0f));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0f);
+            float climb[2] = {p.maxClimb, p.maxSlope};
+            if (ImGui::DragFloat2("step / slope", climb, 0.01f, 0.0f, 89.0f, "%.2f")) {
+                p.maxClimb = climb[0], p.maxSlope = climb[1];
+                changed    = true;
+            }
+            ImGui::SameLine();
+            if (nav.profiles.size() > 1 && ImGui::SmallButton("x")) {
+                nav.profiles.erase(nav.profiles.begin() + static_cast<std::ptrdiff_t>(i));
+                changed = true;
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        if (nav.profiles.size() < kNavMaxProfiles && ImGui::SmallButton("+ Profile")) {
+            nav.profiles.push_back(NavAgentProfile{.name = "Profile " + std::to_string(nav.profiles.size() + 1)});
+            changed = true;
+        }
+        ImGui::SeparatorText("Areas");
+        for (std::size_t i = 0; i < nav.areas.size(); ++i) {
+            NavAreaType& a = nav.areas[i];
+            ImGui::PushID(static_cast<int>(1000 + i));
+            ImGui::ColorEdit3("##color", &a.color.x, ImGuiColorEditFlags_NoInputs);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(130.0f);
+            ImGui::BeginDisabled(i == 0); // "Default" stays
+            changed |= ImGui::InputText("##name", &a.name);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0f);
+            changed |= ImGui::DragFloat("cost", &a.cost, 0.05f, 1.0f, 10000.0f, "%.2f");
+            if (i > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) {
+                    nav.areas.erase(nav.areas.begin() + static_cast<std::ptrdiff_t>(i));
+                    changed = true;
+                    ImGui::PopID();
+                    break;
+                }
+            }
+            changed |= ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::PopID();
+        }
+        if (nav.areas.size() < kNavMaxAreas && ImGui::SmallButton("+ Area")) {
+            nav.areas.push_back(NavAreaType{.name = "Area " + std::to_string(nav.areas.size()), .cost = 2.0f});
+            changed = true;
+        }
+        ImGui::TextDisabled("\"%s\" (Nav Area) removes the surface.", std::string(kNavAreaBlocked).c_str());
+        m_ProjectDirty |= changed;
+        // Costs / colors apply at once; voxel, profile and area-list changes rebuild every navmesh.
+        if (m_Ctx.navigation) {
+            NavSettings next = nav;
+            SanitizeNavSettings(next);
+            const bool rebuild = next.BuildHash() != m_Ctx.navigation->Settings().BuildHash() ||
+                                 next.maxObstacles != m_Ctx.navigation->Settings().maxObstacles ||
+                                 next.maxAgents != m_Ctx.navigation->Settings().maxAgents;
+            if (!rebuild && !(next == m_Ctx.navigation->Settings()))
+                m_Ctx.navigation->SetSettings(next);
+            ImGui::BeginDisabled(!rebuild || ImGui::IsAnyItemActive());
+            if (ImGui::Button("Apply (rebuilds the navmesh)"))
+                m_Ctx.navigation->SetSettings(next);
+            ImGui::EndDisabled();
+        }
+        ImGui::PopID();
+    }
     ImGui::Separator();
     ImGui::BeginDisabled(!IsValidProjectName(s.name));
     if (ImGui::Button("Save")) {
@@ -1828,6 +1944,8 @@ void Editor::DrawProjectSettings()
             project.settings = loaded->settings;
             if (m_Ctx.audio)
                 m_Ctx.audio->Apply(project.settings.audio);
+            if (m_Ctx.navigation)
+                m_Ctx.navigation->SetSettings(project.settings.navigation);
             m_ProjectDirty = false;
         }
     ImGui::End();
