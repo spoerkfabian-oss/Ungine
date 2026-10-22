@@ -5,6 +5,7 @@
 // the background behind a loading screen; streaming volumes / Load Stream Level add sub-levels.
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/FileSystem.h"
@@ -86,6 +87,9 @@ protected:
         m_Particles = std::make_unique<ParticleWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
         m_Scripts->SetParticleWorld(m_Particles.get());
         m_SceneRenderer->particles = m_Particles.get();
+        m_Navigation = std::make_unique<NavigationWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
+        m_Navigation->SetSettings(m_Project.settings.navigation);
+        m_Scripts->SetNavigationWorld(m_Navigation.get());
         m_Loader = std::make_unique<LevelLoader>(GetJobs(), &GetAssets());
         LoadLoadingScreen();
 
@@ -122,6 +126,13 @@ protected:
         ApplyGraphics();
         m_Scene.UpdateTransforms();
         m_Physics->Sync(m_Scene);
+        // The level's baked navmesh (Main.unav next to Main.scene.json); tiles of what changed since,
+        // or everything without a file, are built in the background.
+        if (const fs::path baked = NavMeshFileFor(scene); Vfs::Exists(baked)) {
+            std::string error;
+            if (!m_Navigation->LoadBaked(baked, &error))
+                ENGINE_WARN("Navigation: {} (rebuilding)", error);
+        }
         m_Audio->Begin(m_Scene);
         m_Scripts->SetCurrentLevel(m_Project.Relative(scene));
         m_Scripts->Begin(m_Scene);
@@ -167,6 +178,7 @@ protected:
         m_Streamer->Reset(); // the streamed levels went with the scene
         m_Physics->Reset();
         m_Particles->Reset();
+        m_Navigation->Reset();
         const std::vector<ModelHandle> previous = std::exchange(m_Models, {}); // released after the new level holds its models
         try {
             (void)InstantiatePreparedScene(*result->scene, m_Scene, &GetAssets(), result->models,
@@ -282,6 +294,9 @@ protected:
         // Heard from an Audio Listener, else the primary camera, else the saved camera.
         const CameraData view = m_FallbackCamera.GetData(1.0f);
         m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
+        // Agents after the scripts gave their orders (characters: input for the next physics steps).
+        if (!m_Paused)
+            m_Navigation->Update(m_Scene, static_cast<float>(dt));
         // Particles after physics / scripts / animation moved things (paused menu: frozen).
         m_Particles->SetPaused(m_Paused);
         m_Particles->Update(m_Scene, static_cast<float>(dt));
@@ -334,6 +349,10 @@ protected:
         m_SceneRenderer->particles = nullptr;
         m_Scripts->SetParticleWorld(nullptr);
         m_Particles.reset(); // releases its textures / meshes
+        const NavStats& nav = m_Navigation->Stats();
+        ENGINE_INFO("Navigation: {} tile(s), {} polygon(s), {} agent(s)", nav.tiles, nav.polygons, nav.agents);
+        m_Scripts->SetNavigationWorld(nullptr);
+        m_Navigation.reset();
         m_Scene.Clear();
         m_Streamer->Reset();
         m_Loader->Cancel();
@@ -492,6 +511,7 @@ private:
     std::unique_ptr<ScriptSystem>  m_Scripts;
     std::unique_ptr<LevelStreamer> m_Streamer;
     std::unique_ptr<ParticleWorld> m_Particles;
+    std::unique_ptr<NavigationWorld> m_Navigation;
     std::unique_ptr<LevelLoader>   m_Loader;
     std::string                    m_LoadingName;
     Scene                          m_LoadingScene; // the project's loading screen (UI)

@@ -1,0 +1,168 @@
+{
+  "comments": [
+    {
+      "color": [
+        0.35,
+        0.55,
+        0.3
+      ],
+      "id": 8,
+      "position": [
+        -24.0,
+        150.0
+      ],
+      "size": [
+        1300.0,
+        320.0
+      ],
+      "text": "Walk to a random reachable point on the navmesh, rest, repeat (AI Move To needs a Nav Agent)"
+    }
+  ],
+  "links": [
+    {
+      "from": [
+        1,
+        "Out"
+      ],
+      "to": [
+        2,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        3,
+        "Out"
+      ],
+      "to": [
+        5,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        4,
+        "Point"
+      ],
+      "to": [
+        5,
+        "Location"
+      ]
+    },
+    {
+      "from": [
+        5,
+        "Success"
+      ],
+      "to": [
+        6,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        5,
+        "Failed"
+      ],
+      "to": [
+        6,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        6,
+        "Completed"
+      ],
+      "to": [
+        7,
+        "In"
+      ]
+    }
+  ],
+  "nextId": 9,
+  "nodes": [
+    {
+      "id": 1,
+      "position": [
+        0.0,
+        0.0
+      ],
+      "type": "Event.BeginPlay"
+    },
+    {
+      "id": 2,
+      "param": "Wander",
+      "position": [
+        240.0,
+        0.0
+      ],
+      "type": "Flow.CallEvent"
+    },
+    {
+      "id": 3,
+      "param": "Wander",
+      "position": [
+        0.0,
+        200.0
+      ],
+      "type": "Event.Custom"
+    },
+    {
+      "defaults": {
+        "Origin": {
+          "type": "vec3",
+          "value": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "Radius": {
+          "type": "float",
+          "value": 8.0
+        }
+      },
+      "id": 4,
+      "param": "Default",
+      "position": [
+        200.0,
+        340.0
+      ],
+      "type": "AI.RandomPoint"
+    },
+    {
+      "id": 5,
+      "position": [
+        480.0,
+        200.0
+      ],
+      "type": "AI.MoveTo"
+    },
+    {
+      "defaults": {
+        "Duration": {
+          "type": "float",
+          "value": 0.75
+        }
+      },
+      "id": 6,
+      "position": [
+        800.0,
+        200.0
+      ],
+      "type": "Flow.Delay"
+    },
+    {
+      "id": 7,
+      "param": "Wander",
+      "position": [
+        1040.0,
+        200.0
+      ],
+      "type": "Flow.CallEvent"
+    }
+  ],
+  "variables": [],
+  "version": 2
+}

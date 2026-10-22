@@ -3,6 +3,7 @@
 #include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Audio/SoundCue.h"
+#include "Engine/Navigation/NavTypes.h"
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
@@ -40,6 +41,7 @@ class History;
 class LevelStreamer;
 class ParticleEditor;
 class ParticleWorld;
+class NavigationWorld;
 class GameOptions;
 struct CookReport;
 class ImGuiLayer;
@@ -80,6 +82,9 @@ struct EditorContext {
     // Optional: particle effects. Simulated every frame (edit mode too, like a live viewport),
     // restarted on Play / Stop; the particle effect window edits them live.
     ParticleWorld* particles = nullptr;
+    // Optional: navigation. Edit mode: tiles follow the scene (auto rebuild), baked next to the scene
+    // file when it is saved; play mode: crowd agents move. Settings come from the project.
+    NavigationWorld* navigation = nullptr;
     // ImGui layout file (empty: not saved).
     std::filesystem::path layoutFile = "editor.ini";
 };
@@ -168,6 +173,11 @@ public:
     bool PackageProject(const std::filesystem::path& outputDirectory);
     // Cook report of the last packaging (null before), shown in the "Package report" window.
     [[nodiscard]] const CookReport* PackageReport() const { return m_PackageReport.get(); }
+    // Navigation: rebuilds every tile now and saves the baked file next to the scene (if saved).
+    void BakeNavigation();
+    // Test path of the Navigation window (between two points; the window shows length and corners).
+    void SetNavigationTestPath(const glm::vec3& start, const glm::vec3& end);
+    [[nodiscard]] const NavPath& NavigationTestPath() const { return m_NavPath; }
     bool SaveAll(); // scene (if it has a file) + open blueprints
     // Window close request: true if the application may quit now; with unsaved changes it asks
     // (Save all / Discard / Cancel) and closes the window itself once decided.
@@ -248,6 +258,12 @@ private:
     void PushSubtreesChange(std::string label, const std::vector<std::uint64_t>& uuids, std::string before);
     [[nodiscard]] std::vector<Entity> OutermostRoots(const std::vector<std::uint64_t>& uuids) const;
     void DrawLevels();             // streaming volumes and sub-levels (preview load / unload)
+    void DrawNavigation();         // Navigation window: overlay, bake, auto rebuild, test path, stats
+    void DrawNavigationInspector(Entity entity); // inspector sections of the Nav* components
+    void DrawNavigationOverlay(float x, float y, float width, float height); // navmesh, links, agents, test path
+    void SaveNavigation(const std::filesystem::path& scene); // bakes next to a saved scene (none: removes the file)
+    void LoadNavigation(const std::filesystem::path& scene); // fresh navmesh + the scene's baked file
+    void UpdateNavigationTestPath();
     [[nodiscard]] std::string StreamedLevelOf(Entity entity) const; // level file of a streamed entity, else empty
     void DrawStreamingOverlay(float x, float y, float width, float height); // volume boxes
     void DrawContentBrowser();
@@ -393,6 +409,14 @@ private:
     std::size_t           m_SoundCueVariant = 0; // variant whose sound the file dialog chooses
     bool m_ShowLevels          = true;  // Levels window (with a level streamer)
     bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
+    bool m_ShowNavigation      = true;  // Navigation window (with a navigation world)
+    bool m_ShowNavMesh         = true;  // navmesh overlay in the viewport
+    bool m_NavShowTiles        = false;
+    std::uint32_t m_NavProfile = 0;     // profile shown / used by the test path
+    enum class NavPick : std::uint8_t { None, Start, End } m_NavPick = NavPick::None;
+    std::optional<glm::vec3> m_NavStart, m_NavEnd; // test path end points
+    NavPath                  m_NavPath;
+    bool                     m_NavOtherLevel = false; // Open Level while playing replaced the navmesh
     struct TypeEdit;                    // the enum / struct / interface edited there
     std::shared_ptr<TypeEdit> m_TypeEdit;
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)

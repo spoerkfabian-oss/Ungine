@@ -252,7 +252,8 @@
           0.4,
           0.4
         ]
-      }
+      },
+      "navObstacle": {"shape": "box", "halfExtents": [0.45, 0.45, 0.45]}
     },
     {
       "uuid": 1011,
@@ -304,7 +305,8 @@
           0.4,
           0.4
         ]
-      }
+      },
+      "navObstacle": {"shape": "box", "halfExtents": [0.45, 0.45, 0.45]}
     },
     {
       "uuid": 1012,
@@ -356,7 +358,8 @@
           0.4,
           0.4
         ]
-      }
+      },
+      "navObstacle": {"shape": "box", "halfExtents": [0.45, 0.45, 0.45]}
     },
     {
       "uuid": 1013,
@@ -520,6 +523,29 @@
       "name": "Spark Fountain",
       "transform": {"position": [-1.0, 0.05, 1.5], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
       "particleSystem": {"effect": "../Effects/SparkFountain.uparticle", "autoPlay": true}
+    },
+    {
+      "uuid": 1050,
+      "parent": 0,
+      "name": "Nav Bounds",
+      "transform": {"position": [0, 1.0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "navMeshBounds": {"halfExtents": [10.0, 3.0, 10.0]}
+    },
+    {
+      "uuid": 1051,
+      "parent": 0,
+      "name": "Wanderer",
+      "transform": {"position": [-4.0, 0, 3.0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "navAgent": {"profile": "Default", "maxSpeed": 2.5, "acceleration": 8.0},
+      "script": {"graph": "../Scripts/Wander.ugraph"}
+    },
+    {
+      "uuid": 1052,
+      "parent": 1051,
+      "name": "Wanderer Body",
+      "transform": {"position": [0, 0.6, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
+      "mesh": {"model": {"primitive": {"shape": "capsule", "size": 0.6, "baseColor": [0.3, 0.6, 0.95, 1.0],
+                                       "metallic": 0.0, "roughness": 0.5}}, "index": 0}
     }
   ],
   "camera": {

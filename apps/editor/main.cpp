@@ -5,6 +5,7 @@
 #include "Editor/ProjectLauncher.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/Platform.h"
@@ -81,6 +82,9 @@ protected:
         m_Particles     = std::make_unique<ParticleWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
         m_Scripts->SetParticleWorld(m_Particles.get());
         m_SceneRenderer->particles = m_Particles.get();
+        m_Navigation    = std::make_unique<NavigationWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
+        m_Navigation->SetSettings(m_Project.settings.navigation);
+        m_Scripts->SetNavigationWorld(m_Navigation.get());
         m_Editor        = std::make_unique<Editor>(EditorContext{.window        = GetWindow(),
                                                                  .renderer      = GetRenderer(),
                                                                  .scene         = m_Scene,
@@ -94,6 +98,7 @@ protected:
                                                                  .project       = &m_Project,
                                                                  .streaming     = m_Streamer.get(),
                                                                  .particles     = m_Particles.get(),
+                                                                 .navigation    = m_Navigation.get(),
                                                                  .layoutFile    = m_Project.SavedDirectory() / "EditorLayout.ini"});
         std::error_code ec;
         if (const fs::path start = m_Project.StartScene(); !start.empty() && fs::exists(start, ec))
@@ -133,6 +138,8 @@ protected:
         m_SceneRenderer->particles = nullptr;
         m_Scripts->SetParticleWorld(nullptr);
         m_Particles.reset(); // releases its textures / meshes
+        m_Scripts->SetNavigationWorld(nullptr);
+        m_Navigation.reset();
         m_Audio.reset(); // releases its sounds
         m_Scene.Clear();
         for (ModelHandle h : m_ModelRefs)
@@ -156,6 +163,7 @@ private:
     std::unique_ptr<ScriptSystem>  m_Scripts;
     std::unique_ptr<LevelStreamer> m_Streamer;
     std::unique_ptr<ParticleWorld> m_Particles;
+    std::unique_ptr<NavigationWorld> m_Navigation;
     std::unique_ptr<Editor>        m_Editor; // references the members above: declared after them
 };
 

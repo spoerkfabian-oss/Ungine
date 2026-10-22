@@ -54,6 +54,8 @@ add_library(Engine STATIC
     src/UI/UiSystem.cpp
     src/Particles/ParticleEffect.cpp
     src/Particles/ParticleWorld.cpp
+    src/Navigation/NavigationWorld.cpp
+    src/Navigation/NavJson.cpp
     src/Physics/PhysicsMaterial.cpp
     src/Physics/PhysicsWorld.cpp
     src/Physics/Ragdoll.cpp
@@ -71,7 +73,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio recastnav
             $<$<PLATFORM_ID:Windows>:shell32>)
 
 # Project templates (installed next to the executables, see the root CMakeLists).

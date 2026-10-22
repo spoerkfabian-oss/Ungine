@@ -1,6 +1,7 @@
 #pragma once
 #include "Engine/Audio/AudioTypes.h"
 #include "Engine/Core/InputMap.h"
+#include "Engine/Navigation/NavTypes.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -29,6 +30,7 @@ struct ProjectSettings {
     bool          vsync        = true;
     AudioSettings audio;        // mixer (bus volumes / mutes), occlusion
     InputMap      input;        // input actions / axes for blueprints
+    NavSettings   navigation;   // navmesh voxels / tiles, agent profiles, area types
 };
 
 struct ProjectTemplate {

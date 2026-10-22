@@ -12,6 +12,7 @@
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Audio/SoundCue.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
@@ -3704,6 +3705,127 @@ TEST_CASE(Editor_ParticleEditorAndPreview)
 
     pe.Close();
     runFrames(2);
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(3);
+    }
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_NavigationBakeOverlayAndPlay)
+{
+    // A mesh-collider floor (primitive plane) and a wall inside a Nav Mesh Bounds: the editor keeps
+    // the navmesh up to date, draws it, finds the test path, bakes it next to the saved scene and
+    // loads it with the scene; playing moves a Nav Agent, Stop puts it back.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_navigation_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+
+    Scene           scene;
+    PhysicsWorld    physics(*F().jobs, F().events, F().assets.get());
+    NavigationWorld navigation(F().jobs.get(), F().assets.get(), &physics);
+    SceneRenderer   sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .navigation    = &navigation,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 12.0f, 14.0f};
+    camera.pitch    = -0.75f;
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(10);
+    }
+    const ModelHandle plane = F().assets->CreatePrimitive(PrimitiveDesc{.shape = PrimitiveShape::Plane, .size = 20.0f});
+    modelRefs.push_back(plane);
+    const Entity floor = scene.CreateEntity("Floor");
+    scene.GetRegistry().Emplace<MeshRenderer>(floor, MeshRenderer{.model = plane, .meshIndex = 0});
+    scene.GetRegistry().Emplace<RigidBody>(floor, RigidBody{.type = BodyType::Static});
+    scene.GetRegistry().Emplace<Collider>(floor, Collider{.shape = ColliderShape::Mesh});
+    const Entity wall = scene.CreateEntity("Wall");
+    scene.EditTransform(wall).position = {0.0f, 1.0f, 0.0f};
+    scene.GetRegistry().Emplace<Collider>(wall, Collider{.shape = ColliderShape::Box, .halfExtents = {0.3f, 1.0f, 6.0f}});
+    const Entity bounds = scene.CreateEntity("Bounds");
+    scene.GetRegistry().Emplace<NavMeshBounds>(bounds, NavMeshBounds{.halfExtents = {11.0f, 3.0f, 11.0f}});
+    const std::uint64_t boundsUuid = scene.GetRegistry().Get<Uuid>(bounds).value;
+    const Entity link = scene.CreateEntity("Jump");
+    scene.GetRegistry().Emplace<NavLink>(link, NavLink{.start = {-3.0f, 0.0f, 8.0f}, .end = {-1.0f, 0.0f, 8.5f}});
+    const Entity crate = scene.CreateEntity("Crate");
+    scene.EditTransform(crate).position = {4.0f, 0.0f, -4.0f};
+    scene.GetRegistry().Emplace<NavObstacle>(crate);
+    const Entity agent = scene.CreateEntity("Agent");
+    scene.EditTransform(agent).position = {-5.0f, 0.0f, 0.0f};
+    scene.GetRegistry().Emplace<NavAgent>(agent, NavAgent{.maxSpeed = 6.0f});
+    editor.Select(agent);
+    for (int i = 0; i < 300 && (navigation.Stats().sources < 2 || navigation.IsBuilding()); ++i)
+        runFrames(1); // the plane loads, then its tiles build in the background
+    CHECK(navigation.Stats().sources == 2 && navigation.Stats().tiles > 0 && !navigation.IsBuilding());
+    editor.SetNavigationTestPath({-5.0f, 0.0f, 0.0f}, {5.0f, 0.0f, 0.0f});
+    CHECK(editor.NavigationTestPath().status == NavPathStatus::Complete && editor.NavigationTestPath().Length() > 14.0f);
+    runFrames(5); // window, overlay (navmesh, link, obstacle, path), inspector of the agent
+    if (screenshot) {
+        runFrames(30);
+        (void)std::system((std::string("import -window root ") + std::getenv("UNGINE_TEST_SCREENSHOT")).c_str());
+    }
+
+    // Save: the navmesh goes next to the scene; New forgets it; Open loads it without rebuilding.
+    const fs::path sceneFile = dir / "Nav.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    CHECK(fs::exists(dir / "Nav.unav"));
+    editor.NewScene();
+    runFrames(2);
+    CHECK(navigation.Stats().tiles == 0);
+    CHECK(editor.OpenScene(sceneFile));
+    CHECK(navigation.Stats().tiles > 0 && navigation.Stats().tilesBuilt == 0);
+    runFrames(60);
+    CHECK(navigation.Stats().tilesBuilt == 0); // same sources as baked (the plane loaded meanwhile)
+    editor.SetNavigationTestPath({-5.0f, 0.0f, 0.0f}, {5.0f, 0.0f, 0.0f});
+    CHECK(editor.NavigationTestPath().Length() > 14.0f);
+
+    // Play: the agent walks around the wall; Stop restores it and leaves the crowd.
+    Entity actor = NullEntity;
+    scene.GetRegistry().ViewOf<NavAgent>().Each([&](Entity e, NavAgent&) { actor = e; });
+    const std::uint64_t uuid = scene.GetRegistry().Get<Uuid>(actor).value;
+    editor.Play();
+    navigation.MoveTo(actor, {5.0f, 0.0f, 0.0f});
+    for (int i = 0; i < 400 && navigation.MoveStatus(actor) == NavMoveStatus::Moving; ++i)
+        runFrames(1);
+    CHECK(navigation.MoveStatus(actor) == NavMoveStatus::Arrived);
+    CHECK(glm::distance(scene.GetRegistry().Get<Transform>(actor).position, glm::vec3(5.0f, 0.0f, 0.0f)) < 0.5f);
+    editor.Stop();
+    runFrames(2);
+    const Entity restored = scene.FindByUuid(uuid);
+    CHECK(restored != NullEntity && !navigation.HasAgent(restored));
+    CHECK(glm::distance(scene.GetRegistry().Get<Transform>(restored).position, glm::vec3(-5.0f, 0.0f, 0.0f)) < 0.01f);
+
+    // Bake without a navmesh volume removes a stale file.
+    scene.DestroyEntity(scene.FindByUuid(boundsUuid));
+    CHECK(editor.SaveScene(sceneFile));
+    CHECK(!fs::exists(dir / "Nav.unav"));
     if (screenshot) {
         glfwSetWindowSize(F().window->Native(), 320, 240);
         runFrames(3);

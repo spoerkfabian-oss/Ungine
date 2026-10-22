@@ -4,6 +4,7 @@
 #include "Engine/Audio/AudioSystem.h"
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Physics/Ragdoll.h"
 #include "Engine/Core/GameOptions.h"
@@ -1342,6 +1343,131 @@ std::vector<NodeDesc> BuildRegistry()
                             }, "Multiplies every particle's color (HDR: > 1 glows)"),
                      {{"Color", glm::vec3(1.0f)}, {"Alpha", 1.0f}}));
 
+    // Navigation (AI). Profile params: a NavSettings profile name.
+    {
+        NodeDesc d = Flow("AI.MoveTo", "AI Move To",
+                          {ExecIn(), In("Target", P::Entity), In("Location", P::Vec3), In("Acceptance Radius", P::Float),
+                           ExecOut("Success"), ExecOut("Failed")},
+                          [](ScriptContext& c, int entry) {
+                              ScriptContext::NodeState& s   = c.State();
+                              NavigationWorld*          nav = c.Navigation();
+                              const Entity              e   = c.InEntity(1);
+                              if (!nav || !Alive(c, e)) {
+                                  s.flag = false;
+                                  if (!nav)
+                                      c.Error("Navigation is not available here");
+                                  return 5;
+                              }
+                              if (entry != kScriptResume) {
+                                  nav->MoveTo(e, c.InVec3(2), c.InFloat(3));
+                                  if (s.flag) // already waiting: the waiting chain follows the new target
+                                      return kScriptStop;
+                              }
+                              switch (nav->MoveStatus(e)) {
+                              case NavMoveStatus::Moving:
+                                  s.flag = true;
+                                  c.Suspend(0.0f, 0);
+                                  return kScriptStop;
+                              case NavMoveStatus::Arrived:
+                                  s.flag = false;
+                                  return 4;
+                              default:
+                                  s.flag = false;
+                                  return 5;
+                              }
+                          },
+                          "Moves the entity's Nav Agent along the navmesh; continues when it arrives (Success) or "
+                          "cannot reach the location (Failed). Acceptance Radius < 0: the agent's stopping distance.");
+        d.category = "AI";
+        add(WithDefaults(std::move(d), {{"Acceptance Radius", -1.0f}}));
+        r.back().latent = true;
+    }
+    add(Action("AI.StopMovement", "AI Stop Movement", "AI", {In("Target", P::Entity)}, [](ScriptContext& c) {
+        if (const auto e = Target(c, 2); e && c.Navigation())
+            c.Navigation()->StopMovement(*e);
+    }, "Cancels the Nav Agent's current move (a waiting AI Move To fails)"));
+    add(Pure("AI.GetMoveStatus", "Get AI Move Status", "AI",
+             {In("Target", P::Entity), Out("Moving", P::Bool), Out("Velocity", P::Vec3), Out("Status", P::String)},
+             [](ScriptContext& c) {
+                 NavigationWorld*    nav    = c.Navigation();
+                 const Entity        e      = c.InEntity(0);
+                 const NavMoveStatus status = nav ? nav->MoveStatus(e) : NavMoveStatus::Idle;
+                 c.Out(1, status == NavMoveStatus::Moving);
+                 c.Out(2, nav ? nav->AgentVelocity(e) : glm::vec3(0.0f));
+                 constexpr const char* names[] = {"Idle", "Moving", "Arrived", "Failed"};
+                 c.Out(3, std::string(names[static_cast<int>(status)]));
+             }));
+    const auto profileIndex = [](ScriptContext& c) -> std::uint32_t {
+        const NavigationWorld* nav = c.Navigation();
+        if (!nav)
+            return 0;
+        const auto index = nav->Settings().Profile(c.Param());
+        if (!index)
+            c.Error("Unknown navigation profile '" + c.Param() + "'");
+        return static_cast<std::uint32_t>(index.value_or(0));
+    };
+    add(WithParam(Pure("AI.FindPath", "Find Path", "AI",
+                       {In("Start", P::Vec3), In("End", P::Vec3), Out("Points", P::Vec3Array), Out("Found", P::Bool),
+                        Out("Complete", P::Bool), Out("Length", P::Float)},
+                       [profileIndex](ScriptContext& c) {
+                           NavPath path;
+                           if (c.Navigation())
+                               path = c.Navigation()->FindPath(c.InVec3(0), c.InVec3(1), profileIndex(c));
+                           std::vector<ScriptValue> points(path.points.begin(), path.points.end());
+                           c.Out(2, MakeArray(P::Vec3, std::move(points)));
+                           c.Out(3, path.Found());
+                           c.Out(4, path.status == NavPathStatus::Complete);
+                           c.Out(5, path.Length());
+                       }, "Corners of the shortest path on the navmesh (partial: up to the closest reachable point)"),
+                  ParamKind::Text, "Profile", "Default"));
+    add(WithParam(Pure("AI.RandomPoint", "Get Random Reachable Point", "AI",
+                       {In("Origin", P::Vec3), In("Radius", P::Float), Out("Point", P::Vec3), Out("Found", P::Bool)},
+                       [profileIndex](ScriptContext& c) {
+                           std::optional<glm::vec3> point;
+                           if (NavigationWorld* nav = c.Navigation())
+                               point = c.InFloat(1) > 0.0f ? nav->RandomPointInRadius(c.InVec3(0), c.InFloat(1), profileIndex(c))
+                                                           : nav->RandomPoint(profileIndex(c));
+                           c.Out(2, point.value_or(c.InVec3(0)));
+                           c.Out(3, point.has_value());
+                       }, "Random navmesh point reachable from Origin within Radius (Radius 0: anywhere)"),
+                  ParamKind::Text, "Profile", "Default"));
+    add(WithParam(Pure("AI.ProjectPoint", "Project Point to Navigation", "AI",
+                       {In("Point", P::Vec3), Out("Projected", P::Vec3), Out("Found", P::Bool)},
+                       [profileIndex](ScriptContext& c) {
+                           const auto point = c.Navigation() ? c.Navigation()->ProjectPoint(c.InVec3(0), profileIndex(c))
+                                                             : std::nullopt;
+                           c.Out(1, point.value_or(c.InVec3(0)));
+                           c.Out(2, point.has_value());
+                       }, "Closest navmesh point (within 2 m sideways, 4 m up / down)"),
+                  ParamKind::Text, "Profile", "Default"));
+    add(WithParam(Pure("AI.Raycast", "Navigation Raycast", "AI",
+                       {In("Start", P::Vec3), In("End", P::Vec3), Out("Hit", P::Bool), Out("Point", P::Vec3),
+                        Out("Normal", P::Vec3)},
+                       [profileIndex](ScriptContext& c) {
+                           const NavRaycastHit hit = c.Navigation() ? c.Navigation()->Raycast(c.InVec3(0), c.InVec3(1), profileIndex(c))
+                                                                    : NavRaycastHit{};
+                           c.Out(2, hit.hit);
+                           c.Out(3, hit.point);
+                           c.Out(4, hit.normal);
+                       }, "Walks the navmesh from Start towards End; Hit when a wall is in the way"),
+                  ParamKind::Text, "Profile", "Default"));
+    add(Action("AI.SetAgentSpeed", "Set Agent Speed", "AI", {In("Target", P::Entity), In("Speed", P::Float)},
+               [](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   NavAgent*  a = e ? c.GetScene().GetRegistry().TryGet<NavAgent>(*e) : nullptr;
+                   if (!a)
+                       return c.Error("Target has no Nav Agent");
+                   a->maxSpeed = std::max(c.InFloat(3), 0.0f);
+               }, "Maximum speed of the Nav Agent (m/s)"));
+    add(Action("AI.SetObstacleEnabled", "Set Nav Obstacle Enabled", "AI", {In("Target", P::Entity), In("Enabled", P::Bool)},
+               [](ScriptContext& c) {
+                   const auto   e = Target(c, 2);
+                   NavObstacle* o = e ? c.GetScene().GetRegistry().TryGet<NavObstacle>(*e) : nullptr;
+                   if (!o)
+                       return c.Error("Target has no Nav Obstacle");
+                   o->enabled = c.InBool(3);
+               }, "Cuts the obstacle out of the navmesh (enabled) or gives the area back"));
+
     // Functions (created by the editor's function list; their nodes are not in the palette).
     {
         NodeDesc entry;
@@ -1785,12 +1911,13 @@ std::vector<NodeDesc> BuildRegistry()
                                      : kind == "AudioSource" ? r.Has<AudioSource>(e)
                                      : kind == "Script"    ? r.Has<ScriptComponent>(e)
                                      : kind == "Tags"      ? r.Has<Tags>(e)
+                                     : kind == "NavAgent"  ? r.Has<NavAgent>(e)
                                                            : false;
                            }
                            c.Out(1, has);
                        }),
                   ParamKind::Choice, "Component", "Mesh",
-                  {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags"}));
+                  {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent"}));
     add(Pure("Entity.GetRight", "Get Right Vector", "Transform", {In("Target", P::Entity), Out("Right", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))
