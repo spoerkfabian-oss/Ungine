@@ -5,9 +5,11 @@
 #include "Editor/ProjectLauncher.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/ParticleEditor.h"
+#include "Editor/AnimGraphEditor.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Animation.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
@@ -3704,6 +3706,178 @@ TEST_CASE(Editor_ParticleEditorAndPreview)
     CHECK(particles.IsActive(scene.FindByUuid(uuid)) && sceneRenderer.Stats().particleBatches >= 1);
 
     pe.Close();
+    runFrames(2);
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 320, 240);
+        runFrames(3);
+    }
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_AnimationGraphWindowAndPlay)
+{
+    // The Fox with the Physics template's graph: assigned from the editor (undo), not animated in
+    // edit mode; the graph window with its preview, live edits reaching the scene, problems,
+    // undo / redo, save; Play runs the blend space (skinned pose changes, Step notifies), Stop
+    // restores the rest pose.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_animation_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    const fs::path templateGraph = TemplateDirectory() / "Physics" / "Content" / "Animations" / "Fox.uanim";
+    auto           graph         = LoadAnimGraph(templateGraph);
+    CHECK(graph.has_value());
+    if (!graph)
+        return;
+    const fs::path file = dir / "Fox.uanim";
+    CHECK(SaveAnimGraph(file, *graph)); // previewModel stays the template's Fox (relative path)
+
+    Scene           scene;
+    PhysicsWorld    physics(*F().jobs, F().events, F().assets.get());
+    AnimationSystem animation(F().assets.get(), &physics, &F().events);
+    SceneRenderer   sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .animation     = &animation,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 0.8f, 2.5f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot) {
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+        runFrames(10);
+    }
+    const ModelHandle fox = F().assets->LoadModel(fs::path(ENGINE_ASSET_DIR) / "models" / "Fox.glb");
+    CHECK(F().Pump([&] { return Settled(fox); }));
+    const Model* foxModel = F().assets->Get(fox);
+    CHECK(foxModel != nullptr && foxModel->animations.size() == 3);
+    if (!foxModel) {
+        F().assets->Release(fox);
+        return;
+    }
+    modelRefs.push_back(fox);
+    Registry&    r    = scene.GetRegistry();
+    const Entity root = InstantiateModel(scene, fox, *foxModel);
+    scene.EditTransform(root).scale = glm::vec3(0.01f);
+    std::vector<Entity> bones;
+    r.ViewOf<ModelNodeRef>().Each([&](Entity e, ModelNodeRef& ref) {
+        if (ref.instanceRoot == root)
+            bones.push_back(e);
+    });
+    CHECK(bones.size() >= 20);
+    const auto pose = [&] {
+        std::vector<glm::quat> rotations;
+        for (const Entity bone : bones)
+            rotations.push_back(r.Get<Transform>(bone).rotation);
+        return rotations;
+    };
+    const auto poseDifference = [&](const std::vector<glm::quat>& a, const std::vector<glm::quat>& b) {
+        float most = 0.0f;
+        for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+            most = std::max(most, 1.0f - std::abs(glm::dot(a[i], b[i])));
+        return most;
+    };
+
+    // Assigned to a bone: lands on the model root; undoable.
+    CHECK(!editor.AssignAnimGraph(scene.CreateEntity("Loose"), file));
+    CHECK(editor.AssignAnimGraph(bones.back(), file));
+    CHECK(r.Has<AnimationController>(root) && r.Get<AnimationController>(root).graph == PathToUtf8(file));
+    CHECK(editor.Undo() && !r.Has<AnimationController>(root) && editor.Redo() && r.Has<AnimationController>(root));
+    editor.Select(root);
+    runFrames(5);
+    const std::vector<glm::quat> rest = pose();
+    runFrames(20);
+    CHECK(poseDifference(rest, pose()) < 1e-6f && !animation.HasInstance(root)); // edit mode: no animation
+
+    // The window + preview (the template's Fox).
+    editor.OpenAsset(file);
+    AnimGraphEditor& ag = editor.AnimGraphs();
+    CHECK(ag.IsOpen() && !ag.Dirty() && ag.Problems().empty());
+    for (int i = 0; i < 600 && !ag.PreviewModel(); ++i)
+        runFrames(1);
+    CHECK(ag.PreviewModel() != nullptr);
+    ag.SetPreviewParameter("Speed", 2.5f);
+    runFrames(10);
+    CHECK(ag.Preview().HasInstance(ag.PreviewEntity()));
+    CHECK(ag.Preview().CurrentState(ag.PreviewEntity()) == "Locomotion");
+    CHECK(ag.Preview().Parameter(ag.PreviewEntity(), "Speed").value_or(0.0f) == 2.5f);
+
+    // Live edits: a second state + a transition on a trigger; a broken clip is reported.
+    AnimLayer& base = ag.Graph().layers[0];
+    base.states.push_back(AnimState{.name = "Look", .clip = "Survey", .loop = false, .position = {260.0f, 60.0f}});
+    ag.Graph().parameters.push_back(AnimParameter{.name = "Look", .type = AnimParamType::Trigger});
+    base.transitions.push_back(AnimTransition{.from = "Locomotion", .to = "Look", .duration = 0.1f,
+                                              .conditions = {AnimCondition{.parameter = "Look", .op = AnimCompare::Triggered}}});
+    ag.SelectState(1);
+    ag.Commit();
+    CHECK(ag.Dirty() && ag.Problems().empty());
+    runFrames(3);
+    base.states[1].clip = "Sleep";
+    ag.Commit();
+    runFrames(2);
+    CHECK(!ag.Problems().empty());
+    CHECK(ag.Undo() && ag.Problems().empty() && ag.Graph().layers[0].states[1].clip == "Survey");
+    CHECK(ag.Redo() && ag.Undo());
+    if (screenshot) {
+        runFrames(40);
+        (void)std::system((std::string("import -window root ") + std::getenv("UNGINE_TEST_SCREENSHOT")).c_str());
+    }
+
+    // Play: the unsaved graph runs on the scene's Fox; notifies fire, the trigger switches states.
+    int         steps = 0;
+    Subscription stepSub = F().events.Subscribe<AnimNotifyEvent>([&](const AnimNotifyEvent& e) {
+        steps += e.name == "Step" ? 1 : 0;
+        return false;
+    });
+    editor.Play();
+    CHECK(animation.SetFloat(root, "Speed", 2.5f));
+    runFrames(90);
+    CHECK(animation.HasInstance(root) && animation.CurrentState(root) == "Locomotion");
+    CHECK(poseDifference(rest, pose()) > 1e-3f);
+    CHECK(steps >= 2);
+    CHECK(animation.SetTrigger(root, "Look"));
+    runFrames(15);
+    CHECK(animation.CurrentState(root) == "Look");
+    CHECK(animation.Stats().instances == 1);
+    const std::uint64_t uuid = r.Get<Uuid>(root).value;
+    editor.Stop();
+    runFrames(3);
+    const Entity restored = scene.FindByUuid(uuid);
+    CHECK(restored != NullEntity && !animation.HasInstance(restored));
+    bones.clear();
+    r.ViewOf<ModelNodeRef>().Each([&](Entity e, ModelNodeRef& ref) {
+        if (ref.instanceRoot == restored)
+            bones.push_back(e);
+    });
+    CHECK(poseDifference(rest, pose()) < 1e-5f);
+
+    // Save writes the edited graph.
+    CHECK(ag.Save() && !ag.Dirty());
+    const auto saved = LoadAnimGraph(file);
+    CHECK(saved && saved->layers[0].states.size() == 2 && saved->layers[0].transitions.size() == 1);
+    ag.Close();
     runFrames(2);
     if (screenshot) {
         glfwSetWindowSize(F().window->Native(), 320, 240);

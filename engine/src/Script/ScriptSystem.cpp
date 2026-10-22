@@ -1,4 +1,5 @@
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/UI/UiLayout.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Core/Input.h"
@@ -404,6 +405,7 @@ struct ScriptSystem::Impl {
         LevelStreamer*     Streaming() override { return m_Impl.streamer; }
         ParticleWorld*     Particles() override { return m_Impl.particles; }
         NavigationWorld*   Navigation() override { return m_Impl.navigation; }
+        AnimationSystem*   Animation() override { return m_Impl.animation; }
         GameOptions*       Options() override { return m_Impl.options; }
         const Input*       GetInput() override { return m_Impl.acceptInput ? m_Impl.input : nullptr; }
         ScriptViewport     Viewport() const override { return m_Impl.viewport; }
@@ -690,6 +692,11 @@ struct ScriptSystem::Impl {
         jointSub = events.Subscribe<JointBrokenEvent>([this](const JointBrokenEvent& e) {
             if (running)
                 brokenJoints.push_back(e);
+            return false;
+        });
+        notifySub = events.Subscribe<AnimNotifyEvent>([this](const AnimNotifyEvent& e) {
+            if (running)
+                animNotifies.push_back(e);
             return false;
         });
         levelSub = events.Subscribe<LevelStreamedEvent>([this](const LevelStreamedEvent& e) {
@@ -1509,11 +1516,14 @@ struct ScriptSystem::Impl {
     Subscription  collisionSub;
     Subscription  persistSub;
     Subscription  jointSub;
+    Subscription  notifySub;
     std::vector<JointBrokenEvent> brokenJoints; // since the last update
+    std::vector<AnimNotifyEvent>  animNotifies; // since the last update
     Subscription  levelSub;
     LevelStreamer*                  streamer = nullptr;
     ParticleWorld*                  particles = nullptr;
     NavigationWorld*                navigation = nullptr;
+    AnimationSystem*                animation  = nullptr;
     GameOptions*                    options  = nullptr;
     std::vector<LevelStreamedEvent> levelEvents; // since the last update
 
@@ -1733,6 +1743,16 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
                     out[3] = e.b;
                 });
     }
+
+    const std::vector<AnimNotifyEvent> notifies = std::exchange(w.animNotifies, {});
+    for (const AnimNotifyEvent& e : notifies) // the controller's entity and its ancestors (the character)
+        for (Entity x = e.entity; x != NullEntity && scene.GetRegistry().Valid(x); x = scene.GetRegistry().Get<Hierarchy>(x).parent)
+            if (const auto it = w.instances.find(static_cast<std::uint64_t>(x)); it != w.instances.end())
+                w.Fire(scene, *it->second, "Event.AnimNotify", nullptr, [&](const CompiledNode&, std::vector<ScriptValue>& out) {
+                    out[1] = e.name;
+                    out[2] = e.state;
+                    out[3] = e.position;
+                });
 
     // Streamed levels added / removed since the last update: entity variables that were waiting
     // for their target, then Level Loaded / Unloaded.
@@ -1982,6 +2002,7 @@ void ScriptSystem::SetCurrentLevel(std::string scene) { m_Impl->currentLevel = s
 void ScriptSystem::SetLevelStreamer(LevelStreamer* streamer) { m_Impl->streamer = streamer; }
 void ScriptSystem::SetParticleWorld(ParticleWorld* particles) { m_Impl->particles = particles; }
 void ScriptSystem::SetNavigationWorld(NavigationWorld* navigation) { m_Impl->navigation = navigation; }
+void ScriptSystem::SetAnimationSystem(AnimationSystem* animation) { m_Impl->animation = animation; }
 void ScriptSystem::SetGameOptions(GameOptions* options) { m_Impl->options = options; }
 
 void ScriptSystem::EndPlayFor(Scene& scene, std::span<const Entity> roots)

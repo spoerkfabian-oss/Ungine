@@ -5,6 +5,7 @@
 // the background behind a loading screen; streaming volumes / Load Stream Level add sub-levels.
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Application.h"
@@ -90,6 +91,10 @@ protected:
         m_Navigation = std::make_unique<NavigationWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
         m_Navigation->SetSettings(m_Project.settings.navigation);
         m_Scripts->SetNavigationWorld(m_Navigation.get());
+        m_Animation = std::make_unique<AnimationSystem>(&GetAssets(), m_Physics.get(), &GetEvents());
+        m_Animation->SetAudio(m_Audio.get());
+        m_Animation->SetParticles(m_Particles.get());
+        m_Scripts->SetAnimationSystem(m_Animation.get());
         m_Loader = std::make_unique<LevelLoader>(GetJobs(), &GetAssets());
         LoadLoadingScreen();
 
@@ -179,6 +184,7 @@ protected:
         m_Physics->Reset();
         m_Particles->Reset();
         m_Navigation->Reset();
+        m_Animation->Reset();
         const std::vector<ModelHandle> previous = std::exchange(m_Models, {}); // released after the new level holds its models
         try {
             (void)InstantiatePreparedScene(*result->scene, m_Scene, &GetAssets(), result->models,
@@ -285,6 +291,9 @@ protected:
             m_Scripts->DispatchUiEvent(m_Scene, event);
         }
         UpdateAnimations(m_Scene, GetAssets(), static_cast<float>(dt));
+        // Animation graphs after the scripts set their parameters (paused menu: frozen pose).
+        m_Animation->SetPaused(m_Paused);
+        m_Animation->Update(m_Scene, static_cast<float>(dt));
         m_Scene.UpdateTransforms();
         // Sub-levels follow the streaming sources (else the camera).
         if (!m_Paused) {
@@ -349,6 +358,10 @@ protected:
         m_SceneRenderer->particles = nullptr;
         m_Scripts->SetParticleWorld(nullptr);
         m_Particles.reset(); // releases its textures / meshes
+        const AnimationStats& anim = m_Animation->Stats();
+        ENGINE_INFO("Animation: {} graph instance(s), {} graph file(s)", anim.instances, anim.graphs);
+        m_Scripts->SetAnimationSystem(nullptr);
+        m_Animation.reset();
         const NavStats& nav = m_Navigation->Stats();
         ENGINE_INFO("Navigation: {} tile(s), {} polygon(s), {} agent(s)", nav.tiles, nav.polygons, nav.agents);
         m_Scripts->SetNavigationWorld(nullptr);
@@ -512,6 +525,7 @@ private:
     std::unique_ptr<LevelStreamer> m_Streamer;
     std::unique_ptr<ParticleWorld> m_Particles;
     std::unique_ptr<NavigationWorld> m_Navigation;
+    std::unique_ptr<AnimationSystem> m_Animation;
     std::unique_ptr<LevelLoader>   m_Loader;
     std::string                    m_LoadingName;
     Scene                          m_LoadingScene; // the project's loading screen (UI)

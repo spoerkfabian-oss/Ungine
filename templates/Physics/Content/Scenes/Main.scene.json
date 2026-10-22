@@ -539,14 +539,33 @@
       "navAgent": {"profile": "Default", "maxSpeed": 2.5, "acceleration": 8.0},
       "script": {"graph": "../Scripts/Wander.ugraph"}
     },
-    {
-      "uuid": 1052,
-      "parent": 1051,
-      "name": "Wanderer Body",
-      "transform": {"position": [0, 0.6, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]},
-      "mesh": {"model": {"primitive": {"shape": "capsule", "size": 0.6, "baseColor": [0.3, 0.6, 0.95, 1.0],
-                                       "metallic": 0.0, "roughness": 0.5}}, "index": 0}
-    }
+    {"uuid": 1052, "parent": 1051, "name": "Fox", "transform": {"position": [0, 0, 0], "rotation": [0, 1, 0, 0], "scale": [0.01, 0.01, 0.01]}, "modelInstance": {"model": {"file": "../Models/Fox.glb"}}, "animationController": {"graph": "../Animations/Fox.uanim", "enabled": true, "speed": 1.0, "applyRootMotion": false, "ik": true}},
+    {"uuid": 1053, "parent": 1052, "name": "root", "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]}, "modelNode": 0},
+    {"uuid": 1054, "parent": 1053, "name": "_rootJoint", "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]}, "modelNode": 1},
+    {"uuid": 1055, "parent": 1054, "name": "b_Root_00", "transform": {"position": [0, 0, 0], "rotation": [-0.707108092, 0, 0, 0.70710547], "scale": [1, 1, 1]}, "modelNode": 2},
+    {"uuid": 1056, "parent": 1055, "name": "b_Hip_01", "transform": {"position": [0, 26.748404, 42.938171], "rotation": [0.127690942, -0.695482019, -0.127690227, 0.69548184], "scale": [1, 1, 1]}, "modelNode": 3},
+    {"uuid": 1057, "parent": 1056, "name": "b_Spine01_02", "transform": {"position": [12.850601, 0, 0], "rotation": [0, 0, -0.590415764, 0.807099266], "scale": [1, 1, 1]}, "modelNode": 4},
+    {"uuid": 1058, "parent": 1057, "name": "b_Spine02_03", "transform": {"position": [21.655754, -0.000118, 0], "rotation": [0, 0, 0.017411952, 0.9998484], "scale": [1, 1, 1]}, "modelNode": 5},
+    {"uuid": 1059, "parent": 1058, "name": "b_Neck_04", "transform": {"position": [25.649143, 0, 0], "rotation": [0, 0, 0.30337914, 0.952869927], "scale": [1, 1, 1]}, "modelNode": 6},
+    {"uuid": 1060, "parent": 1059, "name": "b_Head_05", "transform": {"position": [13.376961, 0, 0], "rotation": [0, 0, -0.400285415, 0.916390521], "scale": [1, 1, 1]}, "modelNode": 7},
+    {"uuid": 1061, "parent": 1058, "name": "b_RightUpperArm_06", "transform": {"position": [18.677914, -4.29734, 6.967575], "rotation": [0.000467327, -0.000446148, -0.712179288, 0.701997325], "scale": [1, 1, 1]}, "modelNode": 8},
+    {"uuid": 1062, "parent": 1061, "name": "b_RightForeArm_07", "transform": {"position": [23.045126, 0, 0], "rotation": [0, 0, 0.0371259, 0.999310596], "scale": [1, 1, 1]}, "modelNode": 9},
+    {"uuid": 1063, "parent": 1062, "name": "b_RightHand_08", "transform": {"position": [19.350056, -0.145987, 0], "rotation": [-0.012037407, -0.00782221, 0.460562328, 0.887511271], "scale": [1, 1, 1]}, "modelNode": 10},
+    {"uuid": 1064, "parent": 1058, "name": "b_LeftUpperArm_09", "transform": {"position": [18.677917, -4.297344, -6.967987], "rotation": [0.000497262, -0.000882192, -0.712087493, 0.702090006], "scale": [1, 1, 1]}, "modelNode": 11},
+    {"uuid": 1065, "parent": 1064, "name": "b_LeftForeArm_010", "transform": {"position": [23.045124, 0, 0], "rotation": [0, 0, 0.0371259, 0.999310596], "scale": [1, 1, 1]}, "modelNode": 12},
+    {"uuid": 1066, "parent": 1065, "name": "b_LeftHand_011", "transform": {"position": [19.350052, -0.14599, 0], "rotation": [0.016517914, 0.01401374, 0.460075575, 0.887615479], "scale": [1, 1, 1]}, "modelNode": 13},
+    {"uuid": 1067, "parent": 1056, "name": "b_Tail01_012", "transform": {"position": [4.260376, 15.958771, 0], "rotation": [0, 0, 0.981892894, 0.189436915], "scale": [1, 1, 1]}, "modelNode": 14},
+    {"uuid": 1068, "parent": 1067, "name": "b_Tail02_013", "transform": {"position": [12.411919, 0, 0], "rotation": [0, 0, -0.069617166, 0.997573782], "scale": [1, 1, 1]}, "modelNode": 15},
+    {"uuid": 1069, "parent": 1068, "name": "b_Tail03_014", "transform": {"position": [24.240322, 0, 0], "rotation": [0, 0, -0.053832745, 0.998549966], "scale": [1, 1, 1]}, "modelNode": 16},
+    {"uuid": 1070, "parent": 1056, "name": "b_LeftLeg01_015", "transform": {"position": [4.81377, 5.154018, -6.968006], "rotation": [0, -0.000171752, 0.970015883, -0.243041471], "scale": [1, 1, 1]}, "modelNode": 17},
+    {"uuid": 1071, "parent": 1070, "name": "b_LeftLeg02_016", "transform": {"position": [18.944176, 0, 0], "rotation": [0, 0, -0.368043789, 0.929808459], "scale": [1, 1, 1]}, "modelNode": 18},
+    {"uuid": 1072, "parent": 1071, "name": "b_LeftFoot01_017", "transform": {"position": [17.942812, 0, 0], "rotation": [0.000248411, 0, 0.458484112, 0.88870257], "scale": [1, 1, 1]}, "modelNode": 19},
+    {"uuid": 1073, "parent": 1072, "name": "b_LeftFoot02_018", "transform": {"position": [15.779939, 0, 0], "rotation": [0, 0, 0.547288295, 0.836944157], "scale": [1, 1, 1]}, "modelNode": 20},
+    {"uuid": 1074, "parent": 1056, "name": "b_RightLeg01_019", "transform": {"position": [4.813778, 5.154026, 6.967564], "rotation": [0, 0, 0.969958594, -0.243270067], "scale": [1, 1, 1]}, "modelNode": 21},
+    {"uuid": 1075, "parent": 1074, "name": "b_RightLeg02_020", "transform": {"position": [18.944183, 0, 0], "rotation": [0, 0, -0.368043814, 0.929808448], "scale": [1, 1, 1]}, "modelNode": 22},
+    {"uuid": 1076, "parent": 1075, "name": "b_RightFoot01_021", "transform": {"position": [17.94281, 0, 0], "rotation": [-0.000153455, 0, 0.457909375, 0.888998865], "scale": [1, 1, 1]}, "modelNode": 23},
+    {"uuid": 1077, "parent": 1076, "name": "b_RightFoot02_022", "transform": {"position": [15.779936, 0, 0], "rotation": [0, 0, 0.547288295, 0.836944157], "scale": [1, 1, 1]}, "modelNode": 24},
+    {"uuid": 1078, "parent": 1052, "name": "fox", "transform": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "scale": [1, 1, 1]}, "modelNode": 25, "mesh": {"model": {"file": "../Models/Fox.glb"}, "index": 0}}
   ],
   "camera": {
     "position": [

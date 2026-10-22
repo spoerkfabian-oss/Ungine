@@ -18,6 +18,7 @@ class AudioSystem;
 class LevelStreamer;
 class ParticleWorld;
 class NavigationWorld;
+class AnimationSystem;
 class GameOptions;
 struct UiEvent;
 class EventBus;
@@ -163,6 +164,9 @@ public:
     void SetParticleWorld(ParticleWorld* particles);
     // Navigation (AI Move To, Find Path, ...); null: those nodes report errors.
     void SetNavigationWorld(NavigationWorld* navigation);
+    // Animation graphs (Set Anim Float, Set IK Target, ...); null: those nodes report errors.
+    // AnimNotifyEvents on the EventBus reach On Anim Notify.
+    void SetAnimationSystem(AnimationSystem* animation);
     // Ends the scripts in these subtrees (EndPlay) before they are destroyed (level unload).
     void EndPlayFor(Scene& scene, std::span<const Entity> roots);
 

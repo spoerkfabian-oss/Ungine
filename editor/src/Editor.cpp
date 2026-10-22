@@ -1,4 +1,6 @@
 #include "Editor/Editor.h"
+#include "Editor/AnimGraphEditor.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Editor/ParticleEditor.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
@@ -72,7 +74,9 @@ Editor::Editor(const EditorContext& context)
       m_FileDialog(std::make_unique<FileDialog>()),
       m_Graphs(std::make_unique<ScriptGraphEditor>()),
       m_ParticleEditor(std::make_unique<ParticleEditor>(
-          ParticleEditor::Context{context.renderer, context.assets, *m_ImGui, context.particles}))
+          ParticleEditor::Context{context.renderer, context.assets, *m_ImGui, context.particles})),
+      m_AnimGraphEditor(std::make_unique<AnimGraphEditor>(
+          AnimGraphEditor::Context{context.renderer, context.assets, *m_ImGui, context.animation}))
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
@@ -161,6 +165,7 @@ Editor::~Editor()
     }
     ReleaseTexturePreviews(true);
     m_ParticleEditor.reset(); // its preview texture belongs to the ImGui layer
+    m_AnimGraphEditor.reset();
     m_ImGui.reset(); // waits for the device, frees pending textures, shuts the backends down
 }
 
@@ -228,6 +233,7 @@ void Editor::Update(float dt)
     if (m_ShowSoundCue)
         DrawSoundCue();
     m_ParticleEditor->Draw(dt);
+    m_AnimGraphEditor->Draw(dt);
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
     if (m_ShowNavigation && m_Ctx.navigation)
@@ -273,8 +279,11 @@ void Editor::Update(float dt)
     }
     m_UiEvents.clear(); // no scripts / not playing: nobody listens
 
-    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
+    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused())) {
         UpdateAnimations(m_Ctx.scene, m_Ctx.assets, static_cast<float>(dt));
+        if (m_Ctx.animation) // graphs after the scripts set their parameters
+            m_Ctx.animation->Update(m_Ctx.scene, static_cast<float>(dt));
+    }
     // Level streaming: previews in edit mode, volumes + requests while playing (around the camera).
     if (m_Ctx.streaming && (m_PlayState == PlayState::Edit ||
                             (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused())))) {
@@ -358,6 +367,7 @@ void Editor::Render(const FrameContext& frame, float physicsAlpha)
     }
 
     m_ParticleEditor->Render(frame); // preview of the particle effect window
+    m_AnimGraphEditor->Render(frame);
 
     GpuScope scope(&m_Ctx.renderer.Profiler(), cmd, "Editor UI");
     m_ImGui->Render(cmd, frame.view, frame.extent);

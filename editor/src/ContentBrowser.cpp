@@ -1,4 +1,6 @@
 #include "Editor/Editor.h"
+#include "Editor/AnimGraphEditor.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Editor/ParticleEditor.h"
 #include "Engine/Particles/ParticleEffect.h"
 #include "Editor/ScriptGraphEditor.h"
@@ -80,11 +82,12 @@ ImVec4 KindColor(int kind)
     case 8: return {0.80f, 0.70f, 0.50f, 1.0f}; // physics material
     case 9: return {0.30f, 0.95f, 0.70f, 1.0f}; // sound cue
     case 10: return {1.00f, 0.55f, 0.25f, 1.0f}; // particle effect
+    case 11: return {0.95f, 0.45f, 0.60f, 1.0f}; // animation graph
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "ANIM", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -178,7 +181,7 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
                                           it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
-                                          it.key() == "mesh")) {
+                                          it.key() == "mesh" || it.key() == "previewModel")) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -236,7 +239,7 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
         const bool legacyScene = EndsWith(name, ".json") && Lower(PathToUtf8(it->path().parent_path().filename())) == "scenes";
         if (!(EndsWith(name, ".scene.json") || EndsWith(name, ".uprefab") || EndsWith(name, ".ugraph") ||
               EndsWith(name, ".gltf") || EndsWith(name, std::string(kSoundCueExtension)) ||
-              EndsWith(name, std::string(kParticleEffectExtension)) || legacyScene))
+              EndsWith(name, std::string(kParticleEffectExtension)) || EndsWith(name, ".uanim") || legacyScene))
             continue;
 
         std::ifstream input(it->path(), std::ios::binary);
@@ -383,6 +386,8 @@ bool Editor::SaveAll()
     ok = m_Graphs->SaveAll() && ok;
     if (m_ParticleEditor->Dirty())
         ok = m_ParticleEditor->Save() && ok;
+    if (m_AnimGraphEditor->Dirty())
+        ok = m_AnimGraphEditor->Save() && ok;
     if (m_Ctx.project && m_ProjectDirty) {
         std::string error;
         if (m_Ctx.project->Save(&error))
@@ -397,7 +402,8 @@ bool Editor::SaveAll()
 
 bool Editor::ConfirmQuit()
 {
-    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty && !m_ParticleEditor->Dirty()))
+    if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty && !m_ParticleEditor->Dirty() &&
+                           !m_AnimGraphEditor->Dirty()))
         return true;
     m_AskQuit = true;
     return false;
@@ -533,6 +539,14 @@ void Editor::OpenAsset(const fs::path& file)
         else if (!m_ParticleEditor->IsOpen() || m_ParticleEditor->File() != absolute)
             m_ParticleEditor->Open(absolute);
         ImGui::SetWindowFocus("###particleeditor");
+    } else if (IsAnimGraphFile(file)) {
+        std::error_code ec;
+        const fs::path  absolute = fs::absolute(file, ec).lexically_normal();
+        if (m_AnimGraphEditor->Dirty() && m_AnimGraphEditor->File() != absolute) // one graph at a time: keep the edits
+            m_Status = "Save or revert " + PathToUtf8(m_AnimGraphEditor->File().filename()) + " first";
+        else if (!m_AnimGraphEditor->IsOpen() || m_AnimGraphEditor->File() != absolute)
+            m_AnimGraphEditor->Open(absolute);
+        ImGui::SetWindowFocus("###animgrapheditor");
     } else if (IsSoundCueFile(file)) {
         std::string error;
         if (const auto cue = LoadSoundCue(file, &error)) {
@@ -626,6 +640,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::SoundCue;
         else if (IsParticleEffectFile(path))
             item.kind = ContentItem::Kind::ParticleEffect;
+        else if (IsAnimGraphFile(path))
+            item.kind = ContentItem::Kind::AnimGraph;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -1039,6 +1055,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         ScriptComponent* script = registry.TryGet<ScriptComponent>(entity);
         AudioSource* audio = registry.TryGet<AudioSource>(entity);
         ParticleSystem* particles = registry.TryGet<ParticleSystem>(entity);
+        AnimationController* controller = registry.TryGet<AnimationController>(entity);
         UiWidget* widget = registry.TryGet<UiWidget>(entity);
         PrefabInstance* prefab = registry.TryGet<PrefabInstance>(entity);
         LevelStreamingVolume* volume = registry.TryGet<LevelStreamingVolume>(entity);
@@ -1052,6 +1069,8 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
                                      : std::optional<fs::path>{};
         const auto effectPath = particles ? RelocateReference(particles->effect, source, target, wasDirectory)
                                           : std::optional<fs::path>{};
+        const auto graphPath = controller ? RelocateReference(controller->graph, source, target, wasDirectory)
+                                          : std::optional<fs::path>{};
         const auto imagePath = widget ? RelocateReference(widget->image, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto prefabPath = prefab ? RelocateReference(prefab->prefab, source, target, wasDirectory)
@@ -1059,7 +1078,8 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
-        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !imagePath && !prefabPath && !levelPath && !colliderMoved)
+        if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !graphPath && !imagePath && !prefabPath && !levelPath &&
+            !colliderMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -1067,6 +1087,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (scriptPath) script->graph = PathToUtf8(*scriptPath);
         if (audioPath) audio->sound = PathToUtf8(*audioPath);
         if (effectPath) particles->effect = PathToUtf8(*effectPath);
+        if (graphPath) controller->graph = PathToUtf8(*graphPath);
         if (imagePath) widget->image = PathToUtf8(*imagePath);
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
         if (levelPath) volume->level = PathToUtf8(*levelPath);
@@ -1212,6 +1233,16 @@ void Editor::DrawContentBrowser()
                 m_Status = error;
             }
         }
+        if (ImGui::MenuItem("Animation graph")) {
+            const fs::path file = UniquePath(m_ContentDir, "NewAnimGraph", ".uanim");
+            std::string    error;
+            if (SaveAnimGraph(file, MakeDefaultAnimGraph(), &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
+        }
         if (ImGui::MenuItem("Physics material")) {
             const fs::path file = UniquePath(m_ContentDir, "NewPhysicsMaterial", std::string(kPhysicsMaterialExtension));
             std::string    error;
@@ -1302,6 +1333,9 @@ void Editor::DrawContentBrowser()
                         if (Selected() != NullEntity && ImGui::MenuItem("Assign to selection"))
                             AssignSound(Selected(), item.path);
                     }
+                    if (item.kind == ContentItem::Kind::AnimGraph && Selected() != NullEntity &&
+                        ImGui::MenuItem("Assign to selection") && !AssignAnimGraph(Selected(), item.path))
+                        m_Status = "The selection is not part of a model instance";
                     if (item.kind == ContentItem::Kind::ParticleEffect) {
                         if (ImGui::MenuItem("Place particle system"))
                             CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));

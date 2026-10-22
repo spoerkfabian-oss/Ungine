@@ -52,6 +52,8 @@ MeshOptimizeStats OptimizeMeshes(ModelData& data, const MeshOptimizeSettings& se
     if (!settings.optimize && lodCount == 1)
         return stats;
 
+    if (!data.skinInfluences.empty() && data.skinInfluences.size() != data.vertices.size())
+        throw std::runtime_error("OptimizeMeshes: skin influences do not match the vertices");
     // Vertex count of each submesh: highest referenced index + 1.
     std::vector<std::uint32_t> counts;
     for (const Mesh& mesh : data.meshes)
@@ -93,6 +95,10 @@ MeshOptimizeStats OptimizeMeshes(ModelData& data, const MeshOptimizeSettings& se
                     remap.resize(vertexCount);
                     meshopt_optimizeVertexFetchRemap(remap.data(), indices.data(), indices.size(), vertexCount);
                     meshopt_remapVertexBuffer(vertices, vertices, vertexCount, sizeof(Vertex), remap.data());
+                    if (!data.skinInfluences.empty()) // the influences belong to the vertices
+                        meshopt_remapVertexBuffer(data.skinInfluences.data() + sm.vertexOffset,
+                                                  data.skinInfluences.data() + sm.vertexOffset, vertexCount,
+                                                  sizeof(VertexSkinInfluence), remap.data());
                     meshopt_remapIndexBuffer(indices.data(), indices.data(), indices.size(), remap.data());
                     ++stats.reorderedMeshes;
                 }

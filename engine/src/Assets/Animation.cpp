@@ -198,6 +198,9 @@ void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
     registry.ViewOf<Animator, ModelInstance>().Each([&](Entity root, Animator& animator, ModelInstance& instance) {
         if (const auto* ragdoll = registry.TryGet<Ragdoll>(root); ragdoll && ragdoll->simulate)
             return; // the physics moves the bones
+        if (const auto* controller = registry.TryGet<AnimationController>(root);
+            controller && controller->enabled && !controller->graph.empty())
+            return; // the AnimationSystem runs the graph
         const Model* model = assets.Get(instance.model);
         if (!model || model->animations.empty())
             return;
