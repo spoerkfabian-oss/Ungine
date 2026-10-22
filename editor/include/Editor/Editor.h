@@ -40,6 +40,8 @@ class FlyCamera;
 class History;
 class LevelStreamer;
 class ParticleEditor;
+class AnimGraphEditor;
+class AnimationSystem;
 class ParticleWorld;
 class NavigationWorld;
 class GameOptions;
@@ -85,6 +87,9 @@ struct EditorContext {
     // Optional: navigation. Edit mode: tiles follow the scene (auto rebuild), baked next to the scene
     // file when it is saved; play mode: crowd agents move. Settings come from the project.
     NavigationWorld* navigation = nullptr;
+    // Optional: animation graphs (AnimationController). Run while playing (Reset on Play / Stop);
+    // the animation graph window edits them live.
+    AnimationSystem* animation = nullptr;
     // ImGui layout file (empty: not saved).
     std::filesystem::path layoutFile = "editor.ini";
 };
@@ -165,6 +170,8 @@ public:
     [[nodiscard]] ScriptGraphEditor& Blueprints() { return *m_Graphs; }
     // Particle effect window (.uparticle).
     [[nodiscard]] ParticleEditor& Particles() { return *m_ParticleEditor; }
+    // Animation graph window (.uanim).
+    [[nodiscard]] AnimGraphEditor& AnimGraphs() { return *m_AnimGraphEditor; }
 
     // Project: Content browser root (the project's Content/, else the working directory), Build &
     // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
@@ -184,6 +191,9 @@ public:
     bool ConfirmQuit();
     // Content browser actions (also double-click / drag & drop).
     void OpenAsset(const std::filesystem::path& file); // scene, blueprint or model (instantiated)
+    // Animation Controller on the model instance the entity belongs to (added if missing), + undo.
+    // False when the entity is not part of a model instance.
+    bool AssignAnimGraph(Entity entity, const std::filesystem::path& graph);
     // Import (copied in the background into `directory`, which must be inside ContentRoot();
     // a .gltf brings its external files along): false if rejected, see Status().
     bool ImportContent(const std::filesystem::path& source, const std::filesystem::path& directory);
@@ -323,6 +333,7 @@ private:
     std::unique_ptr<FileDialog> m_FileDialog;
     std::unique_ptr<ScriptGraphEditor> m_Graphs;
     std::unique_ptr<ParticleEditor>    m_ParticleEditor;
+    std::unique_ptr<AnimGraphEditor>   m_AnimGraphEditor;
 
     // Viewport render target (RGBA8 sRGB, sampled by ImGui).
     Image         m_ViewportImage;
@@ -426,7 +437,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, AnimGraph, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -463,7 +474,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
@@ -474,6 +485,7 @@ private:
     Entity                      m_ScriptTarget = NullEntity; // entity whose Script component the dialog fills
     Entity                      m_SoundTarget  = NullEntity; // entity whose Audio Source the dialog fills
     Entity                      m_EffectTarget = NullEntity; // entity whose Particle System the dialog fills
+    Entity                      m_AnimGraphTarget = NullEntity; // entity whose Animation Controller the dialog fills
     std::string                 m_LoadPath = "assets/models/BoxTextured.glb";
 };
 

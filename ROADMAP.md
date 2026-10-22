@@ -57,8 +57,12 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Recast/Detour gekachelt mit Laufzeit-Rebake, DetourCrowd, mehrere Agenten-Profile, Areas/Kosten, Off-Mesh-Links, dynamische Hindernisse, gebackene Datei, vollständige Editor-Werkzeuge.
 - Fortschritt (2026-10-15): umgesetzt und lokal verifiziert – TileCache-Navmesh pro Profil aus statischen Collidern in NavMeshBounds, Hintergrund-Neubau geänderter Kacheln, `.unav` neben der Szene (beim Laden nur geänderte Kacheln neu), Areas/Blocked, Links, Hindernisse, Crowd-Agenten (direkt oder über den CharacterController), Abfragen, Blueprint-Knoten (AI Move To, Find Path, …), Editor (Navigation-Fenster, Overlay, Testpfad, Inspector, Project Settings), Physics-Template-Wanderer. Grenzen in CLAUDE.md, Offene Punkte 21.
 
-### Phasen 30–34 (C, Reihenfolge vom Nutzer bestätigt)
-- 30 Animation-State-Machine/IK, 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
+### Phase 30 – Animation-State-Machine + IK (C)
+- `.uanim`-Asset mit Graph-Editor, 1D-/2D-Blend-Spaces, Layer + Bone-Masken, Notifies; IK: Two-Bone, Foot-IK auf Gelände, Look-At, FABRIK; Testmodell Khronos-Fuchs.
+- Fortschritt (2026-10-22): umgesetzt und lokal verifiziert – Parameter/Layer/States/Transitions (Any State, Exit Time, Trigger), phasensynchrone Blend Spaces (2D per Delaunay), Additiv-Layer, Notifies (Event/Sound/Partikel), Root Motion, vier IK-Löser, AnimationController + AnimationSystem, Blueprint-Knoten, Cooker-Prüfung, Animation-Graph-Fenster mit Live-Vorschau, Fuchs als Physics-Template-Wanderer. Fix: Skinning-Fehler aus Phase 21 (Skin-Einflüsse beim Vertex-Reorder). Grenzen in CLAUDE.md, Offene Punkte 22.
+
+### Phasen 31–34 (C, Reihenfolge vom Nutzer bestätigt)
+- 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
 
 ## Arbeitsregeln
 - Pro Phase erst bestehende Schnittstellen prüfen, dann vertikal implementieren (Datenformat → Laufzeit → Editor/Player → Dokumentation).

@@ -1807,6 +1807,25 @@ TEST_CASE(MeshOptimizer_LodChainAndReordering)
     const std::vector<std::uint32_t> indices = untouched.indices;
     (void)OptimizeMeshes(untouched, {.optimize = false, .lodCount = 1});
     CHECK(untouched.indices == indices);
+
+    // Skin influences move with their vertices (the reorder used to leave them behind: a skinned
+    // Fox exploded). Each vertex's joint index encodes its original position.
+    ModelData skinned = MakeCapsule("Skinned", 1.0f, 0.0f, MaterialData{}, 32, 16);
+    std::vector<glm::vec3> skinnedPositions;
+    for (std::size_t i = 0; i < skinned.vertices.size(); ++i) {
+        skinnedPositions.push_back(skinned.vertices[i].position);
+        skinned.skinInfluences.push_back(VertexSkinInfluence{
+            .joints = glm::u16vec4(static_cast<std::uint16_t>(i), 0, 0, 0), .weights = {1.0f, 0.0f, 0.0f, 0.0f}});
+    }
+    CHECK(OptimizeMeshes(skinned, {.lodCount = 1}).reorderedMeshes == 1);
+    bool followed = skinned.skinInfluences.size() == skinned.vertices.size(), moved = false;
+    for (const std::uint32_t index : skinned.indices) {
+        const std::uint16_t original = skinned.skinInfluences[index].joints.x;
+        followed = followed && original < skinnedPositions.size() &&
+                   skinnedPositions[original] == skinned.vertices[index].position;
+        moved = moved || original != index;
+    }
+    CHECK(followed && moved);
 }
 
 TEST_CASE(ShaderHotReload_CompileDebounceAndErrors)

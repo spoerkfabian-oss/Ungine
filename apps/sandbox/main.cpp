@@ -3,6 +3,7 @@
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Core/Application.h"
@@ -74,6 +75,10 @@ protected:
         m_SceneRenderer->particles = m_Particles.get();
         m_Navigation = std::make_unique<Engine::NavigationWorld>(&GetJobs(), &GetAssets(), m_Physics.get());
         m_Scripts->SetNavigationWorld(m_Navigation.get());
+        m_Animation = std::make_unique<Engine::AnimationSystem>(&GetAssets(), m_Physics.get(), &GetEvents());
+        m_Animation->SetAudio(m_Audio.get());
+        m_Animation->SetParticles(m_Particles.get());
+        m_Scripts->SetAnimationSystem(m_Animation.get());
         if (!m_StartWithEditor) {
             m_Audio->Begin(m_Scene);
             m_Scripts->Begin(m_Scene);
@@ -139,6 +144,7 @@ protected:
         } else {
             const Engine::CameraData view = m_Camera.GetData(1.0f);
             m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
+            m_Animation->Update(m_Scene, static_cast<float>(dt));
             m_Navigation->Update(m_Scene, static_cast<float>(dt));
             m_Particles->Update(m_Scene, static_cast<float>(dt));
         }
@@ -204,6 +210,8 @@ protected:
         m_Particles.reset();
         m_Scripts->SetNavigationWorld(nullptr);
         m_Navigation.reset();
+        m_Scripts->SetAnimationSystem(nullptr);
+        m_Animation.reset();
         m_Scripts->End(m_Scene); // releases spawned models
         m_Audio->End(m_Scene);
         m_Audio.reset(); // releases its sounds
@@ -246,7 +254,8 @@ private:
                 .audio         = m_Audio.get(),
                 .streaming     = m_Streamer.get(),
                 .particles     = m_Particles.get(),
-                .navigation    = m_Navigation.get()});
+                .navigation    = m_Navigation.get(),
+                .animation     = m_Animation.get()});
         } else {
             m_Editor.reset(); // waits for the GPU once
             m_Audio->Begin(m_Scene);
@@ -650,6 +659,7 @@ private:
     std::unique_ptr<Engine::LevelStreamer> m_Streamer;
     std::unique_ptr<Engine::ParticleWorld> m_Particles;
     std::unique_ptr<Engine::NavigationWorld> m_Navigation;
+    std::unique_ptr<Engine::AnimationSystem> m_Animation;
     std::filesystem::path                  m_StartScript; // --script
     Engine::Subscription                   m_CollisionSub;
     std::uint32_t                          m_Collisions = 0; // Begin events since the last title update

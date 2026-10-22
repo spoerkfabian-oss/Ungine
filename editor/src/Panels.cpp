@@ -1,5 +1,7 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Editor/AnimGraphEditor.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
@@ -1229,6 +1231,59 @@ void Editor::DrawInspector()
             registry.Remove<ParticleSystem>(e);
     }
 
+    if (AnimationController* controller = registry.TryGet<AnimationController>(e);
+        controller && ImGui::CollapsingHeader("Animation Controller", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##animgraph", "path/to/graph.uanim", &controller->graph);
+        if (ImGui::Button("Browse...##animgraph")) {
+            m_AnimGraphTarget = e;
+            m_DialogPurpose   = DialogPurpose::AssignAnimGraph;
+            m_FileDialog->Open("Choose animation graph", FileDialog::Mode::Open,
+                               controller->graph.empty() ? ContentRoot() : PathFromUtf8(controller->graph).parent_path(), {".uanim"});
+        }
+        if (!controller->graph.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Edit##animgraph"))
+                OpenAsset(PathFromUtf8(controller->graph));
+        }
+        if (!registry.Has<ModelInstance>(e))
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Needs a model instance root (the entity a model was placed as)");
+        if (BeginProperties("animcontroller")) {
+            CheckboxRow("Enabled", &controller->enabled);
+            DragFloatRow("Speed", &controller->speed, 0.01f, 0.0f, 10.0f, "%.2fx");
+            CheckboxRow("Apply root motion", &controller->applyRootMotion);
+            CheckboxRow("IK", &controller->ik);
+            ImGui::EndTable();
+        }
+        // While playing: the running state machine; parameters can be changed live.
+        if (m_Ctx.animation && m_PlayState != PlayState::Edit) {
+            if (const auto info = m_Ctx.animation->Inspect(e)) {
+                for (std::size_t i = 0; i < info->layers.size(); ++i) {
+                    const AnimLayerStatus& l = info->layers[i];
+                    ImGui::Text("Layer %zu: %s  %.2f%s%s", i, l.state.c_str(), l.normalizedTime,
+                                l.transition >= 0.0f ? "  <- " : "", l.transition >= 0.0f ? l.fromState.c_str() : "");
+                }
+                for (const auto& [parameter, value] : info->parameters) {
+                    float v = value;
+                    ImGui::PushID(parameter.name.c_str());
+                    if (parameter.type == AnimParamType::Trigger) {
+                        if (ImGui::SmallButton(parameter.name.c_str()))
+                            m_Ctx.animation->SetTrigger(e, parameter.name);
+                    } else if (parameter.type == AnimParamType::Bool) {
+                        bool b = v != 0.0f;
+                        if (ImGui::Checkbox(parameter.name.c_str(), &b))
+                            m_Ctx.animation->SetBool(e, parameter.name, b);
+                    } else if (ImGui::DragFloat(parameter.name.c_str(), &v, 0.02f))
+                        m_Ctx.animation->SetFloat(e, parameter.name, v);
+                    ImGui::PopID();
+                }
+            } else
+                ImGui::TextDisabled("Not running (model loading, graph missing or broken)");
+        }
+        if (ImGui::Button("Remove animation controller"))
+            registry.Remove<AnimationController>(e);
+    }
+
     if (registry.Has<AudioListener>(e) && ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("The scene is heard from here (else from the primary camera).");
         if (ImGui::Button("Remove listener"))
@@ -1371,6 +1426,8 @@ void Editor::DrawInspector()
         ImGui::Separator();
         if (ImGui::MenuItem("Particle System", nullptr, false, !registry.Has<ParticleSystem>(e)))
             registry.Emplace<ParticleSystem>(e);
+        if (ImGui::MenuItem("Animation Controller", nullptr, false, !registry.Has<AnimationController>(e) && registry.Has<ModelInstance>(e)))
+            registry.Emplace<AnimationController>(e);
         ImGui::Separator();
         if (ImGui::MenuItem("Level Streaming Volume", nullptr, false, !registry.Has<LevelStreamingVolume>(e)))
             registry.Emplace<LevelStreamingVolume>(e);
@@ -1960,6 +2017,12 @@ void Editor::DrawStats()
             ImGui::Text("Particles      %u  (+%u / -%u last frame)", ps.particles, ps.spawned, ps.died);
             ImGui::Text("Simulation     %.2f ms, %u collision rays", ps.simulateMs, ps.collisionRays);
             ImGui::Text("Drawn          %u in %u batches, %u draw calls", rs.particlesDrawn, rs.particleBatches, rs.particleDrawCalls);
+        }
+        if (m_Ctx.animation) {
+            const AnimationStats& an = m_Ctx.animation->Stats();
+            ImGui::SeparatorText("Animation");
+            ImGui::Text("Graphs         %u instance(s), %u file(s)", an.instances, an.graphs);
+            ImGui::Text("Last update    %.2f ms, %u IK goal(s), %u notify(s)", an.updateMs, an.ikSolved, an.notifies);
         }
         if (m_Ctx.navigation) {
             const NavStats& ns = m_Ctx.navigation->Stats();
