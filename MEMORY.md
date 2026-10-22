@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-16 (Phase 28 merged (PR #18); Phase 29 navigation verified (CTest 19/19, ASan, Clang) on `branch`, PR open; next Phase 30 animation state machine / IK after the merge, ask first)
+- Last updated: 2026-10-22 (Phase 29 navigation merged (PR #19, fa23918); `branch` restarted from main; Phase 30 questions asked; next Phase 30 animation state machine / IK after the merge, ask first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1027,3 +1027,9 @@ If an audit finds no concrete defect:
 - Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) merged (PR #17, 2026-10-14).
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
 - Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) implemented on `branch` (2026-10-15), PR pending.
+
+### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
+- State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
+- Blending: 1D blend space (phase sync), 2D blend space (triangulated), layers + bone masks (incl. additive), anim notifies/events (sound/particles/blueprint).
+- IK: two-bone (pole vector), foot IK on ground (physics raycast, pelvis offset, foot to normal), look-at/aim (limits, weight), FABRIK chains.
+- Test/template model: Khronos glTF sample "Fox" (mesh CC0, rig/animation CC-BY 4.0; clips Survey/Walk/Run), license in LICENSE.md.

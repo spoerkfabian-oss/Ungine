@@ -316,6 +316,6 @@ A. Härtung (PR #13): GPU-Tests für Skinning/Laufzeit-UI/Import, randomisierte 
 
 ## Nächste Schritte (Vorschlag)
 - Phase 27 gemergt (PR #17, 2026-10-14). Phase 28 gemergt (PR #18, 2026-10-15). Branch-Schutz mit erforderlichen CI-Checks empfohlen.
-- Phase 29 (Navigation) per PR; danach Phase 30: Animation-State-Machine/IK – vorher Details erfragen.
+- Phase 29 gemergt (PR #19, 2026-10-22). Phase 30: Animation-State-Machine/IK – vorher Details erfragen.
 - **Danach gemäß [ROADMAP.md](ROADMAP.md):** C (Partikel, Navmesh, Animation-State-Machine/IK, TAA/Decals/SSR/Nebel/Terrain, Material-Editor, verschachtelte Prefabs, Settings-Undo).
 - Weitere spätere Render-/Scripting-Ideen: Meshlets/Cluster-Culling, Hi-Z für Schatten-Views, Deferred-Variante, Mip-Streaming und Blueprint-Vererbung.

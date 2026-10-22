@@ -5,6 +5,7 @@
 #include "Engine/Core/Input.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Navigation/NavigationWorld.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Physics/Ragdoll.h"
 #include "Engine/Core/GameOptions.h"
@@ -129,6 +130,31 @@ std::optional<Entity> Target(ScriptContext& c, int pin)
         return std::nullopt;
     }
     return e;
+}
+
+// The entity with the AnimationController: the target itself or the first one below it (the
+// blueprint often sits on the character, the model instance is a child).
+std::optional<Entity> ControllerTarget(ScriptContext& c, int pin)
+{
+    const auto entity = Target(c, pin);
+    if (!entity)
+        return std::nullopt;
+    if (!c.Animation()) {
+        c.Error("No animation system");
+        return std::nullopt;
+    }
+    const Registry&     r = c.GetScene().GetRegistry();
+    std::vector<Entity> queue{*entity};
+    for (std::size_t i = 0; i < queue.size(); ++i) {
+        if (r.Has<AnimationController>(queue[i])) {
+            c.Animation()->Prepare(c.GetScene(), queue[i]); // names are checked once bound
+            return queue[i];
+        }
+        for (const Entity child : r.Get<Hierarchy>(queue[i]).children)
+            queue.push_back(child);
+    }
+    c.Error("Target has no Animation Controller");
+    return std::nullopt;
 }
 
 std::optional<Entity> AnimatorTarget(ScriptContext& c, int pin)
@@ -478,6 +504,8 @@ std::vector<NodeDesc> BuildRegistry()
     add(Event("Event.JointBroken", "On Joint Broken",
               {Out("Joint", P::Entity), Out("Body A", P::Entity), Out("Body B", P::Entity)},
               "A joint on this entity (or connecting it) exceeded its break force / torque"));
+    add(Event("Event.AnimNotify", "On Anim Notify", {Out("Name", P::String), Out("State", P::String), Out("Location", P::Vec3)},
+              "A state of the animation graph on this entity or below it passed a notify (Location: its bone, else the entity)"));
     add(Event("Event.LevelLoaded", "On Level Loaded", {Out("Level", P::String)},
               "A streamed level was added to the scene (Level: its file, relative to the project)"));
     add(Event("Event.LevelUnloaded", "On Level Unloaded", {Out("Level", P::String)},
@@ -882,6 +910,79 @@ std::vector<NodeDesc> BuildRegistry()
                        }
                        animator.blendWeight = std::clamp(weight, 0.0f, 1.0f);
                    }
+               }));
+    // Animation graphs (AnimationController / AnimationSystem). Target: the controller's entity
+    // or an ancestor of it (the first controller below is used).
+    const auto animParam = [](ScriptContext& c, bool ok, const std::string& name) {
+        if (!ok)
+            c.Error("Unknown animation parameter '" + name + "'");
+    };
+    add(Action("Anim.SetFloat", "Set Anim Float", "Animation",
+               {In("Target", P::Entity), In("Parameter", P::String), In("Value", P::Float)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       animParam(c, c.Animation()->SetFloat(*e, c.InString(3), c.InFloat(4)), c.InString(3));
+               }, "Sets a Float parameter of the animation graph (e.g. Speed for a blend space)"));
+    add(Action("Anim.SetBool", "Set Anim Bool", "Animation",
+               {In("Target", P::Entity), In("Parameter", P::String), In("Value", P::Bool)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       animParam(c, c.Animation()->SetBool(*e, c.InString(3), c.InBool(4)), c.InString(3));
+               }));
+    add(Action("Anim.SetInt", "Set Anim Int", "Animation",
+               {In("Target", P::Entity), In("Parameter", P::String), In("Value", P::Int)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       animParam(c, c.Animation()->SetInt(*e, c.InString(3), c.InInt(4)), c.InString(3));
+               }));
+    add(Action("Anim.SetTrigger", "Set Anim Trigger", "Animation", {In("Target", P::Entity), In("Parameter", P::String)},
+               [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       animParam(c, c.Animation()->SetTrigger(*e, c.InString(3)), c.InString(3));
+               }, "Sets a Trigger parameter; it stays set until a transition uses it"));
+    add(Pure("Anim.GetParameter", "Get Anim Parameter", "Animation",
+             {In("Target", P::Entity), In("Parameter", P::String), Out("Value", P::Float)}, [](ScriptContext& c) {
+                 const auto e = ControllerTarget(c, 0);
+                 c.Out(2, e ? c.Animation()->Parameter(*e, c.InString(1)).value_or(0.0f) : 0.0f);
+             }));
+    add(Pure("Anim.GetState", "Get Anim State", "Animation",
+             {In("Target", P::Entity), In("Layer", P::String), Out("State", P::String), Out("Time", P::Float)},
+             [](ScriptContext& c) {
+                 const auto e = ControllerTarget(c, 0);
+                 c.Out(2, e ? c.Animation()->CurrentState(*e, c.InString(1)) : std::string());
+                 c.Out(3, e ? c.Animation()->StateTime(*e, c.InString(1)) : 0.0f);
+             }, "Current state of a layer (empty Layer: the first) and its normalized time (1.5 = middle of the 2nd loop)"));
+    add(Action("Anim.SetLayerWeight", "Set Anim Layer Weight", "Animation",
+               {In("Target", P::Entity), In("Layer", P::String), In("Weight", P::Float)}, [](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2); e && !c.Animation()->SetLayerWeight(*e, c.InString(3), c.InFloat(4)))
+                       c.Error("Unknown animation layer '" + c.InString(3) + "'");
+               }));
+    const auto ikGoal = [](ScriptContext& c, bool ok) {
+        if (!ok)
+            c.Error("Unknown IK goal '" + c.InString(3) + "'");
+    };
+    add(Action("Anim.SetIkTarget", "Set IK Target", "Animation",
+               {In("Target", P::Entity), In("Goal", P::String), In("Location", P::Vec3)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       ikGoal(c, c.Animation()->SetIkTarget(*e, c.InString(3), c.InVec3(4)));
+               }, "World position a Two Bone / Look At / FABRIK goal reaches for"));
+    add(Action("Anim.SetIkTargetEntity", "Set IK Target Entity", "Animation",
+               {In("Target", P::Entity), In("Goal", P::String), In("Follow", P::Entity)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       ikGoal(c, c.Animation()->SetIkTargetEntity(*e, c.InString(3), c.InEntity(4)));
+               }, "The goal follows this entity's position every frame"));
+    add(Action("Anim.ClearIkTarget", "Clear IK Target", "Animation", {In("Target", P::Entity), In("Goal", P::String)},
+               [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       ikGoal(c, c.Animation()->ClearIkTarget(*e, c.InString(3)));
+               }));
+    add(WithDefaults(Action("Anim.SetIkWeight", "Set IK Weight", "Animation",
+                            {In("Target", P::Entity), In("Goal", P::String), In("Weight", P::Float)}, [=](ScriptContext& c) {
+                                if (const auto e = ControllerTarget(c, 2))
+                                    ikGoal(c, c.Animation()->SetIkWeight(*e, c.InString(3), c.InFloat(4)));
+                            }),
+                     {{"Weight", 1.0f}}));
+    add(Action("Anim.SetIkEnabled", "Set IK Enabled", "Animation",
+               {In("Target", P::Entity), In("Goal", P::String), In("Enabled", P::Bool)}, [=](ScriptContext& c) {
+                   if (const auto e = ControllerTarget(c, 2))
+                       ikGoal(c, c.Animation()->SetIkEnabled(*e, c.InString(3), c.InBool(4)));
                }));
     add(Action("Animation.SetRootMotion", "Set Root Motion", "Animation",
                {In("Target", P::Entity), In("Enabled", P::Bool)}, [](ScriptContext& c) {
@@ -1912,12 +2013,14 @@ std::vector<NodeDesc> BuildRegistry()
                                      : kind == "Script"    ? r.Has<ScriptComponent>(e)
                                      : kind == "Tags"      ? r.Has<Tags>(e)
                                      : kind == "NavAgent"  ? r.Has<NavAgent>(e)
+                                     : kind == "AnimationController" ? r.Has<AnimationController>(e)
                                                            : false;
                            }
                            c.Out(1, has);
                        }),
                   ParamKind::Choice, "Component", "Mesh",
-                  {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent"}));
+                  {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent",
+                   "AnimationController"}));
     add(Pure("Entity.GetRight", "Get Right Vector", "Transform", {In("Target", P::Entity), Out("Right", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))
