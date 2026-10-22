@@ -689,7 +689,14 @@ TEST_CASE(Animation_BlueprintNodesAndSerialization)
         CHECK(LoadSceneFile(file, loaded, nullptr).empty());
         const Entity back = loaded.FindByUuid(scene.GetRegistry().Get<Uuid>(e).value);
         const auto*  c    = back != NullEntity ? loaded.GetRegistry().TryGet<AnimationController>(back) : nullptr;
-        CHECK(c && *c == scene.GetRegistry().Get<AnimationController>(e));
+        CHECK(c != nullptr);
+        if (c) { // the path may come back in another spelling (Windows short temp names)
+            AnimationController expected = scene.GetRegistry().Get<AnimationController>(e), actual = *c;
+            std::error_code     ec;
+            CHECK(fs::equivalent(PathFromUtf8(actual.graph), graph, ec));
+            expected.graph = actual.graph = {};
+            CHECK(actual == expected);
+        }
     }
 
     // Blueprint on the character, the controller on its model child.
