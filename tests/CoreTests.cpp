@@ -1820,10 +1820,10 @@ TEST_CASE(MeshOptimizer_LodChainAndReordering)
     CHECK(OptimizeMeshes(skinned, {.lodCount = 1}).reorderedMeshes == 1);
     bool followed = skinned.skinInfluences.size() == skinned.vertices.size(), moved = false;
     for (const std::uint32_t index : skinned.indices) {
-        const std::uint16_t original = skinned.skinInfluences[index].joints.x;
-        followed = followed && original < skinnedPositions.size() &&
-                   skinnedPositions[original] == skinned.vertices[index].position;
-        moved = moved || original != index;
+        const std::uint16_t source = skinned.skinInfluences[index].joints.x;
+        followed = followed && source < skinnedPositions.size() &&
+                   skinnedPositions[source] == skinned.vertices[index].position;
+        moved = moved || source != index;
     }
     CHECK(followed && moved);
 }
