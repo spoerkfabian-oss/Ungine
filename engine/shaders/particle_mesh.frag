@@ -9,7 +9,10 @@ layout(location = 0) in vec4 inColor;
 layout(location = 1) in vec2 inUv;
 layout(location = 2) in vec3 inNormal;
 layout(location = 3) in float inViewDistance;
+layout(location = 4) in vec4 inCurrentClip;
+layout(location = 5) in vec4 inPreviousClip;
 layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outVelocity; // blended by coverage (alpha) over the opaque motion
 
 void main()
 {
@@ -29,4 +32,5 @@ void main()
     if (color.a <= 0.0)
         discard;
     outColor = (pc.flags & PARTICLE_ADDITIVE) != 0u ? vec4(color.rgb * color.a, color.a) : color;
+    outVelocity = vec4(ParticleMotion(inCurrentClip, inPreviousClip), 0.0, color.a);
 }

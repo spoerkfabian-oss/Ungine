@@ -148,6 +148,7 @@ engine_add_shaders(Engine SOURCES
     shaders/particle_mesh.vert
     shaders/particle_ribbon.vert
     shaders/scatter.comp
+    shaders/taa.comp
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

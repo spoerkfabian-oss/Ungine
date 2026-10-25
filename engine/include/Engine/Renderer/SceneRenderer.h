@@ -31,8 +31,9 @@ class Scene;
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
 
 // tonemap.frag. HiZ: occlusion pyramid (level CullingSettings::hizDebugLevel), Culling: draws that
-// only the late (occlusion) pass found visible are tinted orange.
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod, Count };
+// only the late (occlusion) pass found visible are tinted orange. Velocity: motion vectors.
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod,
+                                       Velocity, Count };
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -54,6 +55,15 @@ struct PostSettings {
     float      minLogLuminance = -10.0f; // histogram range (log2 luminance)
     float      maxLogLuminance = 6.0f;
     DebugView  debugView       = DebugView::None;
+};
+
+// Temporal anti-aliasing: sub-pixel jitter of the camera (Halton 2/3, 8 positions), motion vectors
+// from the depth prepass (objects incl. skinning, camera; particles from their velocity), history
+// reprojection with variance clipping, sharpening in the tone mapping pass.
+struct TaaSettings {
+    bool  enabled   = true;
+    float feedback  = 0.9f;  // history weight: higher = smoother, more ghosting on fast changes
+    float sharpness = 0.25f; // unsharp mask in the tone mapping pass (0 = off)
 };
 
 // Ground-truth ambient occlusion (screen space, indirect light only).
@@ -227,6 +237,7 @@ public:
     LocalShadowSettings                   localShadows;
     SelectionOverlay                      overlay;
     CullingSettings                       culling;
+    TaaSettings                           taa;
     // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
     const ParticleWorld*                  particles = nullptr;
 
@@ -236,6 +247,8 @@ public:
     // Engaged once per request: the entity (NullEntity = background / destroyed meanwhile).
     [[nodiscard]] std::optional<Entity> TakePickResult() { return std::exchange(m_PickResult, std::nullopt); }
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
+    // Camera cut (teleport, level change, play / stop): temporal history (TAA, reflections) restarts.
+    void ResetHistory() { m_HistoryValid = false; }
     // Bounds of the rendered scene (BVH), synced at the start of every Render: queries and raycasts.
     [[nodiscard]] const SpatialIndex&     Spatial() const { return m_Spatial; }
 
@@ -284,6 +297,7 @@ private:
     void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
     void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress, std::uint32_t frameIndex);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
+    void RenderTaa(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
     void ReadExposure(std::uint32_t frameIndex);
@@ -302,6 +316,7 @@ private:
     Pipeline            m_BloomDown, m_BloomUp;
     Pipeline            m_Prepass, m_Gtao, m_GtaoDenoise, m_Histogram, m_ExposureAverage;
     Pipeline            m_LightCull;
+    Pipeline            m_Taa;
     Buffer              m_Clusters; // per-cluster counts + light index lists (written by light_cull.comp)
 
     // Frame targets (recreated on resize).
@@ -312,7 +327,18 @@ private:
     Image                      m_Bloom; // half resolution, one level per mip
     std::vector<ImageView>     m_BloomViews;
     std::vector<std::uint32_t> m_BloomSampled, m_BloomStorage;
-    Image                      m_Normals; // view space, written by the prepass
+    Image                      m_Normals; // view space + roughness, written by the prepass
+    Image                      m_Velocity; // UV motion since last frame, written by the prepass
+    std::uint32_t              m_VelocitySlot = 0;
+    // TAA history, ping-pong in GENERAL: this frame resolves into [m_HistoryIndex], reads the other.
+    std::array<Image, 2>         m_History;
+    std::array<std::uint32_t, 2> m_HistorySampled{}, m_HistoryStorage{};
+    std::uint32_t                m_HistoryIndex = 0;
+    bool                         m_HistoryValid = false;
+    bool                         m_HistoryLayoutReady = false;
+    std::uint32_t                m_ResolvedSlot = 0; // this frame's image for bloom / exposure / tone mapping
+    std::uint64_t                m_FrameCounter = 0;
+    std::optional<glm::mat4>     m_PrevViewProj; // last frame's camera without jitter
     Image                      m_AoRaw, m_Ao;
     std::uint32_t              m_NormalSlot = 0;
     std::uint32_t              m_AoRawSampled = 0, m_AoRawStorage = 0, m_AoSampled = 0, m_AoStorage = 0;

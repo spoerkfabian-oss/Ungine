@@ -27,7 +27,9 @@ struct ParticleRenderStats {
 // particle data is copied into per-frame host-visible buffers (grown on demand).
 class ParticleRenderer {
 public:
-    ParticleRenderer(Renderer& renderer, const AssetManager& assets, VkFormat colorFormat, VkFormat depthFormat);
+    // Color attachments: HDR (blended) + motion vectors (blended by coverage, TAA).
+    ParticleRenderer(Renderer& renderer, const AssetManager& assets, VkFormat colorFormat, VkFormat velocityFormat,
+                     VkFormat depthFormat);
     ~ParticleRenderer();
 
     ParticleRenderer(const ParticleRenderer&)            = delete;
@@ -51,7 +53,7 @@ private:
 
     Renderer&           m_Renderer;
     const AssetManager& m_Assets;
-    VkFormat            m_ColorFormat, m_DepthFormat;
+    VkFormat            m_ColorFormat, m_VelocityFormat, m_DepthFormat;
     std::array<Pipeline, 2> m_Sprite, m_Ribbon, m_Mesh; // [alpha, additive]
     std::array<Buffer, kFramesInFlight> m_Particles, m_Ribbons;
     const ParticleRenderData* m_Data = nullptr;

@@ -14,8 +14,15 @@ layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inTangent;
 layout(location = 4) flat in uint inMaterial;
 layout(location = 6) flat in uint inLodFade; // LOD | fade << 2 | fading in << 9 (VISIBLE_* >> 22)
+#ifdef MESH_BLEND
+layout(location = 7) in vec4 inCurrentClip;
+layout(location = 8) in vec4 inPreviousClip;
+#endif
 
 layout(location = 0) out vec4 outColor;
+#ifdef MESH_BLEND
+layout(location = 1) out vec4 outVelocity; // blended by coverage (alpha) over the opaque motion
+#endif
 
 // Cook-Torrance (GGX, height-correlated Smith, Schlick) + Lambert, times N.L.
 vec3 DirectBrdf(vec3 N, vec3 V, vec3 L, float NdotV, float NdotL, vec3 cDiff, vec3 f0, float a)
@@ -136,7 +143,8 @@ void main()
         color = lod == 0u ? color : color * t + t * 0.08 * frame.sky.x;
     }
 #ifdef MESH_BLEND
-    outColor = vec4(color, base.a); // straight alpha, blended over the opaque image
+    outColor    = vec4(color, base.a); // straight alpha, blended over the opaque image
+    outVelocity = vec4(MotionVector(inCurrentClip, inPreviousClip), 0.0, base.a);
 #else
     outColor = vec4(color, 1.0);
 #endif

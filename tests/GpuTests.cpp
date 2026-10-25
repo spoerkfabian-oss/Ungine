@@ -1041,6 +1041,7 @@ TEST_CASE(Render_GpuDrivenMatchesCpu)
     scene.UpdateTransforms();
 
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.shadows.resolution = 512;
     renderer.post.autoExposure  = false; // adaptation depends on wall-clock frame times
     const glm::vec3  eye{0.0f, 2.0f, 12.0f};
@@ -1430,6 +1431,7 @@ TEST_CASE(Render_ShaderReloadRebuildsPipelines)
     scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
     scene.UpdateTransforms();
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.post.autoExposure = false;
     const std::vector<std::uint8_t> before = RenderImage(renderer, scene, FrontCamera(3.0f), 3);
 
@@ -1545,6 +1547,7 @@ TEST_CASE(Render_TransparentAndShadowOcclusion)
     scene.UpdateTransforms();
 
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.post.autoExposure       = false;
 
     renderer.shadows.resolution      = 512;
@@ -2455,6 +2458,7 @@ TEST_CASE(Render_SkinnedAnimationInstancesAndPrefabs)
 
     Scene         scene;
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     const glm::vec3  eye{0.55f, 0.8f, 2.2f};
     const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.55f, 0.8f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
                             .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
@@ -2983,6 +2987,7 @@ TEST_CASE(Streaming_SubLevelModelsAndRendering)
 
     Scene                           scene;
     SceneRenderer                   renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     const CameraData                camera = FrontCamera(4.0f);
     const std::vector<std::uint8_t> empty  = RenderImage(renderer, scene, camera, 3);
     LevelStreamer                   streamer(*F().jobs, F().assets.get(), &F().events);
@@ -4005,5 +4010,79 @@ TEST_CASE(Editor_NavigationBakeOverlayAndPlay)
         runFrames(3);
     }
     fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_TemporalAntiAliasing)
+{
+    // A box rotated 30 degrees against the sky: TAA turns its stair-stepped edges into partial
+    // coverage, converges for a still image, follows a moving box without leaving a trail
+    // (motion vectors), and the motion vector debug view shows only the moving object.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    CHECK(F().Pump([&] { return Settled(box); }));
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Box");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+    scene.EditTransform(e).rotation = glm::angleAxis(glm::radians(30.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.sharpness     = 0.0f;
+    const CameraData camera = FrontCamera(3.0f);
+
+    // Edge energy: sum of squared brightness steps between neighbors. Anti-aliasing splits the
+    // hard steps of the edges into smaller ones (same total change, smaller squares).
+    const auto energy = [](const std::vector<std::uint8_t>& image) {
+        const auto lum = [&](int x, int y) {
+            const std::size_t i = (static_cast<std::size_t>(y) * 160 + static_cast<std::size_t>(x)) * 4;
+            return static_cast<double>(image[i] + image[i + 1] + image[i + 2]);
+        };
+        double sum = 0.0;
+        for (int y = 0; y < 119; ++y)
+            for (int x = 0; x < 159; ++x)
+                sum += std::pow(lum(x + 1, y) - lum(x, y), 2.0) + std::pow(lum(x, y + 1) - lum(x, y), 2.0);
+        return sum;
+    };
+    renderer.taa.enabled = false;
+    const auto aliased   = RenderImage(renderer, scene, camera, 3);
+    renderer.taa.enabled = true;
+    const auto smooth    = RenderImage(renderer, scene, camera, 24);
+    const auto next      = RenderImage(renderer, scene, camera, 1);
+    std::printf("    edge energy: aliased %.0f, TAA %.0f; converged frames differ in %zu\n", energy(aliased),
+                energy(smooth), DifferentPixels(smooth, next));
+    CHECK(energy(smooth) < energy(aliased) * 0.8);
+    CHECK(DifferentPixels(smooth, next) < 10); // still image: stable
+
+    // Moving box: 12 frames to the right, then compared with a still render at the end position.
+    for (int i = 1; i <= 12; ++i) {
+        scene.EditTransform(e).position.x = 0.05f * static_cast<float>(i);
+        scene.UpdateTransforms();
+        (void)RenderImage(renderer, scene, camera, 1);
+    }
+    renderer.post.debugView = DebugView::Velocity;
+    scene.EditTransform(e).position.x = 0.05f * 13.0f;
+    scene.UpdateTransforms();
+    const auto motion = RenderImage(renderer, scene, camera, 1);
+    renderer.post.debugView = DebugView::None;
+    std::size_t moving = 0, still = 0;
+    for (std::size_t i = 0; i + 3 < motion.size(); i += 4)
+        (motion[i] > 20 ? moving : still) += 1;
+    scene.EditTransform(e).position.x = 0.05f * 14.0f;
+    scene.UpdateTransforms();
+    const auto moved = RenderImage(renderer, scene, camera, 1);
+    SceneRenderer reference(*F().renderer, *F().context, *F().assets);
+    reference.post.autoExposure = false;
+    reference.post.bloom        = false;
+    reference.taa.enabled       = false;
+    const auto target = RenderImage(reference, scene, camera, 3);
+    // A still TAA image differs from an aliased one along the edges: the moving one should not more.
+    const std::size_t edges = DifferentPixels(smooth, aliased);
+    std::printf("    moving: %zu pixels with motion, %zu without; %zu differ from a still render (edges %zu)\n", moving,
+                still, DifferentPixels(moved, target), edges);
+    CHECK(moving > 300 && moving < 3000 && still > 15000);
+    CHECK(DifferentPixels(moved, target) < edges * 3); // softer edges while moving, no trail
+    F().assets->Release(box);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

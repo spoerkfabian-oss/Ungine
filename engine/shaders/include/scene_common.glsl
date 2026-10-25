@@ -67,10 +67,11 @@ struct GpuInstance {
     uint drawCount;
     uint jointOffset;
     uint jointCount;
-    uint pad0;
+    uint prevJointOffset; // last frame's palette (FrameData.prevJointMatrices), ~0u: none
     uint pad1;
     vec4 skinnedBoundsMin;
     vec4 skinnedBoundsMax;
+    mat4 prevModel; // last frame's model matrix (motion vectors)
 };
 #define INSTANCE_MIRRORED 1u
 #define INSTANCE_SKINNED  2u

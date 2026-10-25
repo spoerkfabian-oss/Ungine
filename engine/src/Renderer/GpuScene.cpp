@@ -77,7 +77,7 @@ void GpuScene::RebuildPipelines()
 GpuScene::~GpuScene()
 {
     m_Renderer.DeferRelease(std::move(m_Scatter));
-    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices})
+    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices[0], &m_JointMatrices[1]})
         if (*b)
             m_Renderer.DeferRelease(std::move(*b));
 }
@@ -117,6 +117,17 @@ LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm
 
 void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets)
 {
+    // Moved last frame: the previous matrix catches up (no motion unless it moves again).
+    for (const std::uint32_t i : m_Moved) {
+        m_MovedFlag[i] = false;
+        GpuInstance& data = m_InstanceData[i];
+        if (m_Instances[i].entity != NullEntity && data.prevModel != data.model) {
+            data.prevModel = data.model;
+            MarkInstance(i);
+        }
+    }
+    m_Moved.clear();
+
     // Released models: their pool ranges are freed a few frames from now, so the instances must
     // go now. Reloaded / failed / retried models (new revision): rebuild their draws. Both before
     // any other upsert, so a batch of a freed submesh record is never reused by a new model.
@@ -182,10 +193,13 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
         const std::uint32_t oldFlags = gpu.flags;
         const std::uint32_t oldOffset = gpu.jointOffset;
         const std::uint32_t oldCount = gpu.jointCount;
+        const std::uint32_t oldPrevOffset = gpu.prevJointOffset;
+        gpu.prevJointOffset = ~0u;
         const glm::vec3 oldBoundsMin = glm::vec3(gpu.skinnedBoundsMin);
         const glm::vec3 oldBoundsMax = glm::vec3(gpu.skinnedBoundsMax);
         const auto markIfChanged = [&] {
             if (gpu.flags != oldFlags || gpu.jointOffset != oldOffset || gpu.jointCount != oldCount ||
+                gpu.prevJointOffset != oldPrevOffset ||
                 glm::length(glm::vec3(gpu.skinnedBoundsMin) - oldBoundsMin) > 1.0e-5f ||
                 glm::length(glm::vec3(gpu.skinnedBoundsMax) - oldBoundsMax) > 1.0e-5f)
                 MarkInstance(i);
@@ -250,6 +264,9 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
         gpu.jointOffset = offset;
         gpu.jointCount = static_cast<std::uint32_t>(skin.joints.size());
         gpu.flags |= kInstanceSkinned;
+        // Last frame's palette of this instance sits in the other buffer at its old offset.
+        if (oldOffset != ~0u && oldCount == gpu.jointCount)
+            gpu.prevJointOffset = oldOffset;
 
         if (const auto bounds = ComputeSkinnedBounds(*model, meshRenderer->meshIndex,
                                                      static_cast<std::uint32_t>(skinIndex),
@@ -309,6 +326,7 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
     }
 
     bool newGeometry = true;
+    const bool existed = index != kNone;
     if (index == kNone) {
         if (!m_FreeInstances.empty()) {
             index = m_FreeInstances.back();
@@ -342,6 +360,22 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
 
     GpuInstance&    data   = m_InstanceData[index];
     const glm::mat3 normal = glm::transpose(glm::inverse(linear));
+    if (!existed) { // a reused slot keeps nothing of its previous owner
+        data.prevModel       = world;
+        data.jointOffset     = ~0u;
+        data.jointCount      = 0;
+        data.prevJointOffset = ~0u;
+    } else if (index >= m_MovedFlag.size() || !m_MovedFlag[index]) {
+        data.prevModel = data.model; // where it was drawn last frame
+    }
+    if (data.prevModel != world) {
+        if (index >= m_MovedFlag.size())
+            m_MovedFlag.resize(m_InstanceData.size(), false);
+        if (!m_MovedFlag[index]) {
+            m_MovedFlag[index] = true;
+            m_Moved.push_back(index);
+        }
+    }
     data.model     = world;
     data.normal[0] = glm::vec4(normal[0], 0.0f);
     data.normal[1] = glm::vec4(normal[1], 0.0f);
@@ -548,7 +582,8 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     const bool newDraws     = Ensure(m_Renderer, m_DrawBuffer, m_Draws.size(), sizeof(GpuDraw), "GpuDraws");
     const bool newBatches   = Ensure(m_Renderer, m_BatchBuffer, m_Batches.size(), sizeof(GpuBatch), "GpuBatches");
     const bool newVisible   = Ensure(m_Renderer, m_Visibility, m_Draws.size(), sizeof(std::uint32_t), "GpuDrawVisibility");
-    const bool newJoints    = Ensure(m_Renderer, m_JointMatrices, m_JointMatrixData.size(), sizeof(glm::mat4), "GpuJointMatrices");
+    m_JointBuffer ^= 1u; // the other buffer keeps last frame's palettes
+    const bool newJoints    = Ensure(m_Renderer, m_JointMatrices[m_JointBuffer], m_JointMatrixData.size(), sizeof(glm::mat4), "GpuJointMatrices");
     m_BatchesDirty |= newBatches;
 
     const bool fullInstances = newInstances && !m_InstanceData.empty();
@@ -604,7 +639,7 @@ void GpuScene::Upload(VkCommandBuffer cmd)
         Scatter(cmd, m_BatchBuffer.Address(), m_Batches.data(), sizeof(GpuBatch), {},
                 static_cast<std::uint32_t>(m_Batches.size()));
     if (!m_JointMatrixData.empty())
-        Scatter(cmd, m_JointMatrices.Address(), m_JointMatrixData.data(), sizeof(glm::mat4), {},
+        Scatter(cmd, m_JointMatrices[m_JointBuffer].Address(), m_JointMatrixData.data(), sizeof(glm::mat4), {},
                 static_cast<std::uint32_t>(m_JointMatrixData.size()));
     m_BatchesDirty = false;
 

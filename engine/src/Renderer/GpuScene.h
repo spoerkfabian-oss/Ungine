@@ -8,6 +8,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
@@ -30,12 +31,13 @@ struct GpuInstance {
     std::uint32_t drawCount = 0;
     std::uint32_t jointOffset = ~0u;
     std::uint32_t jointCount = 0;
-    std::uint32_t pad0 = 0;
+    std::uint32_t prevJointOffset = ~0u; // last frame's palette (PrevJointMatrixAddress), ~0u: none
     std::uint32_t pad1 = 0;
     glm::vec4 skinnedBoundsMin{0.0f};
     glm::vec4 skinnedBoundsMax{0.0f};
+    glm::mat4 prevModel{1.0f}; // last frame's model matrix (motion vectors)
 };
-static_assert(sizeof(GpuInstance) == 176);
+static_assert(sizeof(GpuInstance) == 240);
 inline constexpr std::uint32_t kInstanceMirrored = 1;
 inline constexpr std::uint32_t kInstanceSkinned = 2;
 inline constexpr std::uint32_t kInstanceSkinBoundsValid = 4;
@@ -123,7 +125,13 @@ public:
 
     // GPU buffers (valid after Upload).
     [[nodiscard]] VkDeviceAddress InstanceAddress() const { return m_InstanceBuffer.Address(); }
-    [[nodiscard]] VkDeviceAddress JointMatrixAddress() const { return m_JointMatrices.Address(); }
+    [[nodiscard]] VkDeviceAddress JointMatrixAddress() const { return m_JointMatrices[m_JointBuffer].Address(); }
+    // Last frame's skin palettes (motion vectors; 0 before the second frame).
+    [[nodiscard]] VkDeviceAddress PrevJointMatrixAddress() const
+    {
+        const Buffer& b = m_JointMatrices[m_JointBuffer ^ 1u];
+        return b ? b.Address() : 0;
+    }
     [[nodiscard]] VkDeviceAddress DrawAddress() const { return m_DrawBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress BatchAddress() const { return m_BatchBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress VisibilityAddress() const { return m_Visibility.Address(); }
@@ -176,13 +184,21 @@ private:
     std::unordered_map<ModelHandle, ModelUse>        m_ModelUse; // release / reload detection
     std::uint32_t                                    m_VisibleCapacity = 0;
 
+    // Instances whose model matrix changed last frame: prevModel catches up this frame.
+    std::vector<std::uint32_t> m_Moved;
+    std::vector<bool>          m_MovedFlag;
+
     // Pending uploads
     std::vector<std::uint32_t> m_DirtyInstances, m_DirtyDraws;
     std::vector<bool>          m_InstanceDirty, m_DrawDirty;
     bool                       m_BatchesDirty = false;
 
     // GPU buffers (capacity in elements)
-    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility, m_JointMatrices;
+    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility;
+    // Skin palettes, ping-pong: this frame's are written into m_JointMatrices[m_JointBuffer], the
+    // other one still holds last frame's (prevJointOffset indexes it).
+    std::array<Buffer, 2>  m_JointMatrices;
+    std::uint32_t          m_JointBuffer = 0;
     std::vector<glm::mat4> m_JointMatrixData;
 };
 

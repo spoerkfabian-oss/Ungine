@@ -7,6 +7,8 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outUv;
 layout(location = 2) out float outViewDistance;
 layout(location = 3) out vec2 outLocal; // quad corner (-1..1): the untextured round sprite
+layout(location = 4) out vec4 outCurrentClip;  // motion vectors (without jitter)
+layout(location = 5) out vec4 outPreviousClip;
 
 void main()
 {
@@ -39,6 +41,8 @@ void main()
     }
     const vec3 position = p.position + right * (q.x * half_.x) + up * (q.y * half_.y);
     gl_Position     = pc.frame.viewProj * vec4(position, 1.0);
+    outCurrentClip  = pc.frame.unjitteredViewProj * vec4(position, 1.0);
+    outPreviousClip = pc.frame.prevViewProj * vec4(position - p.velocity * pc.frame.taaInfo.z, 1.0);
     outColor        = p.color;
     outUv           = FlipbookUv(vec2(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5), p.frame);
     outViewDistance = -(view * vec4(position, 1.0)).z;

@@ -46,6 +46,33 @@ mat4 SkinMatrix(GpuInstance instance, Vertex vertex)
     return total > 1.0e-6 ? result / total : mat4(1.0);
 }
 
+// Last frame's skin matrix (motion vectors); without a palette of last frame the current one.
+mat4 PrevSkinMatrix(GpuInstance instance, Vertex vertex, mat4 current)
+{
+    if (instance.jointCount == 0u || instance.prevJointOffset == 0xFFFFFFFFu)
+        return current;
+    mat4 result = mat4(0.0);
+    float total = 0.0;
+    for (uint i = 0u; i < 4u; ++i) {
+        const float weight = vertex.weights[i];
+        const uint joint = vertex.joints[i];
+        if (weight > 0.0 && joint < instance.jointCount) {
+            result += pc.frame.prevJointMatrices.m[instance.prevJointOffset + joint] * weight;
+            total += weight;
+        }
+    }
+    return total > 1.0e-6 ? result / total : current;
+}
+
+// Screen-space motion (UV units, this frame minus last frame) from the clip positions of both
+// frames without jitter. The viewport flips y: uv = (ndc.x, -ndc.y) * 0.5 + 0.5.
+vec2 MotionVector(vec4 currentClip, vec4 previousClip)
+{
+    const vec2 current  = currentClip.xy / currentClip.w;
+    const vec2 previous = previousClip.xy / previousClip.w;
+    return (current - previous) * vec2(0.5, -0.5);
+}
+
 #ifdef ENGINE_BINDLESS_GLSL
 // Material textures go through the texture table: a reload swaps the entry, not the material.
 vec4 SampleMaterial(uint entry, uint samplerIndex, vec2 uv)

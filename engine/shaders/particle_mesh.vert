@@ -7,6 +7,8 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outUv;
 layout(location = 2) out vec3 outNormal;
 layout(location = 3) out float outViewDistance;
+layout(location = 4) out vec4 outCurrentClip;  // motion vectors (velocity only when aligned to it)
+layout(location = 5) out vec4 outPreviousClip;
 
 mat3 AxisAngle(vec3 axis, float angle)
 {
@@ -33,6 +35,10 @@ void main()
     }
     const vec3 position = p.position + rotation * (v.position * p.size);
     gl_Position     = pc.frame.viewProj * vec4(position, 1.0);
+    // Unaligned meshes use `velocity` as their spin axis: camera motion only.
+    const vec3 motion = (pc.flags & PARTICLE_ALIGN) != 0u ? p.velocity * pc.frame.taaInfo.z : vec3(0.0);
+    outCurrentClip  = pc.frame.unjitteredViewProj * vec4(position, 1.0);
+    outPreviousClip = pc.frame.prevViewProj * vec4(position - motion, 1.0);
     outColor        = p.color;
     outUv           = vec2(v.uvX, v.uvY);
     outNormal       = rotation * normalize(v.normal / max(p.size, vec3(1.0e-6)));

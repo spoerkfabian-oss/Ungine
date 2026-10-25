@@ -62,6 +62,13 @@ layout(push_constant) uniform ParticlePush {
     float         pad0;
 } pc;
 
+// Motion vectors (TAA): UV motion since last frame from both frames' clip positions without
+// jitter (viewport flips y). Particles move by their velocity over the frame time.
+vec2 ParticleMotion(vec4 currentClip, vec4 previousClip)
+{
+    return (currentClip.xy / currentClip.w - previousClip.xy / previousClip.w) * vec2(0.5, -0.5);
+}
+
 // View distance of the reverse-Z, infinite-far depth buffer value.
 float ViewDistanceFromDepth(float depth)
 {

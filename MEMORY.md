@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-22 (Phase 29 merged (PR #19, fa23918); Phase 30 animation state machine / IK implemented on `branch`, PR open; next Phase 31 TAA/decals/SSR/fog after the merge, ask first)
+- Last updated: 2026-10-25 (Phase 30 merged (PR #20, 0bf373e); `branch` restarted from main; Phase 31 TAA/decals/SSR/fog decisions taken, implementation on `branch`)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1040,3 +1040,9 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Found while testing: foot-IK rays started inside the character's own capsule (actor now ignored; red without fix); LookAt missed when ancestors moved the tip; notifies fired once per update instead of per loop crossing; **Phase 21 bug: OptimizeMeshes reordered vertices (vertex fetch) without the skin influences → every skinned mesh with its own vertex range exploded (Fox; the banner GPU test did not catch it)** → influences remapped too, regression in MeshOptimizer_LodChainAndReordering (red without fix). Lesson: look at a screenshot of every new model.
 - Tests: CPU `tests/AnimationTests.cpp` (6), GPU `Editor_AnimationGraphWindowAndPlay`; Navigation_PhysicsTemplateWanderer now also checks the Speed parameter.
 - Open: edit mode does not animate, foot IK has no effect in the preview (no physics), linear crossfades, unwrapped exit time, no bone overlay / IK gizmo, root motion translation only.
+
+### Phase 31 rendering – decisions (user, 2026-10-25)
+- TAA with motion vectors: sub-pixel jitter, velocity buffer (incl. skinning, particles), reprojection with neighborhood clamp, sharpening, velocity debug view (no upscaling, no FXAA).
+- Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
+- SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
+- Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.

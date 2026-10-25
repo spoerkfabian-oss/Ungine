@@ -1,0 +1,157 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+
+// Temporal anti-aliasing resolve: the jittered HDR frame blended into the reprojected history.
+// History: Catmull-Rom (5 bilinear taps), clipped towards the 3x3 neighborhood (variance box in
+// YCoCg), luminance-weighted blend (no fireflies). Motion: velocity of the closest depth in 3x3
+// (dilated edges); pixels without geometry reproject the camera only.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform TaaPush {
+    FrameData frame;
+    uint      current;  // HDR (sampled)
+    uint      history;  // last resolve (sampled, GENERAL)
+    uint      target;   // this resolve (storage, GENERAL)
+    uint      depth;
+    uint      velocity;
+    float     feedback; // history weight
+    uint      valid;    // 0: no usable history (first frame, resize, cut)
+    uint      pad;
+    uvec2     size;
+} pc;
+
+vec3 Fetch(ivec2 p)
+{
+    p = clamp(p, ivec2(0), ivec2(pc.size) - 1);
+    return texelFetch(sampler2D(uTextures[nonuniformEXT(pc.current)], uSamplers[SAMPLER_NEAREST_CLAMP]), p, 0).rgb;
+}
+
+vec3 RgbToYCoCg(vec3 c)
+{
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)), dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+
+vec3 YCoCgToRgb(vec3 c)
+{
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+vec3 SampleHistory(vec2 uv)
+{
+    return max(SampleTextureLod(pc.history, SAMPLER_LINEAR_CLAMP, uv, 0.0).rgb, vec3(0.0));
+}
+
+// Catmull-Rom through 5 bilinear taps (corners dropped), sharper than plain bilinear.
+vec3 HistoryCatmullRom(vec2 uv)
+{
+    const vec2 size     = vec2(pc.size);
+    const vec2 position = uv * size;
+    const vec2 center   = floor(position - 0.5) + 0.5;
+    const vec2 f        = position - center;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 tc0  = (center - 1.0) / size;
+    const vec2 tc3  = (center + 2.0) / size;
+    const vec2 tc12 = (center + w2 / w12) / size;
+    vec3 result = SampleHistory(vec2(tc12.x, tc0.y)) * (w12.x * w0.y) +
+                  SampleHistory(vec2(tc0.x, tc12.y)) * (w0.x * w12.y) +
+                  SampleHistory(tc12) * (w12.x * w12.y) +
+                  SampleHistory(vec2(tc3.x, tc12.y)) * (w3.x * w12.y) +
+                  SampleHistory(vec2(tc12.x, tc3.y)) * (w12.x * w3.y);
+    const float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(result / weight, vec3(0.0));
+}
+
+// Moves `history` towards the box center until it lies inside (keeps the hue, unlike a clamp).
+vec3 ClipToBox(vec3 history, vec3 boxMin, vec3 boxMax)
+{
+    const vec3 center = 0.5 * (boxMax + boxMin);
+    const vec3 extent = 0.5 * (boxMax - boxMin) + 1e-5;
+    const vec3 offset = history - center;
+    const vec3 units  = abs(offset / extent);
+    const float m     = max(units.x, max(units.y, units.z));
+    return m > 1.0 ? center + offset / m : history;
+}
+
+float Luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(pixel), pc.size)))
+        return;
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.size);
+
+    // Neighborhood statistics (YCoCg) + the closest depth (reverse-Z: largest value).
+    vec3  m1 = vec3(0.0), m2 = vec3(0.0);
+    vec3  center = vec3(0.0);
+    float closest = -1.0;
+    ivec2 closestPixel = pixel;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 p = pixel + ivec2(x, y);
+            const vec3  c = RgbToYCoCg(Fetch(p));
+            m1 += c;
+            m2 += c * c;
+            if (x == 0 && y == 0)
+                center = c;
+            const ivec2 q = clamp(p, ivec2(0), ivec2(pc.size) - 1);
+            const float d = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depth)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                       q, 0).r;
+            if (d > closest) {
+                closest      = d;
+                closestPixel = q;
+            }
+        }
+    const vec3 currentRgb = YCoCgToRgb(center);
+    if (pc.valid == 0u) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(currentRgb, 1.0));
+        return;
+    }
+
+    // Motion: object velocity where there is geometry, camera reprojection of the sky.
+    vec2 previousUv;
+    if (closest > 0.0) {
+        const vec2 velocity = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.velocity)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                         closestPixel, 0).rg;
+        previousUv = uv - velocity;
+    } else {
+        FrameData frame = pc.frame;
+        // Direction through this pixel (depth 0 = infinity, w = 0), seen by last frame's camera.
+        const vec2 ndc       = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        const vec4 direction = frame.invViewProj * vec4(ndc, 0.0, 1.0);
+        const vec4 previous  = frame.prevViewProj * vec4(direction.xyz, 0.0);
+        previousUv = previous.w > 1e-6 ? (previous.xy / previous.w) * vec2(0.5, -0.5) + 0.5 : uv;
+    }
+    if (any(lessThan(previousUv, vec2(0.0))) || any(greaterThan(previousUv, vec2(1.0)))) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(currentRgb, 1.0));
+        return;
+    }
+
+    // Variance box (gamma 1) intersected with min/max of the neighborhood.
+    const vec3 mean  = m1 / 9.0;
+    const vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+    const vec3 boxMin = mean - sigma;
+    const vec3 boxMax = mean + sigma;
+
+    vec3 history = RgbToYCoCg(HistoryCatmullRom(previousUv));
+    history      = ClipToBox(history, boxMin, boxMax);
+    const vec3 historyRgb = max(YCoCgToRgb(history), vec3(0.0));
+
+    // Luminance weighting (Karis 2014): bright outliers do not dominate the average.
+    float       alphaHistory = pc.feedback;
+    float       alphaCurrent = 1.0 - pc.feedback;
+    alphaHistory /= 1.0 + Luminance(historyRgb);
+    alphaCurrent /= 1.0 + Luminance(currentRgb);
+    const vec3 result = (historyRgb * alphaHistory + currentRgb * alphaCurrent) / max(alphaHistory + alphaCurrent, 1e-6);
+    imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(result, 1.0));
+}

@@ -112,6 +112,7 @@ void VulkanContext::SelectPhysicalDevice()
     f10.fillModeNonSolid          = VK_TRUE; // wireframe debug view
     f10.multiDrawIndirect         = VK_TRUE; // GPU-driven rendering
     f10.drawIndirectFirstInstance = VK_TRUE; // firstInstance = offset into the visible instance list
+    f10.independentBlend          = VK_TRUE; // main pass: HDR blended, motion vectors by coverage
 
     vkb::PhysicalDeviceSelector selector{m_Instance};
     m_PhysicalDevice = Expect(selector.set_minimum_version(1, 3)

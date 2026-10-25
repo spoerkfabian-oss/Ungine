@@ -13,10 +13,13 @@ layout(location = 3) in vec4 inTangent;
 layout(location = 4) flat in uint inMaterial;
 layout(location = 5) flat in uint inEntity;
 layout(location = 6) flat in uint inLodFade;
+layout(location = 7) in vec4 inCurrentClip;
+layout(location = 8) in vec4 inPreviousClip;
 
-layout(location = 0) out vec4 outNormal; // view space, [-1, 1]
+layout(location = 0) out vec4 outNormal;   // xyz: view space normal [-1, 1], w: roughness (SSR)
+layout(location = 1) out vec2 outVelocity; // UV motion since last frame (TAA, SSR reprojection)
 #ifdef WRITE_ENTITY_ID
-layout(location = 1) out uint outEntity; // entity slot index + 1, 0 = nothing (editor picking)
+layout(location = 2) out uint outEntity; // entity slot index + 1, 0 = nothing (editor picking)
 #endif
 
 // Depth + normal prepass: everything screen-space effects need before the lighting pass.
@@ -31,7 +34,10 @@ void main()
             discard;
     }
     const vec3 N = PerturbedNormal(m, SurfaceFrame(inNormal, inTangent, inWorldPos, inUV), inUV);
-    outNormal    = vec4(normalize(mat3(pc.frame.view) * N), 0.0);
+    const float roughness = clamp(m.roughness * SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV).g,
+                                  0.045, 1.0);
+    outNormal    = vec4(normalize(mat3(pc.frame.view) * N), roughness);
+    outVelocity  = MotionVector(inCurrentClip, inPreviousClip);
 #ifdef WRITE_ENTITY_ID
     outEntity = inEntity;
 #endif
