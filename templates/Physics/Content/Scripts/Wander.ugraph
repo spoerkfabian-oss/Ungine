@@ -16,6 +16,23 @@
         320.0
       ],
       "text": "Walk to a random reachable point on the navmesh, rest, repeat (AI Move To needs a Nav Agent)"
+    },
+    {
+      "color": [
+        0.55,
+        0.4,
+        0.6
+      ],
+      "id": 13,
+      "position": [
+        -24.0,
+        510.0
+      ],
+      "size": [
+        1000.0,
+        300.0
+      ],
+      "text": "Animation: the fox's locomotion blend space follows the agent's speed (Animations/Fox.uanim)"
     }
   ],
   "links": [
@@ -78,9 +95,39 @@
         7,
         "In"
       ]
+    },
+    {
+      "from": [
+        9,
+        "Out"
+      ],
+      "to": [
+        12,
+        "In"
+      ]
+    },
+    {
+      "from": [
+        10,
+        "Velocity"
+      ],
+      "to": [
+        11,
+        "Vector"
+      ]
+    },
+    {
+      "from": [
+        11,
+        "Length"
+      ],
+      "to": [
+        12,
+        "Value"
+      ]
     }
   ],
-  "nextId": 9,
+  "nextId": 14,
   "nodes": [
     {
       "id": 1,
@@ -161,6 +208,44 @@
         200.0
       ],
       "type": "Flow.CallEvent"
+    },
+    {
+      "id": 9,
+      "position": [
+        0.0,
+        560.0
+      ],
+      "type": "Event.Tick"
+    },
+    {
+      "id": 10,
+      "position": [
+        200.0,
+        700.0
+      ],
+      "type": "AI.GetMoveStatus"
+    },
+    {
+      "id": 11,
+      "position": [
+        460.0,
+        700.0
+      ],
+      "type": "Vector.Length"
+    },
+    {
+      "defaults": {
+        "Parameter": {
+          "type": "string",
+          "value": "Speed"
+        }
+      },
+      "id": 12,
+      "position": [
+        680.0,
+        560.0
+      ],
+      "type": "Anim.SetFloat"
     }
   ],
   "variables": [],

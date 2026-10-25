@@ -101,6 +101,7 @@ void TransformPaths(json& entity, F&& fn)
     apply(at(entity, {"script", "graph"}));
     apply(at(entity, {"audioSource", "sound"}));
     apply(at(entity, {"particleSystem", "effect"}));
+    apply(at(entity, {"animationController", "graph"}));
     apply(at(entity, {"uiWidget", "image"}));
     apply(at(entity, {"levelStreamingVolume", "level"}));
     apply(at(entity, {"collider", "material"}));

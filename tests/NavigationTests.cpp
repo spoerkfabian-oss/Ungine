@@ -1,4 +1,5 @@
 #include "Test.h"
+#include "Engine/Animation/AnimationSystem.h"
 
 #include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
@@ -479,6 +480,8 @@ TEST_CASE(Navigation_PhysicsTemplateWanderer)
     EventBus     events;
     ScriptSystem scripts(events);
     scripts.SetNavigationWorld(&nav);
+    AnimationSystem animation([](ModelHandle) -> const Model* { return nullptr; }); // Speed parameter only
+    scripts.SetAnimationSystem(&animation);
     nav.SetRandomSeed(3);
     std::error_code ec;
     const fs::path  previous = fs::current_path(ec);
@@ -488,6 +491,10 @@ TEST_CASE(Navigation_PhysicsTemplateWanderer)
     Entity wanderer = NullEntity;
     scene.GetRegistry().ViewOf<NavAgent>().Each([&](Entity e, NavAgent&) { wanderer = e; });
     CHECK(wanderer != NullEntity);
+    Entity fox = NullEntity;
+    scene.GetRegistry().ViewOf<AnimationController>().Each([&](Entity e, AnimationController&) { fox = e; });
+    CHECK(fox != NullEntity && scene.IsAncestor(wanderer, fox));
+    float maxSpeed = 0.0f;
     const glm::vec3 start    = scene.GetRegistry().Get<Transform>(wanderer).position;
     float           traveled = 0.0f;
     glm::vec3       last     = start;
@@ -497,10 +504,12 @@ TEST_CASE(Navigation_PhysicsTemplateWanderer)
         const glm::vec3 p = scene.GetRegistry().Get<Transform>(wanderer).position;
         traveled += glm::distance(p, last);
         last = p;
+        maxSpeed = std::max(maxSpeed, animation.Parameter(fox, "Speed").value_or(0.0f));
         CHECK(std::abs(p.x) < 10.5f && std::abs(p.z) < 10.5f); // stays on the ground
     }
     scripts.End(scene);
     fs::current_path(previous, ec);
     CHECK(scripts.Stats().errors == 0);
     CHECK(traveled > 5.0f);
+    CHECK(maxSpeed > 0.5f); // Wander.ugraph drives the Fox's locomotion blend
 }

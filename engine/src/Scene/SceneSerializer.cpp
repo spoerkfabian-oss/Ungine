@@ -517,6 +517,27 @@ json ParticleSystemToJson(const ParticleSystem& p, const std::string& effect)
             {"tint", ToJson(p.tint)}};
 }
 
+json AnimationControllerToJson(const AnimationController& a, const std::string& graph)
+{
+    return {{"graph", graph},
+            {"enabled", a.enabled},
+            {"speed", a.speed},
+            {"applyRootMotion", a.applyRootMotion},
+            {"ik", a.ik}};
+}
+
+AnimationController AnimationControllerFromJson(const json& j)
+{
+    AnimationController a;
+    Read(j, "graph", a.graph);
+    Read(j, "enabled", a.enabled);
+    Read(j, "speed", a.speed);
+    Read(j, "applyRootMotion", a.applyRootMotion);
+    Read(j, "ik", a.ik);
+    a.speed = std::isfinite(a.speed) ? std::clamp(a.speed, 0.0f, 100.0f) : 1.0f;
+    return a;
+}
+
 ParticleSystem ParticleSystemFromJson(const json& j)
 {
     ParticleSystem p;
@@ -791,6 +812,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioListener"] = json::object();
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
+    if (const auto* controller = r.TryGet<AnimationController>(e))
+        j["animationController"] = AnimationControllerToJson(*controller, models.WritePath(controller->graph));
     if (const auto* zone = r.TryGet<ReverbZone>(e))
         j["reverbZone"] = ReverbZoneToJson(*zone);
     if (const auto* navBounds = r.TryGet<NavMeshBounds>(e))
@@ -986,6 +1009,11 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         ParticleSystem particles = ParticleSystemFromJson(p);
         particles.effect         = models.ReadPath(particles.effect);
         return particles;
+    });
+    ApplyOptional<AnimationController>(r, e, j, "animationController", [&](const json& a) {
+        AnimationController controller = AnimationControllerFromJson(a);
+        controller.graph               = models.ReadPath(controller.graph);
+        return controller;
     });
     ApplyOptional<ReverbZone>(r, e, j, "reverbZone", ReverbZoneFromJson);
     ApplyOptional<NavMeshBounds>(r, e, j, "navMeshBounds", [](const json& b) {

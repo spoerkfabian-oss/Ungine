@@ -16,6 +16,7 @@ class AudioSystem;
 class LevelStreamer;
 class ParticleWorld;
 class NavigationWorld;
+class AnimationSystem;
 class GameOptions;
 class Input;
 class PhysicsWorld;
@@ -108,6 +109,7 @@ public:
     [[nodiscard]] virtual LevelStreamer* Streaming() = 0;  // may be null (no level streaming)
     [[nodiscard]] virtual ParticleWorld* Particles() = 0;  // may be null (no particle effects)
     [[nodiscard]] virtual NavigationWorld* Navigation() = 0; // may be null (no navmesh)
+    [[nodiscard]] virtual AnimationSystem* Animation() = 0;  // may be null (no animation graphs)
     [[nodiscard]] virtual GameOptions*   Options() = 0;    // may be null (no user options, e.g. tools)
     [[nodiscard]] virtual const Input*  GetInput() = 0;   // null while the game does not have the input
     // A variable of this instance: the running function's locals first, then the graph's. Null:

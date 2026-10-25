@@ -1,5 +1,6 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Audio/SoundCue.h"
+#include "Engine/Animation/AnimGraph.h"
 #include "Engine/Particles/ParticleEffect.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/FileSystem.h"
@@ -601,6 +602,36 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 check(emitter.render.mesh, "mesh");
         }
         for (const std::string& problem : ValidateParticleEffect(*effect))
+            report.warnings.push_back(std::format("'{}': {}", entryPath(file), problem));
+    }
+
+    // Animation graphs: notify sounds / effects must be packaged (the preview model is editor-only).
+    for (const fs::path& file : files) {
+        if (!IsAnimGraphFile(file))
+            continue;
+        std::string error;
+        const auto  graph = LoadAnimGraph(file, &error);
+        if (!graph) {
+            report.warnings.push_back(error);
+            continue;
+        }
+        const auto check = [&](const std::string& path, const char* what) {
+            if (path.empty())
+                return;
+            const fs::path  target = PathFromUtf8(path).lexically_normal();
+            std::error_code ec;
+            if (!fs::is_regular_file(target, ec))
+                report.warnings.push_back(std::format("'{}': missing {} '{}'", entryPath(file), what, path));
+            else if (!inContent(target))
+                report.warnings.push_back(std::format("'{}': {} '{}' is outside Content/ and not packaged", entryPath(file), what, path));
+        };
+        for (const AnimLayer& layer : graph->layers)
+            for (const AnimState& state : layer.states)
+                for (const AnimNotify& notify : state.notifies) {
+                    check(notify.sound, "sound");
+                    check(notify.effect, "effect");
+                }
+        for (const std::string& problem : ValidateAnimGraph(*graph))
             report.warnings.push_back(std::format("'{}': {}", entryPath(file), problem));
     }
 

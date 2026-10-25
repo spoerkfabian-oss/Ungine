@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "parameters": [
+    {"name": "Speed", "type": "float", "default": 0.0}
+  ],
+  "layers": [
+    {
+      "name": "Base",
+      "mode": "override",
+      "weight": 1.0,
+      "weightParameter": "",
+      "entry": "Locomotion",
+      "mask": [],
+      "states": [
+        {
+          "name": "Locomotion",
+          "kind": "blend1d",
+          "speed": 1.0,
+          "loop": true,
+          "position": [60.0, 60.0],
+          "x": "Speed",
+          "samples": [
+            {"clip": "Survey", "position": [0.0, 0.0], "speed": 1.0},
+            {"clip": "Walk", "position": [0.8, 0.0], "speed": 1.0},
+            {"clip": "Run", "position": [2.5, 0.0], "speed": 1.0}
+          ],
+          "notifies": [
+            {"name": "Step", "time": 0.25, "bone": "b_LeftFoot01_017"},
+            {"name": "Step", "time": 0.75, "bone": "b_RightFoot01_021"}
+          ]
+        }
+      ],
+      "transitions": []
+    }
+  ],
+  "ik": [
+    {
+      "name": "Feet",
+      "kind": "footPlacement",
+      "enabled": true,
+      "weight": 1.0,
+      "weightParameter": "",
+      "feet": ["b_LeftFoot01_017", "b_RightFoot01_021", "b_LeftHand_011", "b_RightHand_08"],
+      "pelvisBone": "b_Hip_01",
+      "rayHeight": 0.4,
+      "rayDepth": 0.4,
+      "maxPelvisOffset": 0.2,
+      "alignToNormal": true,
+      "maxFootAngle": 25.0,
+      "smoothing": 10.0,
+      "layerMask": 65535
+    }
+  ],
+  "previewModel": "../Models/Fox.glb"
+}

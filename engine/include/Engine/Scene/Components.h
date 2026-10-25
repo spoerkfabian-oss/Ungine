@@ -79,6 +79,18 @@ struct Animator {
     bool          applyRootMotion = false;
 };
 
+// Animation graph (.uanim) driving an instantiated model root (AnimationSystem); takes over from
+// the Animator while enabled. Parameters / IK targets are runtime state of the AnimationSystem.
+struct AnimationController {
+    std::string graph{};             // absolute in memory, relative to the scene in files
+    bool        enabled = true;
+    float       speed   = 1.0f;
+    bool        applyRootMotion = false; // the graph's root motion bone moves the entity (or its character)
+    bool        ik = true;               // IK goals of the graph
+
+    bool operator==(const AnimationController&) const = default;
+};
+
 // Screen-space UI canvas. Canvases are independent of the 3D scene camera and are ordered by
 // sortOrder; scaleWithViewport preserves a design resolution while adapting to the game window.
 struct UiCanvas {

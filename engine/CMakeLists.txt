@@ -56,6 +56,10 @@ add_library(Engine STATIC
     src/Particles/ParticleWorld.cpp
     src/Navigation/NavigationWorld.cpp
     src/Navigation/NavJson.cpp
+    src/Animation/AnimGraph.cpp
+    src/Animation/AnimGraphPlayer.cpp
+    src/Animation/AnimIk.cpp
+    src/Animation/AnimationSystem.cpp
     src/Physics/PhysicsMaterial.cpp
     src/Physics/PhysicsWorld.cpp
     src/Physics/Ragdoll.cpp

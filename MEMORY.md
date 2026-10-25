@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-16 (Phase 28 merged (PR #18); Phase 29 navigation verified (CTest 19/19, ASan, Clang) on `branch`, PR open; next Phase 30 animation state machine / IK after the merge, ask first)
+- Last updated: 2026-10-22 (Phase 29 merged (PR #19, fa23918); Phase 30 animation state machine / IK implemented on `branch`, PR open; next Phase 31 TAA/decals/SSR/fog after the merge, ask first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1026,4 +1026,17 @@ If an audit finds no concrete defect:
 - Phase 26 (physics materials, contact data, joints, ragdolls, character tools) merged as PR #16 (2026-10-12).
 - Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) merged (PR #17, 2026-10-14).
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
-- Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) implemented on `branch` (2026-10-15), PR pending.
+- Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) merged (PR #19, fa23918, 2026-10-22).
+
+### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
+- State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
+- Blending: 1D blend space (phase sync), 2D blend space (triangulated), layers + bone masks (incl. additive), anim notifies/events (sound/particles/blueprint).
+- IK: two-bone (pole vector), foot IK on ground (physics raycast, pelvis offset, foot to normal), look-at/aim (limits, weight), FABRIK chains.
+- Test/template model: Khronos glTF sample "Fox" (mesh CC0, rig/animation CC-BY 4.0; clips Survey/Walk/Run), license in LICENSE.md.
+
+### Phase 30 animation (2026-10-22)
+Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
+- New `engine/include/Engine/Animation/` (AnimGraph `.uanim`, AnimGraphPlayer, AnimIk, AnimationSystem), component AnimationController (on the ModelInstance root; UpdateAnimations skips it), `ScriptContext::Animation()` / `ScriptSystem::SetAnimationSystem`, Anim blueprint nodes + On Anim Notify, `EditorContext::animation`, editor `AnimGraphEditor` window (canvas, blend-space plot, live preview), content type ANIM, Fox in the Physics template (Wander.ugraph sets Speed).
+- Found while testing: foot-IK rays started inside the character's own capsule (actor now ignored; red without fix); LookAt missed when ancestors moved the tip; notifies fired once per update instead of per loop crossing; **Phase 21 bug: OptimizeMeshes reordered vertices (vertex fetch) without the skin influences → every skinned mesh with its own vertex range exploded (Fox; the banner GPU test did not catch it)** → influences remapped too, regression in MeshOptimizer_LodChainAndReordering (red without fix). Lesson: look at a screenshot of every new model.
+- Tests: CPU `tests/AnimationTests.cpp` (6), GPU `Editor_AnimationGraphWindowAndPlay`; Navigation_PhysicsTemplateWanderer now also checks the Speed parameter.
+- Open: edit mode does not animate, foot IK has no effect in the preview (no physics), linear crossfades, unwrapped exit time, no bone overlay / IK gizmo, root motion translation only.

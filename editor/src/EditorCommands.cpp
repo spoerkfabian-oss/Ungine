@@ -1,5 +1,7 @@
 // Editor operations that change the scene (all undoable) and scene files.
 #include "Editor/Editor.h"
+#include "Editor/AnimGraphEditor.h"
+#include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Editor/FileDialog.h"
 #include "Editor/History.h"
@@ -377,6 +379,8 @@ void Editor::NewScene()
     m_Ctx.scene.Clear();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    if (m_Ctx.animation)
+        m_Ctx.animation->Reset();
     ReleaseModelRefs();
     m_History->Clear();
     m_Selection.clear();
@@ -468,6 +472,7 @@ void Editor::DrawDialogs()
         case DialogPurpose::AssignScript: AssignScript(m_ScriptTarget, *path); break;
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
         case DialogPurpose::AssignEffect: AssignEffect(m_EffectTarget, *path); break;
+        case DialogPurpose::AssignAnimGraph: (void)AssignAnimGraph(m_AnimGraphTarget, *path); break;
         case DialogPurpose::AssignCueSound:
             if (m_ShowSoundCue && m_SoundCueVariant < m_SoundCueEdit.variants.size()) {
                 std::error_code ec;
@@ -666,6 +671,23 @@ void Editor::AssignEffect(Entity entity, const std::filesystem::path& effect)
     PushStateChange("Assign particle effect", {StateEdit{UuidOf(entity), std::move(before)}});
 }
 
+bool Editor::AssignAnimGraph(Entity entity, const std::filesystem::path& graph)
+{
+    Registry& r = m_Ctx.scene.GetRegistry();
+    if (!r.Valid(entity) || IsStreamed(entity))
+        return false;
+    const Entity root = r.Has<ModelInstance>(entity) ? entity : FindModelInstanceRoot(r, entity);
+    if (root == NullEntity || !r.Has<ModelInstance>(root))
+        return false;
+    std::error_code     ec;
+    std::string         before     = SnapshotEntityState(m_Ctx.scene, root);
+    AnimationController controller = r.Has<AnimationController>(root) ? r.Get<AnimationController>(root) : AnimationController{};
+    controller.graph               = PathToUtf8(std::filesystem::absolute(graph, ec).lexically_normal());
+    r.EmplaceOrReplace<AnimationController>(root, controller);
+    PushStateChange("Assign animation graph", {StateEdit{UuidOf(root), std::move(before)}});
+    return true;
+}
+
 Entity Editor::CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position)
 {
     std::error_code ec;
@@ -717,6 +739,8 @@ void Editor::Play()
     }
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // effects start over with the game
+    if (m_Ctx.animation)
+        m_Ctx.animation->Reset(); // graphs start at their entry states
     if (m_Ctx.scripts) {
         m_Graphs->ProvideTo(*m_Ctx.scripts); // unsaved graph edits run too
         if (m_Ctx.project) {
@@ -765,6 +789,8 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    if (m_Ctx.animation)
+        m_Ctx.animation->Reset();
     m_Selection.clear();
     m_GizmoEdit.reset();
     m_InspectorEdit.reset();
@@ -839,6 +865,8 @@ void Editor::Stop()
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // spawned one-shots go, the edit scene's effects restart
+    if (m_Ctx.animation)
+        m_Ctx.animation->Reset(); // the restored bones show the edit pose
     if (std::exchange(m_NavOtherLevel, false))
         LoadNavigation(m_ScenePath); // back to the edit scene's navmesh
     for (ModelHandle h : std::exchange(m_PlayModels, {}))

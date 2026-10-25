@@ -142,6 +142,15 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Figuren bekommen die Komponente *Nav Agent* und laufen per Blueprint *AI Move To* (weichen
     einander aus; mit Character Controller über die Physik). Agenten-Profile (Radius/Höhe) und
     Area-Typen: *File → Project settings → Navigation*. Beispiel: der Wanderer im Physics-Template.
+20. **Animation**: Content-Browser → *+ New → Animation graph* (`.uanim`) öffnet das Fenster
+    *Animation Graph*: Parameter (Float/Int/Bool/Trigger), Layer (mit Bone-Maske, Override oder
+    Additiv), States per Rechtsklick auf die Fläche (ein Clip oder ein 1D-/2D-Blend-Space),
+    Transitions per Rechtsklick auf einen State (Bedingungen, Überblendzeit, Exit Time), Notifies
+    (Sound/Effekt an einem Knochen) und IK-Ziele (Füße auf dem Boden, Two-Bone, Look-At, FABRIK).
+    Die Vorschau zeigt das Preview-Modell mit den eingestellten Parameterwerten. Zuweisen per
+    *Assign to selection* auf ein platziertes Modell (Komponente *Animation Controller*); gesteuert
+    per Blueprint *Set Anim Float/Bool/Trigger*, Events per *On Anim Notify*. Beispiel: der Fuchs
+    im Physics-Template (Gehen/Rennen nach Geschwindigkeit, Füße folgen dem Boden).
 
 
 ## Entwicklung
