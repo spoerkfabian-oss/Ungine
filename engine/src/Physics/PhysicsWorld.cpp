@@ -7,6 +7,7 @@
 #include "Engine/Events/EventBus.h"
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Terrain/TerrainData.h"
 
 // Jolt stays inside this file: no Jolt type appears in engine headers.
 #include <Jolt/Jolt.h>
@@ -28,6 +29,7 @@
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
@@ -540,6 +542,16 @@ struct PhysicsWorld::Impl {
         std::uint32_t teleported = 0; // visit of the last teleport (joints are remade)
         std::uint32_t materialGeneration = 0;
     };
+    // Static height field of a Terrain component (TerrainStore data).
+    struct TerrainRecord {
+        Entity                       entity = NullEntity;
+        JPH::BodyID                  id;
+        std::shared_ptr<TerrainData> data;
+        std::uint64_t                revision = 0;
+        glm::vec3                    origin{0.0f};
+        double                       built = 0.0; // seconds (steady clock): editor sculpting is throttled
+        std::uint32_t                visit = 0;
+    };
     struct CharacterRecord {
         Entity                          entity = NullEntity;
         JPH::Ref<JPH::CharacterVirtual> character;
@@ -622,6 +634,10 @@ struct PhysicsWorld::Impl {
         for (auto& [key, record] : bodies)
             DestroyBody(record.id);
         bodies.clear();
+        for (auto& [key, record] : terrains)
+            if (!record.id.IsInvalid())
+                DestroyBody(record.id);
+        terrains.clear();
         characters.clear(); // removes the inner bodies
         innerBodies.clear();
         pairs.clear();
@@ -935,6 +951,86 @@ struct PhysicsWorld::Impl {
                 Bodies().SetLinearAndAngularVelocity(r.id, ToJolt(carriedLinear), ToJolt(carriedAngular));
             bodies.emplace(Key(e), r);
             ++stats.created;
+        }
+    }
+
+    // Terrain: a static height field (samples in meters, holes = no collision). Rebuilt when the
+    // heights / holes change; while not stepping (editor sculpting) at most 4 times a second.
+    void SyncTerrain(Entity e, const std::string& path, std::shared_ptr<TerrainData> data, const glm::vec3& origin,
+                     bool stepping)
+    {
+        TerrainStore&       store    = TerrainStore::Instance();
+        auto [it, inserted]          = terrains.try_emplace(Key(e));
+        TerrainRecord&      r        = it->second;
+        r.entity = e;
+        r.visit  = visit;
+        const std::uint64_t revision = store.Revision(path);
+        bool                rebuild  = r.id.IsInvalid() || r.data != data;
+        if (!rebuild && revision != r.revision) {
+            const TerrainChanges changes = store.ChangesSince(path, r.revision);
+            if (changes.kinds & (TerrainChangeHeights | TerrainChangeHoles | TerrainChangeSettings)) {
+                const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (!stepping && now - r.built < 0.25)
+                    return; // the next Sync catches up
+                rebuild = true;
+            } else {
+                r.revision = revision; // splat / foliage only
+            }
+        }
+        if (rebuild) {
+            if (!r.id.IsInvalid()) {
+                EndPairsOf(r.id);
+                DestroyBody(r.id);
+                r.id = {};
+            }
+            const TerrainData&  t     = *data;
+            const std::uint32_t n     = t.resolution;
+            std::vector<float>  samples(static_cast<std::size_t>(n) * n);
+            // Jolt drops the triangles touching a no-collision sample; holes are per cell. A sample goes
+            // only when every cell around it is a hole: painted holes of 2+ cells match (up to two corner
+            // triangles), a single-cell hole keeps its collision (nothing visible is ever solid-less).
+            const auto cellHole = [&](std::int64_t x, std::int64_t z) {
+                return x < 0 || z < 0 || x > static_cast<std::int64_t>(n) - 2 || z > static_cast<std::int64_t>(n) - 2 ||
+                       t.HoleAtSample(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(z));
+            };
+            for (std::uint32_t z = 0; z < n; ++z)
+                for (std::uint32_t x = 0; x < n; ++x) {
+                    const std::int64_t xi = x, zi = z;
+                    const bool hole = !t.holes.empty() && cellHole(xi - 1, zi - 1) && cellHole(xi, zi - 1) &&
+                                      cellHole(xi - 1, zi) && cellHole(xi, zi);
+                    samples[static_cast<std::size_t>(z) * n + x] =
+                        hole ? JPH::HeightFieldShapeConstants::cNoCollisionValue : t.HeightAtSample(x, z);
+                }
+            const float                   cell = t.CellSize();
+            JPH::HeightFieldShapeSettings settings(samples.data(), JPH::Vec3::sZero(), JPH::Vec3(cell, 1.0f, cell), n);
+            const JPH::ShapeSettings::ShapeResult result = settings.Create();
+            if (result.HasError()) {
+                ENGINE_WARN("Physics: terrain height field: {}", result.GetError().c_str());
+                return;
+            }
+            JPH::BodyCreationSettings bodySettings(result.Get(), JPH::RVec3(ToJolt(origin)), JPH::Quat::sIdentity(),
+                                                   JPH::EMotionType::Static, Layers::Make(0, false));
+            bodySettings.mUserData = Key(e);
+            bodySettings.mFriction = 0.7f;
+            r.id = Bodies().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+            if (r.id.IsInvalid()) {
+                ENGINE_WARN("Physics: body limit reached");
+                return;
+            }
+            r.data     = std::move(data);
+            r.revision = revision;
+            r.origin   = origin;
+            r.built    = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            ++stats.created;
+            // Wake what rests on it (a sculpted bump pushes bodies).
+            JPH::AABox bounds = Bodies().GetTransformedShape(r.id).GetWorldSpaceBounds();
+            bounds.ExpandBy(JPH::Vec3::sReplicate(0.1f));
+            Bodies().ActivateBodiesInAABox(bounds, {}, {});
+            return;
+        }
+        if (origin != r.origin) { // the entity moved
+            Bodies().SetPosition(r.id, JPH::RVec3(ToJolt(origin)), JPH::EActivation::DontActivate);
+            r.origin = origin;
         }
     }
 
@@ -1406,6 +1502,7 @@ struct PhysicsWorld::Impl {
     std::unique_ptr<JPH::PhysicsSystem>          system;
     std::unordered_map<std::uint64_t, BodyRecord>      bodies;     // by entity
     std::unordered_map<std::uint64_t, CharacterRecord> characters; // by entity
+    std::unordered_map<std::uint64_t, TerrainRecord>   terrains;   // by entity
     std::unordered_map<std::uint64_t, Pair>            pairs;      // by body pair
     // model index, generation, mesh, revision, materials (MaterialKey + generation)
     using MeshKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::string>;
@@ -1840,6 +1937,28 @@ void PhysicsWorld::Impl::SyncAll(Scene& scene, bool stepping)
             w.SyncBody(scene, e, body, collider, stepping);
     });
 
+    registry.ViewOf<Terrain, WorldTransform>().Each([&](Entity e, Terrain& terrain, WorldTransform& world) {
+        if (!terrain.collision)
+            return;
+        std::shared_ptr<TerrainData> data = TerrainStore::Instance().Get(terrain.data);
+        if (!data)
+            return;
+        const glm::vec3 origin = glm::vec3(world.matrix[3]) - glm::vec3(0.5f * data->size, 0.0f, 0.5f * data->size);
+        w.SyncTerrain(e, terrain.data, std::move(data), origin, stepping);
+    });
+    for (auto it = w.terrains.begin(); it != w.terrains.end();) {
+        if (it->second.visit != w.visit) {
+            if (!it->second.id.IsInvalid()) {
+                w.EndPairsOf(it->second.id);
+                w.DestroyBody(it->second.id);
+            }
+            it = w.terrains.erase(it);
+            ++w.stats.removed;
+        } else {
+            ++it;
+        }
+    }
+
     // Components or entities that are gone.
     for (auto it = w.bodies.begin(); it != w.bodies.end();) {
         if (it->second.visit != w.visit) {
@@ -2181,7 +2300,9 @@ BodyActivity PhysicsWorld::Activity(Entity entity) const
 
 bool PhysicsWorld::HasBody(Entity entity) const
 {
-    return m_Impl->bodies.contains(Key(entity)) || m_Impl->characters.contains(Key(entity));
+    const auto terrain = m_Impl->terrains.find(Key(entity));
+    return m_Impl->bodies.contains(Key(entity)) || m_Impl->characters.contains(Key(entity)) ||
+           (terrain != m_Impl->terrains.end() && !terrain->second.id.IsInvalid());
 }
 
 const PhysicsStats& PhysicsWorld::Stats() const
