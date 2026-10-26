@@ -411,6 +411,20 @@ struct FogVolume {
     bool operator==(const FogVolume&) const = default;
 };
 
+// Heightmap terrain (TerrainData file, shared through TerrainStore): centered on the entity's world
+// X/Z, height 0 at its world Y; rotation and scale are ignored.
+struct Terrain {
+    std::string data{};                // .uterrain (absolute in memory, relative to the scene in files)
+    bool        castShadows     = true;
+    bool        collision       = true; // Jolt height field (PhysicsWorld)
+    bool        navigation      = true; // navmesh source inside NavMeshBounds
+    float       lodDistance     = 24.0f; // meters covered by the finest LOD; each coarser level doubles
+    float       foliageDensity  = 1.0f;  // multiplier of the layers' densities
+    float       foliageDistance = 1.0f;  // multiplier of the layers' view distances
+
+    bool operator==(const Terrain&) const = default;
+};
+
 // --- Navigation (NavigationWorld, Recast/Detour). Geometry: colliders (not triggers) of static
 // bodies or without a RigidBody. Area / profile names refer to NavSettings (project). ---
 

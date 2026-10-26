@@ -564,6 +564,34 @@ FogVolume FogVolumeFromJson(const json& j)
     return f;
 }
 
+json TerrainToJson(const Terrain& t, const std::string& data)
+{
+    return {{"data", data},
+            {"castShadows", t.castShadows},
+            {"collision", t.collision},
+            {"navigation", t.navigation},
+            {"lodDistance", t.lodDistance},
+            {"foliageDensity", t.foliageDensity},
+            {"foliageDistance", t.foliageDistance}};
+}
+
+Terrain TerrainFromJson(const json& j)
+{
+    Terrain t;
+    Read(j, "data", t.data);
+    Read(j, "castShadows", t.castShadows);
+    Read(j, "collision", t.collision);
+    Read(j, "navigation", t.navigation);
+    Read(j, "lodDistance", t.lodDistance);
+    Read(j, "foliageDensity", t.foliageDensity);
+    Read(j, "foliageDistance", t.foliageDistance);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    t.lodDistance     = std::clamp(finite(t.lodDistance, 24.0f), 1.0f, 10000.0f);
+    t.foliageDensity  = std::clamp(finite(t.foliageDensity, 1.0f), 0.0f, 10.0f);
+    t.foliageDistance = std::clamp(finite(t.foliageDistance, 1.0f), 0.0f, 10.0f);
+    return t;
+}
+
 Decal DecalFromJson(const json& j, const ModelRefs& paths)
 {
     Decal d;
@@ -897,6 +925,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["decal"] = DecalToJson(*decal, models);
     if (const auto* fog = r.TryGet<FogVolume>(e))
         j["fogVolume"] = FogVolumeToJson(*fog);
+    if (const auto* terrain = r.TryGet<Terrain>(e))
+        j["terrain"] = TerrainToJson(*terrain, models.WritePath(terrain->data));
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* controller = r.TryGet<AnimationController>(e))
@@ -1099,6 +1129,11 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
     });
     ApplyOptional<Decal>(r, e, j, "decal", [&](const json& d) { return DecalFromJson(d, models); });
     ApplyOptional<FogVolume>(r, e, j, "fogVolume", [](const json& f) { return FogVolumeFromJson(f); });
+    ApplyOptional<Terrain>(r, e, j, "terrain", [&](const json& t) {
+        Terrain terrain = TerrainFromJson(t);
+        terrain.data    = models.ReadPath(terrain.data);
+        return terrain;
+    });
     ApplyOptional<AnimationController>(r, e, j, "animationController", [&](const json& a) {
         AnimationController controller = AnimationControllerFromJson(a);
         controller.graph               = models.ReadPath(controller.graph);

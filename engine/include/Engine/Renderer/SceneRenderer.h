@@ -29,6 +29,7 @@ class Frustum;
 class GpuCulling;
 class GpuScene;
 class ParticleRenderer;
+class TerrainRenderer;
 class ParticleWorld;
 class Scene;
 
@@ -239,6 +240,9 @@ struct SceneRenderStats {
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
     std::uint32_t decals      = 0; // decals after frustum culling
     std::uint32_t fogVolumes  = 0; // FogVolume boxes in the froxel grid this frame
+    std::uint32_t terrains         = 0; // Terrain components drawn
+    std::uint32_t terrainNodes     = 0; // CDLOD patches of the camera
+    std::uint32_t terrainTriangles = 0;
     glm::uvec3    fogGrid{0u};     // froxel grid (0 = volumetric fog off)
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
@@ -486,6 +490,7 @@ private:
     std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
     std::unique_ptr<GpuCulling> m_GpuCulling;
     std::unique_ptr<ParticleRenderer> m_Particles;
+    std::unique_ptr<TerrainRenderer>  m_Terrain;
     bool                        m_ShadowOcclusion = false; // this frame: cascades culled against the Hi-Z
     glm::vec4                   m_LodCamera{0.0f}; // this frame's LOD selection (see SelectLod)
     std::uint32_t               m_LodForced = 0;

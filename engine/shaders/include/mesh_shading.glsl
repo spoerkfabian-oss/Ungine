@@ -4,10 +4,7 @@
 // (MESH_BLEND: alpha-blended, sorted back to front, no screen-space AO).
 #include "bindless.glsl"
 #include "mesh_common.glsl"
-#include "decals.glsl"
-#include "fog.glsl"
-#include "pbr.glsl"
-#include "shadow.glsl"
+#include "shading.glsl"
 #include "surface.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
@@ -26,16 +23,6 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outVelocity; // blended by coverage (alpha) over the opaque motion
 #endif
 
-// Cook-Torrance (GGX, height-correlated Smith, Schlick) + Lambert, times N.L.
-vec3 DirectBrdf(vec3 N, vec3 V, vec3 L, float NdotV, float NdotL, vec3 cDiff, vec3 f0, float a)
-{
-    const vec3  H     = normalize(V + L);
-    const float NdotH = clamp(dot(N, H), 0.0, 1.0);
-    const float VdotH = clamp(dot(V, H), 0.0, 1.0);
-    const vec3  F     = F_Schlick(f0, VdotH);
-    return ((1.0 - F) * cDiff / PI + F * (D_GGX(NdotH, a) * V_SmithGGXCorrelated(NdotV, NdotL, a))) * NdotL;
-}
-
 void main()
 {
     if (LodFadeDiscard(inLodFade, gl_FragCoord.xy)) // same pixels as in the prepass
@@ -53,100 +40,23 @@ void main()
     vec3       N   = PerturbedNormal(m, tbn, inUV);
 
     // --- Material ---
-    const vec4  mr        = SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
-    float       metallic  = clamp(m.metallic * mr.b, 0.0, 1.0);
-    float       roughness = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
-    vec3        emissive  = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
+    const vec4    mr = SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
+    SurfaceSample surface;
+    surface.worldPos   = inWorldPos;
+    surface.geomNormal = tbn[2];
+    surface.N          = N;
+    surface.base       = base.rgb;
+    surface.metallic   = clamp(m.metallic * mr.b, 0.0, 1.0);
+    surface.roughness  = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
+    surface.emissive   = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
+    surface.occlusion  = 1.0 + m.occlusionStrength * (SampleMaterial(m.occlusionTexture, m.samplerIndex, inUV).r - 1.0);
 
-    FrameData   frame     = pc.frame;
-    const float viewDepth = -(frame.view * vec4(inWorldPos, 1.0)).z;
-#ifndef MESH_BLEND // decals project onto opaque surfaces
-    ApplyDecals(frame, inWorldPos, tbn[2], viewDepth, base.rgb, N, roughness, metallic, emissive);
+    FrameData frame = pc.frame;
+#ifdef MESH_BLEND
+    vec3 color = ShadeSurface(frame, surface, false);
+#else
+    vec3 color = ShadeSurface(frame, surface, true);
 #endif
-    const float a         = roughness * roughness;
-    const vec3  cDiff     = mix(base.rgb, vec3(0.0), metallic);
-    const vec3  f0        = mix(vec3(0.04), base.rgb, metallic);
-
-    const vec3      V     = normalize(frame.cameraPosition.xyz - inWorldPos);
-    const float     NdotV = clamp(dot(N, V), 1e-4, 1.0);
-
-    // --- Sun (analytic directional light) ---
-    const vec3  L     = normalize(-frame.sunDirection.xyz);
-    const float NdotL = clamp(dot(N, L), 0.0, 1.0);
-
-    // Shadows use the geometric normal (normal maps would drag the offset into the surface).
-    uint        cascade;
-    const float shadow = NdotL > 0.0 ? SunShadow(frame, inWorldPos, tbn[2], viewDepth, gl_FragCoord.xy, cascade)
-                                     : 0.0;
-
-    vec3 direct = NdotL > 0.0 ? DirectBrdf(N, V, L, NdotV, NdotL, cDiff, f0, a) * frame.sunRadiance.rgb * shadow
-                              : vec3(0.0);
-
-    // --- Punctual lights of this fragment's cluster ---
-    if (frame.lightInfo.x > 0u) {
-        const uint cluster = ClusterIndex(gl_FragCoord.xy, viewDepth, frame.clusterParams.zw, frame.clusterParams.x,
-                                          frame.clusterParams.y);
-        ClusterBuffer clusters = frame.clusters;
-        LightBuffer   lights   = frame.lights;
-        const uint    count    = min(clusters.counts[cluster], CLUSTER_MAX_LIGHTS);
-        const uint    first    = cluster * CLUSTER_MAX_LIGHTS;
-        for (uint i = 0u; i < count; ++i) {
-            const GpuLight light      = lights.l[clusters.indices[first + i]];
-            const vec3     toLight    = light.position - inWorldPos;
-            const float    distanceSq = dot(toLight, toLight);
-            const vec3     Ll         = toLight * inversesqrt(max(distanceSq, 1e-12));
-            const float    NdotLl     = dot(N, Ll);
-            if (NdotLl <= 0.0)
-                continue;
-            float attenuation = DistanceAttenuation(distanceSq, light.range) * SpotAttenuation(-Ll, light);
-            if (attenuation <= 0.0)
-                continue;
-            if (light.shadow != NO_SHADOW)
-                attenuation *= LocalShadow(frame, light, inWorldPos, tbn[2], gl_FragCoord.xy);
-            direct += DirectBrdf(N, V, Ll, NdotV, NdotLl, cDiff, f0, a) * light.color * attenuation;
-        }
-    }
-
-    // --- Image-based lighting: split sum + multiple-scattering compensation (Fdez-Aguera 2019) ---
-    const vec2  lut      = SampleTexture(frame.ibl.z, SAMPLER_LINEAR_CLAMP, vec2(NdotV, roughness)).rg;
-    const vec3  Fr       = max(vec3(1.0 - roughness), f0) - f0;
-    const vec3  kS       = f0 + Fr * pow(1.0 - NdotV, 5.0);
-    const vec3  FssEss   = kS * lut.x + lut.y;
-    const float Ems      = 1.0 - (lut.x + lut.y);
-    const vec3  Favg     = f0 + (1.0 - f0) / 21.0;
-    const vec3  FmsEms   = Ems * FssEss * Favg / (1.0 - Favg * Ems);
-    const vec3  kD       = cDiff * (1.0 - (FssEss + FmsEms));
-
-    const vec3  R          = reflect(-V, N);
-    const float maxLod     = float(frame.ibl.w - 1u);
-    vec3        radiance   = SampleCube(frame.ibl.y, SAMPLER_LINEAR_CLAMP, R, roughness * maxLod).rgb;
-#ifndef MESH_BLEND // screen-space reflections of the opaque surface; the IBL fills where rays miss
-    if (frame.ssrInfo.y != 0u) {
-        const vec4 ssr = SampleTextureLod(frame.ssrInfo.x, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy * frame.ssrParams.zw, 0.0);
-        radiance = mix(radiance, ssr.rgb, clamp(ssr.a * frame.ssrParams.x, 0.0, 1.0));
-    }
-#endif
-    const vec3  irradiance = SampleCube(frame.ibl.x, SAMPLER_LINEAR_CLAMP, N, 0.0).rgb;
-
-    // Ambient occlusion (indirect light only): material AO and screen-space GTAO combined by min.
-    const float occlusion = SampleMaterial(m.occlusionTexture, m.samplerIndex, inUV).r;
-    float       ao        = 1.0 + m.occlusionStrength * (occlusion - 1.0);
-#ifndef MESH_BLEND // screen-space AO belongs to the opaque surface behind a transparent one
-    if (frame.aoInfo.y != 0u)
-        ao = min(ao, texelFetch(sampler2D(uTextures[nonuniformEXT(frame.aoInfo.x)], uSamplers[SAMPLER_NEAREST_CLAMP]),
-                                ivec2(gl_FragCoord.xy), 0).r);
-#endif
-    // Specular occlusion from AO (Lagarde & de Rousiers 2014).
-    const float specAO   = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    const vec3  indirect = (FssEss * radiance * specAO + (FmsEms + kD) * irradiance * ao) * frame.sky.y;
-
-    vec3       color    = direct + indirect + emissive;
-    color               = ApplyFog(frame, color, gl_FragCoord.xy * frame.ssrParams.zw, inWorldPos);
-
-    if (frame.shadowInfo.y != 0u && NdotL > 0.0 && cascade < 4u) { // debug: red, green, blue, yellow
-        const vec3 tint[4] = vec3[](vec3(1.0, 0.3, 0.3), vec3(0.3, 1.0, 0.3), vec3(0.3, 0.3, 1.0), vec3(1.0, 1.0, 0.3));
-        color *= tint[cascade];
-    }
     if ((pc.flags & MESH_TINT_LATE) != 0u) // culling debug view: found by the occlusion (late) pass
         color = color * vec3(0.4, 0.25, 0.1) + vec3(0.6, 0.25, 0.02) * frame.sky.x;
     if ((pc.flags & MESH_TINT_LOD) != 0u) { // LOD debug view: 0 as is, 1 green, 2 yellow, 3 red

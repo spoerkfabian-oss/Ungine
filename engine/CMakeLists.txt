@@ -26,6 +26,7 @@ add_library(Engine STATIC
     src/Renderer/GpuProfiler.cpp
     src/Renderer/GpuScene.cpp
     src/Renderer/ParticleRenderer.cpp
+    src/Renderer/TerrainRenderer.cpp
     src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
@@ -48,6 +49,7 @@ add_library(Engine STATIC
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
     src/Scene/Decals.cpp
+    src/Terrain/TerrainData.cpp
     src/Scene/Prefab.cpp
     src/Scene/LevelStreaming.cpp
     src/Scene/SpatialIndex.cpp
@@ -122,6 +124,9 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/sky.glsl
     shaders/include/ssr.glsl
     shaders/include/fog.glsl
+    shaders/include/shading.glsl
+    shaders/include/terrain.glsl
+    shaders/include/terrain_depth.glsl
     shaders/include/surface.glsl)
 target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
 set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -159,6 +164,12 @@ engine_add_shaders(Engine SOURCES
     shaders/ssr_blur.comp
     shaders/fog_inject.comp
     shaders/fog_integrate.comp
+    shaders/terrain.vert
+    shaders/terrain.frag
+    shaders/terrain_depth.frag
+    shaders/terrain_depth_id.frag
+    shaders/terrain_shadow.vert
+    shaders/terrain_shadow.frag
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

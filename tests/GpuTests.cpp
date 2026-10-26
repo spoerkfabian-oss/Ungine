@@ -35,6 +35,7 @@
 #include "Engine/Scene/SpatialIndex.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Terrain/TerrainData.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
@@ -4450,5 +4451,112 @@ TEST_CASE(Editor_DecalsAndFogUi)
     editor.Stop();
     runFrames(2);
     CHECK(scene.FindByUuid(splatUuid) != NullEntity);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_TerrainCdlodLayersAndEdits)
+{
+    // A 64 m terrain (129^2 samples): red layer on the left half, green on the right, a hill in the
+    // middle, a hole near the front. CDLOD patches change with the LOD distance; a height edit through
+    // the store shows up; picking finds the terrain entity.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const std::string   path = PathToUtf8(fs::temp_directory_path() / "ungine_gpu_terrain" / "Test.uterrain");
+    auto data = std::make_shared<TerrainData>(MakeFlatTerrain(129, 64.0f, 20.0f, 0.0f));
+    data->layers = {TerrainLayer{.name = "Red", .tint = {0.8f, 0.1f, 0.1f}, .roughness = 0.9f},
+                    TerrainLayer{.name = "Green", .tint = {0.1f, 0.7f, 0.1f}, .roughness = 0.9f}};
+    const std::uint32_t n = data->splatResolution;
+    for (std::uint32_t y = 0; y < n; ++y)
+        for (std::uint32_t x = 0; x < n; ++x) {
+            std::uint8_t* w = &data->splat[(static_cast<std::size_t>(y) * n + x) * kMaxTerrainLayers];
+            w[0] = x < n / 2 ? 255 : 0;
+            w[1] = x < n / 2 ? 0 : 255;
+        }
+    const auto heightAt = [&](float meters) { return static_cast<std::uint16_t>(meters / data->heightScale * 65535.0f); };
+    for (std::uint32_t z = 0; z < 129; ++z)
+        for (std::uint32_t x = 0; x < 129; ++x) {
+            const float d = glm::length(glm::vec2(static_cast<float>(x) - 64.0f, static_cast<float>(z) - 64.0f)) * 0.5f;
+            data->heights[z * 129 + x] = heightAt(6.0f * std::exp(-d * d / 40.0f));
+        }
+    data->holes.assign(129u * 129u, 0);
+    for (std::uint32_t z = 100; z < 108; ++z)
+        for (std::uint32_t x = 60; x < 68; ++x)
+            data->holes[z * 129 + x] = 1;
+    TerrainStore::Instance().Provide(path, data);
+
+    Scene        scene;
+    const Entity ground = scene.CreateEntity("Terrain");
+    scene.GetRegistry().Emplace<Terrain>(ground, Terrain{.data = path, .lodDistance = 8.0f});
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 18.0f, 34.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.0f, 4.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const auto       image = RenderImage(renderer, scene, camera, 4);
+    if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) { // screenshot for inspection
+        const std::vector<std::byte> png = EncodePng(image, 160, 120);
+        std::ofstream(fs::path(dir) / "terrain.png", std::ios::binary)
+            .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    }
+    const glm::ivec3 left  = pixel(image, project({-12.0f, 0.0f, 12.0f}));
+    const glm::ivec3 right = pixel(image, project({12.0f, 0.0f, 12.0f}));
+    const glm::ivec3 hole  = pixel(image, project({0.0f, 0.0f, 20.0f})); // sample 64 + 40 -> in the hole
+    const glm::ivec3 hill  = pixel(image, project({0.0f, 6.0f, 0.0f}));
+    std::printf("    terrain: left %d %d %d, right %d %d %d, hole %d %d %d, hill %d %d %d, nodes %u, tris %u\n", left.r, left.g,
+                left.b, right.r, right.g, right.b, hole.r, hole.g, hole.b, hill.r, hill.g, hill.b, renderer.Stats().terrainNodes,
+                renderer.Stats().terrainTriangles);
+    CHECK(renderer.Stats().terrains == 1u && renderer.Stats().terrainNodes > 0u);
+    CHECK(left.r > left.g + 30 && right.g > right.r + 30);
+    CHECK(std::abs(hole.r - left.r) > 40 || std::abs(hole.g - left.g) > 40); // not the red ground: the hole
+    const std::uint32_t nearNodes = renderer.Stats().terrainNodes;
+
+    // A longer finest-LOD range: more (smaller) patches.
+    scene.GetRegistry().Get<Terrain>(ground).lodDistance = 200.0f;
+    (void)RenderImage(renderer, scene, camera, 1);
+    std::printf("    nodes: lodDistance 8 -> %u, 200 -> %u\n", nearNodes, renderer.Stats().terrainNodes);
+    CHECK(renderer.Stats().terrainNodes > nearNodes);
+    scene.GetRegistry().Get<Terrain>(ground).lodDistance = 8.0f;
+
+    // A height edit through the store: a tall bump at the left lifts the red ground into view.
+    const glm::ivec2 bumpPixel = project({-12.0f, 10.0f, -8.0f});
+    const glm::ivec3 beforeBump = pixel(RenderImage(renderer, scene, camera, 1), bumpPixel);
+    for (std::uint32_t z = 40; z < 56; ++z)
+        for (std::uint32_t x = 32; x < 48; ++x)
+            data->heights[z * 129 + x] = heightAt(14.0f);
+    TerrainStore::Instance().MarkDirty(path, TerrainChangeHeights, {32.0f / 128.0f, 40.0f / 128.0f, 48.0f / 128.0f, 56.0f / 128.0f});
+    const glm::ivec3 afterBump = pixel(RenderImage(renderer, scene, camera, 2), bumpPixel);
+    std::printf("    bump: %d %d %d -> %d %d %d\n", beforeBump.r, beforeBump.g, beforeBump.b, afterBump.r, afterBump.g, afterBump.b);
+    CHECK(afterBump.r > afterBump.b + 20 && afterBump.r > beforeBump.r + 50);
+
+    // Picking hits the terrain entity.
+    renderer.overlay.picking = true;
+    std::optional<Entity> picked;
+    bool                  requested = false;
+    for (int i = 0; i < 8 && !picked; ++i)
+        if (auto frame = F().renderer->BeginFrame()) {
+            if (!requested) {
+                renderer.RequestPick(frame->extent.width / 2, frame->extent.height * 3 / 4);
+                requested = true;
+            }
+            renderer.Render(*frame, scene, camera);
+            F().renderer->EndFrame(*frame);
+            picked = renderer.TakePickResult();
+        }
+    CHECK(picked.has_value() && *picked == ground);
+    TerrainStore::Instance().Clear();
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

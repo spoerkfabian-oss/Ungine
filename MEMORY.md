@@ -1047,6 +1047,11 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
 
+### Phase 32 terrain – decisions (user, 2026-10-26)
+- Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
+- Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
+- Splat layers (up to 8: albedo/normal/ORM) + editor painting and sculpting (raise/lower/smooth/flatten) with undo; foliage/grass (instanced, density maps painted, culling, wind); heightmap import/export (16-bit PNG/RAW); holes mask + triplanar on steep slopes.
+
 ### Phase 31 rendering (2026-10-26)
 Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".
 - TAA (Halton jitter, velocity target R16G16 from the prepass incl. skinning/particles/transparents, `taa.comp` resolve, unsharp mask in tonemap), Decal component + clustered decals (light_cull fills decal lists, applied before lighting), Hi-Z SSR (closest-depth pyramid, half res, temporal, roughness blur, IBL fallback), height fog + froxel volumetric fog (`fog_inject.comp` / `fog_integrate.comp`, bindless binding 5/6 = texture3D/image3D), FogVolume component, settings `taa/ssr/decals/fog` in scene files, editor sections/inspectors/overlay, Blueprint *Spawn Decal at Location*, cooker cooks decal textures with their kinds.

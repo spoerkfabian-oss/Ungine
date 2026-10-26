@@ -2,6 +2,7 @@
 #include "GpuCulling.h"
 #include "GpuScene.h"
 #include "ParticleRenderer.h"
+#include "TerrainRenderer.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
@@ -348,6 +349,13 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, Asset
     m_GpuScene   = std::make_unique<GpuScene>(renderer);
     m_GpuCulling = std::make_unique<GpuCulling>(renderer);
     m_Particles  = std::make_unique<ParticleRenderer>(renderer, assets, kHdrFormat, kVelocityFormat, kDepthFormat);
+    m_Terrain    = std::make_unique<TerrainRenderer>(renderer, assets,
+                                                     TerrainRenderer::Formats{.hdr      = kHdrFormat,
+                                                                              .velocity = kVelocityFormat,
+                                                                              .normal   = kNormalFormat,
+                                                                              .entityId = kEntityIdFormat,
+                                                                              .depth    = kDepthFormat,
+                                                                              .shadow   = kShadowFormat});
 }
 
 void SceneRenderer::CreatePipelines()
@@ -504,6 +512,7 @@ void SceneRenderer::RebuildPipelines()
         m_GpuScene->RebuildPipelines();
         m_GpuCulling->RebuildPipelines();
         m_Particles->CreatePipelines();
+        m_Terrain->CreatePipelines();
         ENGINE_INFO("Scene renderer: pipelines rebuilt (shader generation {})", m_Renderer.ShaderGeneration());
     } catch (const std::exception& e) {
         ENGINE_ERROR("Scene renderer: pipeline rebuild failed, keeping the old ones: {}", e.what());
@@ -515,6 +524,7 @@ SceneRenderer::~SceneRenderer()
     m_GpuCulling.reset();
     m_GpuScene.reset();
     m_Particles.reset();
+    m_Terrain.reset();
     ReleaseTargets();
     ReleaseShadowMap();
     ReleaseShadowAtlas();
@@ -1067,6 +1077,16 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     {
         static const ParticleRenderData kNoParticles;
         m_Particles->Prepare(particles ? particles->RenderData() : kNoParticles, frustum, camera.position, frame.frameIndex);
+    }
+    {
+        std::vector<Frustum> cascadeFrusta;
+        for (std::uint32_t c = 0; c < cascadeCount; ++c)
+            cascadeFrusta.push_back(Frustum::FromViewProjection(cascades[c].viewProj, false));
+        m_Terrain->Prepare(cmd, scene, camera.position, frustum, cascadeFrusta, cascadeCount > 0);
+        const TerrainRenderStats& terrainStats = m_Terrain->Stats();
+        m_Stats.terrains         = terrainStats.terrains;
+        m_Stats.terrainNodes     = terrainStats.nodes;
+        m_Stats.terrainTriangles = terrainStats.triangles;
     }
     m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
@@ -1745,6 +1765,7 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
             GatherDraws(Frustum::FromViewProjection(cascades[c].viewProj, false), glm::vec4(0.0f), list, Gather::Shadow);
             DrawCpuShadow(cmd, list, frameAddress, c, m_Shadow, m_ShadowMasked, m_Stats.shadowDraws);
         }
+        m_Terrain->DrawShadow(cmd, frameAddress, c);
         vkCmdEndRendering(cmd);
     }
 
@@ -1881,10 +1902,17 @@ void SceneRenderer::RenderPrepass(VkCommandBuffer cmd, VkExtent2D extent, VkDevi
         vkCmdEndRendering(cmd);
     };
     if (!m_GpuFrame) {
-        drawPass([&] { DrawCpuCamera(cmd, m_CameraDraws, frameAddress, false, 0); });
+        drawPass([&] {
+            DrawCpuCamera(cmd, m_CameraDraws, frameAddress, false, 0);
+            m_Terrain->DrawPrepass(cmd, frameAddress, picking);
+        });
     } else {
         // Early: what was visible last frame (or everything in the frustum without occlusion culling).
-        drawPass([&] { DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0); });
+        // The terrain goes in here too: it occludes most of the scene in the Hi-Z.
+        drawPass([&] {
+            DrawGpuCamera(cmd, kCameraEarlyView, frameAddress, 0);
+            m_Terrain->DrawPrepass(cmd, frameAddress, picking);
+        });
         if (culling.occlusion) {
             // Hi-Z of the early depth -> late culling -> draws that became visible, on top.
             CmdImageBarrier(cmd, {.image     = m_Depth.Handle(),
@@ -2108,6 +2136,7 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceA
     } else {
         DrawCpuCamera(cmd, m_CameraDraws, frameAddress, true, lodTint);
     }
+    m_Terrain->DrawLighting(cmd, frameAddress);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);
