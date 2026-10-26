@@ -1,4 +1,5 @@
 #include "Engine/Assets/ContentCooker.h"
+#include "Engine/Terrain/TerrainData.h"
 #include "Engine/Audio/SoundCue.h"
 #include "Engine/Animation/AnimGraph.h"
 #include "Engine/Particles/ParticleEffect.h"
@@ -634,6 +635,48 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 }
         for (const std::string& problem : ValidateAnimGraph(*graph))
             report.warnings.push_back(std::format("'{}': {}", entryPath(file), problem));
+    }
+
+    // Terrains: layer textures with their kinds, foliage cards (color); meshes must be packaged.
+    for (const fs::path& file : files) {
+        if (file.extension() != kTerrainExtension)
+            continue;
+        std::string error;
+        const auto  terrain = LoadTerrain(file, &error);
+        if (!terrain) {
+            report.warnings.push_back(error);
+            continue;
+        }
+        const auto use = [&](const std::string& path, const char* what, std::optional<TextureKind> kind) {
+            if (path.empty())
+                return;
+            const fs::path  target = PathFromUtf8(path).lexically_normal();
+            std::error_code ec;
+            if (!fs::is_regular_file(target, ec)) {
+                report.warnings.push_back(std::format("'{}': missing {} '{}'", entryPath(file), what, path));
+                return;
+            }
+            if (!inContent(target)) {
+                report.warnings.push_back(std::format("'{}': {} '{}' is outside Content/ and not packaged", entryPath(file), what, path));
+                return;
+            }
+            if (kind)
+                if (const auto bytes = readShared(target)) {
+                    usedImages.insert(PathToUtf8(target));
+                    addTexture(bytes, *kind, PathToUtf8(target.filename()));
+                }
+        };
+        for (const TerrainLayer& layer : terrain->layers) {
+            use(layer.albedo, "layer texture", TextureKind::Color);
+            use(layer.normal, "layer normal map", TextureKind::Normal);
+            use(layer.orm, "layer ORM texture", TextureKind::Linear);
+        }
+        for (const FoliageLayer& foliage : terrain->foliage) {
+            if (foliage.kind == FoliageKind::Mesh)
+                use(foliage.mesh, "foliage mesh", std::nullopt);
+            else
+                use(foliage.texture, "foliage texture", TextureKind::Color);
+        }
     }
 
     // Scenes and prefabs: UI images are color textures; references to missing files are reported.

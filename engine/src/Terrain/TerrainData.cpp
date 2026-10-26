@@ -691,6 +691,8 @@ void TerrainStore::MarkDirty(const std::string& path, std::uint32_t kinds, glm::
     if (it == m_Entries.end() || !it->second.data)
         return;
     it->second.dirty = true;
+    if (kinds == 0) // edited values read live (layer colors, foliage look): nothing to rebuild
+        return;
     Bump(it->second, (kinds & TerrainChangeSettings) != 0, kinds, glm::clamp(rect, glm::vec4(0.0f), glm::vec4(1.0f)));
 }
 

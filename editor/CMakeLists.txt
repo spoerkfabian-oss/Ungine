@@ -11,6 +11,7 @@ add_library(Editor STATIC
     src/ParticleEditor.cpp
     src/AnimGraphEditor.cpp
     src/Navigation.cpp
+    src/TerrainTools.cpp
     src/ProjectLauncher.cpp
     src/ScriptGraphEditor.cpp)
 target_include_directories(Editor PUBLIC include PRIVATE src)

@@ -1,4 +1,5 @@
 #include "Engine/Script/ScriptNodes.h"
+#include "Engine/Terrain/TerrainData.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Primitives.h"
 #include "Engine/Audio/AudioSystem.h"
@@ -1476,6 +1477,35 @@ std::vector<NodeDesc> BuildRegistry()
                                "else it fades out and is destroyed. Angle in degrees."),
                      {{"Normal", glm::vec3(0.0f, 1.0f, 0.0f)}, {"Size", 1.0f}, {"Lifetime", 10.0f}, {"Color", glm::vec3(1.0f)}}));
 
+    // Terrains: height and normal of the ground below / above a location (holes: not found).
+    add(Pure("Terrain.GetHeight", "Get Terrain Height", "Terrain",
+             {In("Location", P::Vec3), Out("Height", P::Float), Out("Normal", P::Vec3), Out("Found", P::Bool), Out("Terrain", P::Entity)},
+             [](ScriptContext& c) {
+                 const glm::vec3 p     = c.InVec3(0);
+                 bool            found = false;
+                 c.GetScene().GetRegistry().ViewOf<Terrain, WorldTransform>().Each([&](Entity e, Terrain& t, WorldTransform& wt) {
+                     if (found)
+                         return;
+                     const std::shared_ptr<TerrainData> data = TerrainStore::Instance().Get(t.data);
+                     if (!data)
+                         return;
+                     const glm::vec3 origin = glm::vec3(wt.matrix[3]) - glm::vec3(0.5f * data->size, 0.0f, 0.5f * data->size);
+                     const glm::vec2 local(p.x - origin.x, p.z - origin.z);
+                     if (local.x < 0.0f || local.y < 0.0f || local.x > data->size || local.y > data->size || TerrainHole(*data, local))
+                         return;
+                     found = true;
+                     c.Out(1, origin.y + TerrainHeight(*data, local));
+                     c.Out(2, TerrainNormal(*data, local));
+                     c.Out(4, e);
+                 });
+                 if (!found) {
+                     c.Out(1, 0.0f);
+                     c.Out(2, glm::vec3(0.0f, 1.0f, 0.0f));
+                     c.Out(4, NullEntity);
+                 }
+                 c.Out(3, found);
+             }, "World height (Y) and normal of the first terrain under the location's X/Z (not found over holes)"));
+
     // Navigation (AI). Profile params: a NavSettings profile name.
     {
         NodeDesc d = Flow("AI.MoveTo", "AI Move To",
@@ -2048,13 +2078,14 @@ std::vector<NodeDesc> BuildRegistry()
                                      : kind == "AnimationController" ? r.Has<AnimationController>(e)
                                      : kind == "Decal"     ? r.Has<Decal>(e)
                                      : kind == "FogVolume" ? r.Has<FogVolume>(e)
+                                     : kind == "Terrain"   ? r.Has<Terrain>(e)
                                                            : false;
                            }
                            c.Out(1, has);
                        }),
                   ParamKind::Choice, "Component", "Mesh",
                   {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent",
-                   "AnimationController", "Decal", "FogVolume"}));
+                   "AnimationController", "Decal", "FogVolume", "Terrain"}));
     add(Pure("Entity.GetRight", "Get Right Vector", "Transform", {In("Target", P::Entity), Out("Right", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))

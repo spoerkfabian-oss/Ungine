@@ -239,6 +239,8 @@ void Editor::Update(float dt)
         DrawLevels();
     if (m_ShowNavigation && m_Ctx.navigation)
         DrawNavigation();
+    if (m_ShowTerrain)
+        DrawTerrainTools();
     if (m_ShowStats)
         DrawStats();
     if (m_ShowContent) // last of the bottom dock node: its visible tab on first run
@@ -504,6 +506,7 @@ void Editor::DrawMenuBar()
             ImGui::MenuItem("Levels", nullptr, &m_ShowLevels);
         if (m_Ctx.navigation)
             ImGui::MenuItem("Navigation", nullptr, &m_ShowNavigation);
+        ImGui::MenuItem("Terrain", nullptr, &m_ShowTerrain);
         if (ImGui::MenuItem("Find in Blueprints", "Ctrl+F (Blueprint)")) {
             m_ShowBlueprint = true;
             m_Graphs->OpenSearch({});
@@ -590,6 +593,20 @@ void Editor::DrawViewport()
                     PlacePrefab(file, target);
                 else
                     m_Status = "Stop playing to place prefabs";
+            } else if (ext == kTerrainExtension) { // a terrain centered where the cursor points
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                glm::vec3        target = cam.position + dir * std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f;
+                if (dir.y < -1e-3f)
+                    target = cam.position + dir * (-cam.position.y / dir.y); // ground plane y = 0
+                if (m_PlayState == PlayState::Edit)
+                    PlaceTerrain(file, glm::vec3(target.x, 0.0f, target.z));
+                else
+                    m_Status = "Stop playing to place terrains";
             } else if (IsParticleEffectFile(file)) { // a new particle system on the surface under the cursor
                 const ImVec2     mouse = ImGui::GetIO().MousePos;
                 const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
@@ -710,6 +727,9 @@ void Editor::DrawViewport()
         }
         iconHit = true; // no selection
     }
+    // Terrain brushes: the left button sculpts / paints the selected terrain (no selection, no gizmo).
+    if (TerrainToolActive())
+        iconHit = UpdateTerrainBrush(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     // Script prints (like UE's on-screen debug messages), newest at the top.
     if (m_Ctx.scripts && m_Ctx.scripts->Running()) {
         const auto  messages = m_Ctx.scripts->Messages();
@@ -826,7 +846,7 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
 {
     Registry&    registry = m_Ctx.scene.GetRegistry();
     const Entity primary  = Selected();
-    if (primary == NullEntity) {
+    if (primary == NullEntity || TerrainToolActive()) { // terrain brushes own the left button
         m_GizmoEdit.reset();
         return;
     }

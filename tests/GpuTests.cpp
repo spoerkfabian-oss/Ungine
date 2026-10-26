@@ -35,6 +35,7 @@
 #include "Engine/Scene/SpatialIndex.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Terrain/TerrainBrush.h"
 #include "Engine/Terrain/TerrainData.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
@@ -4686,5 +4687,163 @@ TEST_CASE(Render_TerrainFoliage)
     std::printf("    cleared: %d %d %d, instances %u\n", cleared.r, cleared.g, cleared.b, renderer.Stats().foliageInstances);
     CHECK(cleared.b >= cleared.r);
     TerrainStore::Instance().Clear();
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_TerrainToolsAndUndo)
+{
+    // Terrain creation (file in Content/Terrains + entity), brush strokes (raise, paint, holes,
+    // foliage) with one undo step each, the Terrain window's settings commit, physics following the
+    // sculpt, saving the scene saves the terrain, placing a .uterrain from the content browser.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir          = fs::temp_directory_path() / "ungine_gpu_terrain" / "editor";
+    std::error_code     ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path previous = fs::current_path();
+    fs::current_path(dir); // the content root without a project
+    TerrainStore::Instance().Clear();
+    {
+        Scene         scene;
+        PhysicsWorld  physics(*F().jobs, F().events, F().assets.get());
+        SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+        sceneRenderer.shadows.resolution = 512;
+        FlyCamera                camera;
+        std::vector<ModelHandle> modelRefs;
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .physics       = &physics,
+                       .layoutFile    = {}});
+        camera.position = {0.0f, 30.0f, 40.0f};
+        camera.pitch    = glm::radians(-35.0f);
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                editor.FixedUpdate(1.0f / 30.0f);
+                F().assets->Update();
+                editor.Update(1.0f / 30.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame, 0.5f);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        const Entity terrain = editor.CreateTerrain({0.0f, 0.0f, 0.0f});
+        CHECK(terrain != NullEntity && editor.Selection().size() == 1);
+        const std::string path = scene.GetRegistry().Get<Terrain>(terrain).data;
+        CHECK(fs::exists(PathFromUtf8(path)) && PathFromUtf8(path).parent_path().filename() == "Terrains");
+        runFrames(4);
+        CHECK(sceneRenderer.Stats().terrains == 1u && physics.HasBody(terrain));
+        std::shared_ptr<TerrainData> data = TerrainStore::Instance().Get(path);
+        CHECK(data != nullptr);
+        if (!data) {
+            fs::current_path(previous);
+            return;
+        }
+        const glm::vec2 center(0.5f * data->size);
+        const float     flat = TerrainHeight(*data, center);
+
+        // Tool off: strokes are refused (the viewport selects).
+        const glm::vec3 point[] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+        CHECK(!editor.ApplyTerrainStroke(point));
+        editor.SetTerrainToolEnabled(true);
+        TerrainBrush& brush = editor.TerrainBrushSettings();
+        brush               = TerrainBrush{.tool = TerrainTool::Raise, .radius = 8.0f, .strength = 1.0f};
+        CHECK(editor.ApplyTerrainStroke(point));
+        const float raised = TerrainHeight(*data, center);
+        std::printf("    terrain raise: %.2f -> %.2f\n", flat, raised);
+        CHECK(raised > flat + 1.0f && editor.CanUndo());
+        // Physics follows (rebuilt at most 4x per second outside play).
+        bool high = false;
+        for (int i = 0; i < 60 && !high; ++i) {
+            runFrames(1);
+            const auto hit = physics.Raycast({0.0f, 50.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+            high = hit && hit->entity == terrain && hit->point.y > raised - 0.1f;
+        }
+        CHECK(high);
+        CHECK(editor.Undo());
+        CHECK(std::abs(TerrainHeight(*data, center) - flat) < 1e-3f);
+        CHECK(editor.Redo());
+        CHECK(std::abs(TerrainHeight(*data, center) - raised) < 1e-3f);
+
+        // Paint (a second layer), holes, foliage: each stroke one undo step.
+        data->layers.push_back(TerrainLayer{.name = "Rock", .tint = {0.6f, 0.2f, 0.1f}});
+        runFrames(2); // the window commits the new layer as a settings step
+        CHECK(editor.Undo());
+        CHECK(data->layers.size() == 1);
+        CHECK(editor.Redo());
+        CHECK(data->layers.size() == 2);
+        brush = TerrainBrush{.tool = TerrainTool::Paint, .radius = 6.0f, .strength = 1.0f, .layer = 1};
+        const glm::vec3 side[] = {{20.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}};
+        CHECK(editor.ApplyTerrainStroke(side));
+        const auto splatAt = [&](glm::vec2 local) {
+            const auto x = static_cast<std::size_t>(local.x / data->size * static_cast<float>(data->splatResolution));
+            const auto z = static_cast<std::size_t>(local.y / data->size * static_cast<float>(data->splatResolution));
+            return data->splat[(z * data->splatResolution + x) * kMaxTerrainLayers + 1];
+        };
+        CHECK(splatAt(center + glm::vec2(20.0f, 0.0f)) == 255);
+        brush = TerrainBrush{.tool = TerrainTool::Holes, .radius = 3.0f};
+        const glm::vec3 pit[] = {{-20.0f, 0.0f, 10.0f}};
+        CHECK(editor.ApplyTerrainStroke(pit));
+        CHECK(TerrainHole(*data, center + glm::vec2(-20.0f, 10.0f)));
+        CHECK(editor.Undo());
+        CHECK(!TerrainHole(*data, center + glm::vec2(-20.0f, 10.0f)));
+        CHECK(editor.Redo());
+        brush = TerrainBrush{.tool = TerrainTool::Foliage, .radius = 10.0f, .strength = 1.0f, .layer = 0};
+        const glm::vec3 meadow[] = {{0.0f, 0.0f, 20.0f}, {0.0f, 0.0f, 20.0f}, {0.0f, 0.0f, 20.0f}};
+        CHECK(!data->foliage.empty() && editor.ApplyTerrainStroke(meadow));
+        runFrames(4);
+        std::printf("    foliage after painting: %u instances\n", sceneRenderer.Stats().foliageInstances);
+        CHECK(sceneRenderer.Stats().foliageInstances > 100u);
+        CHECK(editor.Undo());
+        runFrames(2);
+        CHECK(sceneRenderer.Stats().foliageInstances == 0u);
+        CHECK(editor.Redo());
+
+        // Settings edit through the data (as the window's fields do): one undo step once idle.
+        data->layers[0].tint = glm::vec3(0.1f, 0.2f, 0.9f);
+        runFrames(2);
+        CHECK(editor.Undo());
+        CHECK(data->layers[0].tint != glm::vec3(0.1f, 0.2f, 0.9f));
+        CHECK(editor.Redo());
+        CHECK(data->layers[0].tint == glm::vec3(0.1f, 0.2f, 0.9f));
+
+        // Saving the scene writes the terrain (relative path in the scene).
+        CHECK(TerrainStore::Instance().Dirty(path));
+        const fs::path sceneFile = dir / "Island.scene.json";
+        CHECK(editor.SaveScene(sceneFile));
+        CHECK(!TerrainStore::Instance().Dirty(path));
+        const auto saved = LoadTerrain(PathFromUtf8(path));
+        CHECK(saved && saved->layers.size() == 2 && saved->layers[0].tint == glm::vec3(0.1f, 0.2f, 0.9f) &&
+              std::abs(TerrainHeight(*saved, center) - raised) < 1e-3f);
+        std::ifstream     in(sceneFile);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        CHECK(text.find("\"Terrains/") != std::string::npos);
+
+        // Content browser: opening a .uterrain places it; tool off → selection works again.
+        editor.OpenAsset(PathFromUtf8(path));
+        int terrains = 0;
+        scene.GetRegistry().ViewOf<Terrain>().Each([&](Entity, Terrain&) { ++terrains; });
+        CHECK(terrains == 2);
+        runFrames(3);
+        CHECK(sceneRenderer.Stats().terrains == 2u);
+        editor.SetTerrainToolEnabled(false);
+        CHECK(!editor.TerrainToolActive());
+        // Play: no brushes.
+        editor.SetTerrainToolEnabled(true);
+        editor.Play();
+        runFrames(2);
+        CHECK(!editor.TerrainToolActive() && !editor.ApplyTerrainStroke(point));
+        editor.Stop();
+        runFrames(2);
+    }
+    TerrainStore::Instance().Clear();
+    fs::current_path(previous);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

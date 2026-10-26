@@ -50,6 +50,7 @@ add_library(Engine STATIC
     src/Scene/SceneSerializer.cpp
     src/Scene/Decals.cpp
     src/Terrain/TerrainData.cpp
+    src/Terrain/TerrainBrush.cpp
     src/Scene/Prefab.cpp
     src/Scene/LevelStreaming.cpp
     src/Scene/SpatialIndex.cpp

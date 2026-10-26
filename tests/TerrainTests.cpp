@@ -1,5 +1,6 @@
 // Phase 32 terrain (CPU): data model, files, heightmap exchange, store change tracking, the Jolt
 // height field and the navmesh source. Rendering is covered by the GPU tests.
+#include "BlueprintTestUtil.h"
 #include "Test.h"
 
 #include "Engine/Core/Platform.h"
@@ -10,6 +11,7 @@
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
+#include "Engine/Terrain/TerrainBrush.h"
 #include "Engine/Terrain/TerrainData.h"
 
 #include <cmath>
@@ -347,5 +349,172 @@ TEST_CASE(Terrain_NavigationSource)
     scene.GetRegistry().Get<Terrain>(terrain).navigation = false;
     nav.Build(scene);
     CHECK(nav.Stats().polygons == 0);
+    store.Clear();
+}
+
+TEST_CASE(Terrain_BrushesAndUndoRegions)
+{
+    // 64 m, 65 samples (1 m cells), flat at 2 m; splat all on layer 0 of two.
+    TerrainData t = MakeFlatTerrain(65, 64.0f, 32.0f, 2.0f);
+    t.layers.push_back(TerrainLayer{.name = "Rock"});
+    t.foliage.push_back(FoliageLayer{});
+    SanitizeTerrain(t);
+    const TerrainData original = t;
+    TerrainBrush brush{.tool = TerrainTool::Raise, .radius = 4.0f, .strength = 1.0f, .falloff = 0.5f};
+    CHECK(TerrainBrushWeight(brush, 0.0f) == 1.0f && TerrainBrushWeight(brush, 1.9f) == 1.0f);
+    CHECK(TerrainBrushWeight(brush, 3.0f) > 0.0f && TerrainBrushWeight(brush, 3.0f) < 1.0f && TerrainBrushWeight(brush, 4.0f) == 0.0f);
+
+    // Raise: the center goes up most, nothing outside the radius; the rect covers the dab.
+    TerrainChanges c = ApplyTerrainBrush(t, brush, {32.0f, 32.0f}, 0.5f);
+    CHECK(c.kinds == TerrainChangeHeights && !c.full);
+    CHECK(c.rect.x >= 27.0f / 64.0f && c.rect.z <= 37.0f / 64.0f && c.rect.x < 0.5f && c.rect.z > 0.5f);
+    const float center = TerrainHeight(t, {32.0f, 32.0f});
+    CHECK(Near(center, 2.0f + 1.0f, 0.01f)); // strength 1 x radius / 2 m/s x 0.5 s
+    CHECK(TerrainHeight(t, {34.5f, 32.0f}) > 2.05f && TerrainHeight(t, {34.5f, 32.0f}) < center);
+    CHECK(Near(TerrainHeight(t, {37.0f, 32.0f}), 2.0f, 1e-3f));
+    // Lower / Flatten / Smooth.
+    brush.tool = TerrainTool::Lower;
+    (void)ApplyTerrainBrush(t, brush, {32.0f, 32.0f}, 0.25f);
+    CHECK(Near(TerrainHeight(t, {32.0f, 32.0f}), 2.5f, 0.01f));
+    brush.tool   = TerrainTool::Flatten;
+    brush.target = 5.0f;
+    for (int i = 0; i < 40; ++i)
+        (void)ApplyTerrainBrush(t, brush, {10.0f, 10.0f}, 0.1f);
+    CHECK(Near(TerrainHeight(t, {10.0f, 10.0f}), 5.0f, 0.02f));
+    const float edgeBefore = TerrainHeight(t, {13.0f, 10.0f});
+    brush.tool = TerrainTool::Smooth;
+    for (int i = 0; i < 20; ++i)
+        (void)ApplyTerrainBrush(t, brush, {13.0f, 10.0f}, 0.1f);
+    CHECK(TerrainHeight(t, {10.0f, 10.0f}) < 5.0f && std::abs(TerrainHeight(t, {13.0f, 10.0f}) - edgeBefore) > 0.01f);
+    // Nothing touched: no change.
+    brush.tool = TerrainTool::Raise;
+    CHECK(ApplyTerrainBrush(t, brush, {200.0f, 200.0f}, 0.1f).kinds == 0);
+    CHECK(ApplyTerrainBrush(t, brush, {32.0f, 32.0f}, 0.0f).kinds == 0);
+
+    // Paint: layer 1 takes over, weights keep summing to 255.
+    brush.tool  = TerrainTool::Paint;
+    brush.layer = 1;
+    for (int i = 0; i < 10; ++i)
+        c = ApplyTerrainBrush(t, brush, {48.0f, 16.0f}, 0.1f);
+    CHECK(c.kinds == TerrainChangeSplat);
+    const auto weightsAt = [&](glm::vec2 p) {
+        const auto x = static_cast<std::size_t>(p.x / t.size * static_cast<float>(t.splatResolution));
+        const auto z = static_cast<std::size_t>(p.y / t.size * static_cast<float>(t.splatResolution));
+        return &t.splat[(z * t.splatResolution + x) * kMaxTerrainLayers];
+    };
+    const std::uint8_t* w = weightsAt({48.0f, 16.0f});
+    CHECK(w[1] == 255 && w[0] == 0);
+    w = weightsAt({51.0f, 16.0f}); // falloff band: mixed
+    CHECK(w[0] + w[1] == 255 && w[1] > 0 && w[0] > 0);
+    brush.layer = 7; // no such layer
+    CHECK(ApplyTerrainBrush(t, brush, {48.0f, 16.0f}, 0.1f).kinds == 0);
+
+    // Holes: cells inside the solid part; erase fills them again.
+    brush = TerrainBrush{.tool = TerrainTool::Holes, .radius = 2.0f, .falloff = 0.0f};
+    c = ApplyTerrainBrush(t, brush, {20.0f, 40.0f}, 0.1f);
+    CHECK(c.kinds == TerrainChangeHoles && TerrainHole(t, {20.2f, 40.2f}) && TerrainHole(t, {19.5f, 39.5f}));
+    CHECK(!TerrainHole(t, {23.5f, 40.5f}));
+
+    // Foliage density: painted, erased.
+    brush = TerrainBrush{.tool = TerrainTool::Foliage, .radius = 3.0f, .strength = 1.0f, .layer = 0};
+    for (int i = 0; i < 5; ++i)
+        c = ApplyTerrainBrush(t, brush, {8.0f, 56.0f}, 0.1f);
+    CHECK(c.kinds == TerrainChangeFoliage);
+    const auto densityAt = [&](glm::vec2 p) {
+        const auto x = static_cast<std::size_t>(p.x / t.size * static_cast<float>(t.splatResolution));
+        const auto z = static_cast<std::size_t>(p.y / t.size * static_cast<float>(t.splatResolution));
+        return t.foliage[0].densityMap[z * t.splatResolution + x];
+    };
+    CHECK(densityAt({8.0f, 56.0f}) == 255 && densityAt({14.0f, 56.0f}) == 0);
+    brush.erase = true;
+    for (int i = 0; i < 5; ++i)
+        (void)ApplyTerrainBrush(t, brush, {8.0f, 56.0f}, 0.1f);
+    CHECK(densityAt({8.0f, 56.0f}) == 0);
+
+    // Undo regions: capture before, apply, restore -> identical; redo with the after capture.
+    TerrainData   work   = original;
+    const glm::vec4 rect{0.3f, 0.3f, 0.7f, 0.7f};
+    const std::uint32_t kinds = TerrainChangeHeights | TerrainChangeSplat | TerrainChangeHoles | TerrainChangeFoliage;
+    const TerrainRegion before = CaptureTerrainRegion(work, kinds, rect, 0);
+    CHECK(before.holes.size() == static_cast<std::size_t>(before.sampleRect.z - before.sampleRect.x) * (before.sampleRect.w - before.sampleRect.y));
+    TerrainBrush raise{.tool = TerrainTool::Raise, .radius = 6.0f, .strength = 1.0f};
+    (void)ApplyTerrainBrush(work, raise, {32.0f, 32.0f}, 0.5f);
+    TerrainBrush paint{.tool = TerrainTool::Paint, .radius = 6.0f, .strength = 1.0f, .layer = 1};
+    (void)ApplyTerrainBrush(work, paint, {32.0f, 32.0f}, 0.5f);
+    TerrainBrush hole{.tool = TerrainTool::Holes, .radius = 3.0f};
+    (void)ApplyTerrainBrush(work, hole, {32.0f, 32.0f}, 0.1f);
+    TerrainBrush grow{.tool = TerrainTool::Foliage, .radius = 6.0f, .strength = 1.0f};
+    (void)ApplyTerrainBrush(work, grow, {32.0f, 32.0f}, 0.5f);
+    const TerrainRegion after  = CaptureTerrainRegion(work, kinds, rect, 0);
+    const TerrainData   edited = work;
+    CHECK(RestoreTerrainRegion(work, before));
+    CHECK(work.heights == original.heights && work.splat == original.splat && work.foliage == original.foliage);
+    CHECK(std::ranges::all_of(work.holes, [](std::uint8_t v) { return v == 0; }));
+    CHECK(RestoreTerrainRegion(work, after));
+    CHECK(work.heights == edited.heights && work.splat == edited.splat && work.holes == edited.holes && work.foliage == edited.foliage);
+    // A region from another resolution is refused.
+    TerrainData other = MakeFlatTerrain(17, 16.0f);
+    CHECK(!RestoreTerrainRegion(other, before));
+}
+
+TEST_CASE(Terrain_BlueprintGetHeight)
+{
+    TerrainStore& store = TerrainStore::Instance();
+    store.Clear();
+    auto data = std::make_shared<TerrainData>(MakeFlatTerrain(33, 32.0f, 16.0f, 2.0f));
+    PaintHoles(*data, 0, 0, 4, 4); // the -X/-Z corner (world -16..-12)
+    const std::string path = PathToUtf8(TerrainTempDir("terrain_blueprint") / "Bp.uterrain");
+    store.Provide(path, data);
+
+    using namespace BlueprintTest;
+    Runner r;
+    const Entity terrain = PlaceTerrain(r.scene, path, {0.0f, 1.0f, 0.0f});
+    Graph b;
+    b.g.variables.push_back({"Height", PinType::Float, 0.0f, false});
+    b.g.variables.push_back({"Normal", PinType::Vec3, glm::vec3(0.0f), false});
+    b.g.variables.push_back({"Hit", PinType::Entity, NullEntity, false});
+    b.g.variables.push_back({"InHole", PinType::Bool, true, false});
+    b.g.variables.push_back({"Outside", PinType::Bool, true, false});
+    const auto begin = b.Node("Event.BeginPlay");
+    const auto on    = b.Node("Terrain.GetHeight");
+    b.Set(on, "Location", glm::vec3(3.0f, 50.0f, -2.0f));
+    const auto hole = b.Node("Terrain.GetHeight");
+    b.Set(hole, "Location", glm::vec3(-14.0f, 0.0f, -14.0f));
+    const auto outside = b.Node("Terrain.GetHeight");
+    b.Set(outside, "Location", glm::vec3(40.0f, 0.0f, 0.0f));
+    const auto setHeight  = b.Node("Variable.Set", "Height");
+    const auto setNormal  = b.Node("Variable.Set", "Normal");
+    const auto setHit     = b.Node("Variable.Set", "Hit");
+    const auto setHole    = b.Node("Variable.Set", "InHole");
+    const auto setOutside = b.Node("Variable.Set", "Outside");
+    b.Link(begin, "Out", setHeight, "In");
+    b.Link(setHeight, "Then", setNormal, "In");
+    b.Link(setNormal, "Then", setHit, "In");
+    b.Link(setHit, "Then", setHole, "In");
+    b.Link(setHole, "Then", setOutside, "In");
+    b.Link(on, "Height", setHeight, "Value");
+    b.Link(on, "Normal", setNormal, "Value");
+    b.Link(on, "Terrain", setHit, "Value");
+    b.Link(hole, "Found", setHole, "Value");
+    b.Link(outside, "Found", setOutside, "Value");
+    const auto has = b.Node("Entity.HasComponent", "Terrain");
+    const auto print = b.Node("Debug.Print");
+    b.Link(setOutside, "Then", print, "In");
+    b.Link(on, "Terrain", has, "Target");
+    b.Link(has, "Result", print, "Text");
+    CHECK(b.Valid());
+    const Entity actor = r.Add("Probe", "probe.ugraph", b.g);
+    r.scene.UpdateTransforms();
+    r.scripts.Begin(r.scene);
+    r.Run(0.1f);
+    const ScriptValue height = r.Var("probe.ugraph", actor, "Height");
+    CHECK(std::holds_alternative<float>(height) && Near(std::get<float>(height), 3.0f, 0.01f)); // 1 m entity + 2 m ground
+    const ScriptValue normal = r.Var("probe.ugraph", actor, "Normal");
+    CHECK(std::holds_alternative<glm::vec3>(normal) && Near(std::get<glm::vec3>(normal).y, 1.0f, 1e-4f));
+    const ScriptValue hit = r.Var("probe.ugraph", actor, "Hit");
+    CHECK(std::holds_alternative<Entity>(hit) && std::get<Entity>(hit) == terrain);
+    CHECK(r.Var("probe.ugraph", actor, "InHole") == ScriptValue(false));
+    CHECK(r.Var("probe.ugraph", actor, "Outside") == ScriptValue(false));
+    CHECK(r.Printed("true"));
     store.Clear();
 }

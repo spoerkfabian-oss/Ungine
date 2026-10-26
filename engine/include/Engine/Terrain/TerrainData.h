@@ -137,6 +137,7 @@ public:
     [[nodiscard]] std::shared_ptr<TerrainData> Get(const std::string& path);
     // Unsaved data under a path (new terrain in the editor); replaces a loaded copy.
     void Provide(const std::string& path, std::shared_ptr<TerrainData> data);
+    // kinds 0: only "edited" (values read live, e.g. layer colors): no revision, nothing rebuilds.
     void MarkDirty(const std::string& path, std::uint32_t kinds, glm::vec4 rect = {0.0f, 0.0f, 1.0f, 1.0f});
     [[nodiscard]] std::uint64_t  Revision(const std::string& path) const; // 0: unknown
     [[nodiscard]] TerrainChanges ChangesSince(const std::string& path, std::uint64_t revision) const;

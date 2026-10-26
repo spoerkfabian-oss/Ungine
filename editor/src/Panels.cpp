@@ -296,6 +296,10 @@ void Editor::DrawHierarchy()
             PushCreated("Create decal", roots);
             Select(e);
         }
+        if (ImGui::MenuItem("Terrain")) { // a new terrain file, centered under the camera
+            const glm::vec3 at = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            (void)CreateTerrain(glm::vec3(at.x, 0.0f, at.z));
+        }
         if (ImGui::MenuItem("Fog Volume")) {
             const Entity e = m_Ctx.scene.CreateEntity("Fog Volume");
             m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
@@ -1435,6 +1439,7 @@ void Editor::DrawInspector()
     }
 
     DrawNavigationInspector(e);
+    DrawTerrainInspector(e);
 
     ImGui::Separator();
     if (ImGui::Button("Add component"))
@@ -1519,6 +1524,8 @@ void Editor::DrawInspector()
             registry.Emplace<Decal>(e);
         if (ImGui::MenuItem("Fog Volume", nullptr, false, !registry.Has<FogVolume>(e)))
             registry.Emplace<FogVolume>(e);
+        if (ImGui::MenuItem("Terrain", nullptr, false, !registry.Has<Terrain>(e)))
+            registry.Emplace<Terrain>(e);
         ImGui::Separator();
         if (ImGui::MenuItem("Level Streaming Volume", nullptr, false, !registry.Has<LevelStreamingVolume>(e)))
             registry.Emplace<LevelStreamingVolume>(e);
