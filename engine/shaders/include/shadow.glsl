@@ -70,11 +70,11 @@ float SunShadow(FrameData frame, vec3 worldPos, vec3 normal, float viewDepth, ve
 // Local light shadow from the atlas: the light's view (point lights: the cube face of the major
 // axis), normal offset scaled with the texel size at this distance, 16 rotated Poisson taps kept
 // inside the tile. 1 = lit.
-float LocalShadow(FrameData frame, GpuLight light, vec3 worldPos, vec3 normal, vec2 pixel)
+// Shadow view of a light for the offset d = position - light (point lights: cube face of the
+// major axis) and the distance along that view's axis.
+uint LocalShadowView(GpuLight light, vec3 d, out float axisDistance)
 {
-    const vec3 d     = worldPos - light.position;
-    uint       index = light.shadow;
-    float      axisDistance;
+    uint index = light.shadow;
     if (light.type == LIGHT_POINT) {
         const vec3 a = abs(d);
         if (a.x >= a.y && a.x >= a.z) {
@@ -90,6 +90,13 @@ float LocalShadow(FrameData frame, GpuLight light, vec3 worldPos, vec3 normal, v
     } else {
         axisDistance = dot(d, light.direction);
     }
+    return index;
+}
+
+float LocalShadow(FrameData frame, GpuLight light, vec3 worldPos, vec3 normal, vec2 pixel)
+{
+    float      axisDistance;
+    const uint index = LocalShadowView(light, worldPos - light.position, axisDistance);
 
     ShadowViewBuffer    views = frame.shadowViews;
     const GpuShadowView view  = views.v[index];
@@ -117,6 +124,37 @@ float LocalShadow(FrameData frame, GpuLight light, vec3 worldPos, vec3 normal, v
                        vec3(tap, ndc.z));
     }
     return lit / 16.0;
+}
+
+// Single hardware-PCF taps for the volumetric fog (explicit LOD: compute; the froxel grid and its
+// history average the noise). 1 = lit.
+float SunShadowVolume(FrameData frame, vec3 worldPos, float viewDepth)
+{
+    const uint count   = uint(frame.shadowParams.x);
+    uint       cascade = 0u;
+    while (cascade < count && viewDepth > frame.cascadeSplits[cascade])
+        ++cascade;
+    if (cascade >= count)
+        return 1.0;
+    const vec4 clip = frame.cascadeViewProj[cascade] * vec4(worldPos, 1.0);
+    return textureLod(sampler2DShadow(uTextures[nonuniformEXT(frame.shadowMaps[cascade])], uSamplers[SAMPLER_SHADOW]),
+                      vec3(clip.xy * 0.5 + 0.5, clip.z), 0.0);
+}
+
+float LocalShadowVolume(FrameData frame, GpuLight light, vec3 worldPos)
+{
+    float               axisDistance;
+    ShadowViewBuffer    views = frame.shadowViews;
+    const GpuShadowView view  = views.v[LocalShadowView(light, worldPos - light.position, axisDistance)];
+    const vec4          clip  = view.viewProj * vec4(worldPos, 1.0);
+    if (clip.w <= 0.0)
+        return 1.0;
+    const vec3 ndc = clip.xyz / clip.w;
+    const vec2 uv  = ndc.xy * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        return 1.0;
+    return textureLod(sampler2DShadow(uTextures[nonuniformEXT(frame.localShadowInfo.x)], uSamplers[SAMPLER_SHADOW]),
+                      vec3(view.rect.xy + uv * view.rect.zw, ndc.z), 0.0);
 }
 
 #endif

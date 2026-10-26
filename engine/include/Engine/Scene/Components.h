@@ -399,6 +399,18 @@ struct Decal {
     bool operator==(const Decal&) const = default;
 };
 
+// Local volumetric fog (SceneRenderer, FogSettings::volumetric): extra density inside the box
+// (entity space), faded towards the faces. Needs the volumetric fog of the renderer enabled.
+struct FogVolume {
+    glm::vec3 halfExtents{5.0f, 2.0f, 5.0f};
+    float     density = 0.1f;          // extinction per meter
+    glm::vec3 albedo{1.0f};            // scattering color
+    glm::vec3 emissive{0.0f};          // HDR, emitted per meter of fog
+    float     edgeFade = 1.0f;         // entity-space units faded at the faces
+
+    bool operator==(const FogVolume&) const = default;
+};
+
 // --- Navigation (NavigationWorld, Recast/Detour). Geometry: colliders (not triggers) of static
 // bodies or without a RigidBody. Area / profile names refer to NavSettings (project). ---
 

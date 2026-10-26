@@ -4,6 +4,7 @@
 // Sprites and ribbons: unlit texture x color, soft edges against the scene depth, camera fade.
 #include "include/bindless.glsl"
 #include "include/particle.glsl"
+#include "include/fog.glsl"
 
 layout(location = 0) in vec4 inColor;
 layout(location = 1) in vec2 inUv;
@@ -35,7 +36,10 @@ void main()
     color.a = clamp(color.a, 0.0, 1.0);
     if (color.a <= 0.0)
         discard;
+    // Fog: additive light is only dimmed, blended particles also take the in-scattering.
+    const vec4 fog = ComputeFogAtDepth(pc.frame, gl_FragCoord.xy * pc.frame.ssrParams.zw, inViewDistance);
     // Additive pipelines blend ONE / ONE: premultiply.
-    outColor = (pc.flags & PARTICLE_ADDITIVE) != 0u ? vec4(color.rgb * color.a, color.a) : color;
+    outColor = (pc.flags & PARTICLE_ADDITIVE) != 0u ? vec4(color.rgb * (color.a * fog.a), color.a)
+                                                    : vec4(color.rgb * fog.a + fog.rgb, color.a);
     outVelocity = vec4(ParticleMotion(inCurrentClip, inPreviousClip), 0.0, color.a);
 }

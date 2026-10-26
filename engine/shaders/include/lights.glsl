@@ -67,6 +67,17 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer DecalCluste
     uint indices[];
 };
 
+// Volumetric fog boxes. Mirrors Engine::GpuFogVolume (SceneRenderer.h).
+struct GpuFogVolume {
+    mat4 worldToLocal;  // world -> entity space
+    vec4 halfExtents;   // xyz, w: edge fade (entity units)
+    vec4 albedoDensity; // rgb: albedo, a: density (extinction per meter)
+    vec4 emissive;      // rgb: emitted per meter
+    vec4 bounds;        // xyz: world center, w: radius
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer FogVolumeBuffer { GpuFogVolume v[]; };
+
 // Logarithmic depth slices: slice = log(viewDepth) * scale + bias.
 uint ClusterIndex(vec2 fragCoord, float viewDepth, vec2 tileScale, float sliceScale, float sliceBias)
 {

@@ -4251,3 +4251,140 @@ TEST_CASE(Render_ScreenSpaceReflections)
     F().assets->Release(redBox);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
+
+TEST_CASE(Render_HeightAndVolumetricFog)
+{
+    // A red box 14 m away on a grey floor: height fog pulls it towards the fog color (analytic and
+    // volumetric agree), a FogVolume glows with its emission, a point light inside a fog volume
+    // lights the fog around it (froxels read the light clusters), the sky gets fogged at the horizon.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle floorModel = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 60.0f,
+                                                                 .baseColor = {0.5f, 0.5f, 0.5f, 1.0f}, .metallic = 0.0f,
+                                                                 .roughness = 0.9f});
+    const ModelHandle redBox = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 3.0f,
+                                                             .baseColor = {1.0f, 0.05f, 0.05f, 1.0f}, .metallic = 0.0f,
+                                                             .roughness = 0.8f});
+    CHECK(F().Pump([&] { return Settled(floorModel) && Settled(redBox); }));
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity floor = scene.CreateEntity("Floor");
+    r.Emplace<MeshRenderer>(floor, MeshRenderer{.model = floorModel, .meshIndex = 0});
+    const Entity box = scene.CreateEntity("Box");
+    r.Emplace<MeshRenderer>(box, MeshRenderer{.model = redBox, .meshIndex = 0});
+    scene.EditTransform(box).position = {0.0f, 1.5f, -10.0f};
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 1.5f, 4.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 1.5f, -10.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const glm::ivec2 boxPixel = project({0.0f, 1.5f, -8.5f});
+    const glm::ivec2 nearFloor = project({0.0f, 0.0f, -1.0f});
+    const glm::ivec2 horizon{10, 57}; // sky just above the horizon
+
+    const auto dump = [](const std::vector<std::uint8_t>& image, const char* name) { // UNGINE_TEST_DUMP=<dir>
+        if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) {
+            const std::vector<std::byte> png = EncodePng(image, 160, 120);
+            std::ofstream(std::filesystem::path(dir) / name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        }
+    };
+    const auto plain       = RenderImage(renderer, scene, camera, 4);
+    const glm::ivec3 box0  = pixel(plain, boxPixel);
+    const glm::ivec3 near0 = pixel(plain, nearFloor);
+
+    renderer.fog.enabled       = true;
+    renderer.fog.volumetric    = false;
+    renderer.fog.density       = 0.12f;
+    renderer.fog.heightFalloff = 0.0f;
+    const auto       analytic = RenderImage(renderer, scene, camera, 4);
+    const glm::ivec3 box1     = pixel(analytic, boxPixel);
+    const glm::ivec3 near1    = pixel(analytic, nearFloor);
+    CHECK(renderer.Stats().fogGrid == glm::uvec3(0u));
+
+    renderer.fog.volumetric = true;
+    const auto       volumetric = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 box2       = pixel(volumetric, boxPixel);
+    dump(plain, "fog_plain.png");
+    dump(analytic, "fog_analytic.png");
+    dump(volumetric, "fog_volumetric.png");
+    CHECK(renderer.Stats().fogGrid == glm::uvec3(10u, 8u, 64u));
+    std::printf("    box: plain %d %d %d, analytic %d %d %d, volumetric %d %d %d; near floor %d %d %d -> %d %d %d\n",
+                box0.r, box0.g, box0.b, box1.r, box1.g, box1.b, box2.r, box2.g, box2.b, near0.r, near0.g, near0.b,
+                near1.r, near1.g, near1.b);
+    // Fog: the red box loses most of its saturation, the floor close by much less.
+    CHECK(box1.r - box1.b < (box0.r - box0.b) / 2);
+    CHECK(box2.r - box2.b < (box0.r - box0.b) / 2);
+    CHECK(std::abs(near1.r - near0.r) < std::abs(box1.b - box0.b) + 10);
+    // Analytic and volumetric (shadowed sun, same density) end up close.
+    CHECK(std::abs(box2.r - box1.r) < 40 && std::abs(box2.g - box1.g) < 40 && std::abs(box2.b - box1.b) < 40);
+
+    // Height falloff: thin fog high up, the sky far above the horizon stays untouched; the horizon fogs.
+    renderer.fog.heightFalloff = 1.0f;
+    renderer.fog.maxOpacity    = 0.8f;
+    const auto       layered = RenderImage(renderer, scene, camera, 8);
+    const auto       change  = [&](glm::ivec2 p) {
+        const glm::ivec3 d = glm::abs(pixel(layered, p) - pixel(plain, p));
+        return d.r + d.g + d.b;
+    };
+    std::printf("    height fog: sky change %d (up), %d (horizon)\n", change({20, 5}), change(horizon));
+    CHECK(change({20, 5}) * 3 < change(horizon));
+
+    // A glowing fog volume in front of the camera (no height fog).
+    renderer.fog.density       = 0.0f;
+    renderer.fog.heightFalloff = 0.0f;
+    const Entity glow = scene.CreateEntity("Glow");
+    r.Emplace<FogVolume>(glow, FogVolume{.halfExtents = {1.0f, 1.0f, 1.0f}, .density = 0.3f, .albedo = glm::vec3(1.0f),
+                                         .emissive = {0.0f, 0.6f, 0.0f}, .edgeFade = 0.2f});
+    scene.EditTransform(glow).position = {-2.0f, 1.5f, -2.0f};
+    scene.UpdateTransforms();
+    const glm::ivec2 glowPixel = project({-2.0f, 1.5f, -2.0f});
+    const glm::ivec3 before    = pixel(plain, glowPixel);
+    const auto       glowImage = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 glowing   = pixel(glowImage, glowPixel);
+    dump(glowImage, "fog_glow.png");
+    CHECK(renderer.Stats().fogVolumes == 1u);
+    std::printf("    glow volume: %d %d %d -> %d %d %d\n", before.r, before.g, before.b, glowing.r, glowing.g, glowing.b);
+    CHECK(glowing.g > before.g + 30 && glowing.g > glowing.r + 30);
+
+    // A point light inside a non-emissive fog volume scatters (darker sun so the light dominates).
+    r.Get<FogVolume>(glow).emissive = glm::vec3(0.0f);
+    r.Get<FogVolume>(glow).density  = 0.6f;
+    scene.MarkChanged(glow);
+    renderer.lighting.sky.sunIntensity = 0.3f;
+    renderer.lighting.sky.skyIntensity = 0.2f;
+    const glm::ivec3 unlit = pixel(RenderImage(renderer, scene, camera, 24), glowPixel);
+    const Entity lamp = scene.CreateEntity("Lamp");
+    r.Emplace<Light>(lamp, Light{.type = LightType::Point, .color = {1.0f, 0.8f, 0.4f}, .intensity = 8.0f, .range = 4.0f,
+                                 .castShadows = false});
+    scene.EditTransform(lamp).position = {-2.0f, 1.5f, -2.0f};
+    scene.UpdateTransforms();
+    const auto       litImage = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 lit      = pixel(litImage, glowPixel);
+    dump(litImage, "fog_lamp.png");
+    std::printf("    lamp in fog: %d %d %d -> %d %d %d\n", unlit.r, unlit.g, unlit.b, lit.r, lit.g, lit.b);
+    CHECK(lit.r > unlit.r + 40);
+    renderer.lighting.sky = {};
+
+    // Particles / transparent pipelines and the sky still render valid images with fog (no NaN black).
+    renderer.fog.density = 0.05f;
+    const auto final = RenderImage(renderer, scene, camera, 4);
+    CHECK(pixel(final, {20, 20}).b > 20);
+    F().assets->Release(floorModel);
+    F().assets->Release(redBox);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}

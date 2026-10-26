@@ -60,6 +60,11 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::uvec4 decalInfo;         // x: decal count
     glm::uvec4 ssrInfo;           // x: reflection slot, y: enabled
     glm::vec4  ssrParams;         // x: intensity, zw: 1 / output size
+    glm::vec4  fogColor;          // rgb: albedo, w: density at the base height
+    glm::vec4  fogHeight;         // x: base height, y: falloff, z: start distance, w: max opacity
+    glm::vec4  fogLight;          // x: anisotropy, y: sun, z: ambient, w: punctual lights
+    glm::uvec4 fogInfo;           // x: enabled, y: integrated volume slot, z: volume count, w: volumetric
+    glm::vec4  fogGrid;           // x: grid depth, y: slices, zw: screen UV -> grid UV
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
     VkDeviceAddress shadowViews;
@@ -74,6 +79,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress prevJointMatrices;
     VkDeviceAddress decals;
     VkDeviceAddress decalClusters;
+    VkDeviceAddress fogVolumes;
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -142,6 +148,19 @@ struct SsrHiZPush { // mirrors SsrHiZPush in ssr_hiz.comp
     std::uint32_t   depthSlot;
     std::uint32_t   fromDepth;
 };
+
+struct FogPush { // mirrors FogPush in fog_inject.comp / fog_integrate.comp
+    VkDeviceAddress frame;
+    std::uint32_t   source;
+    std::uint32_t   target;
+    std::uint32_t   valid;
+    std::uint32_t   gridX;
+    std::uint32_t   gridY;
+    std::uint32_t   gridZ;
+    float           feedback;
+    float           prevDistance;
+};
+static_assert(sizeof(FogPush) == 40);
 
 struct TonemapPush { // mirrors TonemapPush in tonemap.frag
     VkDeviceAddress state;
@@ -337,7 +356,7 @@ void SceneRenderer::CreatePipelines()
     struct {
         Pipeline Prepass, PrepassPicking, Mesh, Sky, Shadow, ShadowMasked, LocalShadow, LocalShadowMasked, BloomDown,
             BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull, MeshBlend, Taa, SsrHiZ, SsrTrace, SsrResolve,
-            SsrBlur;
+            SsrBlur, FogInject, FogIntegrate;
     } built;
     const VkDevice         device = m_Renderer.GetContext().Device();
     const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
@@ -440,6 +459,8 @@ void SceneRenderer::CreatePipelines()
     built.SsrTrace        = compute("ssr_trace.comp.spv", "SsrTrace");
     built.SsrResolve      = compute("ssr_resolve.comp.spv", "SsrResolve");
     built.SsrBlur         = compute("ssr_blur.comp.spv", "SsrBlur");
+    built.FogInject       = compute("fog_inject.comp.spv", "FogInject");
+    built.FogIntegrate    = compute("fog_integrate.comp.spv", "FogIntegrate");
 
 
     const auto replace = [&](Pipeline& current, Pipeline& fresh) {
@@ -468,6 +489,8 @@ void SceneRenderer::CreatePipelines()
     replace(m_SsrTrace, built.SsrTrace);
     replace(m_SsrResolve, built.SsrResolve);
     replace(m_SsrBlur, built.SsrBlur);
+    replace(m_FogInject, built.FogInject);
+    replace(m_FogIntegrate, built.FogIntegrate);
     for (auto& [format, pipeline] : m_Tonemap) // rebuilt on demand
         m_Renderer.DeferRelease(std::move(pipeline));
     m_Tonemap.clear();
@@ -496,12 +519,13 @@ SceneRenderer::~SceneRenderer()
     ReleaseShadowMap();
     ReleaseShadowAtlas();
     ReleasePickingTarget();
+    ReleaseFogVolumes();
     for (auto& [format, pipeline] : m_Tonemap)
         m_Renderer.DeferRelease(std::move(pipeline));
     for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp,
                         &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull,
                         &m_LocalShadow, &m_LocalShadowMasked, &m_PrepassPicking, &m_MeshBlend, &m_Taa, &m_SsrHiZ,
-                        &m_SsrTrace, &m_SsrResolve, &m_SsrBlur})
+                        &m_SsrTrace, &m_SsrResolve, &m_SsrBlur, &m_FogInject, &m_FogIntegrate})
         m_Renderer.DeferRelease(std::move(*p));
     m_Renderer.DeferRelease(std::move(m_Clusters));
     m_Renderer.DeferRelease(std::move(m_DecalClusters));
@@ -1028,6 +1052,18 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GatherDraws(frustum, glm::vec4(0.0f), m_TransparentDraws, Gather::Transparent);
     CollectLights(scene, frustum);
     CollectDecals(scene, frustum);
+    m_FogThisFrame = fog.enabled && fog.volumetric;
+    if (m_FogThisFrame) {
+        if (fog != m_FogHistorySettings) { // no lag after changes (editor sliders, scripts)
+            m_FogHistorySettings = fog;
+            m_FogHistoryValid    = false;
+        }
+        EnsureFogVolumes(extent);
+        CollectFogVolumes(scene, frustum, camera.position);
+    } else {
+        ReleaseFogVolumes();
+        m_FogVolumes.clear();
+    }
     {
         static const ParticleRenderData kNoParticles;
         m_Particles->Prepare(particles ? particles->RenderData() : kNoParticles, frustum, camera.position, frame.frameIndex);
@@ -1043,6 +1079,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     };
     const VkDeviceAddress lightAddress      = pushArray(m_Lights);
     const VkDeviceAddress decalAddress      = pushArray(m_Decals);
+    // Never null: llvmpipe speculatively loads from the list even when the loop runs zero times.
+    const VkDeviceAddress fogVolumeAddress  = m_FogVolumes.empty() ? pushArray(std::vector<GpuFogVolume>(1))
+                                                                   : pushArray(m_FogVolumes);
+    const float           fogDistance       = std::max(fog.volumetricDistance, 1.0f);
+    const VkExtent3D      fogGrid           = m_FogThisFrame ? m_FogIntegrated.Extent() : VkExtent3D{1, 1, 1};
     const VkDeviceAddress shadowViewAddress = pushArray(m_ShadowViewData);
     // Logarithmic slices between the near plane and clusterFar: slice = log(z) * scale + bias.
     const float clusterNear  = camera.nearPlane;
@@ -1085,6 +1126,16 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .ssrInfo         = glm::uvec4(m_SsrRawSampled, m_SsrThisFrame ? 1u : 0u, 0u, 0u),
           .ssrParams       = glm::vec4(std::max(ssr.intensity, 0.0f), 0.0f, 1.0f / static_cast<float>(extent.width),
                                        1.0f / static_cast<float>(extent.height)),
+          .fogColor        = glm::vec4(glm::clamp(fog.albedo, glm::vec3(0.0f), glm::vec3(1.0f)), std::max(fog.density, 0.0f)),
+          .fogHeight       = glm::vec4(fog.baseHeight, std::max(fog.heightFalloff, 0.0f), std::max(fog.startDistance, 0.0f),
+                                       std::clamp(fog.maxOpacity, 0.0f, 1.0f)),
+          .fogLight        = glm::vec4(std::clamp(fog.anisotropy, -0.95f, 0.95f), std::max(fog.sunScale, 0.0f),
+                                       std::max(fog.ambientScale, 0.0f), std::max(fog.lightScale, 0.0f)),
+          .fogInfo         = glm::uvec4(fog.enabled ? 1u : 0u, m_FogIntegratedSampled,
+                                        static_cast<std::uint32_t>(m_FogVolumes.size()), m_FogThisFrame ? 1u : 0u),
+          .fogGrid         = glm::vec4(fogDistance, static_cast<float>(fogGrid.depth),
+                                       static_cast<float>(extent.width) / static_cast<float>(fogGrid.width * kFogTileSize),
+                                       static_cast<float>(extent.height) / static_cast<float>(fogGrid.height * kFogTileSize)),
           .lights          = lightAddress,
           .clusters        = m_Clusters.Address(),
           .shadowViews     = shadowViewAddress,
@@ -1098,7 +1149,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .textureTable    = m_Renderer.TextureTableAddress(),
           .prevJointMatrices = m_GpuScene->PrevJointMatrixAddress(),
           .decals          = decalAddress,
-          .decalClusters   = m_DecalClusters.Address()};
+          .decalClusters   = m_DecalClusters.Address(),
+          .fogVolumes      = fogVolumeAddress};
     ++m_FrameCounter;
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
@@ -1144,6 +1196,10 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         RenderSsr(cmd, extent, frameAddress);
     } else {
         m_SsrHistoryValid = false;
+    }
+    if (m_FogThisFrame) {
+        GpuScope scope(profiler, cmd, "Volumetric fog");
+        RenderFog(cmd, frameAddress);
     }
     {
         GpuScope scope(profiler, cmd, "Lighting + sky");
@@ -1450,7 +1506,7 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
                           .oldLayout = m_ShadowAtlasWritten ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                                             : VK_IMAGE_LAYOUT_UNDEFINED,
                           .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           .dstStage  = kDepthStages,
                           .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -1498,7 +1554,7 @@ void SceneRenderer::RenderLocalShadows(VkCommandBuffer cmd, VkDeviceAddress fram
                           .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           .srcStage  = kDepthStages,
                           .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
     m_ShadowAtlasWritten = true;
@@ -1661,7 +1717,7 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
     CmdImageBarrier(cmd, {.image     = m_ShadowMap.Handle(),
                           .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                           .newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .srcStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           .dstStage  = kDepthStages,
                           .dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -1697,7 +1753,7 @@ void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddr
                           .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           .srcStage  = kDepthStages,
                           .srcAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                          .dstStage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                           .aspect    = VK_IMAGE_ASPECT_DEPTH_BIT});
 }
@@ -2211,6 +2267,149 @@ void SceneRenderer::RenderSsr(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAd
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     m_SsrIndex        = source;
     m_SsrHistoryValid = true;
+}
+
+void SceneRenderer::EnsureFogVolumes(VkExtent2D extent)
+{
+    const VkExtent3D grid{(extent.width + kFogTileSize - 1) / kFogTileSize, (extent.height + kFogTileSize - 1) / kFogTileSize,
+                          kFogSlices};
+    if (m_FogIntegrated && m_FogIntegrated.Extent().width == grid.width && m_FogIntegrated.Extent().height == grid.height)
+        return;
+    ReleaseFogVolumes();
+    const VulkanContext& ctx      = m_Renderer.GetContext();
+    BindlessRegistry&    bindless = m_Renderer.GetBindless();
+    const auto make = [&](const char* name, std::uint32_t& sampledSlot, std::uint32_t& storageSlot) {
+        Image image = Image(ctx, {.extent    = grid,
+                                  .format    = kHdrFormat,
+                                  .usage     = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                  .viewType  = VK_IMAGE_VIEW_TYPE_3D,
+                                  .debugName = name});
+        sampledSlot = bindless.AddVolumeTexture(image.View(), VK_IMAGE_LAYOUT_GENERAL);
+        storageSlot = bindless.AddStorageVolume(image.View());
+        return image;
+    };
+    m_FogInjectVolume[0] = make("FogScattering", m_FogInjectSampled[0], m_FogInjectStorage[0]);
+    m_FogInjectVolume[1] = make("FogScattering", m_FogInjectSampled[1], m_FogInjectStorage[1]);
+    m_FogIntegrated      = make("FogIntegrated", m_FogIntegratedSampled, m_FogIntegratedStorage);
+}
+
+void SceneRenderer::ReleaseFogVolumes()
+{
+    if (!m_FogIntegrated)
+        return;
+    Renderer* r = &m_Renderer;
+    r->DeferCall([r, sampled = std::array{m_FogInjectSampled[0], m_FogInjectSampled[1], m_FogIntegratedSampled},
+                  storage = std::array{m_FogInjectStorage[0], m_FogInjectStorage[1], m_FogIntegratedStorage}] {
+        BindlessRegistry& b = r->GetBindless();
+        for (std::uint32_t s : sampled)
+            b.RemoveVolumeTexture(s);
+        for (std::uint32_t s : storage)
+            b.RemoveStorageVolume(s);
+    });
+    for (Image* image : {&m_FogInjectVolume[0], &m_FogInjectVolume[1], &m_FogIntegrated})
+        r->DeferRelease(std::move(*image));
+    m_FogLayoutReady  = false;
+    m_FogHistoryValid = false;
+}
+
+void SceneRenderer::CollectFogVolumes(Scene& scene, const Frustum& frustum, const glm::vec3& cameraPosition)
+{
+    m_FogVolumes.clear();
+    struct Candidate {
+        float         distance;
+        std::uint64_t uuid;
+        GpuFogVolume  gpu;
+    };
+    std::vector<Candidate> candidates;
+    const Registry& registry = scene.GetRegistry();
+    registry.ViewOf<FogVolume, WorldTransform>().Each([&](Entity entity, const FogVolume& volume, const WorldTransform& world) {
+        if (volume.density <= 0.0f && glm::all(glm::lessThanEqual(volume.emissive, glm::vec3(0.0f))))
+            return;
+        const float det = glm::determinant(glm::mat3(world.matrix));
+        if (!std::isfinite(det) || std::abs(det) < 1e-12f)
+            return;
+        const glm::vec3 half   = glm::max(glm::abs(volume.halfExtents), glm::vec3(1e-3f));
+        const glm::vec3 center = world.matrix[3];
+        float           radius = 0.0f; // farthest corner
+        for (int corner = 0; corner < 8; ++corner) {
+            const glm::vec3 local((corner & 1) ? half.x : -half.x, (corner & 2) ? half.y : -half.y,
+                                  (corner & 4) ? half.z : -half.z);
+            radius = std::max(radius, glm::length(glm::mat3(world.matrix) * local));
+        }
+        if (!frustum.Intersects({center - glm::vec3(radius), center + glm::vec3(radius)}))
+            return;
+        GpuFogVolume gpu{.worldToLocal  = glm::inverse(world.matrix),
+                         .halfExtents   = glm::vec4(half, std::max(volume.edgeFade, 0.0f)),
+                         .albedoDensity = glm::vec4(glm::clamp(volume.albedo, glm::vec3(0.0f), glm::vec3(1.0f)),
+                                                    std::max(volume.density, 0.0f)),
+                         .emissive      = glm::vec4(glm::max(volume.emissive, glm::vec3(0.0f)), 0.0f),
+                         .bounds        = glm::vec4(center, radius)};
+        candidates.push_back({std::max(glm::distance(center, cameraPosition) - radius, 0.0f), registry.Get<Uuid>(entity).value, gpu});
+    });
+    // The nearest ones win when there are too many; stable order for identical frames.
+    std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+        return a.distance != b.distance ? a.distance < b.distance : a.uuid < b.uuid;
+    });
+    if (candidates.size() > kMaxFogVolumes) {
+        static bool warned = false;
+        if (!std::exchange(warned, true))
+            ENGINE_WARN("More than {} visible fog volumes: the farthest are dropped", kMaxFogVolumes);
+        candidates.resize(kMaxFogVolumes);
+    }
+    for (const Candidate& c : candidates)
+        m_FogVolumes.push_back(c.gpu);
+    m_Stats.fogVolumes = static_cast<std::uint32_t>(m_FogVolumes.size());
+}
+
+void SceneRenderer::RenderFog(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
+{
+    const auto&            bindless = m_Renderer.GetBindless();
+    const VkPipelineLayout layout   = bindless.PipelineLayout();
+    constexpr auto         kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    constexpr auto         kRW      = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    // Earlier frames read the volumes (history, lighting pass, particles, sky): WAR.
+    MemoryBarrier(cmd, kCompute | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, kRW);
+    if (!m_FogLayoutReady) {
+        for (const Image* image : {&m_FogInjectVolume[0], &m_FogInjectVolume[1], &m_FogIntegrated})
+            CmdImageBarrier(cmd, {.image     = image->Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                  .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                  .srcStage  = kCompute | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                  .dstStage  = kCompute,
+                                  .dstAccess = kRW});
+        m_FogLayoutReady  = true;
+        m_FogHistoryValid = false;
+    }
+    const VkExtent3D    grid     = m_FogIntegrated.Extent();
+    const float         distance = std::max(fog.volumetricDistance, 1.0f);
+    const std::uint32_t target = m_FogIndex, source = target ^ 1u;
+    FogPush push{.frame        = frameAddress,
+                 .source       = m_FogInjectSampled[source],
+                 .target       = m_FogInjectStorage[target],
+                 .valid        = m_FogHistoryValid && m_FogPrevDistance > 0.0f ? 1u : 0u,
+                 .gridX        = grid.width,
+                 .gridY        = grid.height,
+                 .gridZ        = grid.depth,
+                 .feedback     = std::clamp(fog.temporalFeedback, 0.0f, 0.98f),
+                 .prevDistance = m_FogPrevDistance};
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_FogInject.Handle());
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (grid.width + 3) / 4, (grid.height + 3) / 4, (grid.depth + 3) / 4);
+    MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+    push.source = m_FogInjectSampled[target];
+    push.target = m_FogIntegratedStorage;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_FogIntegrate.Handle());
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (grid.width + 7) / 8, (grid.height + 7) / 8, 1);
+    MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    m_FogIndex        = source;
+    m_FogHistoryValid = true;
+    m_FogPrevDistance = distance;
+    m_Stats.fogGrid   = glm::uvec3(grid.width, grid.height, grid.depth);
 }
 
 void SceneRenderer::RenderBloom(VkCommandBuffer cmd)

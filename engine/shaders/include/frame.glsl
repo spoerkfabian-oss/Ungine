@@ -45,6 +45,12 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     uvec4 decalInfo; // x: decal count (0 = no decals this frame)
     uvec4 ssrInfo;   // x: reflection texture slot (half resolution), y: enabled this frame
     vec4  ssrParams; // x: intensity, zw: 1 / output size
+    // Fog (fog.glsl)
+    vec4  fogColor;  // rgb: albedo of the height fog, w: density at the base height
+    vec4  fogHeight; // x: base height, y: falloff, z: start distance, w: max opacity (analytic)
+    vec4  fogLight;  // x: anisotropy, y: sun scale, z: ambient scale, w: punctual light scale
+    uvec4 fogInfo;   // x: enabled, y: integrated volume slot, z: fog volume count, w: volumetric this frame
+    vec4  fogGrid;   // x: grid depth (m), y: slices, zw: screen UV -> grid UV
 
     LightBuffer      lights;
     ClusterBuffer    clusters;
@@ -60,6 +66,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     JointMatrixBuffer prevJointMatrices; // last frame's skin palettes (GpuInstance.prevJointOffset)
     DecalBuffer        decals;
     DecalClusterBuffer decalClusters;
+    FogVolumeBuffer    fogVolumes;
 };
 
 #endif

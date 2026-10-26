@@ -5,6 +5,7 @@
 #include "bindless.glsl"
 #include "mesh_common.glsl"
 #include "decals.glsl"
+#include "fog.glsl"
 #include "pbr.glsl"
 #include "shadow.glsl"
 #include "surface.glsl"
@@ -140,6 +141,7 @@ void main()
     const vec3  indirect = (FssEss * radiance * specAO + (FmsEms + kD) * irradiance * ao) * frame.sky.y;
 
     vec3       color    = direct + indirect + emissive;
+    color               = ApplyFog(frame, color, gl_FragCoord.xy * frame.ssrParams.zw, inWorldPos);
 
     if (frame.shadowInfo.y != 0u && NdotL > 0.0 && cascade < 4u) { // debug: red, green, blue, yellow
         const vec3 tint[4] = vec3[](vec3(1.0, 0.3, 0.3), vec3(0.3, 1.0, 0.3), vec3(0.3, 0.3, 1.0), vec3(1.0, 1.0, 0.3));

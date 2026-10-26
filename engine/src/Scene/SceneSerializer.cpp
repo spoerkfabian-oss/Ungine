@@ -538,6 +538,32 @@ json DecalToJson(const Decal& d, const ModelRefs& paths)
             {"age", d.age}};
 }
 
+json FogVolumeToJson(const FogVolume& f)
+{
+    return {{"halfExtents", ToJson(f.halfExtents)},
+            {"density", f.density},
+            {"albedo", ToJson(f.albedo)},
+            {"emissive", ToJson(f.emissive)},
+            {"edgeFade", f.edgeFade}};
+}
+
+FogVolume FogVolumeFromJson(const json& j)
+{
+    FogVolume f;
+    Read(j, "halfExtents", f.halfExtents);
+    Read(j, "density", f.density);
+    Read(j, "albedo", f.albedo);
+    Read(j, "emissive", f.emissive);
+    Read(j, "edgeFade", f.edgeFade);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    f.halfExtents = glm::max(glm::abs(f.halfExtents), glm::vec3(1e-3f));
+    f.density     = std::clamp(finite(f.density, 0.1f), 0.0f, 100.0f);
+    f.albedo      = glm::clamp(f.albedo, glm::vec3(0.0f), glm::vec3(1.0f));
+    f.emissive    = glm::max(f.emissive, glm::vec3(0.0f));
+    f.edgeFade    = std::max(finite(f.edgeFade, 1.0f), 0.0f);
+    return f;
+}
+
 Decal DecalFromJson(const json& j, const ModelRefs& paths)
 {
     Decal d;
@@ -869,6 +895,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioListener"] = json::object();
     if (const auto* decal = r.TryGet<Decal>(e))
         j["decal"] = DecalToJson(*decal, models);
+    if (const auto* fog = r.TryGet<FogVolume>(e))
+        j["fogVolume"] = FogVolumeToJson(*fog);
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* controller = r.TryGet<AnimationController>(e))
@@ -1070,6 +1098,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         return particles;
     });
     ApplyOptional<Decal>(r, e, j, "decal", [&](const json& d) { return DecalFromJson(d, models); });
+    ApplyOptional<FogVolume>(r, e, j, "fogVolume", [](const json& f) { return FogVolumeFromJson(f); });
     ApplyOptional<AnimationController>(r, e, j, "animationController", [&](const json& a) {
         AnimationController controller = AnimationControllerFromJson(a);
         controller.graph               = models.ReadPath(controller.graph);

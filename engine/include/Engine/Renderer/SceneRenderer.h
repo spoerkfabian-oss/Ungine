@@ -84,6 +84,28 @@ struct SsrSettings {
     float         feedback     = 0.85f; // temporal history weight
 };
 
+// Height fog (analytic, everywhere) + volumetric fog (froxel grid in view space up to
+// volumetricDistance: sun with cascade shadows, punctual lights with their shadows, sky ambient,
+// FogVolume components, temporal reprojection). Beyond the grid the analytic height fog continues.
+struct FogSettings {
+    bool      enabled       = false;
+    glm::vec3 albedo{0.8f, 0.85f, 0.9f}; // scattering color
+    float     density       = 0.02f; // extinction per meter at baseHeight
+    float     baseHeight    = 0.0f;
+    float     heightFalloff = 0.15f; // per meter: density = d * exp(-falloff * (y - baseHeight))
+    float     startDistance = 0.0f;  // meters from the camera without fog (analytic part)
+    float     maxOpacity    = 1.0f;  // cap of the analytic fog (keeps the sky visible)
+    float     anisotropy    = 0.6f;  // Henyey-Greenstein g: > 0 scatters forward (glow around the sun)
+    float     sunScale      = 1.0f;
+    float     ambientScale  = 1.0f;  // sky irradiance
+    float     lightScale    = 1.0f;  // punctual lights (volumetric only)
+    bool      volumetric    = true;
+    float     volumetricDistance = 64.0f; // meters covered by the froxel grid
+    float     temporalFeedback   = 0.9f;  // history weight of the froxel grid
+
+    bool operator==(const FogSettings&) const = default;
+};
+
 // Ground-truth ambient occlusion (screen space, indirect light only).
 struct AoSettings {
     bool          enabled      = true;
@@ -163,6 +185,21 @@ struct GpuDecal {
 };
 static_assert(sizeof(GpuDecal) == 192);
 
+// Volumetric fog boxes (FogVolume components).
+inline constexpr std::uint32_t kMaxFogVolumes  = 64;  // visible per frame
+inline constexpr std::uint32_t kFogTileSize    = 16;  // froxel width / height in pixels, mirrored in fog.glsl
+inline constexpr std::uint32_t kFogSlices      = 64;  // depth slices (quadratic distribution)
+
+// Mirrors GpuFogVolume in fog.glsl.
+struct GpuFogVolume {
+    glm::mat4 worldToLocal{1.0f};
+    glm::vec4 halfExtents{0.0f};   // xyz, w: edge fade (entity units)
+    glm::vec4 albedoDensity{0.0f}; // rgb albedo, a density
+    glm::vec4 emissive{0.0f};
+    glm::vec4 bounds{0.0f};        // world center, radius
+};
+static_assert(sizeof(GpuFogVolume) == 128);
+
 // Mirrors GpuShadowView in lights.glsl.
 struct GpuShadowView {
     glm::mat4 viewProj{1.0f};
@@ -201,6 +238,8 @@ struct SceneRenderStats {
     std::uint64_t triangles   = 0;
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
     std::uint32_t decals      = 0; // decals after frustum culling
+    std::uint32_t fogVolumes  = 0; // FogVolume boxes in the froxel grid this frame
+    glm::uvec3    fogGrid{0u};     // froxel grid (0 = volumetric fog off)
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
     std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
@@ -283,6 +322,7 @@ public:
     TaaSettings                           taa;
     DecalSettings                         decals;
     SsrSettings                           ssr;
+    FogSettings                           fog;
     // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
     const ParticleWorld*                  particles = nullptr;
 
@@ -293,7 +333,11 @@ public:
     [[nodiscard]] std::optional<Entity> TakePickResult() { return std::exchange(m_PickResult, std::nullopt); }
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
     // Camera cut (teleport, level change, play / stop): temporal history (TAA, reflections) restarts.
-    void ResetHistory() { m_HistoryValid = false; }
+    void ResetHistory()
+    {
+        m_HistoryValid    = false;
+        m_FogHistoryValid = false;
+    }
     // Bounds of the rendered scene (BVH), synced at the start of every Render: queries and raycasts.
     [[nodiscard]] const SpatialIndex&     Spatial() const { return m_Spatial; }
 
@@ -330,6 +374,11 @@ private:
     [[nodiscard]] std::uint32_t DecalTexture(const std::string& path, TextureKind kind); // table entry, ~0u: none
     void ReleaseUnusedDecalTextures();
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
+    void CollectFogVolumes(Scene& scene, const Frustum& frustum, const glm::vec3& cameraPosition);
+    void EnsureFogVolumes(VkExtent2D extent); // froxel grid for this output size
+    void ReleaseFogVolumes();
+    // After light culling (and all shadow maps), before the lighting pass.
+    void RenderFog(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
     bool EnsureShadowAtlas(); // true: (re)created, contents undefined
     void ReleaseShadowAtlas();
@@ -368,6 +417,7 @@ private:
     Pipeline            m_LightCull;
     Pipeline            m_Taa;
     Pipeline            m_SsrHiZ, m_SsrTrace, m_SsrResolve, m_SsrBlur;
+    Pipeline            m_FogInject, m_FogIntegrate;
     Buffer              m_Clusters; // per-cluster counts + light index lists (written by light_cull.comp)
 
     // Frame targets (recreated on resize).
@@ -398,6 +448,19 @@ private:
     std::uint32_t                m_SsrRawSampled = 0, m_SsrRawStorage = 0, m_SsrTempSampled = 0, m_SsrTempStorage = 0;
     std::array<std::uint32_t, 2> m_SsrHistorySampled{}, m_SsrHistoryStorage{};
     std::uint32_t                m_SsrIndex = 0;
+    // Volumetric fog (GENERAL): scattering + extinction per froxel (temporal ping-pong) and the
+    // integrated in-scattering + transmittance front to back.
+    std::array<Image, 2>         m_FogInjectVolume;
+    Image                        m_FogIntegrated;
+    std::array<std::uint32_t, 2> m_FogInjectSampled{}, m_FogInjectStorage{};
+    std::uint32_t                m_FogIntegratedSampled = 0, m_FogIntegratedStorage = 0;
+    std::uint32_t                m_FogIndex = 0;
+    bool                         m_FogHistoryValid = false;
+    bool                         m_FogLayoutReady  = false;
+    bool                         m_FogThisFrame    = false;
+    float                        m_FogPrevDistance = 0.0f; // grid depth of the history
+    FogSettings                  m_FogHistorySettings;     // settings the history was built with
+    std::vector<GpuFogVolume>    m_FogVolumes;
     bool                         m_SsrHistoryValid = false;
     bool                         m_SsrLayoutReady = false;
     bool                         m_SsrThisFrame = false;

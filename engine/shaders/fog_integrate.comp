@@ -1,0 +1,50 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+#include "fog.glsl"
+
+// Volumetric fog, step 2: front-to-back integration per froxel column (energy-conserving
+// in-scattering per slice, Hillaire 2015). Slice z: light scattered towards the camera and the
+// transmittance between the camera and the slice's far end.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform FogPush {
+    FrameData frame;
+    uint      source;       // this frame's scattering volume (sampled)
+    uint      target;       // integrated volume (storage)
+    uint      valid;
+    uint      gridX;
+    uint      gridY;
+    uint      gridZ;
+    float     feedback;
+    float     prevDistance;
+} pc;
+
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(id, uvec2(pc.gridX, pc.gridY))))
+        return;
+    FrameData   frame   = pc.frame;
+    const vec2  uv      = (vec2(id) + 0.5) / vec2(pc.gridX, pc.gridY) / frame.fogGrid.zw;
+    const float stretch = 1.0 / max(dot(FogRayDirection(frame, uv), FogForward(frame)), 1e-3); // ray length per view depth
+
+    vec3  scattered     = vec3(0.0);
+    float transmittance = 1.0;
+    float previous      = 0.0;
+    for (uint z = 0u; z < pc.gridZ; ++z) {
+        const float w      = float(z + 1u) / float(pc.gridZ);
+        const float depth  = frame.fogGrid.x * w * w;
+        const float length_ = (depth - previous) * stretch;
+        previous           = depth;
+        const vec4  v      = texelFetch(sampler3D(uVolumeTextures[nonuniformEXT(pc.source)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                        ivec3(id, z), 0);
+        const float sigma  = max(v.a, 1e-6);
+        const float t      = exp(-sigma * length_);
+        scattered += transmittance * (v.rgb - v.rgb * t) / sigma;
+        transmittance *= t;
+        imageStore(uStorageVolumes[nonuniformEXT(pc.target)], ivec3(id, z), vec4(scattered, transmittance));
+    }
+}
