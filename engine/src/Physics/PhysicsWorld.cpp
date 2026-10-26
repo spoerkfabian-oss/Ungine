@@ -1002,8 +1002,8 @@ struct PhysicsWorld::Impl {
                         hole ? JPH::HeightFieldShapeConstants::cNoCollisionValue : t.HeightAtSample(x, z);
                 }
             const float                   cell = t.CellSize();
-            JPH::HeightFieldShapeSettings settings(samples.data(), JPH::Vec3::sZero(), JPH::Vec3(cell, 1.0f, cell), n);
-            const JPH::ShapeSettings::ShapeResult result = settings.Create();
+            JPH::HeightFieldShapeSettings fieldSettings(samples.data(), JPH::Vec3::sZero(), JPH::Vec3(cell, 1.0f, cell), n);
+            const JPH::ShapeSettings::ShapeResult result = fieldSettings.Create(); // (not `settings`: MSVC C4458)
             if (result.HasError()) {
                 ENGINE_WARN("Physics: terrain height field: {}", result.GetError().c_str());
                 return;
