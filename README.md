@@ -151,6 +151,16 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     *Assign to selection* auf ein platziertes Modell (Komponente *Animation Controller*); gesteuert
     per Blueprint *Set Anim Float/Bool/Trigger*, Events per *On Anim Notify*. Beispiel: der Fuchs
     im Physics-Template (Gehen/Rennen nach Geschwindigkeit, Füße folgen dem Boden).
+21. **Bildqualität, Decals, Reflexionen, Nebel**: Im Renderer-Panel sind *Anti-aliasing (TAA)*
+    (glättet Kanten über mehrere Frames, mit Nachschärfen) und *Reflections (SSR)* (Spiegelungen
+    glatter Flächen aus dem Bild, sonst Himmel) standardmäßig an. *+ Add → Decal* projiziert eine
+    Textur (Albedo/Normal/Maske/Emissive, per Drag & Drop aus dem Content-Browser in den
+    Inspector) entlang −Z auf die Oberflächen in der Box; *Sort order* bestimmt, was oben liegt,
+    *Lifetime* lässt Decals im Spiel ausblenden (Blueprint *Spawn Decal at Location*). Unter *Fog*
+    wird Höhennebel eingeschaltet; *Volumetric* fügt Lichtstrahlen von Sonne und Lampen (mit
+    Schatten) hinzu, *+ Add → Fog Volume* setzt lokale Nebelboxen (auch leuchtend). Alle
+    Einstellungen werden mit der Szene gespeichert; die Toolbar *Volumes* zeigt Decal- und
+    Nebelboxen.
 
 
 ## Entwicklung

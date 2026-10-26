@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-25 (Phase 30 merged (PR #20, 0bf373e); `branch` restarted from main; Phase 31 TAA/decals/SSR/fog decisions taken, implementation on `branch`)
+- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog implemented on `branch`, PR pending)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1046,3 +1046,10 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
+
+### Phase 31 rendering (2026-10-26)
+Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".
+- TAA (Halton jitter, velocity target R16G16 from the prepass incl. skinning/particles/transparents, `taa.comp` resolve, unsharp mask in tonemap), Decal component + clustered decals (light_cull fills decal lists, applied before lighting), Hi-Z SSR (closest-depth pyramid, half res, temporal, roughness blur, IBL fallback), height fog + froxel volumetric fog (`fog_inject.comp` / `fog_integrate.comp`, bindless binding 5/6 = texture3D/image3D), FogVolume component, settings `taa/ssr/decals/fog` in scene files, editor sections/inspectors/overlay, Blueprint *Spawn Decal at Location*, cooker cooks decal textures with their kinds.
+- Gotchas found: llvmpipe speculatively loads from a null buffer reference even when the loop runs 0 times → never pass address 0 for lists read in loops (fog volumes get a dummy element); TAA jitter breaks pixel-exact frame comparisons (5 tests set `taa.enabled = false`); fog history must reset on settings change (else ~10 frames lag); shadow maps are now also read from compute (barrier stages extended).
+- Tests: CPU `tests/RenderingTests.cpp` (2), GPU `Render_TemporalAntiAliasing`, `Render_ClusteredDecals`, `Render_ScreenSpaceReflections`, `Render_HeightAndVolumetricFog`, `Editor_DecalsAndFogUi`.
+- Open: no TAA/SSR/fog player options, SSR only from on-screen data, decals only on opaque, fog volumes only boxes, orthographic cameras unsupported by fog reprojection.

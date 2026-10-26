@@ -4382,8 +4382,8 @@ TEST_CASE(Render_HeightAndVolumetricFog)
 
     // Particles / transparent pipelines and the sky still render valid images with fog (no NaN black).
     renderer.fog.density = 0.05f;
-    const auto final = RenderImage(renderer, scene, camera, 4);
-    CHECK(pixel(final, {20, 20}).b > 20);
+    const auto fogged = RenderImage(renderer, scene, camera, 4);
+    CHECK(pixel(fogged, {20, 20}).b > 20);
     F().assets->Release(floorModel);
     F().assets->Release(redBox);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
