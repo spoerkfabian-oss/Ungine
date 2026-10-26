@@ -607,7 +607,8 @@ double Now()
 
 std::string Key(const std::string& path)
 {
-    return path.empty() ? path : PathToUtf8(PathFromUtf8(path).lexically_normal());
+    // One entry per file: "C:/a/b" and "C:\\a\\b" (scene files vs. dialogs on Windows) must meet.
+    return path.empty() ? path : PathToUtf8(PathFromUtf8(path).lexically_normal().make_preferred());
 }
 
 constexpr std::size_t kMaxTrackedEdits = 256;

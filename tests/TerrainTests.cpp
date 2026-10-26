@@ -208,7 +208,7 @@ TEST_CASE(Terrain_StoreTracksEditsAndFiles)
     CHECK(LoadSceneFile(sceneFile, back, nullptr).empty());
     bool found = false;
     back.GetRegistry().ViewOf<Terrain>().Each([&](Entity, Terrain& bt) {
-        found = bt.data == path && !bt.castShadows && bt.lodDistance == 40.0f && bt.foliageDensity == 0.5f;
+        found = PathFromUtf8(bt.data).lexically_normal() == PathFromUtf8(path).lexically_normal() && !bt.castShadows && bt.lodDistance == 40.0f && bt.foliageDensity == 0.5f;
     });
     CHECK(found);
     store.Clear();
