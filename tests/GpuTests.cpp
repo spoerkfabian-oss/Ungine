@@ -4842,6 +4842,14 @@ TEST_CASE(Editor_TerrainToolsAndUndo)
         CHECK(!editor.TerrainToolActive() && !editor.ApplyTerrainStroke(point));
         editor.Stop();
         runFrames(2);
+        // New scene drops unsaved terrain edits (the file keeps its saved state).
+        editor.Select(terrain);
+        brush = TerrainBrush{.tool = TerrainTool::Raise, .radius = 8.0f, .strength = 1.0f};
+        CHECK(editor.ApplyTerrainStroke(point) && TerrainStore::Instance().Dirty(path));
+        editor.NewScene();
+        CHECK(!TerrainStore::Instance().Dirty(path));
+        const auto reloaded = TerrainStore::Instance().Get(path);
+        CHECK(reloaded && std::abs(TerrainHeight(*reloaded, center) - raised) < 1e-3f);
     }
     TerrainStore::Instance().Clear();
     fs::current_path(previous);

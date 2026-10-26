@@ -161,6 +161,16 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Schatten) hinzu, *+ Add → Fog Volume* setzt lokale Nebelboxen (auch leuchtend). Alle
     Einstellungen werden mit der Szene gespeichert; die Toolbar *Volumes* zeigt Decal- und
     Nebelboxen.
+22. **Terrain**: *+ Add → Terrain* (oder Content-Browser *+ New → Terrain*, `.uterrain` per
+    Doppelklick/Drag & Drop platzieren) legt ein 128-m-Terrain an. Im Fenster *Terrain* (bei
+    ausgewähltem Terrain) gibt es Pinsel *Raise/Lower/Smooth/Flatten* (Shift+Klick nimmt die
+    Flatten-Höhe), *Paint* (Layer in der Liste wählen), *Holes* und *Foliage*; Strg kehrt um
+    (senken/radieren), jeder Strich ist ein Undo-Schritt. Layer haben Albedo/Normal/ORM-Texturen
+    (Drag & Drop aus dem Content-Browser), Tint, Kachelung; steile Hänge werden triplanar
+    projiziert. Foliage-Layer sind prozedurale Grashalme, Textur-Karten oder Meshes (Dichte,
+    Größe, Wind, Sichtweite). Heightmaps (16-Bit-PNG/RAW) per *Import/Export*. Das Terrain
+    kollidiert (Physik), dient als Navmesh-Quelle und wird beim Speichern der Szene mitgespeichert;
+    Blueprint *Get Terrain Height* liefert Höhe und Normale.
 
 
 ## Entwicklung

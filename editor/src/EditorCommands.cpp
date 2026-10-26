@@ -374,6 +374,7 @@ void Editor::RequestSceneChange(std::function<void()> action)
 
 void Editor::NewScene()
 {
+    DiscardTerrainEdits(); // asked before (RequestSceneChange); the files keep their saved state
     if (m_Ctx.streaming)
         m_Ctx.streaming->Reset(); // previews go with the scene
     m_Ctx.scene.Clear();
@@ -383,7 +384,6 @@ void Editor::NewScene()
     if (m_Ctx.animation)
         m_Ctx.animation->Reset();
     ReleaseModelRefs();
-    DiscardTerrainEdits(); // asked before (RequestSceneChange); the files keep their saved state
     m_History->Clear();
     m_Selection.clear();
     m_GizmoEdit.reset();

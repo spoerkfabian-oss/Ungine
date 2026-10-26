@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog implemented on `branch`, PR pending)
+- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog + Phase 32 terrain on `branch`, both in PR #21 (open, user merges); next: Phase 33 material editor – ask details first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1051,7 +1051,11 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
 - Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
 - Splat layers (up to 8: albedo/normal/ORM) + editor painting and sculpting (raise/lower/smooth/flatten) with undo; foliage/grass (instanced, density maps painted, culling, wind); heightmap import/export (16-bit PNG/RAW); holes mask + triplanar on steep slopes.
-- Progress: P32a data (`Terrain/TerrainData.h`, `TerrainStore`), P32b CDLOD renderer (`src/Renderer/TerrainRenderer`, shared `shading.glsl`/`ShadeSurface`), P32c physics (Jolt HeightField; a sample is no-collision only if all 4 surrounding cells are holes → 1-cell holes stay solid) + nav source (triangles per tile clip, signature = hash of heights/holes) + CPU `tests/TerrainTests.cpp` (4), P32d foliage (`foliage.glsl`, 16-m chunks scattered on the CPU, shuffled so a prefix = thinning; heights/holes/slope resolved in the shader; GPU `Render_TerrainFoliage`) done and pushed to `branch` (PR #21). Next: P32e editor/cooker/Blueprint/player, P32f verification/docs.
+- Done (2026-10-26), in PR #21 together with Phase 31. Technical details: CLAUDE.md "Terrain (Phase 32)".
+- Key design: one shared `TerrainStore` copy per path (renderer/physics/nav/editor), edits report kinds + normalized rects (`MarkDirty`; kinds 0 = live values only); renderer uploads only changed rects; foliage scattered per 16 m chunk on the CPU but placed/culled by height/holes/slope in the shader; editor strokes = one undo step each (`CaptureTerrainRegion`), window field edits commit when no widget is active (baseline reset by the terrain undo lambdas, not by history revision).
+- Gotchas: Jolt height-field holes are per vertex (sample removed only if all 4 cells are holes); hole mask stores 1 (shader threshold > 0.001); staging memory reuse needs an execution barrier (sync-val WAR); foliage mesh frame must be a rotation (z → +facing), else lighting is mirrored.
+- Tests: CPU `tests/TerrainTests.cpp` (6), GPU `Render_TerrainCdlodLayersAndEdits`, `Render_TerrainFoliage`, `Editor_TerrainToolsAndUndo`.
+- Open: see CLAUDE.md open point 24 (single grid, fixed resolution, CPU scatter, no wind zones, binary file paths not repaired on move).
 
 ### Phase 31 rendering (2026-10-26)
 Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".
