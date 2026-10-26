@@ -4837,13 +4837,14 @@ TEST_CASE(Editor_TerrainToolsAndUndo)
         CHECK(!editor.TerrainToolActive());
         // Play: no brushes.
         editor.SetTerrainToolEnabled(true);
+        const std::uint64_t terrainUuid = scene.GetRegistry().Get<Uuid>(terrain).value;
         editor.Play();
         runFrames(2);
         CHECK(!editor.TerrainToolActive() && !editor.ApplyTerrainStroke(point));
         editor.Stop();
         runFrames(2);
         // New scene drops unsaved terrain edits (the file keeps its saved state).
-        editor.Select(terrain);
+        editor.Select(scene.FindByUuid(terrainUuid)); // stop re-created the entities
         brush = TerrainBrush{.tool = TerrainTool::Raise, .radius = 8.0f, .strength = 1.0f};
         CHECK(editor.ApplyTerrainStroke(point) && TerrainStore::Instance().Dirty(path));
         editor.NewScene();
