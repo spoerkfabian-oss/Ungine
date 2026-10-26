@@ -43,6 +43,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     // Temporal anti-aliasing
     vec4  taaInfo;  // xy: this frame's jitter (NDC), z: frame time (s), w: frame counter
     uvec4 decalInfo; // x: decal count (0 = no decals this frame)
+    uvec4 ssrInfo;   // x: reflection texture slot (half resolution), y: enabled this frame
+    vec4  ssrParams; // x: intensity, zw: 1 / output size
 
     LightBuffer      lights;
     ClusterBuffer    clusters;

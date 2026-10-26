@@ -4190,3 +4190,64 @@ TEST_CASE(Render_ClusteredDecals)
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
+
+TEST_CASE(Render_ScreenSpaceReflections)
+{
+    // A mirror-like floor in front of a red box: with SSR the floor shows the box (red), without
+    // it only the IBL (sky). Rough floors keep the IBL; the debug view shows the reflection buffer.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle mirror = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 10.0f,
+                                                             .baseColor = {0.9f, 0.9f, 0.9f, 1.0f}, .metallic = 1.0f,
+                                                             .roughness = 0.05f});
+    const ModelHandle redBox = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f,
+                                                             .baseColor = {1.0f, 0.05f, 0.05f, 1.0f}, .metallic = 0.0f,
+                                                             .roughness = 0.8f});
+    CHECK(F().Pump([&] { return Settled(mirror) && Settled(redBox); }));
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity floor = scene.CreateEntity("Floor");
+    r.Emplace<MeshRenderer>(floor, MeshRenderer{.model = mirror, .meshIndex = 0});
+    const Entity box = scene.CreateEntity("Box");
+    r.Emplace<MeshRenderer>(box, MeshRenderer{.model = redBox, .meshIndex = 0});
+    scene.EditTransform(box).position = {0.0f, 0.5f, 0.0f};
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    const glm::vec3  eye{0.0f, 1.5f, 4.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const glm::ivec2 reflection = project({0.0f, 0.0f, 0.9f}); // the floor point that mirrors the box front
+
+    renderer.ssr.enabled = false;
+    const glm::ivec3 ibl = pixel(RenderImage(renderer, scene, camera, 8), reflection);
+    renderer.ssr.enabled = true;
+    const glm::ivec3 ssr = pixel(RenderImage(renderer, scene, camera, 12), reflection);
+    renderer.post.debugView = DebugView::Reflections;
+    const glm::ivec3 buffer = pixel(RenderImage(renderer, scene, camera, 1), reflection);
+    renderer.post.debugView = DebugView::None;
+    std::printf("    floor mirror: IBL %d %d %d, SSR %d %d %d, buffer %d %d %d\n", ibl.r, ibl.g, ibl.b, ssr.r, ssr.g, ssr.b,
+                buffer.r, buffer.g, buffer.b);
+    CHECK(ssr.r > ssr.b + 40 && ssr.r > ibl.r);   // the red box in the floor
+    CHECK(ibl.b >= ibl.r);                        // without SSR: the sky
+    CHECK(buffer.r > buffer.g + 30);
+
+    // A rough floor (beyond maxRoughness) keeps the IBL only.
+    renderer.ssr.maxRoughness = 0.02f;
+    const glm::ivec3 rough = pixel(RenderImage(renderer, scene, camera, 8), reflection);
+    CHECK(std::abs(rough.r - ibl.r) < 12 && std::abs(rough.b - ibl.b) < 12);
+    F().assets->Release(mirror);
+    F().assets->Release(redBox);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}

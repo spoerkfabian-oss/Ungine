@@ -36,8 +36,9 @@ enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirr
 
 // tonemap.frag. HiZ: occlusion pyramid (level CullingSettings::hizDebugLevel), Culling: draws that
 // only the late (occlusion) pass found visible are tinted orange. Velocity: motion vectors.
+// Reflections: the screen-space reflection buffer (rgb, confidence as brightness overlay).
 enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod,
-                                       Velocity, Count };
+                                       Velocity, Reflections, Count };
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -68,6 +69,19 @@ struct TaaSettings {
     bool  enabled   = true;
     float feedback  = 0.9f;  // history weight: higher = smoother, more ghosting on fast changes
     float sharpness = 0.25f; // unsharp mask in the tone mapping pass (0 = off)
+};
+
+// Screen-space reflections: mirror rays through a closest-depth pyramid (half resolution), color
+// from last frame's image, temporal accumulation, roughness-dependent blur. Replaces the IBL
+// reflection where a ray found something (confidence), the IBL stays the fallback.
+struct SsrSettings {
+    bool          enabled      = true;
+    float         intensity    = 1.0f;
+    float         maxRoughness = 0.5f;  // rougher surfaces keep the IBL reflection only
+    float         thickness    = 0.3f;  // meters behind a surface that still count as a hit
+    float         maxDistance  = 40.0f; // meters
+    std::uint32_t maxSteps     = 64;    // traversal steps per ray
+    float         feedback     = 0.85f; // temporal history weight
 };
 
 // Ground-truth ambient occlusion (screen space, indirect light only).
@@ -268,6 +282,7 @@ public:
     CullingSettings                       culling;
     TaaSettings                           taa;
     DecalSettings                         decals;
+    SsrSettings                           ssr;
     // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
     const ParticleWorld*                  particles = nullptr;
 
@@ -331,6 +346,8 @@ private:
     void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress, std::uint32_t frameIndex);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
     void RenderTaa(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
+    // Before the lighting pass: needs depth, normals + roughness, motion vectors, last frame's image.
+    void RenderSsr(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
     void ReadExposure(std::uint32_t frameIndex);
@@ -350,6 +367,7 @@ private:
     Pipeline            m_Prepass, m_Gtao, m_GtaoDenoise, m_Histogram, m_ExposureAverage;
     Pipeline            m_LightCull;
     Pipeline            m_Taa;
+    Pipeline            m_SsrHiZ, m_SsrTrace, m_SsrResolve, m_SsrBlur;
     Buffer              m_Clusters; // per-cluster counts + light index lists (written by light_cull.comp)
 
     // Frame targets (recreated on resize).
@@ -372,6 +390,19 @@ private:
     std::uint32_t                m_ResolvedSlot = 0; // this frame's image for bloom / exposure / tone mapping
     std::uint64_t                m_FrameCounter = 0;
     std::optional<glm::mat4>     m_PrevViewProj; // last frame's camera without jitter
+    bool                         m_PrevHdrValid = false; // m_Hdr holds last frame's image (SSR without TAA)
+    // Screen-space reflections (half resolution, GENERAL): raw rays, temporal history ping-pong,
+    // blur temp; the result ends up in m_SsrRaw (sampled by the lighting pass).
+    Image                        m_SsrRaw, m_SsrTemp;
+    std::array<Image, 2>         m_SsrHistory;
+    std::uint32_t                m_SsrRawSampled = 0, m_SsrRawStorage = 0, m_SsrTempSampled = 0, m_SsrTempStorage = 0;
+    std::array<std::uint32_t, 2> m_SsrHistorySampled{}, m_SsrHistoryStorage{};
+    std::uint32_t                m_SsrIndex = 0;
+    bool                         m_SsrHistoryValid = false;
+    bool                         m_SsrLayoutReady = false;
+    bool                         m_SsrThisFrame = false;
+    Buffer                       m_SsrPyramid;
+    std::uint32_t                m_SsrLevels = 0;
     Image                      m_AoRaw, m_Ao;
     std::uint32_t              m_NormalSlot = 0;
     std::uint32_t              m_AoRawSampled = 0, m_AoRawStorage = 0, m_AoSampled = 0, m_AoStorage = 0;

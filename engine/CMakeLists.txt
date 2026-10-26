@@ -120,6 +120,7 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/scene_common.glsl
     shaders/include/shadow.glsl
     shaders/include/sky.glsl
+    shaders/include/ssr.glsl
     shaders/include/surface.glsl)
 target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
 set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -151,6 +152,10 @@ engine_add_shaders(Engine SOURCES
     shaders/particle_ribbon.vert
     shaders/scatter.comp
     shaders/taa.comp
+    shaders/ssr_hiz.comp
+    shaders/ssr_trace.comp
+    shaders/ssr_resolve.comp
+    shaders/ssr_blur.comp
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

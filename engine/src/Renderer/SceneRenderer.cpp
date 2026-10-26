@@ -58,6 +58,8 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::uvec4 hizInfo;           // xy: Hi-Z level 0 size, z: levels, w: debug level
     glm::vec4  taaInfo;           // xy: jitter (NDC), z: frame time, w: frame counter
     glm::uvec4 decalInfo;         // x: decal count
+    glm::uvec4 ssrInfo;           // x: reflection slot, y: enabled
+    glm::vec4  ssrParams;         // x: intensity, zw: 1 / output size
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
     VkDeviceAddress shadowViews;
@@ -111,6 +113,35 @@ glm::vec2 HaltonJitter(std::uint64_t frame)
     const auto index = static_cast<std::uint32_t>(frame % 8) + 1;
     return {halton(index, 2) - 0.5f, halton(index, 3) - 0.5f};
 }
+
+struct SsrPush { // mirrors SsrPush in ssr.glsl
+    VkDeviceAddress frame;
+    VkDeviceAddress pyramid;
+    glm::uvec2      fullSize;
+    glm::uvec2      size;
+    std::uint32_t   levels;
+    std::uint32_t   depth;
+    std::uint32_t   normals;
+    std::uint32_t   velocity;
+    std::uint32_t   source;
+    std::uint32_t   history;
+    std::uint32_t   target;
+    std::uint32_t   mode;
+    float           maxRoughness;
+    float           thickness;
+    float           maxDistance;
+    float           feedback;
+};
+static_assert(sizeof(SsrPush) <= kPushConstantSize);
+
+struct SsrHiZPush { // mirrors SsrHiZPush in ssr_hiz.comp
+    VkDeviceAddress src;
+    VkDeviceAddress dst;
+    glm::uvec2      srcSize;
+    glm::uvec2      dstSize;
+    std::uint32_t   depthSlot;
+    std::uint32_t   fromDepth;
+};
 
 struct TonemapPush { // mirrors TonemapPush in tonemap.frag
     VkDeviceAddress state;
@@ -259,6 +290,7 @@ const char* ToString(DebugView v)
     case DebugView::Culling:          return "Culling (late = orange)";
     case DebugView::Lod:              return "LOD (1 green, 2 yellow, 3 red)";
     case DebugView::Velocity:         return "Motion vectors";
+    case DebugView::Reflections:      return "Reflections (SSR)";
     default:                          return "?";
     }
 }
@@ -304,7 +336,8 @@ void SceneRenderer::CreatePipelines()
     // Built completely before anything is replaced: a failure keeps the old pipelines.
     struct {
         Pipeline Prepass, PrepassPicking, Mesh, Sky, Shadow, ShadowMasked, LocalShadow, LocalShadowMasked, BloomDown,
-            BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull, MeshBlend, Taa;
+            BloomUp, Gtao, GtaoDenoise, Histogram, ExposureAverage, LightCull, MeshBlend, Taa, SsrHiZ, SsrTrace, SsrResolve,
+            SsrBlur;
     } built;
     const VkDevice         device = m_Renderer.GetContext().Device();
     const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
@@ -403,6 +436,10 @@ void SceneRenderer::CreatePipelines()
     built.ExposureAverage = compute("exposure_average.comp.spv", "ExposureAverage");
     built.LightCull       = compute("light_cull.comp.spv", "LightCull");
     built.Taa             = compute("taa.comp.spv", "TemporalAA");
+    built.SsrHiZ          = compute("ssr_hiz.comp.spv", "SsrDepthPyramid");
+    built.SsrTrace        = compute("ssr_trace.comp.spv", "SsrTrace");
+    built.SsrResolve      = compute("ssr_resolve.comp.spv", "SsrResolve");
+    built.SsrBlur         = compute("ssr_blur.comp.spv", "SsrBlur");
 
 
     const auto replace = [&](Pipeline& current, Pipeline& fresh) {
@@ -427,6 +464,10 @@ void SceneRenderer::CreatePipelines()
     replace(m_LightCull, built.LightCull);
     replace(m_MeshBlend, built.MeshBlend);
     replace(m_Taa, built.Taa);
+    replace(m_SsrHiZ, built.SsrHiZ);
+    replace(m_SsrTrace, built.SsrTrace);
+    replace(m_SsrResolve, built.SsrResolve);
+    replace(m_SsrBlur, built.SsrBlur);
     for (auto& [format, pipeline] : m_Tonemap) // rebuilt on demand
         m_Renderer.DeferRelease(std::move(pipeline));
     m_Tonemap.clear();
@@ -459,10 +500,13 @@ SceneRenderer::~SceneRenderer()
         m_Renderer.DeferRelease(std::move(pipeline));
     for (Pipeline* p : {&m_Mesh, &m_Sky, &m_Shadow, &m_ShadowMasked, &m_BloomDown, &m_BloomUp,
                         &m_Prepass, &m_Gtao, &m_GtaoDenoise, &m_Histogram, &m_ExposureAverage, &m_LightCull,
-                        &m_LocalShadow, &m_LocalShadowMasked, &m_PrepassPicking, &m_MeshBlend, &m_Taa})
+                        &m_LocalShadow, &m_LocalShadowMasked, &m_PrepassPicking, &m_MeshBlend, &m_Taa, &m_SsrHiZ,
+                        &m_SsrTrace, &m_SsrResolve, &m_SsrBlur})
         m_Renderer.DeferRelease(std::move(*p));
     m_Renderer.DeferRelease(std::move(m_Clusters));
     m_Renderer.DeferRelease(std::move(m_DecalClusters));
+    if (m_SsrPyramid)
+        m_Renderer.DeferRelease(std::move(m_SsrPyramid));
     for (auto& [key, entry] : m_DecalTextures)
         m_Assets.Release(entry.handle);
     m_DecalTextures.clear();
@@ -481,8 +525,10 @@ void SceneRenderer::ReleaseTargets()
     std::vector<std::uint32_t> sampled = m_BloomSampled;
     std::vector<std::uint32_t> storage = m_BloomStorage;
     sampled.insert(sampled.end(), {m_DepthSlot, m_HdrSlot, m_NormalSlot, m_AoRawSampled, m_AoSampled, m_VelocitySlot,
-                                   m_HistorySampled[0], m_HistorySampled[1]});
-    storage.insert(storage.end(), {m_AoRawStorage, m_AoStorage, m_HistoryStorage[0], m_HistoryStorage[1]});
+                                   m_HistorySampled[0], m_HistorySampled[1], m_SsrRawSampled, m_SsrTempSampled,
+                                   m_SsrHistorySampled[0], m_SsrHistorySampled[1]});
+    storage.insert(storage.end(), {m_AoRawStorage, m_AoStorage, m_HistoryStorage[0], m_HistoryStorage[1], m_SsrRawStorage,
+                                   m_SsrTempStorage, m_SsrHistoryStorage[0], m_SsrHistoryStorage[1]});
     r->DeferCall([r, sampled = std::move(sampled), storage = std::move(storage)] {
         BindlessRegistry& b = r->GetBindless();
         for (std::uint32_t s : sampled)
@@ -491,10 +537,14 @@ void SceneRenderer::ReleaseTargets()
             b.RemoveStorageImage(s);
     });
     r->DeferRelease(std::move(m_BloomViews));
-    for (Image* image : {&m_Depth, &m_Bloom, &m_Hdr, &m_Normals, &m_AoRaw, &m_Ao, &m_Velocity, &m_History[0], &m_History[1]})
+    for (Image* image : {&m_Depth, &m_Bloom, &m_Hdr, &m_Normals, &m_AoRaw, &m_Ao, &m_Velocity, &m_History[0], &m_History[1],
+                         &m_SsrRaw, &m_SsrTemp, &m_SsrHistory[0], &m_SsrHistory[1]})
         r->DeferRelease(std::move(*image));
     m_HistoryValid       = false;
     m_HistoryLayoutReady = false;
+    m_PrevHdrValid       = false;
+    m_SsrHistoryValid    = false;
+    m_SsrLayoutReady     = false;
     m_BloomViews.clear();
     m_BloomSampled.clear();
     m_BloomStorage.clear();
@@ -546,6 +596,22 @@ void SceneRenderer::EnsureTargets(VkExtent2D extent)
                                  .usage     = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                  .debugName = "MotionVectors"});
     m_VelocitySlot = bindless.AddSampledImage(m_Velocity.View());
+    // Reflections at half resolution (rounded up), always GENERAL.
+    const VkExtent2D halfSize = MipExtent({extent.width + 1, extent.height + 1}, 1);
+    const auto makeSsr = [&](const char* name, std::uint32_t& sampledSlot, std::uint32_t& storageSlot) {
+        Image image = Image(ctx, {.extent    = {halfSize.width, halfSize.height, 1},
+                                  .format    = kHdrFormat,
+                                  .usage     = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                  .debugName = name});
+        sampledSlot = bindless.AddSampledImage(image.View(), VK_IMAGE_LAYOUT_GENERAL);
+        storageSlot = bindless.AddStorageImage(image.View());
+        return image;
+    };
+    m_SsrRaw        = makeSsr("SsrRaw", m_SsrRawSampled, m_SsrRawStorage);
+    m_SsrTemp       = makeSsr("SsrTemp", m_SsrTempSampled, m_SsrTempStorage);
+    m_SsrHistory[0] = makeSsr("SsrHistory", m_SsrHistorySampled[0], m_SsrHistoryStorage[0]);
+    m_SsrHistory[1] = makeSsr("SsrHistory", m_SsrHistorySampled[1], m_SsrHistoryStorage[1]);
+
     for (std::uint32_t i = 0; i < 2; ++i) { // TAA history: storage writes, sampled reads, always GENERAL
         m_History[i]        = Image(ctx, {.extent    = {extent.width, extent.height, 1},
                                           .format    = kHdrFormat,
@@ -983,6 +1049,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     const float clusterFar   = std::max(lights.clusterFar, clusterNear * 2.0f);
     const float sliceScale   = static_cast<float>(kClusterGridZ) / std::log(clusterFar / clusterNear);
     const float sliceBias    = -std::log(clusterNear) * sliceScale;
+    // Reflections need last frame's image: the TAA history, else the HDR target (still unchanged).
+    m_SsrThisFrame = ssr.enabled && ssr.intensity > 0.0f && (taa.enabled ? m_HistoryValid : m_PrevHdrValid);
 
     FrameUniforms   uniforms{
           .viewProj       = viewProj,
@@ -1014,6 +1082,9 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .hizInfo         = glm::uvec4(m_GpuCulling->HiZSize(), m_GpuCulling->HiZLevels(), culling.hizDebugLevel),
           .taaInfo         = glm::vec4(jitter, deltaTime, static_cast<float>(m_FrameCounter % 1024)),
           .decalInfo       = glm::uvec4(static_cast<std::uint32_t>(m_Decals.size()), 0u, 0u, 0u),
+          .ssrInfo         = glm::uvec4(m_SsrRawSampled, m_SsrThisFrame ? 1u : 0u, 0u, 0u),
+          .ssrParams       = glm::vec4(std::max(ssr.intensity, 0.0f), 0.0f, 1.0f / static_cast<float>(extent.width),
+                                       1.0f / static_cast<float>(extent.height)),
           .lights          = lightAddress,
           .clusters        = m_Clusters.Address(),
           .shadowViews     = shadowViewAddress,
@@ -1068,10 +1139,17 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GpuScope scope(profiler, cmd, "Light + decal culling");
         CullLights(cmd, frameAddress);
     }
+    if (m_SsrThisFrame) {
+        GpuScope scope(profiler, cmd, "Reflections");
+        RenderSsr(cmd, extent, frameAddress);
+    } else {
+        m_SsrHistoryValid = false;
+    }
     {
         GpuScope scope(profiler, cmd, "Lighting + sky");
         RenderMain(cmd, extent, frameAddress, frame.frameIndex);
     }
+    m_PrevHdrValid = true;
 
     // HDR -> sampled by bloom (compute) and tone mapping (fragment).
     CmdImageBarrier(cmd, {.image     = m_Hdr.Handle(),
@@ -1160,6 +1238,7 @@ std::uint32_t SceneRenderer::DebugTexture() const
     case DebugView::Normals:       return m_NormalSlot;
     case DebugView::LightClusters: return m_DepthSlot;
     case DebugView::Velocity:      return m_VelocitySlot;
+    case DebugView::Reflections:   return m_SsrRawSampled;
     case DebugView::ShadowAtlas:
         return m_ShadowAtlasWritten ? m_ShadowAtlasSlot : m_Renderer.DefaultTextureIndex(DefaultTexture::Black);
     default:                       return m_AoSampled;
@@ -2035,6 +2114,103 @@ void SceneRenderer::RenderTaa(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAd
     m_ResolvedSlot = m_HistorySampled[target];
     m_HistoryIndex = source;
     m_HistoryValid = true;
+}
+
+void SceneRenderer::RenderSsr(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress)
+{
+    const auto&            bindless = m_Renderer.GetBindless();
+    const VkPipelineLayout layout   = bindless.PipelineLayout();
+    constexpr auto         kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    constexpr auto         kRW      = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+    // Closest-depth pyramid: level 0 = full resolution, then halved down to 1 x 1.
+    std::vector<glm::uvec2> sizes{glm::uvec2(extent.width, extent.height)};
+    while (sizes.back().x > 1 || sizes.back().y > 1)
+        sizes.push_back(glm::max((sizes.back() + 1u) / 2u, glm::uvec2(1)));
+    VkDeviceSize total = 0;
+    for (const glm::uvec2& s : sizes)
+        total += VkDeviceSize{s.x} * s.y;
+    if (!m_SsrPyramid || m_SsrPyramid.Size() < total * sizeof(float)) {
+        if (m_SsrPyramid)
+            m_Renderer.DeferRelease(std::move(m_SsrPyramid));
+        m_SsrPyramid = Buffer(m_Renderer.GetContext(), {.size = total * sizeof(float), .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                        .debugName = "SsrDepthPyramid"});
+    }
+    m_SsrLevels = static_cast<std::uint32_t>(sizes.size());
+
+    // Earlier frames read the pyramid and the targets (compute, lighting, debug view): WAR.
+    MemoryBarrier(cmd, kCompute | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, kRW);
+    if (!m_SsrLayoutReady) {
+        for (const Image* image : {&m_SsrRaw, &m_SsrTemp, &m_SsrHistory[0], &m_SsrHistory[1]})
+            CmdImageBarrier(cmd, {.image     = image->Handle(),
+                                  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                  .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                  .srcStage  = kCompute | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                  .dstStage  = kCompute,
+                                  .dstAccess = kRW});
+        m_SsrLayoutReady  = true;
+        m_SsrHistoryValid = false;
+    }
+    bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SsrHiZ.Handle());
+    VkDeviceSize offset = 0;
+    for (std::size_t level = 0; level < sizes.size(); ++level) {
+        const VkDeviceSize previous = level > 0 ? offset - VkDeviceSize{sizes[level - 1].x} * sizes[level - 1].y : 0;
+        const SsrHiZPush push{.src       = m_SsrPyramid.Address() + previous * sizeof(float),
+                              .dst       = m_SsrPyramid.Address() + offset * sizeof(float),
+                              .srcSize   = level == 0 ? sizes[0] : sizes[level - 1],
+                              .dstSize   = sizes[level],
+                              .depthSlot = m_DepthSlot,
+                              .fromDepth = level == 0 ? 1u : 0u};
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (sizes[level].x + 7) / 8, (sizes[level].y + 7) / 8, 1);
+        MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        offset += VkDeviceSize{sizes[level].x} * sizes[level].y;
+    }
+
+    const VkExtent2D half = m_SsrRaw.Extent2D();
+    const std::uint32_t target = m_SsrIndex, source = target ^ 1u;
+    SsrPush push{.frame        = frameAddress,
+                 .pyramid      = m_SsrPyramid.Address(),
+                 .fullSize     = {extent.width, extent.height},
+                 .size         = {half.width, half.height},
+                 .levels       = m_SsrLevels,
+                 .depth        = m_DepthSlot,
+                 .normals      = m_NormalSlot,
+                 .velocity     = m_VelocitySlot,
+                 .source       = taa.enabled ? m_HistorySampled[m_HistoryIndex ^ 1u] : m_HdrSlot, // last frame
+                 .history      = 0,
+                 .target       = m_SsrRawStorage,
+                 .mode         = std::clamp(ssr.maxSteps, 8u, 256u),
+                 .maxRoughness = std::clamp(ssr.maxRoughness, 0.05f, 1.0f),
+                 .thickness    = std::max(ssr.thickness, 0.01f),
+                 .maxDistance  = std::max(ssr.maxDistance, 0.5f),
+                 .feedback     = std::clamp(ssr.feedback, 0.0f, 0.98f)};
+    const auto dispatch = [&](const Pipeline& pipeline) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle());
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (half.width + 7) / 8, (half.height + 7) / 8, 1);
+        MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kCompute, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    };
+    dispatch(m_SsrTrace);
+    push.source  = m_SsrRawSampled; // temporal accumulation
+    push.history = m_SsrHistorySampled[source];
+    push.target  = m_SsrHistoryStorage[target];
+    push.mode    = m_SsrHistoryValid ? 1u : 0u;
+    dispatch(m_SsrResolve);
+    push.source = m_SsrHistorySampled[target]; // blur: horizontal, then vertical into the result
+    push.target = m_SsrTempStorage;
+    push.mode   = 0;
+    dispatch(m_SsrBlur);
+    push.source = m_SsrTempSampled;
+    push.target = m_SsrRawStorage;
+    push.mode   = 1;
+    dispatch(m_SsrBlur);
+    MemoryBarrier(cmd, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    m_SsrIndex        = source;
+    m_SsrHistoryValid = true;
 }
 
 void SceneRenderer::RenderBloom(VkCommandBuffer cmd)

@@ -172,6 +172,11 @@ void main()
         outColor = vec4(pc.debugView == 1u ? v.rrr : v * 0.5 + 0.5, 1.0);
         return;
     }
+    if (pc.debugView == 9u) { // reflections: color x confidence (black = IBL fallback)
+        const vec2 size = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
+        const vec4 s    = SampleTextureLod(pc.debugTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size, 0.0);
+        hdr = s.rgb * s.a;
+    }
     hdr *= pc.autoExposure != 0u ? pc.state.exposure : pc.exposure;
     vec3 ldr;
     switch (pc.tonemapper) {

@@ -1,0 +1,50 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+#include "ssr.glsl"
+
+// Roughness-dependent blur of the resolved reflections (separable, depth-aware): glossy surfaces
+// get wider kernels, mirrors stay sharp. Weighted by confidence so misses do not darken hits.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+ivec2 Full(ivec2 p)
+{
+    return min(p * 2, ivec2(pc.fullSize) - 1);
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(pixel), pc.size)))
+        return;
+    const float roughness = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.normals)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                       Full(pixel), 0).a;
+    const float depth     = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depth)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                       Full(pixel), 0).r;
+    const vec4  center    = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.source)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                       pixel, 0);
+    const int   radius    = int(round(clamp(roughness / max(pc.maxRoughness, 1e-3), 0.0, 1.0) * 6.0));
+    if (radius == 0 || depth <= 0.0) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, center);
+        return;
+    }
+    const ivec2 axis = pc.mode == 0u ? ivec2(1, 0) : ivec2(0, 1);
+    vec3  color = vec3(0.0);
+    float confidence = 0.0, weights = 0.0, colorWeights = 0.0;
+    const float sigma = float(radius) * 0.5 + 0.5;
+    for (int i = -radius; i <= radius; ++i) {
+        const ivec2 p = clamp(pixel + axis * i, ivec2(0), ivec2(pc.size) - 1);
+        const vec4  s = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.source)], uSamplers[SAMPLER_NEAREST_CLAMP]), p, 0);
+        const float d = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depth)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                   Full(p), 0).r;
+        const float w = exp(-float(i * i) / (2.0 * sigma * sigma)) * (abs(d - depth) <= depth * 0.05 ? 1.0 : 0.0);
+        color        += s.rgb * s.a * w;
+        colorWeights += s.a * w;
+        confidence   += s.a * w;
+        weights      += w;
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel,
+               vec4(colorWeights > 1e-5 ? color / colorWeights : center.rgb, weights > 0.0 ? confidence / weights : center.a));
+}

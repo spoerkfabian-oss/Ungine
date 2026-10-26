@@ -118,7 +118,13 @@ void main()
 
     const vec3  R          = reflect(-V, N);
     const float maxLod     = float(frame.ibl.w - 1u);
-    const vec3  radiance   = SampleCube(frame.ibl.y, SAMPLER_LINEAR_CLAMP, R, roughness * maxLod).rgb;
+    vec3        radiance   = SampleCube(frame.ibl.y, SAMPLER_LINEAR_CLAMP, R, roughness * maxLod).rgb;
+#ifndef MESH_BLEND // screen-space reflections of the opaque surface; the IBL fills where rays miss
+    if (frame.ssrInfo.y != 0u) {
+        const vec4 ssr = SampleTextureLod(frame.ssrInfo.x, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy * frame.ssrParams.zw, 0.0);
+        radiance = mix(radiance, ssr.rgb, clamp(ssr.a * frame.ssrParams.x, 0.0, 1.0));
+    }
+#endif
     const vec3  irradiance = SampleCube(frame.ibl.x, SAMPLER_LINEAR_CLAMP, N, 0.0).rgb;
 
     // Ambient occlusion (indirect light only): material AO and screen-space GTAO combined by min.
