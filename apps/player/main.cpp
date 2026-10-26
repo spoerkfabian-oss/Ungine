@@ -8,6 +8,7 @@
 #include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
+#include "Engine/Scene/Decals.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Core/GameOptions.h"
@@ -185,6 +186,7 @@ protected:
         m_Particles->Reset();
         m_Navigation->Reset();
         m_Animation->Reset();
+        m_SceneRenderer->ResetHistory(); // camera cut
         const std::vector<ModelHandle> previous = std::exchange(m_Models, {}); // released after the new level holds its models
         try {
             (void)InstantiatePreparedScene(*result->scene, m_Scene, &GetAssets(), result->models,
@@ -304,8 +306,10 @@ protected:
         const CameraData view = m_FallbackCamera.GetData(1.0f);
         m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
         // Agents after the scripts gave their orders (characters: input for the next physics steps).
-        if (!m_Paused)
+        if (!m_Paused) {
             m_Navigation->Update(m_Scene, static_cast<float>(dt));
+            UpdateDecals(m_Scene, static_cast<float>(dt)); // lifetimes
+        }
         // Particles after physics / scripts / animation moved things (paused menu: frozen).
         m_Particles->SetPaused(m_Paused);
         m_Particles->Update(m_Scene, static_cast<float>(dt));

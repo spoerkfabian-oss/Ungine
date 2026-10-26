@@ -1194,6 +1194,7 @@ json RendererToJson(const SceneRenderer& sr)
     const ShadowSettings& s = sr.shadows;
     const AoSettings& ao    = sr.ao;
     const LocalShadowSettings& ls = sr.localShadows;
+    const FogSettings& f    = sr.fog;
     return {
         {"lighting",
          {{"sunDirection", ToJson(sky.sunDirection)}, {"sunColor", ToJson(sky.sunColor)},
@@ -1219,6 +1220,18 @@ json RendererToJson(const SceneRenderer& sr)
           {"slopeBias", ls.slopeBias}, {"normalBias", ls.normalBias}, {"filterRadius", ls.filterRadius}}},
         {"culling", {{"gpuDriven", sr.culling.gpuDriven}, {"occlusion", sr.culling.occlusion}, {"lod", sr.culling.lod},
                      {"lodPixelError", sr.culling.lodPixelError}}}, // no debug state
+        {"taa", {{"enabled", sr.taa.enabled}, {"feedback", sr.taa.feedback}, {"sharpness", sr.taa.sharpness}}},
+        {"ssr",
+         {{"enabled", sr.ssr.enabled}, {"intensity", sr.ssr.intensity}, {"maxRoughness", sr.ssr.maxRoughness},
+          {"thickness", sr.ssr.thickness}, {"maxDistance", sr.ssr.maxDistance}, {"maxSteps", sr.ssr.maxSteps},
+          {"feedback", sr.ssr.feedback}}},
+        {"decals", {{"enabled", sr.decals.enabled}}},
+        {"fog",
+         {{"enabled", f.enabled}, {"albedo", ToJson(f.albedo)}, {"density", f.density}, {"baseHeight", f.baseHeight},
+          {"heightFalloff", f.heightFalloff}, {"startDistance", f.startDistance}, {"maxOpacity", f.maxOpacity},
+          {"anisotropy", f.anisotropy}, {"sunScale", f.sunScale}, {"ambientScale", f.ambientScale},
+          {"lightScale", f.lightScale}, {"volumetric", f.volumetric}, {"volumetricDistance", f.volumetricDistance},
+          {"temporalFeedback", f.temporalFeedback}}},
     };
 }
 
@@ -1288,6 +1301,61 @@ void RendererFromJson(const json& j, SceneRenderer& sr)
         Read(*it, "occlusion", sr.culling.occlusion);
         Read(*it, "lod", sr.culling.lod);
         Read(*it, "lodPixelError", sr.culling.lodPixelError);
+    }
+    const auto finite = [](float& v, float fallback, float lo, float hi) { v = std::isfinite(v) ? std::clamp(v, lo, hi) : fallback; };
+    if (const auto it = j.find("taa"); it != j.end()) {
+        Read(*it, "enabled", sr.taa.enabled);
+        Read(*it, "feedback", sr.taa.feedback);
+        Read(*it, "sharpness", sr.taa.sharpness);
+        finite(sr.taa.feedback, 0.9f, 0.0f, 0.98f);
+        finite(sr.taa.sharpness, 0.25f, 0.0f, 2.0f);
+    }
+    if (const auto it = j.find("ssr"); it != j.end()) {
+        SsrSettings& r = sr.ssr;
+        Read(*it, "enabled", r.enabled);
+        Read(*it, "intensity", r.intensity);
+        Read(*it, "maxRoughness", r.maxRoughness);
+        Read(*it, "thickness", r.thickness);
+        Read(*it, "maxDistance", r.maxDistance);
+        Read(*it, "maxSteps", r.maxSteps);
+        Read(*it, "feedback", r.feedback);
+        finite(r.intensity, 1.0f, 0.0f, 4.0f);
+        finite(r.maxRoughness, 0.5f, 0.0f, 1.0f);
+        finite(r.thickness, 0.3f, 0.01f, 10.0f);
+        finite(r.maxDistance, 40.0f, 0.5f, 1000.0f);
+        finite(r.feedback, 0.85f, 0.0f, 0.98f);
+        r.maxSteps = std::clamp(r.maxSteps, 8u, 256u);
+    }
+    if (const auto it = j.find("decals"); it != j.end())
+        Read(*it, "enabled", sr.decals.enabled);
+    if (const auto it = j.find("fog"); it != j.end()) {
+        FogSettings& f = sr.fog;
+        Read(*it, "enabled", f.enabled);
+        Read(*it, "albedo", f.albedo);
+        Read(*it, "density", f.density);
+        Read(*it, "baseHeight", f.baseHeight);
+        Read(*it, "heightFalloff", f.heightFalloff);
+        Read(*it, "startDistance", f.startDistance);
+        Read(*it, "maxOpacity", f.maxOpacity);
+        Read(*it, "anisotropy", f.anisotropy);
+        Read(*it, "sunScale", f.sunScale);
+        Read(*it, "ambientScale", f.ambientScale);
+        Read(*it, "lightScale", f.lightScale);
+        Read(*it, "volumetric", f.volumetric);
+        Read(*it, "volumetricDistance", f.volumetricDistance);
+        Read(*it, "temporalFeedback", f.temporalFeedback);
+        f.albedo = glm::clamp(f.albedo, glm::vec3(0.0f), glm::vec3(1.0f));
+        finite(f.density, 0.02f, 0.0f, 10.0f);
+        finite(f.baseHeight, 0.0f, -1e5f, 1e5f);
+        finite(f.heightFalloff, 0.15f, 0.0f, 10.0f);
+        finite(f.startDistance, 0.0f, 0.0f, 1e5f);
+        finite(f.maxOpacity, 1.0f, 0.0f, 1.0f);
+        finite(f.anisotropy, 0.6f, -0.95f, 0.95f);
+        finite(f.sunScale, 1.0f, 0.0f, 100.0f);
+        finite(f.ambientScale, 1.0f, 0.0f, 100.0f);
+        finite(f.lightScale, 1.0f, 0.0f, 100.0f);
+        finite(f.volumetricDistance, 64.0f, 1.0f, 1000.0f);
+        finite(f.temporalFeedback, 0.9f, 0.0f, 0.98f);
     }
 }
 

@@ -20,6 +20,7 @@
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Decals.h"
 #include "Engine/Core/GameOptions.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
@@ -306,6 +307,9 @@ void Editor::Update(float dt)
         else if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
             m_Ctx.navigation->Update(m_Ctx.scene, dt, true);
     }
+    // Decal lifetimes only run while playing (edit mode keeps placed decals).
+    if (m_PlayState == PlayState::Playing && !(m_Ctx.scripts && m_Ctx.scripts->DebugPaused()))
+        UpdateDecals(m_Ctx.scene, dt);
     // Particles run in edit mode too; pause / breakpoints hold them.
     if (m_Ctx.particles) {
         m_Ctx.particles->SetPaused(m_PlayState == PlayState::Paused || (m_Ctx.scripts && m_Ctx.scripts->DebugPaused()));
@@ -1164,6 +1168,26 @@ void Editor::DrawStreamingOverlay(float x, float y, float width, float height)
                 list->AddText(ImVec2(p.x - size.x * 0.5f, p.y - size.y - 2.0f), color, label.c_str());
             }
         });
+    // Decals (violet, arrow along the projection) and fog volumes (light blue).
+    const auto box = [&](const glm::mat4& m, const glm::vec3& h, ImU32 color) {
+        glm::vec3 c[8];
+        for (int i = 0; i < 8; ++i)
+            c[i] = glm::vec3(m * glm::vec4((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z, 1.0f));
+        static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                              {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        for (const auto& edge : kEdges)
+            projector.Line(list, c[edge[0]], c[edge[1]], color);
+    };
+    registry.ViewOf<Decal, WorldTransform>().Each([&](Entity e, Decal& decal, WorldTransform& world) {
+        const ImU32 color = IsSelected(e) ? IM_COL32(220, 140, 255, 255) : IM_COL32(170, 100, 230, 150);
+        box(world.matrix, decal.halfExtents, color);
+        const glm::vec3 from(world.matrix * glm::vec4(0.0f, 0.0f, decal.halfExtents.z, 1.0f));
+        const glm::vec3 to(world.matrix * glm::vec4(0.0f, 0.0f, -decal.halfExtents.z, 1.0f));
+        projector.Line(list, from, to, color);
+    });
+    registry.ViewOf<FogVolume, WorldTransform>().Each([&](Entity e, FogVolume& fog, WorldTransform& world) {
+        box(world.matrix, fog.halfExtents, IsSelected(e) ? IM_COL32(170, 220, 255, 255) : IM_COL32(130, 180, 230, 130));
+    });
     list->PopClipRect();
 }
 

@@ -379,6 +379,7 @@ void Editor::NewScene()
     m_Ctx.scene.Clear();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset();
     ReleaseModelRefs();
@@ -739,6 +740,7 @@ void Editor::Play()
     }
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // effects start over with the game
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset(); // graphs start at their entry states
     if (m_Ctx.scripts) {
@@ -789,6 +791,7 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset();
     m_Selection.clear();
@@ -865,6 +868,7 @@ void Editor::Stop()
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // spawned one-shots go, the edit scene's effects restart
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset(); // the restored bones show the edit pose
     if (std::exchange(m_NavOtherLevel, false))

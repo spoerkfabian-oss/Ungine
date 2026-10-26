@@ -6,6 +6,7 @@
 #include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
+#include "Engine/Scene/Decals.h"
 #include "Engine/Core/Application.h"
 #include "Engine/Events/Events.h"
 #include "Engine/Physics/PhysicsWorld.h"
@@ -146,6 +147,7 @@ protected:
             m_Audio->Update(m_Scene, static_cast<float>(dt), &view);
             m_Animation->Update(m_Scene, static_cast<float>(dt));
             m_Navigation->Update(m_Scene, static_cast<float>(dt));
+            Engine::UpdateDecals(m_Scene, static_cast<float>(dt));
             m_Particles->Update(m_Scene, static_cast<float>(dt));
         }
 

@@ -153,6 +153,7 @@ public:
     void SimulateText(std::string_view utf8);
     void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
     void ExpandAudioMixer() { m_ExpandAudioMixer = true; } // opens the Renderer panel's Audio sections once (UI tests)
+    void ExpandRenderingSections() { m_ExpandRendering = true; } // TAA / SSR / decals / fog sections once (UI tests)
     // The scene image of the viewport in window pixels (x, y, width, height); zero while hidden.
     [[nodiscard]] glm::vec4 ViewportRect() const { return m_ViewportRect; }
 
@@ -349,6 +350,7 @@ private:
     bool          m_ViewportVisible = false; // drawn this frame (else the scene render is skipped)
     int           m_FocusViewport   = 0; // frames until the viewport tab is brought to front (default layout)
     bool          m_ExpandAudioMixer = false;
+    bool          m_ExpandRendering  = false;
     bool          m_ViewportFocused = false;
     bool          m_PickAdditive    = false; // a pick request is pending: Ctrl was held
     // Left button pressed in the viewport: click (pick on release) or box selection (dragged).

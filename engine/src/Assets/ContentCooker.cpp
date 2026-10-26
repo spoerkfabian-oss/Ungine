@@ -18,6 +18,7 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -650,7 +651,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         if (!doc.is_object() || list == doc.end() || !list->is_array())
             continue;
         const fs::path dir   = file.parent_path();
-        const auto     check = [&](const std::string& reference, bool image) {
+        const auto     check = [&](const std::string& reference, std::optional<TextureKind> image) {
             const fs::path target = (PathFromUtf8(reference).is_relative() ? dir / PathFromUtf8(reference) : PathFromUtf8(reference))
                                         .lexically_normal();
             std::error_code ec;
@@ -661,7 +662,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 report.warnings.push_back(std::format("'{}': '{}' is outside Content/ and not packaged", entryPath(file), reference));
             else if (image) {
                 usedImages.insert(PathToUtf8(target));
-                addTexture(readShared(target), TextureKind::Color, PathToUtf8(target.filename()));
+                addTexture(readShared(target), *image, PathToUtf8(target.filename()));
             }
         };
         for (json entity : *list) {
@@ -669,16 +670,24 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 continue;
             if (const auto ui = entity.find("uiWidget"); ui != entity.end() && ui->is_object())
                 if (const auto image = ui->find("image"); image != ui->end() && image->is_string() && !image->get<std::string>().empty()) {
-                    check(image->get<std::string>(), true);
+                    check(image->get<std::string>(), TextureKind::Color);
                     ui->erase("image"); // checked: TransformPaths below skips it
                 }
+            if (const auto decal = entity.find("decal"); decal != entity.end() && decal->is_object()) // each with its kind
+                for (const auto& [key, kind] : {std::pair{"albedo", TextureKind::Color}, std::pair{"normal", TextureKind::Normal},
+                                                std::pair{"mask", TextureKind::Linear}, std::pair{"emissive", TextureKind::Color}})
+                    if (const auto texture = decal->find(key); texture != decal->end() && texture->is_string()) {
+                        if (!texture->get<std::string>().empty())
+                            check(texture->get<std::string>(), kind);
+                        decal->erase(key);
+                    }
             SceneJson::TransformPaths(entity, [&](const std::string& p) {
-                check(p, false);
+                check(p, std::nullopt);
                 return p;
             });
             if (const auto prefab = entity.find("prefab"); prefab != entity.end() && prefab->is_object())
                 if (const auto f = prefab->find("file"); f != prefab->end() && f->is_string() && !f->get<std::string>().empty())
-                    check(f->get<std::string>(), false);
+                    check(f->get<std::string>(), std::nullopt);
         }
     }
 

@@ -392,7 +392,7 @@ TEST_CASE(Render_ClusteredLights)
     CHECK(stats.lightsTotal == 4 && stats.lights == 2);
     bool cullScope = false;
     for (const GpuTiming& t : F().renderer->Profiler().Results())
-        cullScope |= std::string_view{t.name} == "Light culling";
+        cullScope |= std::string_view{t.name} == "Light + decal culling";
     CHECK(!F().renderer->Profiler().Supported() || cullScope);
 
     renderer.post.debugView = DebugView::LightClusters;
@@ -4386,5 +4386,69 @@ TEST_CASE(Render_HeightAndVolumetricFog)
     CHECK(pixel(final, {20, 20}).b > 20);
     F().assets->Release(floorModel);
     F().assets->Release(redBox);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_DecalsAndFogUi)
+{
+    // Decal / Fog Volume inspectors, the Renderer panel's TAA / SSR / decal / fog sections (with
+    // volumetric fog on), "+ Add" style creation through components, play: a timed decal fades and
+    // goes, stop brings it back.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity splat = scene.CreateEntity("Splat");
+    scene.EditTransform(splat).rotation = glm::angleAxis(glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    r.Emplace<Decal>(splat, Decal{.emissiveColor = {0.0f, 1.0f, 0.0f}, .lifetime = 0.3f, .fadeOut = 0.2f});
+    const Entity mist = scene.CreateEntity("Mist");
+    r.Emplace<FogVolume>(mist, FogVolume{.density = 0.3f});
+    const std::uint64_t splatUuid = r.Get<Uuid>(splat).value;
+
+    PhysicsWorld  physics(*F().jobs, F().events, F().assets.get()); // Play needs a simulation
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    sceneRenderer.fog.enabled        = true;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 2.0f, 6.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 30.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 30.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    editor.Select(splat);
+    editor.ExpandRenderingSections();
+    runFrames(4);
+    editor.Select(mist);
+    runFrames(3);
+    CHECK(sceneRenderer.Stats().fogGrid.z == kFogSlices);
+    CHECK(sceneRenderer.Stats().fogVolumes == 1u);
+
+    // Edit mode keeps the timed decal; play ages and removes it; stop restores it.
+    runFrames(15);
+    CHECK(scene.FindByUuid(splatUuid) != NullEntity);
+    editor.Play();
+    runFrames(20);
+    CHECK(scene.FindByUuid(splatUuid) == NullEntity);
+    editor.Stop();
+    runFrames(2);
+    CHECK(scene.FindByUuid(splatUuid) != NullEntity);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

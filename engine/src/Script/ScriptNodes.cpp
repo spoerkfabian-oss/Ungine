@@ -22,6 +22,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <filesystem>
 #include <random>
 #include <unordered_map>
 
@@ -1444,6 +1445,37 @@ std::vector<NodeDesc> BuildRegistry()
                             }, "Multiplies every particle's color (HDR: > 1 glows)"),
                      {{"Color", glm::vec3(1.0f)}, {"Alpha", 1.0f}}));
 
+    // Decals. Texture paths: absolute or relative to the working directory (the project root).
+    add(WithDefaults(Action("Decal.SpawnAt", "Spawn Decal at Location", "Rendering",
+                            {In("Texture", P::String), In("Location", P::Vec3), In("Normal", P::Vec3), In("Size", P::Float),
+                             In("Angle", P::Float), In("Lifetime", P::Float), In("Color", P::Vec3), Out("Spawned", P::Entity)},
+                            [](ScriptContext& c) {
+                                glm::vec3 normal = c.InVec3(4);
+                                if (!(glm::dot(normal, normal) > 1e-8f))
+                                    return c.Error("Normal must not be zero");
+                                normal = glm::normalize(normal);
+                                Scene&       scene = c.GetScene();
+                                const Entity e     = scene.CreateEntity("Decal");
+                                Transform&   t     = scene.EditTransform(e);
+                                t.position         = c.InVec3(3);
+                                // Decal -Z projects into the surface: +Z along the normal, then spun around it.
+                                const glm::vec3 up = std::abs(normal.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+                                const glm::vec3 x  = glm::normalize(glm::cross(up, normal));
+                                const glm::mat3 basis(x, glm::cross(normal, x), normal);
+                                t.rotation = glm::angleAxis(glm::radians(c.InFloat(6)), normal) * glm::quat_cast(basis);
+                                const float size = std::max(c.InFloat(5), 0.01f);
+                                std::string texture = c.InString(2);
+                                if (!texture.empty())
+                                    texture = PathToUtf8(std::filesystem::absolute(PathFromUtf8(texture)).lexically_normal());
+                                scene.GetRegistry().Emplace<Decal>(e, Decal{.halfExtents = {0.5f * size, 0.5f * size, std::max(0.25f * size, 0.05f)},
+                                                                            .albedo      = std::move(texture),
+                                                                            .color       = glm::vec4(glm::max(c.InVec3(8), glm::vec3(0.0f)), 1.0f),
+                                                                            .lifetime    = std::max(c.InFloat(7), 0.0f)});
+                                c.Out(9, e);
+                            }, "Projects a texture onto the surface (Normal: away from it). Lifetime 0 = forever, "
+                               "else it fades out and is destroyed. Angle in degrees."),
+                     {{"Normal", glm::vec3(0.0f, 1.0f, 0.0f)}, {"Size", 1.0f}, {"Lifetime", 10.0f}, {"Color", glm::vec3(1.0f)}}));
+
     // Navigation (AI). Profile params: a NavSettings profile name.
     {
         NodeDesc d = Flow("AI.MoveTo", "AI Move To",
@@ -2014,13 +2046,15 @@ std::vector<NodeDesc> BuildRegistry()
                                      : kind == "Tags"      ? r.Has<Tags>(e)
                                      : kind == "NavAgent"  ? r.Has<NavAgent>(e)
                                      : kind == "AnimationController" ? r.Has<AnimationController>(e)
+                                     : kind == "Decal"     ? r.Has<Decal>(e)
+                                     : kind == "FogVolume" ? r.Has<FogVolume>(e)
                                                            : false;
                            }
                            c.Out(1, has);
                        }),
                   ParamKind::Choice, "Component", "Mesh",
                   {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent",
-                   "AnimationController"}));
+                   "AnimationController", "Decal", "FogVolume"}));
     add(Pure("Entity.GetRight", "Get Right Vector", "Transform", {In("Target", P::Entity), Out("Right", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))

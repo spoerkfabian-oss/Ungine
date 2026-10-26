@@ -177,7 +177,7 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
 {
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
-            // pathValues: every string of the object is a path (a collider's meshMaterials).
+            // pathValues: every string of the object is a path (a collider's meshMaterials, a decal).
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
                                           it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
@@ -210,7 +210,7 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                 }
             } else {
                 RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory,
-                                   it.key() == "meshMaterials");
+                                   it.key() == "meshMaterials" || it.key() == "decal"); // their strings are all paths
             }
         }
     } else if (value.is_array()) {
@@ -1078,8 +1078,20 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
+        std::optional<Decal> decalMoved;
+        if (const Decal* decal = registry.TryGet<Decal>(entity)) {
+            Decal moved = *decal;
+            bool  any   = false;
+            for (std::string* path : {&moved.albedo, &moved.normal, &moved.mask, &moved.emissive})
+                if (const auto relocated = RelocateReference(*path, source, target, wasDirectory)) {
+                    *path = PathToUtf8(*relocated);
+                    any   = true;
+                }
+            if (any)
+                decalMoved = std::move(moved);
+        }
         if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !graphPath && !imagePath && !prefabPath && !levelPath &&
-            !colliderMoved)
+            !colliderMoved && !decalMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -1092,6 +1104,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
         if (levelPath) volume->level = PathToUtf8(*levelPath);
         if (colliderMoved) registry.Get<Collider>(entity) = *colliderMoved;
+        if (decalMoved) registry.Get<Decal>(entity) = std::move(*decalMoved);
         m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
