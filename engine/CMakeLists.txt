@@ -170,6 +170,12 @@ engine_add_shaders(Engine SOURCES
     shaders/terrain_depth_id.frag
     shaders/terrain_shadow.vert
     shaders/terrain_shadow.frag
+    shaders/foliage.vert
+    shaders/foliage.frag
+    shaders/foliage_depth.frag
+    shaders/foliage_depth_id.frag
+    shaders/foliage_shadow.vert
+    shaders/foliage_shadow.frag
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

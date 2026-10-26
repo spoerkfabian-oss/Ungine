@@ -1,5 +1,7 @@
 #include "TerrainRenderer.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Assets/Model.h"
+#include "Engine/Renderer/GeometryPool.h"
 #include "Engine/Core/Platform.h"
 #include "Engine/Renderer/ShaderReload.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
@@ -9,6 +11,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 
@@ -24,6 +28,46 @@ struct TerrainPush { // mirrors TerrainPush in terrain.glsl
     std::uint32_t   flags;
 };
 static_assert(sizeof(TerrainPush) <= kPushConstantSize);
+
+struct FoliagePush { // mirrors FoliagePush in foliage.glsl
+    VkDeviceAddress frame;
+    VkDeviceAddress terrain;
+    VkDeviceAddress layer;
+    VkDeviceAddress instances;
+    std::uint32_t   cascade;
+    std::uint32_t   material;
+};
+static_assert(sizeof(FoliagePush) <= kPushConstantSize);
+
+constexpr std::uint32_t kFoliageBlades = 0, kFoliageCards = 1, kFoliageMesh = 2; // foliage.glsl kinds
+constexpr std::uint32_t kFoliageAlignToNormal = 1;
+
+double SteadySeconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// PCG-style hash: deterministic scatter per (seed, chunk, cell).
+std::uint32_t Hash32(std::uint32_t v)
+{
+    v = v * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (v >> 22u) ^ v;
+}
+
+float Unit(std::uint32_t& state)
+{
+    state = Hash32(state);
+    return static_cast<float>(state >> 8) * (1.0f / 16777216.0f);
+}
+
+// Fraction of a chunk's instances the shader may keep at distance d (thinning, see foliage.glsl),
+// plus the width of its shrink band.
+float FoliageKeep(float d, float range)
+{
+    const float keep = d < 0.4f * range ? 1.0f : 1.0f + (0.3f - 1.0f) * std::clamp((d - 0.4f * range) / (0.45f * range), 0.0f, 1.0f);
+    return std::min(1.0f, keep + 0.08f);
+}
 
 constexpr VkPipelineStageFlags2 kShaderStages =
     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -68,6 +112,7 @@ TerrainRenderer::TerrainRenderer(Renderer& renderer, AssetManager& assets, const
                                                   .memory    = MemoryUsage::Upload,
                                                   .debugName = "TerrainPatchIndices"});
     m_Indices.Write(indices.data(), indices.size() * sizeof(std::uint32_t));
+    m_StartTime = SteadySeconds();
     CreatePipelines();
 }
 
@@ -77,9 +122,15 @@ TerrainRenderer::~TerrainRenderer()
         ReleaseTextures(*instance);
     for (auto& [key, layer] : m_LayerTextures)
         m_Assets.Release(layer.handle);
-    for (Pipeline* p : {&m_Prepass, &m_PrepassPicking, &m_Lighting, &m_Shadow})
+    for (auto& [key, model] : m_FoliageModels)
+        m_Assets.Release(model.handle);
+    for (Pipeline* p : {&m_Prepass, &m_PrepassPicking, &m_Lighting, &m_Shadow, &m_FoliagePrepass, &m_FoliagePrepassPicking,
+                        &m_FoliageLighting, &m_FoliageShadow})
         if (*p)
             m_Renderer.DeferRelease(std::move(*p));
+    for (Buffer& b : m_FoliageBuffers)
+        if (b)
+            m_Renderer.DeferRelease(std::move(b));
     m_Renderer.DeferRelease(std::move(m_Indices));
 }
 
@@ -124,6 +175,45 @@ void TerrainRenderer::CreatePipelines()
                           .SetDynamicDepthBias(true)
                           .SetDebugName("TerrainShadow")
                           .Build(device, layout);
+    // Foliage: two-sided, same targets as the terrain.
+    Pipeline foliagePrepass = GraphicsPipelineBuilder{}
+                                  .SetShaders(ShaderPath("foliage.vert.spv"), ShaderPath("foliage_depth.frag.spv"))
+                                  .AddColorAttachment(m_Formats.normal)
+                                  .AddColorAttachment(m_Formats.velocity)
+                                  .SetDepthFormat(m_Formats.depth)
+                                  .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                                  .SetCulling(VK_CULL_MODE_NONE)
+                                  .SetDebugName("FoliagePrepass")
+                                  .Build(device, layout);
+    Pipeline foliagePicking = GraphicsPipelineBuilder{}
+                                  .SetShaders(ShaderPath("foliage.vert.spv"), ShaderPath("foliage_depth_id.frag.spv"))
+                                  .AddColorAttachment(m_Formats.normal)
+                                  .AddColorAttachment(m_Formats.velocity)
+                                  .AddColorAttachment(m_Formats.entityId)
+                                  .SetDepthFormat(m_Formats.depth)
+                                  .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                                  .SetCulling(VK_CULL_MODE_NONE)
+                                  .SetDebugName("FoliagePrepassId")
+                                  .Build(device, layout);
+    Pipeline foliageLighting = GraphicsPipelineBuilder{}
+                                   .SetShaders(ShaderPath("foliage.vert.spv"), ShaderPath("foliage.frag.spv"))
+                                   .AddColorAttachment(m_Formats.hdr)
+                                   .AddColorAttachment(m_Formats.velocity)
+                                   .SetAttachmentBlend(1, BlendMode::NoWrite)
+                                   .SetDepthFormat(m_Formats.depth)
+                                   .SetDepth(true, false, VK_COMPARE_OP_EQUAL)
+                                   .SetCulling(VK_CULL_MODE_NONE)
+                                   .SetDebugName("FoliageLighting")
+                                   .Build(device, layout);
+    Pipeline foliageShadow = GraphicsPipelineBuilder{}
+                                 .SetShaders(ShaderPath("foliage_shadow.vert.spv"), ShaderPath("foliage_shadow.frag.spv"))
+                                 .SetDepthFormat(m_Formats.shadow)
+                                 .SetDepth(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                                 .SetDepthClamp(true)
+                                 .SetDynamicDepthBias(true)
+                                 .SetCulling(VK_CULL_MODE_NONE)
+                                 .SetDebugName("FoliageShadow")
+                                 .Build(device, layout);
     const auto replace = [&](Pipeline& current, Pipeline& fresh) {
         if (current)
             m_Renderer.DeferRelease(std::move(current));
@@ -133,6 +223,10 @@ void TerrainRenderer::CreatePipelines()
     replace(m_PrepassPicking, picking);
     replace(m_Lighting, lighting);
     replace(m_Shadow, shadow);
+    replace(m_FoliagePrepass, foliagePrepass);
+    replace(m_FoliagePrepassPicking, foliagePicking);
+    replace(m_FoliageLighting, foliageLighting);
+    replace(m_FoliageShadow, foliageShadow);
 }
 
 void TerrainRenderer::ReleaseTextures(Instance& instance)
@@ -322,6 +416,7 @@ void TerrainRenderer::Sync(VkCommandBuffer cmd, Instance& instance)
     if (changes.kinds == 0 && !changes.full)
         return;
     instance.revision = current;
+    MarkFoliageDirty(instance, changes);
     if (changes.kinds & (TerrainChangeHeights | TerrainChangeSettings)) {
         const glm::uvec4 rect = SampleRect(changes.rect, data.resolution, changes.full);
         Upload(cmd, instance.height, 2, data.resolution, data.heights.data(), data.resolution * 2, rect);
@@ -349,10 +444,12 @@ void TerrainRenderer::Sync(VkCommandBuffer cmd, Instance& instance)
 }
 
 void TerrainRenderer::Prepare(VkCommandBuffer cmd, Scene& scene, const glm::vec3& camera, const Frustum& cameraFrustum,
-                              const std::vector<Frustum>& cascades, bool shadows)
+                              const std::vector<Frustum>& cascades, bool shadows, std::uint32_t frameIndex)
 {
     ++m_Frame;
-    m_Stats = {};
+    m_Stats      = {};
+    m_FrameIndex = frameIndex % kFramesInFlight;
+    m_FoliageScratch.clear();
     TerrainStore& store    = TerrainStore::Instance();
     Registry&     registry = scene.GetRegistry();
     registry.ViewOf<Terrain, WorldTransform>().Each([&](Entity entity, Terrain& terrain, WorldTransform& world) {
@@ -370,11 +467,14 @@ void TerrainRenderer::Prepare(VkCommandBuffer cmd, Scene& scene, const glm::vec3
             instance.path     = terrain.data;
             instance.data     = std::move(data);
             instance.revision = 0;
+            instance.foliage.clear();
             ReleaseTextures(instance);
         }
         instance.seen        = m_Frame;
         instance.lodDistance = std::max(terrain.lodDistance, 1.0f);
         instance.castShadows = terrain.castShadows;
+        instance.foliageDensity  = std::max(terrain.foliageDensity, 0.0f);
+        instance.foliageDistance = std::max(terrain.foliageDistance, 0.0f);
         instance.size        = instance.data->size;
         instance.origin      = glm::vec3(world.matrix[3]) - glm::vec3(0.5f * instance.size, 0.0f, 0.5f * instance.size);
     });
@@ -433,11 +533,36 @@ void TerrainRenderer::Prepare(VkCommandBuffer cmd, Scene& scene, const glm::vec3
             instance.cascadeAddress[c] = pushNodes(instance.cascadeNodes[c]);
             m_Stats.shadowNodes += static_cast<std::uint32_t>(instance.cascadeNodes[c].size());
         }
+        PrepareFoliage(instance, camera, cameraFrustum, cascades, shadows && instance.castShadows);
         ++m_Stats.terrains;
         m_Stats.nodes += static_cast<std::uint32_t>(instance.cameraNodes.size());
         m_Stats.triangles += static_cast<std::uint32_t>(instance.cameraNodes.size()) * m_IndexCount / 3;
     }
 
+    // This frame's foliage instances (all terrains and views) -> the frame slot's buffer.
+    if (!m_FoliageScratch.empty()) {
+        Buffer&            buffer = m_FoliageBuffers[m_FrameIndex];
+        const VkDeviceSize bytes  = m_FoliageScratch.size() * sizeof(GpuFoliageInstance);
+        if (!buffer || buffer.Size() < bytes) {
+            if (buffer)
+                m_Renderer.DeferRelease(std::move(buffer));
+            buffer = Buffer(m_Renderer.GetContext(), {.size      = std::bit_ceil(std::max<VkDeviceSize>(bytes, 64 * 1024)),
+                                                      .usage     = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                      .memory    = MemoryUsage::Upload,
+                                                      .debugName = "FoliageInstances"});
+        }
+        std::memcpy(buffer.Mapped(), m_FoliageScratch.data(), bytes);
+        buffer.Flush(0, bytes);
+    }
+    // Foliage meshes no longer used.
+    for (auto it = m_FoliageModels.begin(); it != m_FoliageModels.end();) {
+        if (m_Frame - it->second.lastUsed > 300) {
+            m_Assets.Release(it->second.handle);
+            it = m_FoliageModels.erase(it);
+        } else {
+            ++it;
+        }
+    }
     // Layer textures unused for a while (layers removed / terrain gone).
     for (auto it = m_LayerTextures.begin(); it != m_LayerTextures.end();) {
         if (m_Frame - it->second.lastUsed > 300) {
@@ -467,6 +592,7 @@ void TerrainRenderer::DrawPrepass(VkCommandBuffer cmd, VkDeviceAddress frameAddr
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, picking ? m_PrepassPicking.Handle() : m_Prepass.Handle());
     for (const auto& instance : m_Instances)
         Draw(cmd, frameAddress, *instance, instance->cameraAddress, static_cast<std::uint32_t>(instance->cameraNodes.size()), 0);
+    DrawFoliage(cmd, frameAddress, picking ? 3u : 0u, 0);
 }
 
 void TerrainRenderer::DrawLighting(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
@@ -476,6 +602,7 @@ void TerrainRenderer::DrawLighting(VkCommandBuffer cmd, VkDeviceAddress frameAdd
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Lighting.Handle());
     for (const auto& instance : m_Instances)
         Draw(cmd, frameAddress, *instance, instance->cameraAddress, static_cast<std::uint32_t>(instance->cameraNodes.size()), 0);
+    DrawFoliage(cmd, frameAddress, 1, 0);
 }
 
 void TerrainRenderer::DrawShadow(VkCommandBuffer cmd, VkDeviceAddress frameAddress, std::uint32_t cascade)
@@ -486,6 +613,257 @@ void TerrainRenderer::DrawShadow(VkCommandBuffer cmd, VkDeviceAddress frameAddre
     for (const auto& instance : m_Instances)
         Draw(cmd, frameAddress, *instance, instance->cascadeAddress[cascade],
              static_cast<std::uint32_t>(instance->cascadeNodes[cascade].size()), cascade);
+    DrawFoliage(cmd, frameAddress, 2, cascade);
+}
+
+// --- Foliage ------------------------------------------------------------------------------------
+
+void TerrainRenderer::MarkFoliageDirty(Instance& instance, const TerrainChanges& changes)
+{
+    if (!(changes.kinds & (TerrainChangeFoliage | TerrainChangeSettings)) && !changes.full)
+        return;
+    const bool all = changes.full || (changes.kinds & TerrainChangeSettings) != 0;
+    for (FoliageState& state : instance.foliage) {
+        const std::uint32_t n = state.chunksPerSide;
+        if (n == 0)
+            continue;
+        // Chunk range of the rectangle (normalized over the terrain); a texel of margin.
+        const float scale = instance.size / kFoliageChunkSize;
+        const auto  lo    = [&](float v) { return static_cast<std::uint32_t>(std::clamp(std::floor(v * scale - 0.05f), 0.0f, static_cast<float>(n - 1))); };
+        const auto  hi    = [&](float v) { return static_cast<std::uint32_t>(std::clamp(std::floor(v * scale + 0.05f), 0.0f, static_cast<float>(n - 1))); };
+        const glm::uvec4 r = all ? glm::uvec4(0, 0, n - 1, n - 1)
+                                 : glm::uvec4(lo(changes.rect.x), lo(changes.rect.y), hi(changes.rect.z), hi(changes.rect.w));
+        for (std::uint32_t z = r.y; z <= r.w; ++z)
+            for (std::uint32_t x = r.x; x <= r.z; ++x)
+                state.chunks[static_cast<std::size_t>(z) * n + x].built = false;
+    }
+}
+
+void TerrainRenderer::BuildChunk(const Instance& instance, const FoliageLayer& layer, std::uint32_t cx, std::uint32_t cz,
+                                 FoliageChunk& out) const
+{
+    out.instances.clear();
+    out.built = true;
+    const TerrainData& data    = *instance.data;
+    const float        density = std::min(layer.density * instance.foliageDensity, kFoliageMaxDensity);
+    if (!(density > 1e-4f) || layer.densityMap.empty())
+        return;
+    const float spacing = 1.0f / std::sqrt(density);
+    const float x0 = static_cast<float>(cx) * kFoliageChunkSize, z0 = static_cast<float>(cz) * kFoliageChunkSize;
+    const float x1 = std::min(x0 + kFoliageChunkSize, data.size), z1 = std::min(z0 + kFoliageChunkSize, data.size);
+    const auto  nx = static_cast<std::uint32_t>(std::ceil((x1 - x0) / spacing));
+    const auto  nz = static_cast<std::uint32_t>(std::ceil((z1 - z0) / spacing));
+    const std::uint32_t splat = data.splatResolution;
+    const std::uint32_t chunkSeed = Hash32(layer.seed * 0x9E3779B9u ^ Hash32(cx * 73856093u ^ cz * 19349663u));
+    // Jittered grid: one candidate per cell, kept with the painted density.
+    for (std::uint32_t j = 0; j < nz; ++j)
+        for (std::uint32_t i = 0; i < nx; ++i) {
+            std::uint32_t rng = chunkSeed ^ Hash32(i * 2654435761u + j * 40503u + 1u);
+            const float   px  = x0 + (static_cast<float>(i) + Unit(rng)) * spacing;
+            const float   pz  = z0 + (static_cast<float>(j) + Unit(rng)) * spacing;
+            if (px >= x1 || pz >= z1)
+                continue;
+            const auto sx = std::min(splat - 1, static_cast<std::uint32_t>(px / data.size * static_cast<float>(splat)));
+            const auto sz = std::min(splat - 1, static_cast<std::uint32_t>(pz / data.size * static_cast<float>(splat)));
+            const float painted = static_cast<float>(layer.densityMap[static_cast<std::size_t>(sz) * splat + sx]) / 255.0f;
+            if (Unit(rng) >= painted)
+                continue;
+            const auto yaw   = static_cast<std::uint32_t>(Unit(rng) * 255.99f);
+            const auto scale = static_cast<std::uint32_t>(Unit(rng) * 255.99f);
+            const auto tint  = static_cast<std::uint32_t>(Unit(rng) * 255.99f);
+            out.instances.push_back({glm::vec2(px, pz), yaw | (scale << 8) | (tint << 24), 0u});
+        }
+    // Shuffle so any prefix is an even thinning; the key is the position in the list.
+    std::uint32_t rng = chunkSeed ^ 0x51ED27u;
+    for (std::size_t k = out.instances.size(); k > 1; --k)
+        std::swap(out.instances[k - 1], out.instances[static_cast<std::size_t>(Unit(rng) * static_cast<float>(k)) % k]);
+    const auto count = static_cast<float>(out.instances.size());
+    for (std::size_t k = 0; k < out.instances.size(); ++k)
+        out.instances[k].bits |= std::min(255u, static_cast<std::uint32_t>(static_cast<float>(k) / count * 256.0f)) << 16;
+}
+
+glm::vec2 TerrainRenderer::RectMinMax(const Instance& instance, glm::vec2 lo, glm::vec2 hi) const
+{
+    const float         leaf = static_cast<float>(kTerrainPatchQuads) * instance.data->CellSize();
+    const auto          clampPatch = [&](float v) {
+        return static_cast<std::uint32_t>(std::clamp(v / leaf, 0.0f, static_cast<float>(instance.patches - 1)));
+    };
+    const std::uint32_t px0 = clampPatch(lo.x), pz0 = clampPatch(lo.y), px1 = clampPatch(hi.x), pz1 = clampPatch(hi.y);
+    glm::vec2 mm(1e30f, -1e30f);
+    for (std::uint32_t z = pz0; z <= pz1; ++z)
+        for (std::uint32_t x = px0; x <= px1; ++x) {
+            const glm::vec2 v = instance.minMax[static_cast<std::size_t>(z) * instance.patches + x];
+            mm = glm::vec2(std::min(mm.x, v.x), std::max(mm.y, v.y));
+        }
+    return mm;
+}
+
+ModelHandle TerrainRenderer::FoliageMesh(const std::string& path)
+{
+    if (path.empty())
+        return {};
+    auto it = m_FoliageModels.find(path);
+    if (it == m_FoliageModels.end())
+        it = m_FoliageModels.emplace(path, FoliageModel{.handle = m_Assets.LoadModel(PathFromUtf8(path))}).first;
+    it->second.lastUsed = m_Frame;
+    return it->second.handle;
+}
+
+void TerrainRenderer::PrepareFoliage(Instance& instance, const glm::vec3& camera, const Frustum& cameraFrustum,
+                                     const std::vector<Frustum>& cascades, bool shadows)
+{
+    const TerrainData& data = *instance.data;
+    instance.foliage.resize(data.foliage.size());
+    const float time = static_cast<float>(std::fmod(SteadySeconds() - m_StartTime, 3600.0));
+    for (std::size_t li = 0; li < data.foliage.size(); ++li) {
+        const FoliageLayer& layer = data.foliage[li];
+        FoliageState&       state = instance.foliage[li];
+        state.camera   = {};
+        state.cascades = {};
+        state.gpu      = 0;
+        const float range = layer.viewDistance * instance.foliageDistance;
+        if (!(range > 0.5f) || layer.densityMap.empty())
+            continue;
+
+        // Scatter settings: a change rescatters every chunk (density map edits only theirs).
+        std::uint64_t key = 1469598103934665603ull;
+        for (const std::uint64_t v : {static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(layer.density)),
+                                      static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(instance.foliageDensity)),
+                                      static_cast<std::uint64_t>(layer.seed), static_cast<std::uint64_t>(data.splatResolution),
+                                      static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(data.size))})
+            key = (key ^ v) * 1099511628211ull;
+        const auto chunks = static_cast<std::uint32_t>(std::ceil(data.size / kFoliageChunkSize));
+        if (state.scatterKey != key || state.chunksPerSide != chunks) {
+            state.scatterKey    = key;
+            state.chunksPerSide = chunks;
+            state.chunks.assign(static_cast<std::size_t>(chunks) * chunks, FoliageChunk{});
+        }
+
+        // Kind, mesh, layer constants.
+        std::uint32_t textureEntry = ~0u, kind = kFoliageBlades;
+        float         meshHeight   = layer.height;
+        const Model*  model        = nullptr;
+        std::uint32_t meshIndex    = 0;
+        if (layer.kind == FoliageKind::Mesh) {
+            state.mesh = FoliageMesh(layer.mesh);
+            const ResolvedMesh resolved = m_Assets.ResolveMesh(state.mesh, layer.meshIndex);
+            if (!resolved.model || resolved.placeholder || resolved.meshIndex >= resolved.model->meshes.size())
+                continue; // loading / failed: nothing (no placeholder boxes in the grass)
+            model     = resolved.model;
+            meshIndex = resolved.meshIndex;
+            kind      = kFoliageMesh;
+            float top = 0.05f;
+            for (const Submesh& sm : model->meshes[meshIndex].submeshes)
+                top = std::max(top, sm.boundsMax.y);
+            meshHeight = top;
+        } else if (!layer.texture.empty()) {
+            textureEntry = LayerTextureEntry(layer.texture, TextureKind::Color);
+            kind         = kFoliageCards;
+        }
+        state.kind      = kind;
+        state.meshIndex = meshIndex;
+        GpuFoliageLayer gpu{};
+        gpu.baseColor = glm::vec4(layer.baseColor, layer.wind);
+        gpu.tipColor  = glm::vec4(layer.tipColor, time);
+        gpu.size      = glm::vec4(kind == kFoliageMesh ? 1.0f : layer.width, kind == kFoliageMesh ? meshHeight : layer.height,
+                                  std::min(layer.minScale, layer.maxScale), std::max(layer.minScale, layer.maxScale));
+        gpu.fade      = glm::vec4(range, std::cos(glm::radians(std::clamp(layer.maxSlope, 0.0f, 90.0f))), 1.0f / 60.0f, 0.0f);
+        gpu.info      = glm::uvec4(kind, textureEntry, layer.alignToNormal && kind == kFoliageMesh ? kFoliageAlignToNormal : 0u,
+                                   EntityIndex(instance.entity) + 1);
+        state.gpu     = m_Renderer.PushTransient(gpu, 16);
+
+        // Chunks in range, per view: the camera, then the cascades (shadow casters).
+        const float topMargin = (kind == kFoliageMesh ? meshHeight : layer.height) * gpu.size.w + layer.wind;
+        const float sideMargin = (kind == kFoliageMesh ? meshHeight : layer.width) * gpu.size.w + layer.wind;
+        const glm::vec2 cam(camera.x - instance.origin.x, camera.z - instance.origin.z);
+        const auto lo = [&](float v) { return static_cast<std::int64_t>(std::floor((v - range) / kFoliageChunkSize)); };
+        const auto hi = [&](float v) { return static_cast<std::int64_t>(std::floor((v + range) / kFoliageChunkSize)); };
+        const std::int64_t cx0 = std::max<std::int64_t>(0, lo(cam.x)), cz0 = std::max<std::int64_t>(0, lo(cam.y));
+        const std::int64_t cx1 = std::min<std::int64_t>(chunks - 1, hi(cam.x)), cz1 = std::min<std::int64_t>(chunks - 1, hi(cam.y));
+        const bool castShadows = shadows && layer.castShadows;
+        const auto gather = [&](const Frustum& frustum, FoliageView& view, std::uint32_t& stat) {
+            view.first = static_cast<std::uint32_t>(m_FoliageScratch.size());
+            for (std::int64_t cz = cz0; cz <= cz1; ++cz)
+                for (std::int64_t cx = cx0; cx <= cx1; ++cx) {
+                    const glm::vec2 c0(static_cast<float>(cx) * kFoliageChunkSize, static_cast<float>(cz) * kFoliageChunkSize);
+                    const glm::vec2 c1 = glm::min(c0 + glm::vec2(kFoliageChunkSize), glm::vec2(data.size));
+                    const glm::vec2 mm = RectMinMax(instance, c0, c1);
+                    const Aabb box{instance.origin + glm::vec3(c0.x - sideMargin, mm.x, c0.y - sideMargin),
+                                   instance.origin + glm::vec3(c1.x + sideMargin, mm.y + topMargin, c1.y + sideMargin)};
+                    const glm::vec3 closest = glm::clamp(camera, box.min, box.max);
+                    const float     nearest = glm::distance(camera, closest);
+                    if (nearest >= range || !frustum.Intersects(box))
+                        continue;
+                    FoliageChunk& chunk = state.chunks[static_cast<std::size_t>(cz) * chunks + static_cast<std::size_t>(cx)];
+                    if (!chunk.built) {
+                        BuildChunk(instance, layer, static_cast<std::uint32_t>(cx), static_cast<std::uint32_t>(cz), chunk);
+                        ++m_Stats.foliageChunksBuilt;
+                    }
+                    const auto n    = static_cast<std::uint32_t>(chunk.instances.size());
+                    auto       take = std::min(n, static_cast<std::uint32_t>(std::ceil(static_cast<float>(n) * FoliageKeep(nearest, range))));
+                    take = std::min<std::uint32_t>(take, kFoliageMaxInstances - static_cast<std::uint32_t>(std::min<std::size_t>(m_FoliageScratch.size(), kFoliageMaxInstances)));
+                    m_FoliageScratch.insert(m_FoliageScratch.end(), chunk.instances.begin(), chunk.instances.begin() + take);
+                }
+            view.count = static_cast<std::uint32_t>(m_FoliageScratch.size()) - view.first;
+            stat += view.count;
+        };
+        gather(cameraFrustum, state.camera, m_Stats.foliageInstances);
+        if (castShadows)
+            for (std::size_t c = 0; c < cascades.size() && c < state.cascades.size(); ++c)
+                gather(cascades[c], state.cascades[c], m_Stats.foliageShadowInstances);
+    }
+}
+
+void TerrainRenderer::DrawFoliage(VkCommandBuffer cmd, VkDeviceAddress frameAddress, std::uint32_t pass, std::uint32_t cascade)
+{
+    const Buffer& buffer = m_FoliageBuffers[m_FrameIndex];
+    if (!buffer)
+        return;
+    const Pipeline& pipeline = pass == 0 ? m_FoliagePrepass : pass == 1 ? m_FoliageLighting : pass == 2 ? m_FoliageShadow
+                                                                                                         : m_FoliagePrepassPicking;
+    const VkPipelineLayout layout = m_Renderer.GetBindless().PipelineLayout();
+    bool bound = false, indexBound = false;
+    for (const auto& instance : m_Instances)
+        for (const FoliageState& state : instance->foliage) {
+            const FoliageView& view = pass == 2 ? state.cascades[cascade] : state.camera;
+            if (view.count == 0 || state.gpu == 0)
+                continue;
+            if (!bound) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Handle());
+                bound = true;
+            }
+            FoliagePush push{.frame     = frameAddress,
+                             .terrain   = instance->gpu,
+                             .layer     = state.gpu,
+                             .instances = buffer.Address() + static_cast<VkDeviceAddress>(view.first) * sizeof(GpuFoliageInstance),
+                             .cascade   = cascade,
+                             .material  = 0};
+            if (state.kind != kFoliageMesh) {
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+                vkCmdDraw(cmd, state.kind == kFoliageCards ? 12u : 15u, view.count, 0, 0);
+                ++m_Stats.foliageDrawCalls;
+                continue;
+            }
+            const ResolvedMesh resolved = m_Assets.ResolveMesh(state.mesh, state.meshIndex);
+            if (!resolved.model || resolved.placeholder || resolved.meshIndex >= resolved.model->meshes.size())
+                continue;
+            const Model& model = *resolved.model;
+            const Mesh&  mesh  = model.meshes[resolved.meshIndex];
+            if (!indexBound) {
+                vkCmdBindIndexBuffer(cmd, m_Renderer.Geometry().IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+                indexBound = true;
+            }
+            for (std::size_t k = 0; k < mesh.submeshes.size(); ++k) {
+                const std::size_t record = mesh.firstGpuSubmesh - model.submeshes.offset + k;
+                if (record >= model.gpuSubmeshes.size())
+                    break;
+                const GpuSubmesh& s = model.gpuSubmeshes[record];
+                push.material       = s.material;
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+                vkCmdDrawIndexed(cmd, s.indexCount, view.count, s.firstIndex, s.vertexOffset, 0);
+                ++m_Stats.foliageDrawCalls;
+            }
+        }
 }
 
 } // namespace Engine

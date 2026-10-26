@@ -4560,3 +4560,131 @@ TEST_CASE(Render_TerrainCdlodLayersAndEdits)
     TerrainStore::Instance().Clear();
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
+
+TEST_CASE(Render_TerrainFoliage)
+{
+    // A 32 m gray terrain seen from above: yellow procedural blades painted on the left half (with a
+    // hole in them), textured box meshes on the right front quarter. Instances come and go with the
+    // view distance and density map edits; blades cast sun shadows.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const std::string   path = PathToUtf8(fs::temp_directory_path() / "ungine_gpu_terrain" / "Foliage.uterrain");
+    auto data = std::make_shared<TerrainData>(MakeFlatTerrain(65, 32.0f, 10.0f, 0.0f));
+    data->layers[0].tint = glm::vec3(0.35f);
+    const std::uint32_t n = data->splatResolution;
+    FoliageLayer grass;
+    grass.name         = "Grass";
+    grass.density      = 40.0f;
+    grass.width        = 0.12f;
+    grass.height       = 0.6f;
+    grass.baseColor    = glm::vec3(0.9f, 0.75f, 0.05f);
+    grass.tipColor     = glm::vec3(1.0f, 0.85f, 0.1f);
+    grass.wind         = 0.0f;
+    grass.viewDistance = 80.0f;
+    grass.castShadows  = true;
+    grass.densityMap.assign(static_cast<std::size_t>(n) * n, 0);
+    FoliageLayer boxes = grass;
+    boxes.name        = "Boxes";
+    boxes.kind        = FoliageKind::Mesh;
+    boxes.mesh        = PathToUtf8(kBox);
+    boxes.density     = 0.6f;
+    boxes.minScale    = 0.8f;
+    boxes.maxScale    = 0.8f;
+    boxes.castShadows = false;
+    for (std::uint32_t y = 0; y < n; ++y)
+        for (std::uint32_t x = 0; x < n; ++x) {
+            grass.densityMap[static_cast<std::size_t>(y) * n + x] = x < n / 2 ? 255 : 0;
+            boxes.densityMap[static_cast<std::size_t>(y) * n + x] = x >= n / 2 && y >= n / 2 ? 255 : 0;
+        }
+    data->foliage = {grass, boxes};
+    data->holes.assign(65u * 65u, 0);
+    for (std::uint32_t z = 12; z < 20; ++z) // 6..10 m from the corner: x, z in [-10, -6]
+        for (std::uint32_t x = 12; x < 20; ++x)
+            data->holes[z * 65 + x] = 1;
+    TerrainStore::Instance().Provide(path, data);
+
+    Scene        scene;
+    const Entity ground = scene.CreateEntity("Terrain");
+    scene.GetRegistry().Emplace<Terrain>(ground, Terrain{.data = path});
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 26.0f, 14.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    // Average over a few pixels around a point (blades are thin).
+    const auto area = [&](const std::vector<std::uint8_t>& image, glm::vec3 p) {
+        const glm::ivec2 c = project(p);
+        glm::ivec3       sum(0);
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                sum += pixel(image, glm::clamp(c + glm::ivec2(dx, dy), glm::ivec2(0), glm::ivec2(159, 119)));
+        return sum / 25;
+    };
+    std::vector<std::uint8_t> image;
+    for (int i = 0; i < 200; ++i) { // until the box mesh has loaded (it adds its own draws)
+        F().assets->Update();
+        image = RenderImage(renderer, scene, camera, 1);
+        if (renderer.Stats().foliageDrawCalls > 6)
+            break;
+    }
+    image = RenderImage(renderer, scene, camera, 3);
+    if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) {
+        const std::vector<std::byte> png = EncodePng(image, 160, 120);
+        std::ofstream(fs::path(dir) / "foliage.png", std::ios::binary)
+            .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    }
+    const SceneRenderStats stats      = renderer.Stats();
+    const glm::ivec3       grassPixel = area(image, {-8.0f, 0.0f, 6.0f});
+    const glm::ivec3       bare       = area(image, {8.0f, 0.0f, -6.0f});
+    const glm::ivec3       holePixel  = area(image, {-8.0f, 0.0f, -8.0f});
+    std::printf("    foliage: grass %d %d %d, bare %d %d %d, hole %d %d %d, instances %u (shadow %u), draws %u\n", grassPixel.r,
+                grassPixel.g, grassPixel.b, bare.r, bare.g, bare.b, holePixel.r, holePixel.g, holePixel.b, stats.foliageInstances,
+                stats.foliageShadowInstances, stats.foliageDrawCalls);
+    CHECK(stats.foliageInstances > 5000u && stats.foliageShadowInstances > 0u);
+    CHECK(grassPixel.r > grassPixel.b + 20 && grassPixel.g > grassPixel.b + 20); // yellow blades
+    CHECK(bare.b >= bare.r);                                                      // bluish-gray lit ground
+    CHECK(holePixel.r < 40 && holePixel.g < 40);                                  // no blades over the hole
+    // Boxes: the textured mesh changes the right front quarter.
+    int        changed = 0;
+    glm::ivec3 boxColor(0);
+    for (float x = 3.0f; x < 15.0f; x += 1.0f)
+        for (float z = 3.0f; z < 15.0f; z += 1.0f) {
+            const glm::ivec3 c = pixel(image, project({x, 0.4f, z}));
+            if (std::abs(c.r - bare.r) + std::abs(c.g - bare.g) + std::abs(c.b - bare.b) > 40) {
+                ++changed;
+                boxColor += c;
+            }
+        }
+    boxColor /= std::max(changed, 1);
+    std::printf("    boxes: %d of 144 samples changed (avg %d %d %d)\n", changed, boxColor.r, boxColor.g, boxColor.b);
+    CHECK(changed > 10);
+
+    // View distance: nothing beyond it.
+    scene.GetRegistry().Get<Terrain>(ground).foliageDistance = 0.05f; // 4 m: the camera is ~26 m away
+    (void)RenderImage(renderer, scene, camera, 1);
+    CHECK(renderer.Stats().foliageInstances == 0u && renderer.Stats().foliageDrawCalls == 0u);
+    scene.GetRegistry().Get<Terrain>(ground).foliageDistance = 1.0f;
+
+    // Density map edit (only its chunks rescatter): the left half is cleared.
+    std::ranges::fill(data->foliage[0].densityMap, std::uint8_t{0});
+    TerrainStore::Instance().MarkDirty(path, TerrainChangeFoliage, {0.0f, 0.0f, 0.5f, 1.0f});
+    image = RenderImage(renderer, scene, camera, 2);
+    const glm::ivec3 cleared = area(image, {-8.0f, 0.0f, 6.0f});
+    std::printf("    cleared: %d %d %d, instances %u\n", cleared.r, cleared.g, cleared.b, renderer.Stats().foliageInstances);
+    CHECK(cleared.b >= cleared.r);
+    TerrainStore::Instance().Clear();
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}

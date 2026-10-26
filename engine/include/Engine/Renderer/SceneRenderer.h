@@ -243,6 +243,9 @@ struct SceneRenderStats {
     std::uint32_t terrains         = 0; // Terrain components drawn
     std::uint32_t terrainNodes     = 0; // CDLOD patches of the camera
     std::uint32_t terrainTriangles = 0;
+    std::uint32_t foliageInstances = 0; // camera (uploaded)
+    std::uint32_t foliageShadowInstances = 0;
+    std::uint32_t foliageDrawCalls = 0; // prepass + shadows + lighting
     glm::uvec3    fogGrid{0u};     // froxel grid (0 = volumetric fog off)
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame

@@ -1051,6 +1051,7 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
 - Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
 - Splat layers (up to 8: albedo/normal/ORM) + editor painting and sculpting (raise/lower/smooth/flatten) with undo; foliage/grass (instanced, density maps painted, culling, wind); heightmap import/export (16-bit PNG/RAW); holes mask + triplanar on steep slopes.
+- Progress: P32a data (`Terrain/TerrainData.h`, `TerrainStore`), P32b CDLOD renderer (`src/Renderer/TerrainRenderer`, shared `shading.glsl`/`ShadeSurface`), P32c physics (Jolt HeightField; a sample is no-collision only if all 4 surrounding cells are holes → 1-cell holes stay solid) + nav source (triangles per tile clip, signature = hash of heights/holes) + CPU `tests/TerrainTests.cpp` (4) done and pushed to `branch` (PR #21). Next: P32d foliage, P32e editor/cooker/Blueprint/player, P32f verification/docs.
 
 ### Phase 31 rendering (2026-10-26)
 Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".

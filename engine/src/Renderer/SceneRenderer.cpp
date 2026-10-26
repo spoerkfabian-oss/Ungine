@@ -1082,11 +1082,13 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         std::vector<Frustum> cascadeFrusta;
         for (std::uint32_t c = 0; c < cascadeCount; ++c)
             cascadeFrusta.push_back(Frustum::FromViewProjection(cascades[c].viewProj, false));
-        m_Terrain->Prepare(cmd, scene, camera.position, frustum, cascadeFrusta, cascadeCount > 0);
+        m_Terrain->Prepare(cmd, scene, camera.position, frustum, cascadeFrusta, cascadeCount > 0, frame.frameIndex);
         const TerrainRenderStats& terrainStats = m_Terrain->Stats();
         m_Stats.terrains         = terrainStats.terrains;
         m_Stats.terrainNodes     = terrainStats.nodes;
         m_Stats.terrainTriangles = terrainStats.triangles;
+        m_Stats.foliageInstances       = terrainStats.foliageInstances;
+        m_Stats.foliageShadowInstances = terrainStats.foliageShadowInstances;
     }
     m_Stats.cpuCullingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cullStart).count();
     AssignLocalShadows(camera); // sets GpuLight::shadow
@@ -2137,6 +2139,7 @@ void SceneRenderer::RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceA
         DrawCpuCamera(cmd, m_CameraDraws, frameAddress, true, lodTint);
     }
     m_Terrain->DrawLighting(cmd, frameAddress);
+    m_Stats.foliageDrawCalls = m_Terrain->Stats().foliageDrawCalls; // all passes of this frame
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Sky.Handle());
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(frameAddress), &frameAddress);

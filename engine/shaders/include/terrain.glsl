@@ -33,6 +33,7 @@ struct TerrainNode {
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer TerrainNodeBuffer { TerrainNode n[]; };
 
+#ifndef TERRAIN_CUSTOM_PUSH // foliage.glsl declares its own (also starting with frame)
 layout(push_constant) uniform TerrainPush {
     FrameData         frame;
     TerrainBuffer     terrain;
@@ -40,16 +41,19 @@ layout(push_constant) uniform TerrainPush {
     uint              cascade; // shadow passes
     uint              flags;
 } pc;
+#endif
 
 vec2 TerrainMotionVector(vec4 currentClip, vec4 previousClip)
 {
     return (currentClip.xy / currentClip.w - previousClip.xy / previousClip.w) * vec2(0.5, -0.5);
 }
 
+#ifndef TERRAIN_CUSTOM_PUSH
 vec4 TerrainSample(uint entry, vec2 uv)
 {
     return SampleTexture(pc.frame.textureTable.slot[entry], SAMPLER_LINEAR_REPEAT, uv);
 }
+#endif
 
 // Height texture UV of a terrain-space point (sample centers on the grid points).
 vec2 TerrainHeightUv(TerrainBuffer t, vec2 local)
