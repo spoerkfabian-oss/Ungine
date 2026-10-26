@@ -14,9 +14,15 @@ layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer C
     uint indices[];
 };
 
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer DecalClusterOutput {
+    uint counts[CLUSTER_COUNT];
+    uint indices[];
+};
+
 layout(push_constant) uniform CullPush {
-    FrameData     frame;
-    ClusterOutput clusters;
+    FrameData          frame;
+    ClusterOutput      clusters;
+    DecalClusterOutput decalClusters;
 } pc;
 
 shared vec4  sPositionRange[GROUP_SIZE]; // view space position, range
@@ -98,4 +104,27 @@ void main()
     }
     if (valid)
         pc.clusters.counts[cluster] = count;
+
+    // Decals: bounding spheres vs the cluster box, kept in sort order (lists are filled in order).
+    const uint decalCount = frame.decalInfo.x;
+    const uint decalFirst = cluster * CLUSTER_MAX_DECALS;
+    uint       decals     = 0u;
+    for (uint base = 0u; base < decalCount; base += GROUP_SIZE) {
+        const uint i = base + gl_LocalInvocationIndex;
+        if (i < decalCount) {
+            const vec4 bounds = frame.decals.d[i].bounds;
+            sPositionRange[gl_LocalInvocationIndex] = vec4((frame.view * vec4(bounds.xyz, 1.0)).xyz, bounds.w);
+        }
+        barrier();
+        const uint batch = min(GROUP_SIZE, decalCount - base);
+        for (uint j = 0u; valid && j < batch && decals < CLUSTER_MAX_DECALS; ++j) {
+            const vec4 pr = sPositionRange[j];
+            const vec3 d  = max(boxMin - pr.xyz, 0.0) + max(pr.xyz - boxMax, 0.0);
+            if (dot(d, d) <= pr.w * pr.w)
+                pc.decalClusters.indices[decalFirst + decals++] = base + j;
+        }
+        barrier();
+    }
+    if (valid)
+        pc.decalClusters.counts[cluster] = decals;
 }

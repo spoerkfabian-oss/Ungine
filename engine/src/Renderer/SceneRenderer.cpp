@@ -5,10 +5,14 @@
 #include "Engine/Particles/ParticleWorld.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
+#include "Engine/Core/Platform.h"
+#include "Engine/Scene/Components.h"
 #include "Engine/Renderer/ShadowAtlas.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Scene/Frustum.h"
 #include "Engine/Scene/Scene.h"
+
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -53,6 +57,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::vec4  localShadowParams; // x: normal bias (texels), y: PCF radius (texels)
     glm::uvec4 hizInfo;           // xy: Hi-Z level 0 size, z: levels, w: debug level
     glm::vec4  taaInfo;           // xy: jitter (NDC), z: frame time, w: frame counter
+    glm::uvec4 decalInfo;         // x: decal count
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
     VkDeviceAddress shadowViews;
@@ -65,6 +70,8 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress hiz;
     VkDeviceAddress textureTable; // material texture entry -> bindless slot
     VkDeviceAddress prevJointMatrices;
+    VkDeviceAddress decals;
+    VkDeviceAddress decalClusters;
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -126,6 +133,7 @@ struct TonemapPush { // mirrors TonemapPush in tonemap.frag
 struct LightCullPush { // mirrors CullPush in light_cull.comp
     VkDeviceAddress frame;
     VkDeviceAddress clusters;
+    VkDeviceAddress decalClusters;
 };
 
 constexpr std::uint32_t kClusterCount = kClusterGridX * kClusterGridY * kClusterGridZ;
@@ -265,7 +273,7 @@ const char* ToString(Tonemapper t)
     }
 }
 
-SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets)
+SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, AssetManager& assets)
     : m_Renderer(renderer), m_Assets(assets), m_Environment(renderer)
 {
     CreatePipelines();
@@ -278,6 +286,8 @@ SceneRenderer::SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const
                                         .debugName = "ExposureState"});
     m_Clusters           = Buffer(ctx, {.size  = std::uint64_t{kClusterCount} * (1 + kClusterMaxLights) * sizeof(std::uint32_t),
                                         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .debugName = "LightClusters"});
+    m_DecalClusters      = Buffer(ctx, {.size  = std::uint64_t{kClusterCount} * (1 + kClusterMaxDecals) * sizeof(std::uint32_t),
+                                        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .debugName = "DecalClusters"});
     for (Buffer& b : m_PickReadback)
         b = Buffer(ctx, {.size = 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .memory = MemoryUsage::Readback,
                          .debugName = "PickReadback"});
@@ -452,6 +462,10 @@ SceneRenderer::~SceneRenderer()
                         &m_LocalShadow, &m_LocalShadowMasked, &m_PrepassPicking, &m_MeshBlend, &m_Taa})
         m_Renderer.DeferRelease(std::move(*p));
     m_Renderer.DeferRelease(std::move(m_Clusters));
+    m_Renderer.DeferRelease(std::move(m_DecalClusters));
+    for (auto& [key, entry] : m_DecalTextures)
+        m_Assets.Release(entry.handle);
+    m_DecalTextures.clear();
     m_Renderer.DeferRelease(std::move(m_LuminanceHistogram));
     m_Renderer.DeferRelease(std::move(m_ExposureState));
     m_Renderer.DeferRelease(std::move(m_ExposureReadback));
@@ -947,6 +961,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     if (m_GpuScene->BlendDraws() > 0) // both paths: blending needs a CPU sort
         GatherDraws(frustum, glm::vec4(0.0f), m_TransparentDraws, Gather::Transparent);
     CollectLights(scene, frustum);
+    CollectDecals(scene, frustum);
     {
         static const ParticleRenderData kNoParticles;
         m_Particles->Prepare(particles ? particles->RenderData() : kNoParticles, frustum, camera.position, frame.frameIndex);
@@ -961,6 +976,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         return a.gpu;
     };
     const VkDeviceAddress lightAddress      = pushArray(m_Lights);
+    const VkDeviceAddress decalAddress      = pushArray(m_Decals);
     const VkDeviceAddress shadowViewAddress = pushArray(m_ShadowViewData);
     // Logarithmic slices between the near plane and clusterFar: slice = log(z) * scale + bias.
     const float clusterNear  = camera.nearPlane;
@@ -997,6 +1013,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .localShadowParams = glm::vec4(localShadows.normalBias, localShadows.filterRadius, 0.0f, 0.0f),
           .hizInfo         = glm::uvec4(m_GpuCulling->HiZSize(), m_GpuCulling->HiZLevels(), culling.hizDebugLevel),
           .taaInfo         = glm::vec4(jitter, deltaTime, static_cast<float>(m_FrameCounter % 1024)),
+          .decalInfo       = glm::uvec4(static_cast<std::uint32_t>(m_Decals.size()), 0u, 0u, 0u),
           .lights          = lightAddress,
           .clusters        = m_Clusters.Address(),
           .shadowViews     = shadowViewAddress,
@@ -1008,7 +1025,9 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .draws           = m_GpuScene->DrawAddress(),
           .hiz             = m_GpuCulling->HiZAddress(),
           .textureTable    = m_Renderer.TextureTableAddress(),
-          .prevJointMatrices = m_GpuScene->PrevJointMatrixAddress()};
+          .prevJointMatrices = m_GpuScene->PrevJointMatrixAddress(),
+          .decals          = decalAddress,
+          .decalClusters   = m_DecalClusters.Address()};
     ++m_FrameCounter;
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;
@@ -1045,8 +1064,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
         GpuScope scope(profiler, cmd, "GTAO");
         RenderAmbientOcclusion(cmd, extent, camera);
     }
-    if (!m_Lights.empty()) {
-        GpuScope scope(profiler, cmd, "Light culling");
+    if (!m_Lights.empty() || !m_Decals.empty()) {
+        GpuScope scope(profiler, cmd, "Light + decal culling");
         CullLights(cmd, frameAddress);
     }
     {
@@ -1451,6 +1470,87 @@ void SceneRenderer::CollectLights(Scene& scene, const Frustum& frustum)
     m_Stats.lights = static_cast<std::uint32_t>(m_Lights.size());
 }
 
+std::uint32_t SceneRenderer::DecalTexture(const std::string& path, TextureKind kind)
+{
+    if (path.empty())
+        return ~0u;
+    const std::string key = std::to_string(static_cast<int>(kind)) + '|' + path;
+    auto it = m_DecalTextures.find(key);
+    if (it == m_DecalTextures.end())
+        it = m_DecalTextures.emplace(key, DecalTextureEntry{.handle = m_Assets.LoadTexture(PathFromUtf8(path), kind)}).first;
+    it->second.lastUsed = m_FrameCounter;
+    return m_Assets.TableEntry(it->second.handle); // neutral default while loading, placeholder on failure
+}
+
+void SceneRenderer::ReleaseUnusedDecalTextures()
+{
+    constexpr std::uint64_t kKeepFrames = 300; // keep briefly unused ones (decals culled for a moment)
+    for (auto it = m_DecalTextures.begin(); it != m_DecalTextures.end();) {
+        if (m_FrameCounter - it->second.lastUsed > kKeepFrames) {
+            m_Assets.Release(it->second.handle); // the table entry is freed deferred
+            it = m_DecalTextures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void SceneRenderer::CollectDecals(Scene& scene, const Frustum& frustum)
+{
+    m_Decals.clear();
+    if (!decals.enabled)
+        return;
+    struct Candidate {
+        std::int32_t  order;
+        std::uint64_t uuid;
+        GpuDecal      gpu;
+    };
+    std::vector<Candidate> candidates;
+    const Registry& registry = scene.GetRegistry();
+    registry.ViewOf<Decal, WorldTransform>().Each([&](Entity entity, const Decal& decal, const WorldTransform& world) {
+        const glm::mat4 box = world.matrix * glm::scale(glm::mat4(1.0f), glm::max(glm::abs(decal.halfExtents), glm::vec3(1e-3f)));
+        const float     det = glm::determinant(glm::mat3(box));
+        if (!std::isfinite(det) || std::abs(det) < 1e-12f)
+            return;
+        const glm::vec3 center = box[3];
+        const float     radius = glm::length(glm::vec3(box[0])) + glm::length(glm::vec3(box[1])) + glm::length(glm::vec3(box[2]));
+        if (!frustum.Intersects({center - glm::vec3(radius), center + glm::vec3(radius)}))
+            return;
+        float opacity = decal.color.a;
+        if (decal.lifetime > 0.0f && decal.fadeOut > 0.0f) // last seconds of the lifetime
+            opacity *= std::clamp((decal.lifetime - decal.age) / decal.fadeOut, 0.0f, 1.0f);
+        const float start = glm::radians(std::clamp(decal.angleFade, 0.0f, 89.0f));
+        const float end   = std::max(start + glm::radians(5.0f), glm::radians(89.0f));
+        GpuDecal gpu{.worldToDecal = glm::inverse(box),
+                     .color        = glm::vec4(glm::vec3(decal.color), opacity),
+                     .emissive     = glm::vec4(decal.emissiveColor, decal.normalStrength),
+                     .textures     = glm::uvec4(DecalTexture(decal.albedo, TextureKind::Color),
+                                                DecalTexture(decal.normal, TextureKind::Normal),
+                                                DecalTexture(decal.mask, TextureKind::Linear),
+                                                DecalTexture(decal.emissive, TextureKind::Color)),
+                     .params       = glm::vec4(decal.roughness, decal.metallic, decal.materialOpacity, decal.edgeFade),
+                     .fade         = glm::vec4(std::cos(start), std::cos(end), 0.0f, 0.0f),
+                     .tangent      = glm::vec4(glm::normalize(glm::vec3(world.matrix[0])), 0.0f),
+                     .axis         = glm::vec4(-glm::normalize(glm::vec3(world.matrix[2])), 0.0f),
+                     .bounds       = glm::vec4(center, radius)};
+        candidates.push_back({decal.sortOrder, registry.Get<Uuid>(entity).value, gpu});
+    });
+    // Sort order first, then a stable tie-break: the cluster lists keep this order.
+    std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+        return a.order != b.order ? a.order < b.order : a.uuid < b.uuid;
+    });
+    if (candidates.size() > kMaxVisibleDecals) {
+        static bool warned = false;
+        if (!std::exchange(warned, true))
+            ENGINE_WARN("More than {} visible decals: the rest is dropped", kMaxVisibleDecals);
+        candidates.resize(kMaxVisibleDecals);
+    }
+    for (const Candidate& c : candidates)
+        m_Decals.push_back(c.gpu);
+    m_Stats.decals = static_cast<std::uint32_t>(m_Decals.size());
+    ReleaseUnusedDecalTextures();
+}
+
 void SceneRenderer::CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress)
 {
     const auto& bindless = m_Renderer.GetBindless();
@@ -1461,11 +1561,13 @@ void SceneRenderer::CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress
                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     bindless.Bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_LightCull.Handle());
-    const LightCullPush push{.frame = frameAddress, .clusters = m_Clusters.Address()};
+    const LightCullPush push{.frame = frameAddress, .clusters = m_Clusters.Address(), .decalClusters = m_DecalClusters.Address()};
     vkCmdPushConstants(cmd, bindless.PipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, kClusterCount / kLightCullGroupSize, 1, 1);
+    // Read by shading (fragment) and the volumetric fog (compute).
     MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 }
 
 void SceneRenderer::RenderShadows(VkCommandBuffer cmd, VkDeviceAddress frameAddress,

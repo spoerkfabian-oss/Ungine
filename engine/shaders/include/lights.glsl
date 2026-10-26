@@ -43,6 +43,30 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer ClusterBuff
     uint indices[];
 };
 
+// Projected decals, clustered like the lights. Mirrors Engine::GpuDecal (SceneRenderer.h).
+#define CLUSTER_MAX_DECALS 32u // per cluster, in sort order; the list is truncated beyond
+#define DECAL_NO_TEXTURE   0xFFFFFFFFu
+
+struct GpuDecal {
+    mat4  worldToDecal; // world -> box [-1, 1]^3, projection along -z
+    vec4  color;        // albedo tint, a: opacity (lifetime fade included)
+    vec4  emissive;     // rgb: HDR emissive, w: normal strength
+    uvec4 textures;     // texture table entries: albedo, normal, mask, emissive (DECAL_NO_TEXTURE)
+    vec4  params;       // x: roughness, y: metallic, z: material opacity, w: edge fade (box depth fraction)
+    vec4  fade;         // x: cos of the angle where fading starts, y: where it ends
+    vec4  tangent;      // xyz: decal +x axis (world)
+    vec4  axis;         // xyz: projection direction (world, decal -z)
+    vec4  bounds;       // xyz: world center, w: radius (culling)
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DecalBuffer { GpuDecal d[]; };
+
+// counts[c], then CLUSTER_MAX_DECALS indices per cluster.
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer DecalClusterBuffer {
+    uint counts[CLUSTER_COUNT];
+    uint indices[];
+};
+
 // Logarithmic depth slices: slice = log(viewDepth) * scale + bias.
 uint ClusterIndex(vec2 fragCoord, float viewDepth, vec2 tileScale, float sliceScale, float sliceBias)
 {

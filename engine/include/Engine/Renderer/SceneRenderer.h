@@ -1,4 +1,6 @@
 #pragma once
+#include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Environment.h"
 #include "Engine/Renderer/Renderer.h"
@@ -15,6 +17,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -122,6 +126,29 @@ struct CullingSettings {
     bool          shadowOcclusion = true;
 };
 
+// Projected decals (Decal components): clustered like the lights, applied to opaque surfaces
+// before lighting, in sort order.
+inline constexpr std::uint32_t kClusterMaxDecals = 32;   // per cluster, mirrored in lights.glsl
+inline constexpr std::uint32_t kMaxVisibleDecals = 1024; // after CPU frustum culling
+
+struct DecalSettings {
+    bool enabled = true;
+};
+
+// Mirrors GpuDecal in lights.glsl.
+struct GpuDecal {
+    glm::mat4  worldToDecal{1.0f};
+    glm::vec4  color{1.0f};
+    glm::vec4  emissive{0.0f};     // w: normal strength
+    glm::uvec4 textures{~0u};      // texture table entries: albedo, normal, mask, emissive
+    glm::vec4  params{0.0f};       // roughness, metallic, material opacity, edge fade
+    glm::vec4  fade{0.0f};         // cos start, cos end
+    glm::vec4  tangent{0.0f};      // decal +X (world)
+    glm::vec4  axis{0.0f};         // projection direction (world)
+    glm::vec4  bounds{0.0f};       // world center, radius
+};
+static_assert(sizeof(GpuDecal) == 192);
+
 // Mirrors GpuShadowView in lights.glsl.
 struct GpuShadowView {
     glm::mat4 viewProj{1.0f};
@@ -159,6 +186,7 @@ struct SceneRenderStats {
     std::uint32_t shadowDraws = 0; // over all cascades (GPU: draws emitted by the culling pass)
     std::uint64_t triangles   = 0;
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
+    std::uint32_t decals      = 0; // decals after frustum culling
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
     std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
@@ -220,7 +248,8 @@ struct RenderOutput {
 //   tone mapping pass (+ bloom composite, debug views) -> swapchain image
 class SceneRenderer {
 public:
-    SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets);
+    // `assets` also loads the decal textures (held until they go unused, released in the dtor).
+    SceneRenderer(Renderer& renderer, const VulkanContext& ctx, AssetManager& assets);
     ~SceneRenderer(); // defers GPU destruction through the renderer
 
     SceneRenderer(const SceneRenderer&)            = delete;
@@ -238,6 +267,7 @@ public:
     SelectionOverlay                      overlay;
     CullingSettings                       culling;
     TaaSettings                           taa;
+    DecalSettings                         decals;
     // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
     const ParticleWorld*                  particles = nullptr;
 
@@ -281,6 +311,9 @@ private:
                  std::uint32_t cascadeCount, VkExtent2D extent);
     [[nodiscard]] bool GpuPath() const;
     void CollectLights(Scene& scene, const Frustum& frustum);
+    void CollectDecals(Scene& scene, const Frustum& frustum);
+    [[nodiscard]] std::uint32_t DecalTexture(const std::string& path, TextureKind kind); // table entry, ~0u: none
+    void ReleaseUnusedDecalTextures();
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
     bool EnsureShadowAtlas(); // true: (re)created, contents undefined
@@ -305,7 +338,7 @@ private:
     void ReleaseShadowMap();
 
     Renderer&           m_Renderer;
-    const AssetManager& m_Assets;
+    AssetManager&       m_Assets;
     Environment         m_Environment;
     std::uint64_t       m_ShaderGeneration = 0; // Renderer::ShaderGeneration the pipelines were built for
     Pipeline            m_Mesh; // cull mode + front face are dynamic
@@ -376,6 +409,13 @@ private:
     std::optional<glm::uvec2>            m_PickRequest;
     std::optional<Entity>                m_PickResult;
 
+    std::vector<GpuDecal> m_Decals; // this frame's visible decals, in sort order
+    Buffer                m_DecalClusters; // per-cluster counts + decal index lists (light_cull.comp)
+    struct DecalTextureEntry {
+        TextureHandle handle;
+        std::uint64_t lastUsed = 0; // m_FrameCounter
+    };
+    std::unordered_map<std::string, DecalTextureEntry> m_DecalTextures; // kind + '|' + path
     std::vector<GpuLight> m_Lights; // this frame's visible lights
     std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
     std::vector<Entity>   m_LightEntities;     // parallel to m_Lights

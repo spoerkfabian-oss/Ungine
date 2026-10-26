@@ -47,6 +47,7 @@ add_library(Engine STATIC
     src/Scene/AabbTree.cpp
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/Decals.cpp
     src/Scene/Prefab.cpp
     src/Scene/LevelStreaming.cpp
     src/Scene/SpatialIndex.cpp
@@ -106,6 +107,7 @@ set_target_properties(Engine PROPERTIES FOLDER "Engine")
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE
 set(ENGINE_SHADER_INCLUDES
     shaders/include/bindless.glsl
+    shaders/include/decals.glsl
     shaders/include/depth_normal.glsl
     shaders/include/exposure.glsl
     shaders/include/frame.glsl

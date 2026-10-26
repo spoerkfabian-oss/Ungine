@@ -4,6 +4,7 @@
 // (MESH_BLEND: alpha-blended, sorted back to front, no screen-space AO).
 #include "bindless.glsl"
 #include "mesh_common.glsl"
+#include "decals.glsl"
 #include "pbr.glsl"
 #include "shadow.glsl"
 #include "surface.glsl"
@@ -39,7 +40,7 @@ void main()
     if (LodFadeDiscard(inLodFade, gl_FragCoord.xy)) // same pixels as in the prepass
         discard;
     const Material m    = pc.frame.materials.m[inMaterial];
-    const vec4     base = m.baseColorFactor * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV);
+    vec4           base = m.baseColorFactor * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV);
 
 #ifndef MESH_BLEND
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u && base.a < m.alphaCutoff)
@@ -48,17 +49,23 @@ void main()
 
     // --- Normal ---
     const mat3 tbn = SurfaceFrame(inNormal, inTangent, inWorldPos, inUV);
-    const vec3 N   = PerturbedNormal(m, tbn, inUV);
+    vec3       N   = PerturbedNormal(m, tbn, inUV);
 
     // --- Material ---
     const vec4  mr        = SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV); // G rough, B metal
-    const float metallic  = clamp(m.metallic * mr.b, 0.0, 1.0);
-    const float roughness = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
+    float       metallic  = clamp(m.metallic * mr.b, 0.0, 1.0);
+    float       roughness = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
+    vec3        emissive  = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
+
+    FrameData   frame     = pc.frame;
+    const float viewDepth = -(frame.view * vec4(inWorldPos, 1.0)).z;
+#ifndef MESH_BLEND // decals project onto opaque surfaces
+    ApplyDecals(frame, inWorldPos, tbn[2], viewDepth, base.rgb, N, roughness, metallic, emissive);
+#endif
     const float a         = roughness * roughness;
     const vec3  cDiff     = mix(base.rgb, vec3(0.0), metallic);
     const vec3  f0        = mix(vec3(0.04), base.rgb, metallic);
 
-    FrameData       frame = pc.frame;
     const vec3      V     = normalize(frame.cameraPosition.xyz - inWorldPos);
     const float     NdotV = clamp(dot(N, V), 1e-4, 1.0);
 
@@ -67,7 +74,6 @@ void main()
     const float NdotL = clamp(dot(N, L), 0.0, 1.0);
 
     // Shadows use the geometric normal (normal maps would drag the offset into the surface).
-    const float viewDepth = -(frame.view * vec4(inWorldPos, 1.0)).z;
     uint        cascade;
     const float shadow = NdotL > 0.0 ? SunShadow(frame, inWorldPos, tbn[2], viewDepth, gl_FragCoord.xy, cascade)
                                      : 0.0;
@@ -127,7 +133,6 @@ void main()
     const float specAO   = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
     const vec3  indirect = (FssEss * radiance * specAO + (FmsEms + kD) * irradiance * ao) * frame.sky.y;
 
-    const vec3 emissive = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
     vec3       color    = direct + indirect + emissive;
 
     if (frame.shadowInfo.y != 0u && NdotL > 0.0 && cascade < 4u) { // debug: red, green, blue, yellow

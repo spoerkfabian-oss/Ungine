@@ -42,6 +42,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
 
     // Temporal anti-aliasing
     vec4  taaInfo;  // xy: this frame's jitter (NDC), z: frame time (s), w: frame counter
+    uvec4 decalInfo; // x: decal count (0 = no decals this frame)
 
     LightBuffer      lights;
     ClusterBuffer    clusters;
@@ -55,6 +56,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     HiZBuffer        hiz;
     TextureTable     textureTable; // material texture entry -> bindless slot
     JointMatrixBuffer prevJointMatrices; // last frame's skin palettes (GpuInstance.prevJointOffset)
+    DecalBuffer        decals;
+    DecalClusterBuffer decalClusters;
 };
 
 #endif

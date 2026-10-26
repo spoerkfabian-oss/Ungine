@@ -517,6 +517,63 @@ json ParticleSystemToJson(const ParticleSystem& p, const std::string& effect)
             {"tint", ToJson(p.tint)}};
 }
 
+json DecalToJson(const Decal& d, const ModelRefs& paths)
+{
+    return {{"halfExtents", ToJson(d.halfExtents)},
+            {"albedo", paths.WritePath(d.albedo)},
+            {"normal", paths.WritePath(d.normal)},
+            {"mask", paths.WritePath(d.mask)},
+            {"emissive", paths.WritePath(d.emissive)},
+            {"color", ToJson(d.color)},
+            {"emissiveColor", ToJson(d.emissiveColor)},
+            {"roughness", d.roughness},
+            {"metallic", d.metallic},
+            {"materialOpacity", d.materialOpacity},
+            {"normalStrength", d.normalStrength},
+            {"angleFade", d.angleFade},
+            {"edgeFade", d.edgeFade},
+            {"sortOrder", d.sortOrder},
+            {"lifetime", d.lifetime},
+            {"fadeOut", d.fadeOut},
+            {"age", d.age}};
+}
+
+Decal DecalFromJson(const json& j, const ModelRefs& paths)
+{
+    Decal d;
+    Read(j, "halfExtents", d.halfExtents);
+    Read(j, "albedo", d.albedo);
+    Read(j, "normal", d.normal);
+    Read(j, "mask", d.mask);
+    Read(j, "emissive", d.emissive);
+    Read(j, "color", d.color);
+    Read(j, "emissiveColor", d.emissiveColor);
+    Read(j, "roughness", d.roughness);
+    Read(j, "metallic", d.metallic);
+    Read(j, "materialOpacity", d.materialOpacity);
+    Read(j, "normalStrength", d.normalStrength);
+    Read(j, "angleFade", d.angleFade);
+    Read(j, "edgeFade", d.edgeFade);
+    Read(j, "sortOrder", d.sortOrder);
+    Read(j, "lifetime", d.lifetime);
+    Read(j, "fadeOut", d.fadeOut);
+    Read(j, "age", d.age);
+    for (std::string* path : {&d.albedo, &d.normal, &d.mask, &d.emissive})
+        *path = paths.ReadPath(*path);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    d.halfExtents     = glm::max(glm::abs(d.halfExtents), glm::vec3(1e-3f));
+    d.roughness       = std::clamp(finite(d.roughness, 0.6f), 0.0f, 1.0f);
+    d.metallic        = std::clamp(finite(d.metallic, 0.0f), 0.0f, 1.0f);
+    d.materialOpacity = std::clamp(finite(d.materialOpacity, 1.0f), 0.0f, 1.0f);
+    d.normalStrength  = std::clamp(finite(d.normalStrength, 1.0f), 0.0f, 4.0f);
+    d.angleFade       = std::clamp(finite(d.angleFade, 70.0f), 0.0f, 89.0f);
+    d.edgeFade        = std::clamp(finite(d.edgeFade, 0.1f), 0.0f, 1.0f);
+    d.lifetime        = std::max(finite(d.lifetime, 0.0f), 0.0f);
+    d.fadeOut         = std::max(finite(d.fadeOut, 1.0f), 0.0f);
+    d.age             = std::max(finite(d.age, 0.0f), 0.0f);
+    return d;
+}
+
 json AnimationControllerToJson(const AnimationController& a, const std::string& graph)
 {
     return {{"graph", graph},
@@ -810,6 +867,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioSource"] = AudioSourceToJson(*source, models.WritePath(source->sound));
     if (r.Has<AudioListener>(e))
         j["audioListener"] = json::object();
+    if (const auto* decal = r.TryGet<Decal>(e))
+        j["decal"] = DecalToJson(*decal, models);
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* controller = r.TryGet<AnimationController>(e))
@@ -1010,6 +1069,7 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         particles.effect         = models.ReadPath(particles.effect);
         return particles;
     });
+    ApplyOptional<Decal>(r, e, j, "decal", [&](const json& d) { return DecalFromJson(d, models); });
     ApplyOptional<AnimationController>(r, e, j, "animationController", [&](const json& a) {
         AnimationController controller = AnimationControllerFromJson(a);
         controller.graph               = models.ReadPath(controller.graph);

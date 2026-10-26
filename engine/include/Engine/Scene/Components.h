@@ -374,6 +374,31 @@ struct ParticleSystem {
     bool operator==(const ParticleSystem&) const = default;
 };
 
+// Projected decal (clustered, applied before lighting): the box +-halfExtents in entity space,
+// projected along the entity's -Z axis onto whatever surface lies inside. Texture paths are
+// absolute in memory, relative to the scene in files; an empty albedo path is a plain color.
+struct Decal {
+    glm::vec3     halfExtents{0.5f, 0.5f, 0.25f};
+    std::string   albedo{};   // sRGB, alpha = coverage
+    std::string   normal{};   // tangent space (decal X/Y), optional
+    std::string   mask{};     // glTF metallic-roughness style: G roughness, B metallic (optional)
+    std::string   emissive{}; // sRGB, times emissiveColor (optional; without it emissiveColor x coverage)
+    glm::vec4     color{1.0f};          // albedo tint, a = opacity
+    glm::vec3     emissiveColor{0.0f};  // HDR
+    float         roughness       = 0.6f;
+    float         metallic        = 0.0f;
+    float         materialOpacity = 1.0f; // how far roughness / metallic follow the decal (0 = keep the surface)
+    float         normalStrength  = 1.0f;
+    float         angleFade       = 70.0f; // degrees between surface and projection axis where fading starts
+    float         edgeFade        = 0.1f;  // fraction of the box depth faded at the front / back
+    std::int32_t  sortOrder       = 0;     // higher draws on top
+    float         lifetime        = 0.0f;  // seconds, 0 = forever (UpdateDecals ages and removes them)
+    float         fadeOut         = 1.0f;  // last seconds of the lifetime: opacity to 0
+    float         age             = 0.0f;  // runtime
+
+    bool operator==(const Decal&) const = default;
+};
+
 // --- Navigation (NavigationWorld, Recast/Detour). Geometry: colliders (not triggers) of static
 // bodies or without a RigidBody. Area / profile names refer to NavSettings (project). ---
 

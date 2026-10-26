@@ -27,6 +27,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Decals.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
@@ -4084,5 +4085,108 @@ TEST_CASE(Render_TemporalAntiAliasing)
     CHECK(moving > 300 && moving < 3000 && still > 15000);
     CHECK(DifferentPixels(moved, target) < edges * 3); // softer edges while moving, no trail
     F().assets->Release(box);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_ClusteredDecals)
+{
+    // A ground plane and a wall; decals projected straight down onto the ground: a red texture,
+    // a green one with a higher sort order overlapping it, an emissive one. The wall (90 degrees
+    // to the projection) stays untouched, a decal with a lifetime fades and is removed.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_decals_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    WriteFile(dir / "red.png", SolidPng(255, 0, 0));
+    WriteFile(dir / "green.png", SolidPng(0, 255, 0));
+
+    const ModelHandle plane = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 10.0f});
+    const ModelHandle box   = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    CHECK(F().Pump([&] { return Settled(plane) && Settled(box); }));
+    Scene        scene;
+    Registry&    r      = scene.GetRegistry();
+    const Entity ground = scene.CreateEntity("Ground");
+    r.Emplace<MeshRenderer>(ground, MeshRenderer{.model = plane, .meshIndex = 0});
+    const Entity wall = scene.CreateEntity("Wall");
+    r.Emplace<MeshRenderer>(wall, MeshRenderer{.model = box, .meshIndex = 0});
+    scene.EditTransform(wall).position = {1.6f, 0.5f, 0.0f};
+    scene.EditTransform(wall).scale    = {0.2f, 1.0f, 2.0f};
+    const glm::quat down = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // -Z projects down
+    const auto addDecal = [&](const char* name, glm::vec3 position, Decal decal) {
+        const Entity e = scene.CreateEntity(name);
+        scene.EditTransform(e).position = position;
+        scene.EditTransform(e).rotation = down;
+        r.Emplace<Decal>(e, std::move(decal));
+        return e;
+    };
+    const Entity red = addDecal("Red", {-0.6f, 0.0f, 0.0f}, Decal{.halfExtents = {0.5f, 0.5f, 0.5f}, .albedo = PathToUtf8(dir / "red.png")});
+    // Covers the right half of the red one, drawn on top (higher order) although created later only by chance.
+    addDecal("Green", {-0.1f, 0.0f, 0.0f}, Decal{.halfExtents = {0.3f, 0.3f, 0.5f}, .albedo = PathToUtf8(dir / "green.png"), .sortOrder = 1});
+    // Reaches into the wall: the wall's sides face sideways (no decal), only the ground below it.
+    addDecal("Glow", {1.0f, 0.0f, 0.0f}, Decal{.halfExtents = {0.9f, 0.3f, 1.2f}, .color = {1.0f, 1.0f, 1.0f, 0.0f},
+                                              .emissiveColor = {0.0f, 0.0f, 4.0f}});
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled       = false;
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    const glm::vec3  eye{0.0f, 4.0f, 3.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    // Textures load in the background: render until the red one shows.
+    std::vector<std::uint8_t> image;
+    for (int i = 0; i < 60; ++i) {
+        image = RenderImage(renderer, scene, camera, 2);
+        F().assets->Update();
+        const glm::ivec3 c = pixel(image, project({-0.85f, 0.0f, 0.0f}));
+        if (c.r > 2 * c.g + 20 && c.r > 2 * c.b + 20)
+            break;
+    }
+    const glm::ivec3 redPixel   = pixel(image, project({-0.85f, 0.0f, 0.0f}));
+    const glm::ivec3 greenPixel = pixel(image, project({-0.1f, 0.0f, 0.0f}));
+    const glm::ivec3 glowPixel  = pixel(image, project({0.8f, 0.0f, 0.0f}));
+    const glm::ivec3 plain      = pixel(image, project({-0.6f, 0.0f, 1.5f}));
+    const glm::ivec3 wallSide   = pixel(image, project({1.5f, 0.6f, 0.4f}));
+    std::printf("    red %d %d %d, green %d %d %d, glow %d %d %d, ground %d %d %d, wall %d %d %d (decals %u)\n", redPixel.r,
+                redPixel.g, redPixel.b, greenPixel.r, greenPixel.g, greenPixel.b, glowPixel.r, glowPixel.g, glowPixel.b,
+                plain.r, plain.g, plain.b, wallSide.r, wallSide.g, wallSide.b, renderer.Stats().decals);
+    CHECK(renderer.Stats().decals == 3);
+    CHECK(redPixel.r > 2 * redPixel.g + 20 && redPixel.r > 2 * redPixel.b + 20);
+    CHECK(greenPixel.g > 2 * greenPixel.r + 20); // sort order: on top of the red one
+    CHECK(glowPixel.b > plain.b + 20);
+
+    // Off: the ground under the decals is plain again; outside them and on the wall side (90
+    // degrees to the projection: faded out) nothing changed.
+    renderer.decals.enabled = false;
+    const auto       offImage = RenderImage(renderer, scene, camera, 1);
+    const glm::ivec3 off      = pixel(offImage, project({-0.85f, 0.0f, 0.0f}));
+    const auto       same     = [](glm::ivec3 a, glm::ivec3 b) { return glm::all(glm::lessThan(glm::abs(a - b), glm::ivec3(6))); };
+    CHECK(std::abs(off.r - off.g) < 30 && off.r < redPixel.r);
+    CHECK(same(plain, pixel(offImage, project({-0.6f, 0.0f, 1.5f}))));
+    CHECK(same(wallSide, pixel(offImage, project({1.5f, 0.6f, 0.4f}))));
+    const glm::ivec3 noGlow = pixel(offImage, project({0.8f, 0.0f, 0.0f}));
+    CHECK(glowPixel.b - glowPixel.r > noGlow.b - noGlow.r + 40); // bluer than without the emissive decal
+    renderer.decals.enabled = true;
+    r.Get<Decal>(red).lifetime = 1.0f;
+    r.Get<Decal>(red).fadeOut  = 0.5f;
+    UpdateDecals(scene, 0.75f); // half faded
+    const glm::ivec3 half = pixel(RenderImage(renderer, scene, camera, 1), project({-0.85f, 0.0f, 0.0f}));
+    CHECK(half.r < redPixel.r && half.r > off.r);
+    UpdateDecals(scene, 0.5f);
+    CHECK(!r.Valid(red));
+    F().assets->Release(plane);
+    F().assets->Release(box);
+    fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
