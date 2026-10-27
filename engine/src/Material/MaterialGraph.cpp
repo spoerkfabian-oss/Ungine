@@ -315,10 +315,11 @@ MaterialGraph MakeDefaultMaterialGraph()
     metallic.name = "Metallic";
     graph.parameters = {color, roughness, metallic};
 
+    // Laid out without overlaps (a vector parameter node is 150 units high).
     const std::uint32_t output = graph.AddNode(kMaterialOutputNode, {420.0f, 0.0f});
-    const std::uint32_t c      = graph.AddNode("Param.Vector", {80.0f, -40.0f}, "BaseColor");
-    const std::uint32_t r      = graph.AddNode("Param.Scalar", {80.0f, 120.0f}, "Roughness");
+    const std::uint32_t c      = graph.AddNode("Param.Vector", {80.0f, -120.0f}, "BaseColor");
     const std::uint32_t m      = graph.AddNode("Param.Scalar", {80.0f, 60.0f}, "Metallic");
+    const std::uint32_t r      = graph.AddNode("Param.Scalar", {80.0f, 140.0f}, "Roughness");
     graph.Connect(c, "RGB", output, "BaseColor");
     graph.Connect(m, "Value", output, "Metallic");
     graph.Connect(r, "Value", output, "Roughness");

@@ -42,6 +42,7 @@ class History;
 class LevelStreamer;
 class ParticleEditor;
 class AnimGraphEditor;
+class MaterialEditor;
 class AnimationSystem;
 class ParticleWorld;
 class NavigationWorld;
@@ -174,6 +175,7 @@ public:
     [[nodiscard]] ParticleEditor& Particles() { return *m_ParticleEditor; }
     // Animation graph window (.uanim).
     [[nodiscard]] AnimGraphEditor& AnimGraphs() { return *m_AnimGraphEditor; }
+    [[nodiscard]] MaterialEditor&  MaterialWindow() { return *m_MaterialEditor; }
 
     // Project: Content browser root (the project's Content/, else the working directory), Build &
     // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
@@ -207,6 +209,10 @@ public:
     // Animation Controller on the model instance the entity belongs to (added if missing), + undo.
     // False when the entity is not part of a model instance.
     bool AssignAnimGraph(Entity entity, const std::filesystem::path& graph);
+    // A .umat / .uminst on the entity's meshes (submesh -1: every submesh; empty path: the model's
+    // material again). Meshes below the entity (model roots) too. Undoable; false without a mesh.
+    bool AssignMaterial(Entity entity, const std::filesystem::path& material, int submesh = -1);
+    void DrawMaterialSlots(Entity entity); // inspector (Mesh Renderer)
     // Import (copied in the background into `directory`, which must be inside ContentRoot();
     // a .gltf brings its external files along): false if rejected, see Status().
     bool ImportContent(const std::filesystem::path& source, const std::filesystem::path& directory);
@@ -357,6 +363,7 @@ private:
     std::unique_ptr<ScriptGraphEditor> m_Graphs;
     std::unique_ptr<ParticleEditor>    m_ParticleEditor;
     std::unique_ptr<AnimGraphEditor>   m_AnimGraphEditor;
+    std::unique_ptr<MaterialEditor>    m_MaterialEditor;
 
     // Viewport render target (RGBA8 sRGB, sampled by ImGui).
     Image         m_ViewportImage;
@@ -478,7 +485,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, AnimGraph, Terrain, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, AnimGraph, Terrain, Material, MaterialInstance, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;

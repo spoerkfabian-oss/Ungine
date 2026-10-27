@@ -6,6 +6,7 @@
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/ParticleEditor.h"
 #include "Editor/AnimGraphEditor.h"
+#include "Editor/MaterialEditor.h"
 #include "Engine/Core/Project.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Animation.h"
@@ -5084,6 +5085,179 @@ TEST_CASE(Render_CustomMaterials)
     (void)half;
     F().assets->Release(plane);
     F().assets->Release(box);
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_MaterialEditorAndAssignment)
+{
+    // Assigning a material (undoable), the material window with its preview, live edits reaching
+    // the asset, problems, palette by mouse, undo / redo, save; an instance window; the inspector
+    // slots and scene files with relative material paths.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_mateditor_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir / "Materials", ec);
+    const fs::path file = dir / "Materials" / "Paint.umat";
+    CHECK(SaveMaterialGraph(file, MakeDefaultMaterialGraph()));
+
+    Scene         scene;
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 1.5f, 5.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto click = [&](glm::vec2 at, int button) {
+        editor.SimulateMouse(at);
+        runFrames(1);
+        editor.SimulateMouse(at, button, true);
+        runFrames(1);
+        editor.SimulateMouse(at, button, false);
+        runFrames(1);
+    };
+    const auto materialOf = [&](const fs::path& path) -> const MaterialAsset* {
+        for (const MaterialInfo& info : F().assets->Materials())
+            if (fs::weakly_canonical(PathFromUtf8(info.path), ec) == fs::weakly_canonical(path, ec))
+                return F().assets->Get(info.handle);
+        return nullptr;
+    };
+    const bool screenshot = std::getenv("UNGINE_TEST_SCREENSHOT") != nullptr;
+    if (screenshot)
+        glfwSetWindowSize(F().window->Native(), 1600, 900);
+
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    modelRefs.push_back(box);
+    CHECK(F().Pump([&] { return Settled(box); }));
+    const Entity e = scene.CreateEntity("Box");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box});
+    scene.UpdateTransforms();
+    runFrames(4);
+
+    // Assign: undo / redo.
+    CHECK(editor.AssignMaterial(e, file));
+    Registry& r = scene.GetRegistry();
+    CHECK(r.Has<MaterialOverrides>(e) && r.Get<MaterialOverrides>(e).materials.size() == 1);
+    CHECK(editor.Undo() && !r.Has<MaterialOverrides>(e));
+    CHECK(editor.Redo() && r.Has<MaterialOverrides>(e));
+    editor.Select(e);
+    for (int i = 0; i < 200 && !materialOf(file); ++i)
+        runFrames(1);
+    CHECK(materialOf(file) != nullptr);
+
+    // The window + preview.
+    editor.OpenAsset(file);
+    MaterialEditor& me = editor.MaterialWindow();
+    CHECK(me.IsOpen() && !me.IsInstance() && !me.Dirty());
+    runFrames(20);
+    CHECK(me.PreviewFrames() > 0);
+
+    // A live edit of a parameter reaches the asset (unsaved).
+    me.Graph().FindParameter("BaseColor")->value = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+    me.Commit();
+    CHECK(me.Dirty());
+    bool red = false;
+    for (int i = 0; i < 200 && !red; ++i) {
+        runFrames(1);
+        if (const MaterialAsset* m = materialOf(file))
+            red = m->block[m->ParameterSlot("BaseColor")] == glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+    }
+    CHECK(red);
+
+    // A broken parameter node: reported; undo removes it.
+    const std::uint32_t broken = me.Graph().AddNode("Param.Scalar", {0.0f, 300.0f}, "Nope");
+    me.Graph().Connect(broken, "Value", me.Graph().OutputNode()->id, "Opacity");
+    me.Commit();
+    runFrames(2);
+    CHECK(std::any_of(me.Problems().begin(), me.Problems().end(), [&](const MaterialProblem& p) { return p.error && p.node == broken; }));
+    CHECK(me.Undo() && !me.Graph().FindNode(broken));
+    CHECK(me.Redo() && me.Graph().FindNode(broken));
+    CHECK(me.Undo());
+    runFrames(2);
+    CHECK(std::none_of(me.Problems().begin(), me.Problems().end(), [](const MaterialProblem& p) { return p.error; }));
+
+    // Palette by mouse: right click on the canvas, type, Enter (the window must fit the screen).
+    int width = 0, height = 0;
+    glfwGetWindowSize(F().window->Native(), &width, &height);
+    glfwSetWindowSize(F().window->Native(), 1280, 800);
+    runFrames(6);
+    const glm::vec4 canvas = me.CanvasRect();
+    CHECK(canvas.z > 100.0f && canvas.w > 100.0f);
+    const auto fresnels = [&] {
+        return std::ranges::count_if(me.Graph().nodes, [](const MaterialNode& n) { return n.type == "Utility.Fresnel"; });
+    };
+    const auto before = fresnels();
+    click({canvas.x + canvas.z * 0.9f, canvas.y + canvas.w * 0.9f}, 1);
+    runFrames(1);
+    editor.SimulateText("Fresnel");
+    runFrames(2);
+    editor.SimulateKey("Enter", true);
+    runFrames(1);
+    editor.SimulateKey("Enter", false);
+    runFrames(2);
+    CHECK(fresnels() == before + 1);
+    if (!screenshot)
+        glfwSetWindowSize(F().window->Native(), width, height);
+
+    CHECK(me.Save() && !me.Dirty());
+    const auto saved = LoadMaterialGraph(file);
+    CHECK(saved && saved->FindParameter("BaseColor")->value == glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
+    runFrames(4); // inspector: material slots + parameters
+    if (screenshot) {
+        runFrames(30);
+        (void)std::system((std::string("import -window root ") + std::getenv("UNGINE_TEST_SCREENSHOT")).c_str());
+    }
+
+    // An instance in the same window: an override reaches its asset.
+    const fs::path instanceFile = dir / "Materials" / "Paint_Inst.uminst";
+    MaterialInstanceFile instance;
+    instance.parent = PathToUtf8(file);
+    CHECK(SaveMaterialInstance(instanceFile, instance));
+    editor.OpenAsset(instanceFile);
+    CHECK(me.IsOpen() && me.IsInstance());
+    runFrames(4);
+    me.Instance().overrides.push_back({"BaseColor", MaterialParameterType::Vector, glm::vec4(0.0f, 1.0f, 0.0f, 1.0f), {}});
+    me.Commit();
+    CHECK(editor.AssignMaterial(e, instanceFile));
+    bool green = false;
+    for (int i = 0; i < 200 && !green; ++i) {
+        runFrames(1);
+        if (const MaterialAsset* m = materialOf(instanceFile))
+            green = m->block[m->ParameterSlot("BaseColor")] == glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
+    }
+    CHECK(green);
+    CHECK(me.Save());
+    const auto savedInstance = LoadMaterialInstance(instanceFile);
+    CHECK(savedInstance && savedInstance->overrides.size() == 1);
+
+    // Scene files keep the material relative to the scene.
+    const fs::path sceneFile = dir / "Main.scene.json";
+    CHECK(editor.SaveScene(sceneFile));
+    std::ifstream     in(sceneFile);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(text.find("Materials/Paint_Inst.uminst") != std::string::npos);
+    CHECK(text.find(PathToUtf8(dir)) == std::string::npos);
+    me.Close();
+    runFrames(2);
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
