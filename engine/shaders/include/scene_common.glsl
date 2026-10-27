@@ -82,7 +82,7 @@ struct GpuDraw {
     uint instance;
     uint submesh;
     uint batch;
-    uint pad;
+    uint params; // custom material: parameter block (vec4 index into FrameData.materialParams)
 };
 #define DRAW_FREE 0xFFFFFFFFu
 
@@ -105,6 +105,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Su
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer InstanceBuffer { GpuInstance i[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer JointMatrixBuffer { mat4 m[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DrawBuffer     { GpuDraw     d[]; };
+// Parameter blocks of custom (node graph) materials, one vec4 per slot (material_common.glsl).
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MaterialParamBuffer { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BatchBuffer    { GpuBatch    b[]; };
 // Draw record per drawn instance (indexed by gl_InstanceIndex: firstInstance selects the slice).
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer VisibleBuffer   { uint        v[]; };

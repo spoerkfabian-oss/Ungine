@@ -66,6 +66,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     glm::vec4  fogLight;          // x: anisotropy, y: sun, z: ambient, w: punctual lights
     glm::uvec4 fogInfo;           // x: enabled, y: integrated volume slot, z: volume count, w: volumetric
     glm::vec4  fogGrid;           // x: grid depth, y: slices, zw: screen UV -> grid UV
+    glm::vec4  materialTime;      // x: time, y: last frame's time (custom materials)
     VkDeviceAddress lights;
     VkDeviceAddress clusters;
     VkDeviceAddress shadowViews;
@@ -81,6 +82,7 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress decals;
     VkDeviceAddress decalClusters;
     VkDeviceAddress fogVolumes;
+    VkDeviceAddress materialParams; // GPU scene: custom material parameter blocks
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -1115,6 +1117,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
     // Reflections need last frame's image: the TAA history, else the HDR target (still unchanged).
     m_SsrThisFrame = ssr.enabled && ssr.intensity > 0.0f && (taa.enabled ? m_HistoryValid : m_PrevHdrValid);
 
+    const double previousMaterialTime = m_MaterialTime;
+    m_MaterialTime += static_cast<double>(deltaTime);
     FrameUniforms   uniforms{
           .viewProj       = viewProj,
           .view           = camera.view,
@@ -1158,6 +1162,7 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .fogGrid         = glm::vec4(fogDistance, static_cast<float>(fogGrid.depth),
                                        static_cast<float>(extent.width) / static_cast<float>(fogGrid.width * kFogTileSize),
                                        static_cast<float>(extent.height) / static_cast<float>(fogGrid.height * kFogTileSize)),
+          .materialTime    = glm::vec4(static_cast<float>(m_MaterialTime), static_cast<float>(previousMaterialTime), 0.0f, 0.0f),
           .lights          = lightAddress,
           .clusters        = m_Clusters.Address(),
           .shadowViews     = shadowViewAddress,
@@ -1172,7 +1177,8 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .prevJointMatrices = m_GpuScene->PrevJointMatrixAddress(),
           .decals          = decalAddress,
           .decalClusters   = m_DecalClusters.Address(),
-          .fogVolumes      = fogVolumeAddress};
+          .fogVolumes      = fogVolumeAddress,
+          .materialParams  = m_GpuScene->MaterialParamAddress()};
     ++m_FrameCounter;
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;

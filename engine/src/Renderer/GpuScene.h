@@ -135,6 +135,8 @@ public:
     [[nodiscard]] VkDeviceAddress DrawAddress() const { return m_DrawBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress BatchAddress() const { return m_BatchBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress VisibilityAddress() const { return m_Visibility.Address(); }
+    // Custom material parameter blocks (vec4 per slot; GpuDraw::params indexes them).
+    [[nodiscard]] VkDeviceAddress MaterialParamAddress() const { return m_ParamBuffer ? m_ParamBuffer.Address() : 0; }
 
 private:
     void Upsert(const Scene& scene, const AssetManager& assets, Entity entity);
@@ -194,7 +196,7 @@ private:
     bool                       m_BatchesDirty = false;
 
     // GPU buffers (capacity in elements)
-    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility;
+    Buffer m_InstanceBuffer, m_DrawBuffer, m_BatchBuffer, m_Visibility, m_ParamBuffer;
     // Skin palettes, ping-pong: this frame's are written into m_JointMatrices[m_JointBuffer], the
     // other one still holds last frame's (prevJointOffset indexes it).
     std::array<Buffer, 2>  m_JointMatrices;

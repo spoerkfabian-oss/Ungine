@@ -446,6 +446,7 @@ private:
     bool                         m_HistoryLayoutReady = false;
     std::uint32_t                m_ResolvedSlot = 0; // this frame's image for bloom / exposure / tone mapping
     std::uint64_t                m_FrameCounter = 0;
+    double                       m_MaterialTime = 0.0; // custom materials (Time node)
     std::optional<glm::mat4>     m_PrevViewProj; // last frame's camera without jitter
     bool                         m_PrevHdrValid = false; // m_Hdr holds last frame's image (SSR without TAA)
     // Screen-space reflections (half resolution, GENERAL): raw rays, temporal history ping-pong,
