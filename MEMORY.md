@@ -1047,6 +1047,11 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
 
+### Phase 33 material editor – decisions (user, 2026-10-27)
+- Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
+- Also: material instances (override parameters of a base material, settable per Blueprint at runtime), blend/shading models (Opaque/Masked/Translucent/Additive, Unlit, Two-Sided, Emissive), vertex animation (world position offset with velocity for TAA), per-submesh material overrides on MeshRenderer (drag & drop in the editor).
+- glTF materials stay the default; `.umat` only as override.
+
 ### Phase 32 terrain – decisions (user, 2026-10-26)
 - Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
 - Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
