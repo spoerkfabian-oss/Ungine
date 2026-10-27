@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog + Phase 32 terrain on `branch`, both in PR #21 (open, user merges); next: Phase 33 material editor – ask details first)
+- Last updated: 2026-10-27 (Phase 31 + 32 merged via PR #21, 83cdfcb; `branch` = main; next: Phase 33 material editor – ask details first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
