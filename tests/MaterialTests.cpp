@@ -1,13 +1,19 @@
 // Phase 33 materials (CPU): node graph files, instances, code generation and compiling the
 // generated shaders from the engine's templates (glslang). Rendering is covered by the GPU tests.
+#include "BlueprintTestUtil.h"
 #include "Test.h"
 
 #include "Engine/Core/Platform.h"
 #include "Engine/Material/MaterialGraph.h"
 #include "Engine/Renderer/ShaderCompiler.h"
+#include "Engine/Scene/Components.h"
+#include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 
 using namespace Engine;
 namespace fs = std::filesystem;
@@ -311,4 +317,104 @@ TEST_CASE(Material_EveryNodeCompiles)
     const ShaderCompileResult broken = CompileEngineShader(ShaderStage::Fragment, "mesh.frag", options);
     CHECK(!broken.Ok() && !broken.log.empty());
     CHECK(ShaderSourceHash() != 0 && ShaderSourceHash() == ShaderSourceHash());
+}
+
+TEST_CASE(Material_OverridesFilesNodesAndTemplate)
+{
+    const fs::path dir = MaterialTempDir("material_overrides");
+    fs::create_directories(dir / "Scenes");
+    // Scene files: material paths relative to the scene, parameters kept; undo snapshots.
+    {
+        Scene        scene;
+        const Entity e = scene.CreateEntity("Mesh");
+        scene.GetRegistry().Emplace<MaterialOverrides>(
+            e, MaterialOverrides{.materials  = {PathToUtf8(dir / "Materials" / "A.umat"), ""},
+                                 .parameters = {{"Glow", glm::vec4(2.0f, 0.0f, 0.0f, 0.0f), -1},
+                                                {"Tint", glm::vec4(1.0f, 0.5f, 0.0f, 1.0f), 1}}});
+        const fs::path file = dir / "Scenes" / "S.scene.json";
+        SaveSceneFile(file, scene, nullptr);
+        std::ifstream     in(file);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        CHECK(text.find("../Materials/A.umat") != std::string::npos);
+        Scene loaded;
+        CHECK(LoadSceneFile(file, loaded, nullptr).empty());
+        bool found = false;
+        loaded.GetRegistry().ViewOf<MaterialOverrides>().Each([&](Entity, const MaterialOverrides& m) {
+            found = m == scene.GetRegistry().Get<MaterialOverrides>(e);
+        });
+        CHECK(found);
+        const std::string before = SnapshotEntityState(scene, e);
+        scene.GetRegistry().Remove<MaterialOverrides>(e);
+        ApplyEntityState(scene, e, before);
+        CHECK(scene.GetRegistry().Has<MaterialOverrides>(e));
+    }
+
+    // Blueprint nodes reach every mesh below the target.
+    {
+        using namespace BlueprintTest;
+        Runner     r;
+        Graph      b;
+        const auto begin  = b.Node("Event.BeginPlay");
+        const auto scalar = b.Node("Material.SetScalar");
+        b.Set(scalar, "Name", std::string("Glow"));
+        b.Set(scalar, "Value", 3.0f);
+        const auto vector = b.Node("Material.SetVector");
+        b.Set(vector, "Name", std::string("Tint"));
+        b.Set(vector, "Color", glm::vec3(1.0f, 0.0f, 0.0f));
+        b.Set(vector, "Submesh", std::int32_t{0});
+        const auto set = b.Node("Material.Set");
+        b.Set(set, "Material", PathToUtf8(dir / "Materials" / "B.uminst"));
+        const auto wrong = b.Node("Material.Set");
+        b.Set(wrong, "Material", std::string("Textures/x.png"));
+        b.Link(begin, "Out", scalar, "In");
+        b.Link(scalar, "Then", vector, "In");
+        b.Link(vector, "Then", set, "In");
+        b.Link(set, "Then", wrong, "In");
+        CHECK(b.Valid());
+        const Entity holder = r.Add("Holder", "materials.ugraph", b.g);
+        const Entity mesh   = r.scene.CreateEntity("Mesh", holder);
+        r.scene.GetRegistry().Emplace<MeshRenderer>(mesh, MeshRenderer{});
+        r.scripts.Begin(r.scene);
+        r.Run(0.1f);
+        CHECK(r.scripts.Stats().errors >= 1); // the png is no material
+        const MaterialOverrides* o = r.scene.GetRegistry().TryGet<MaterialOverrides>(mesh);
+        CHECK(o != nullptr);
+        if (o) {
+            CHECK(o->parameters.size() == 2);
+            CHECK(o->parameters[0].name == "Glow" && o->parameters[0].value.x == 3.0f && o->parameters[0].submesh == -1);
+            CHECK(o->parameters[1].value == glm::vec4(1.0f, 0.0f, 0.0f, 1.0f) && o->parameters[1].submesh == 0);
+            CHECK(o->materials.size() == 1 && o->materials[0].ends_with("B.uminst"));
+        }
+        CHECK(!r.scene.GetRegistry().Has<MaterialOverrides>(holder)); // no mesh: untouched
+
+        Runner     c;
+        Graph      g;
+        const auto start = g.Node("Event.BeginPlay");
+        const auto clear = g.Node("Material.ClearParameters");
+        g.Link(start, "Out", clear, "In");
+        const Entity owner = c.Add("Owner", "clear.ugraph", g.g);
+        c.scene.GetRegistry().Emplace<MeshRenderer>(owner, MeshRenderer{});
+        c.scene.GetRegistry().Emplace<MaterialOverrides>(owner, MaterialOverrides{.materials = {"x.umat"}, .parameters = {{"Glow", glm::vec4(1.0f), -1}}});
+        c.scripts.Begin(c.scene);
+        c.Run(0.1f);
+        CHECK(c.scene.GetRegistry().Get<MaterialOverrides>(owner).parameters.empty());
+        CHECK(c.scene.GetRegistry().Get<MaterialOverrides>(owner).materials.size() == 1);
+    }
+
+    // The Basic template's example material and instance.
+    const fs::path materials = TemplateDirectory() / "Basic" / "Content" / "Materials";
+    const auto     pulse     = LoadMaterialGraph(materials / "Pulse.umat");
+    CHECK(pulse.has_value());
+    if (pulse) {
+        CHECK(GenerateMaterialCode(*pulse).Ok());
+        CHECK(CompileVariants(*pulse).empty());
+    }
+    const auto warm = LoadMaterialInstance(materials / "Pulse_Warm.uminst");
+    CHECK(warm && fs::exists(PathFromUtf8(warm->parent)));
+    if (pulse && warm) {
+        const std::vector<MaterialParameter> resolved = ResolveMaterialParameters(*pulse, warm->overrides);
+        CHECK(std::any_of(resolved.begin(), resolved.end(), [](const MaterialParameter& p) {
+            return p.name == "BaseColor" && p.value == glm::vec4(1.0f, 0.45f, 0.1f, 1.0f);
+        }));
+    }
 }

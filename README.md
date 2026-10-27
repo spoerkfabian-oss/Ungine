@@ -171,6 +171,17 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     Größe, Wind, Sichtweite). Heightmaps (16-Bit-PNG/RAW) per *Import/Export*. Das Terrain
     kollidiert (Physik), dient als Navmesh-Quelle und wird beim Speichern der Szene mitgespeichert;
     Blueprint *Get Terrain Height* liefert Höhe und Normale.
+23. **Materialien**: Content-Browser *+ New → Material* legt einen Node-Graph (`.umat`) an,
+    *Create instance* bzw. *+ New → Material instance* eine Instanz (`.uminst`), die Parameter
+    überschreibt. Im Fenster *Material*: Rechtsklick auf die Fläche öffnet die Knotenauswahl (tippen,
+    Enter), Pins per Ziehen verbinden, Alt-Klick trennt, Entf löscht; links Blend-Modus (Opaque/
+    Masked/Translucent/Additive), Lit/Unlit, Two-sided, Parameter (Scalar/Vector/Texture) und die
+    Werte des gewählten Knotens; rechts die Vorschau (Kugel/Box/Ebene). *World Position Offset*
+    bewegt Vertices (für das Culling *Max displacement* setzen). Zuweisen: Material auf ein Mesh im
+    Viewport ziehen oder im Inspector (*Mesh Renderer → Materials*) pro Submesh ablegen; dort lassen
+    sich Parameter pro Objekt überschreiben. Blueprints: *Set Material*, *Set Material Scalar/Vector
+    Parameter*, *Clear Material Parameters*. Die Shader entstehen beim ersten Laden (Cache unter
+    `Saved/Cache/Shaders`); das Basic-Template zeigt ein pulsierendes Beispielmaterial.
 
 
 ## Entwicklung

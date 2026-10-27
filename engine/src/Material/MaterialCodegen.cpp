@@ -337,8 +337,7 @@ private:
     }
 
     // Common width of generic inputs (0-width pins); errors on mismatching vectors.
-    std::uint32_t Generic(const MaterialNode& node, const MaterialNodeDesc& desc, std::vector<Value>& inputs,
-                          std::initializer_list<std::size_t> scalarOk = {})
+    std::uint32_t Generic(const MaterialNode& node, const MaterialNodeDesc& desc, std::vector<Value>& inputs)
     {
         std::uint32_t width = 1;
         for (std::size_t i = 0; i < inputs.size(); ++i)
@@ -357,7 +356,6 @@ private:
                 inputs[i].width = desc.inputs[i].width;
             }
         }
-        (void)scalarOk;
         return width;
     }
 

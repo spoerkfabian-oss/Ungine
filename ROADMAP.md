@@ -69,6 +69,10 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Heightmap-Terrain mit CDLOD, Splat-Layern + Painting/Sculpting mit Undo, Foliage/Gras, Heightmap-Import/-Export, Löchern + Triplanar.
 - Fortschritt (2026-10-26): umgesetzt und lokal verifiziert – `.uterrain` (Höhen/Splat/Löcher/Foliage-Dichte, `TerrainStore` mit Änderungsrechtecken), CDLOD-Quadtree mit Morphing (Prepass/Hi-Z, Kaskaden, Lighting mit gemeinsamem `ShadeSurface`), bis 8 Layer (Albedo/Normal/ORM, triplanar an Hängen), Löcher (Render/Physik/Navmesh), Jolt-HeightField, Navmesh-Quelle pro Kachel, Foliage (Chunk-Scatter, Halme/Karten/Meshes, Wind mit Motion Vectors, Ausdünnung, Schatten), Editor (Pinsel mit Undo pro Strich, Terrain-Fenster, Inspector, Content-Typ TER, Import/Export), Cooker, Blueprint *Get Terrain Height*. Grenzen in CLAUDE.md, Offene Punkte 24.
 
+### Phase 33 – Material-Editor (C)
+- Node-Graph-Materialien mit generiertem GLSL und eigener Pipeline pro Material, Live-Vorschau; Instanzen; Blend-/Shading-Modelle; World Position Offset mit Motion Vectors; Zuweisung pro Submesh; glTF-Materialien bleiben Standard.
+- Fortschritt (2026-10-27): umgesetzt und lokal verifiziert – `.umat` (~55 Knoten, Parameter, Settings) + `.uminst`, Codegen in die bestehenden Mesh-/Schatten-Shader, Laufzeit-Kompilierung per glslang (Speicher-/Disk-Cache), Material-Assets im AssetManager (Instanz-Ketten, Texturen, Hot-Reload, Provide), dynamische Culling-Buckets pro Material-Pipeline, Parameterblöcke pro Draw, `MaterialOverrides` + Blueprint-Knoten, Material-Fenster (Canvas, Palette, Vorschau, Undo), Inspector-Slots + Drag & Drop, Cooker/Packaging, Beispielmaterial im Basic-Template. Grenzen in CLAUDE.md, Offene Punkte 25.
+
 ### Phasen 31–34 (C, Reihenfolge vom Nutzer bestätigt)
 - 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
 

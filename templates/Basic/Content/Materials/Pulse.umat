@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "settings": {
+    "blendMode": "Opaque",
+    "shadingModel": "Lit",
+    "twoSided": false,
+    "castShadows": true,
+    "alphaCutoff": 0.5,
+    "maxDisplacement": 0.0
+  },
+  "parameters": [
+    {"name": "BaseColor", "type": "Vector", "value": [0.15, 0.45, 0.9, 1.0]},
+    {"name": "Glow", "type": "Scalar", "value": [1.5, 0.0, 0.0, 0.0], "range": [0.0, 5.0]},
+    {"name": "Speed", "type": "Scalar", "value": [2.0, 0.0, 0.0, 0.0], "range": [0.0, 10.0]}
+  ],
+  "nodes": [
+    {"id": 1, "type": "Material.Output", "position": [760.0, 0.0]},
+    {"id": 2, "type": "Param.Vector", "position": [60.0, -200.0], "param": "BaseColor"},
+    {"id": 3, "type": "Param.Scalar", "position": [400.0, 200.0], "param": "Glow"},
+    {"id": 4, "type": "Input.Time", "position": [-240.0, 40.0]},
+    {"id": 5, "type": "Param.Scalar", "position": [-240.0, 120.0], "param": "Speed"},
+    {"id": 6, "type": "Math.Multiply", "position": [-40.0, 60.0]},
+    {"id": 7, "type": "Math.Sin", "position": [160.0, 60.0]},
+    {"id": 8, "type": "Math.Multiply", "position": [320.0, 60.0], "inputs": {"B": [0.5, 0.0, 0.0, 0.0]}},
+    {"id": 9, "type": "Math.Add", "position": [480.0, 60.0], "inputs": {"B": [0.5, 0.0, 0.0, 0.0]}},
+    {"id": 10, "type": "Math.Multiply", "position": [400.0, -60.0]},
+    {"id": 11, "type": "Math.Multiply", "position": [580.0, 120.0]},
+    {"id": 12, "type": "Utility.Fresnel", "position": [400.0, 300.0], "inputs": {"Exponent": [3.0, 0.0, 0.0, 0.0]}},
+    {"id": 13, "type": "Math.Add", "position": [580.0, 260.0]}
+  ],
+  "links": [
+    {"from": [2, "RGB"], "to": [1, "BaseColor"]},
+    {"from": [4, "Time"], "to": [6, "A"]},
+    {"from": [5, "Value"], "to": [6, "B"]},
+    {"from": [6, "Result"], "to": [7, "X"]},
+    {"from": [7, "Result"], "to": [8, "A"]},
+    {"from": [8, "Result"], "to": [9, "A"]},
+    {"from": [2, "RGB"], "to": [10, "A"]},
+    {"from": [9, "Result"], "to": [13, "A"]},
+    {"from": [12, "Result"], "to": [13, "B"]},
+    {"from": [13, "Result"], "to": [10, "B"]},
+    {"from": [10, "Result"], "to": [11, "A"]},
+    {"from": [3, "Value"], "to": [11, "B"]},
+    {"from": [11, "Result"], "to": [1, "Emissive"]}
+  ],
+  "comments": [
+    {"id": 14, "text": "Pulsing glow with a Fresnel rim", "position": [-260.0, -20.0], "size": [1000.0, 420.0], "color": [0.3, 0.3, 0.3, 0.4]}
+  ],
+  "nextId": 15
+}

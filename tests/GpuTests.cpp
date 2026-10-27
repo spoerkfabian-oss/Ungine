@@ -1000,6 +1000,18 @@ std::vector<std::uint8_t> RenderImage(SceneRenderer& renderer, Scene& scene, con
                                          .srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                                          .dstStage  = VK_PIPELINE_STAGE_2_COPY_BIT,
                                          .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT});
+            // The readback buffer may reuse memory a freed buffer was read from in an earlier
+            // submission (syncval reports WAR across the reuse): an execution dependency first.
+            VkMemoryBarrier2 reuse{};
+            reuse.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            reuse.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            reuse.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+            reuse.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            VkDependencyInfo dependency{};
+            dependency.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers    = &reuse;
+            vkCmdPipelineBarrier2(frame->cmd, &dependency);
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageExtent      = {kExtent.width, kExtent.height, 1};
