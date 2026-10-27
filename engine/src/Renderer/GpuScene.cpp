@@ -442,7 +442,7 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
             const std::uint32_t d         = *first + k;
             m_DrawSubmeshes[d] = model->gpuSubmeshes[submeshId - model->submeshes.offset];
             const MaterialAsset* material = assets.Get(materials[k]);
-            std::uint32_t        slot     = ~0u;
+            std::uint32_t        materialSlot = ~0u;
             std::uint32_t        params   = 0;
             if (material) {
                 const auto size = static_cast<std::uint32_t>(material->block.size());
@@ -452,13 +452,13 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
                     m_ParamData.resize(m_ParamRanges.Capacity());
                     range = m_ParamRanges.Allocate(size);
                 }
-                slot                = AcquireMaterialSlot(materials[k], *material);
+                materialSlot        = AcquireMaterialSlot(materials[k], *material);
                 params              = *range;
                 m_DrawParamCount[d] = size;
             }
             m_Draws[d] = {.instance = index,
                           .submesh  = submeshId,
-                          .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored, slot,
+                          .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored, materialSlot,
                                                    material ? assets.Revision(materials[k]) : 0u),
                           .params   = params};
             if (material)
