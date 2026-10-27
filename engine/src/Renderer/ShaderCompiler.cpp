@@ -130,7 +130,7 @@ ShaderCompileResult CompileGlsl(ShaderStage stage, const ShaderSource& source, c
     shader.setStringsWithLengthsAndNames(&text, &length, &name, 1);
     shader.setEnvInput(glslang::EShSourceGlsl, language, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
-    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
+    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_5); // 1.6 turns discard into demote (extra feature)
     if (options.debugInfo)
         shader.setDebugInfo(true);
 

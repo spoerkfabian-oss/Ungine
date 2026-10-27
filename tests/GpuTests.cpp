@@ -21,6 +21,7 @@
 #include "Engine/Core/Window.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Physics/Ragdoll.h"
@@ -4854,5 +4855,235 @@ TEST_CASE(Editor_TerrainToolsAndUndo)
     }
     TerrainStore::Instance().Clear();
     fs::current_path(previous);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+namespace {
+// Unlit material whose emissive is a vector parameter "Color" (deterministic pixels without
+// lighting); optional world position offset, mask and blend settings.
+MaterialGraph UnlitColorMaterial(glm::vec4 color, MaterialSettings settings = {})
+{
+    MaterialGraph g;
+    g.settings              = settings;
+    g.settings.shadingModel = MaterialShadingModel::Unlit;
+    MaterialParameter p;
+    p.name  = "Color";
+    p.type  = MaterialParameterType::Vector;
+    p.value = color;
+    g.parameters.push_back(p);
+    const std::uint32_t out   = g.AddNode(kMaterialOutputNode, {400.0f, 0.0f});
+    const std::uint32_t param = g.AddNode("Param.Vector", {0.0f, 0.0f}, "Color");
+    g.Connect(param, "RGB", out, "Emissive");
+    g.Connect(param, "A", out, "Opacity");
+    return g;
+}
+} // namespace
+
+TEST_CASE(Render_CustomMaterials)
+{
+    // Boxes with node-graph materials (MaterialOverrides): an unlit red graph, a green instance of
+    // it, a per-entity blue parameter override, a world position offset lifting a box, a masked
+    // half, a translucent quad. GPU and CPU paths agree; picking, live edits (Provide) and removing
+    // the override (back to the glTF material) follow.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_materials_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    const fs::path redFile = dir / "Red.umat";
+    CHECK(SaveMaterialGraph(redFile, UnlitColorMaterial({1.0f, 0.0f, 0.0f, 1.0f})));
+    MaterialInstanceFile green;
+    green.parent = PathToUtf8(redFile);
+    green.overrides.push_back({"Color", MaterialParameterType::Vector, glm::vec4(0.0f, 1.0f, 0.0f, 1.0f), {}});
+    CHECK(SaveMaterialInstance(dir / "Green.uminst", green));
+    // Lifted by 0.6 m (vertex stage), yellow.
+    MaterialGraph lift = UnlitColorMaterial({1.0f, 1.0f, 0.0f, 1.0f}, {.maxDisplacement = 0.7f});
+    {
+        const std::uint32_t up = lift.AddNode("Constant3", {0.0f, 200.0f});
+        lift.FindNode(up)->value = glm::vec4(0.0f, 0.6f, 0.0f, 0.0f);
+        lift.Connect(up, "Value", lift.OutputNode()->id, "WorldPositionOffset");
+    }
+    CHECK(SaveMaterialGraph(dir / "Lift.umat", lift));
+    // Masked: only the part above world y 0.5 stays (white).
+    MaterialGraph masked = UnlitColorMaterial({1.0f, 1.0f, 1.0f, 1.0f}, {.blendMode = MaterialBlendMode::Masked});
+    {
+        const std::uint32_t pos  = masked.AddNode("Input.WorldPosition", {0.0f, 200.0f});
+        const std::uint32_t mask = masked.AddNode("Math.Mask", {100.0f, 200.0f}, "y");
+        const std::uint32_t step = masked.AddNode("Math.Step", {200.0f, 200.0f});
+        masked.Connect(pos, "Position", mask, "X");
+        masked.Connect(mask, "Result", step, "X");
+        masked.Connect(step, "Result", masked.OutputNode()->id, "OpacityMask");
+    }
+    CHECK(SaveMaterialGraph(dir / "Masked.umat", masked));
+    CHECK(SaveMaterialGraph(dir / "Glass.umat",
+                            UnlitColorMaterial({0.0f, 0.0f, 1.0f, 0.5f}, {.blendMode = MaterialBlendMode::Translucent})));
+
+    const ModelHandle plane = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 20.0f,
+                                                           .baseColor = {0.5f, 0.5f, 0.5f, 1.0f}});
+    const ModelHandle box   = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f,
+                                                           .baseColor = {0.6f, 0.6f, 0.6f, 1.0f}});
+    CHECK(F().Pump([&] { return Settled(plane) && Settled(box); }));
+    Scene        scene;
+    Registry&    r      = scene.GetRegistry();
+    const Entity ground = scene.CreateEntity("Ground");
+    r.Emplace<MeshRenderer>(ground, MeshRenderer{.model = plane, .meshIndex = 0});
+    const auto addBox = [&](const char* name, float x, const std::string& material) {
+        const Entity e = scene.CreateEntity(name);
+        r.Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+        scene.EditTransform(e).position = {x, 0.5f, 0.0f};
+        r.Emplace<MaterialOverrides>(e, MaterialOverrides{.materials = {material}});
+        return e;
+    };
+    const Entity red    = addBox("Red", -3.0f, PathToUtf8(redFile));
+    const Entity greenE = addBox("Green", -1.5f, PathToUtf8(dir / "Green.uminst"));
+    const Entity blue   = addBox("Blue", 0.0f, PathToUtf8(redFile));
+    r.Get<MaterialOverrides>(blue).parameters.push_back({"Color", glm::vec4(0.0f, 0.0f, 1.0f, 1.0f), -1});
+    const Entity lifted = addBox("Lift", 1.5f, PathToUtf8(dir / "Lift.umat"));
+    const Entity half   = addBox("Masked", 3.0f, PathToUtf8(dir / "Masked.umat"));
+    const Entity glass  = addBox("Glass", 0.0f, PathToUtf8(dir / "Glass.umat"));
+    scene.EditTransform(glass).position = {-1.5f, 1.0f, 1.5f};
+    scene.EditTransform(glass).scale    = {3.0f, 0.4f, 0.05f};
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled       = false;
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.post.exposure     = 1.0f;
+    renderer.post.tonemapper   = Tonemapper::None;
+    const glm::vec3  eye{0.0f, 1.5f, 7.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.7f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    // Materials compile in the background.
+    std::vector<std::uint8_t> image;
+    for (int i = 0; i < 400; ++i) {
+        image = RenderImage(renderer, scene, camera, 1);
+        F().assets->Update();
+        const std::vector<MaterialInfo> infos = F().assets->Materials();
+        const bool ready = infos.size() == 5 && std::all_of(infos.begin(), infos.end(), [](const MaterialInfo& m) {
+                               return m.state == AssetState::Ready || m.state == AssetState::Failed;
+                           });
+        if (ready && i > 3)
+            break;
+    }
+    image = RenderImage(renderer, scene, camera, 2);
+    for (const MaterialInfo& m : F().assets->Materials()) {
+        if (!m.error.empty())
+            std::printf("    %s: %s\n", m.path.c_str(), m.error.c_str());
+        CHECK(m.state == AssetState::Ready);
+    }
+    const glm::ivec3 redPx    = pixel(image, project({-3.0f, 0.3f, 0.5f}));
+    const glm::ivec3 greenPx  = pixel(image, project({-1.5f, 0.3f, 0.5f}));
+    const glm::ivec3 bluePx   = pixel(image, project({0.0f, 0.3f, 0.5f}));
+    const glm::ivec3 liftTop  = pixel(image, project({1.5f, 1.4f, 0.5f})); // above the unlifted box
+    const glm::ivec3 liftLow  = pixel(image, project({1.5f, 0.25f, 0.5f})); // below the lifted box: ground
+    const glm::ivec3 maskTop  = pixel(image, project({3.0f, 0.8f, 0.5f}));
+    const glm::ivec3 maskLow  = pixel(image, project({3.0f, 0.2f, 0.5f}));
+    const glm::ivec3 glassPx  = pixel(image, project({-2.2f, 1.0f, 1.5f})); // in front of the red box
+    std::printf("    red %d %d %d, green %d %d %d, blue %d %d %d, lift top %d %d %d low %d %d %d, mask top %d %d %d "
+                "low %d %d %d, glass %d %d %d\n",
+                redPx.r, redPx.g, redPx.b, greenPx.r, greenPx.g, greenPx.b, bluePx.r, bluePx.g, bluePx.b, liftTop.r,
+                liftTop.g, liftTop.b, liftLow.r, liftLow.g, liftLow.b, maskTop.r, maskTop.g, maskTop.b, maskLow.r,
+                maskLow.g, maskLow.b, glassPx.r, glassPx.g, glassPx.b);
+    CHECK(redPx.r > 200 && redPx.g < 30 && redPx.b < 30);
+    CHECK(greenPx.g > 200 && greenPx.r < 30 && greenPx.b < 30); // instance override
+    CHECK(bluePx.b > 200 && bluePx.r < 30 && bluePx.g < 30);    // per-entity parameter
+    CHECK(liftTop.r > 200 && liftTop.g > 200 && liftTop.b < 30); // world position offset
+    CHECK(!(liftLow.r > 200 && liftLow.g > 200 && liftLow.b < 30));
+    CHECK(maskTop.r > 200 && maskTop.g > 200 && maskTop.b > 200);
+    CHECK(maskLow.r < 200); // discarded: the ground shows through
+    CHECK(glassPx.b > 90 && glassPx.b < 200 && glassPx.r > 90 && glassPx.r < 200); // half blue over the red box
+
+    // The CPU path draws the same picture.
+    renderer.culling.gpuDriven = false;
+    const std::vector<std::uint8_t> cpu = RenderImage(renderer, scene, camera, 2);
+    renderer.culling.gpuDriven = true;
+    int differing = 0;
+    for (std::size_t i = 0; i < cpu.size(); ++i)
+        differing += std::abs(int(cpu[i]) - int(image[i])) > 3 ? 1 : 0;
+    std::printf("    GPU vs CPU path: %d differing channels\n", differing);
+    CHECK(differing < 40);
+
+    // Picking through the material's own prepass.
+    renderer.overlay.picking = true;
+    std::optional<Entity> picked;
+    bool                  requested = false;
+    for (int i = 0; i < 8 && !picked; ++i)
+        if (auto frame = F().renderer->BeginFrame()) {
+            if (!requested) {
+                const glm::ivec2 p = project({-3.0f, 0.3f, 0.5f});
+                renderer.RequestPick(static_cast<std::uint32_t>(p.x) * frame->extent.width / 160,
+                                     static_cast<std::uint32_t>(p.y) * frame->extent.height / 120);
+                requested = true;
+            }
+            const CameraData wide{.view = camera.view,
+                                  .projection = PerspectiveReverseZ(glm::radians(60.0f),
+                                                                    static_cast<float>(frame->extent.width) /
+                                                                        static_cast<float>(frame->extent.height), 0.05f),
+                                  .position = eye};
+            renderer.Render(*frame, scene, wide);
+            F().renderer->EndFrame(*frame);
+            picked = renderer.TakePickResult();
+        }
+    CHECK(picked.has_value() && *picked == red);
+    renderer.overlay.picking = false;
+
+    // Live edit of the base graph (unsaved): red -> yellow; the instance keeps its green.
+    F().assets->ProvideMaterial(redFile, UnlitColorMaterial({1.0f, 1.0f, 0.0f, 1.0f}));
+    glm::ivec3 edited{0};
+    for (int i = 0; i < 200; ++i) {
+        F().assets->Update();
+        image  = RenderImage(renderer, scene, camera, 1);
+        edited = pixel(image, project({-3.0f, 0.3f, 0.5f}));
+        if (edited.g > 200)
+            break;
+    }
+    CHECK(edited.r > 200 && edited.g > 200 && edited.b < 30);
+    CHECK(pixel(image, project({-1.5f, 0.3f, 0.5f})).g > 200);
+    CHECK(pixel(image, project({-1.5f, 0.3f, 0.5f})).r < 30);
+    F().assets->ProvideMaterial(redFile, std::nullopt);
+
+    // Without the override the glTF material comes back (lit gray).
+    r.Remove<MaterialOverrides>(red);
+    scene.MarkChanged(red);
+    image = RenderImage(renderer, scene, camera, 2);
+    const glm::ivec3 plain = pixel(image, project({-3.0f, 0.3f, 0.5f}));
+    CHECK(std::abs(plain.r - plain.g) < 20 && std::abs(plain.g - plain.b) < 30);
+
+    // A lit graph with the box's glTF values shades like the glTF material (sun, IBL, shadows).
+    MaterialGraph litGraph = MakeDefaultMaterialGraph();
+    litGraph.FindParameter("BaseColor")->value = glm::vec4(0.6f, 0.6f, 0.6f, 1.0f);
+    litGraph.FindParameter("Roughness")->value = glm::vec4(0.6f, 0.0f, 0.0f, 0.0f);
+    CHECK(SaveMaterialGraph(dir / "Lit.umat", litGraph));
+    r.Emplace<MaterialOverrides>(red, MaterialOverrides{.materials = {PathToUtf8(dir / "Lit.umat")}});
+    scene.MarkChanged(red);
+    glm::ivec3 lit{0};
+    for (int i = 0; i < 200; ++i) {
+        F().assets->Update();
+        const bool ready = std::any_of(F().assets->Materials().begin(), F().assets->Materials().end(), [](const MaterialInfo& m) {
+            return m.path.ends_with("Lit.umat") && m.state == AssetState::Ready;
+        });
+        lit = pixel(RenderImage(renderer, scene, camera, 2), project({-3.0f, 0.3f, 0.5f}));
+        if (ready)
+            break;
+    }
+    lit = pixel(RenderImage(renderer, scene, camera, 2), project({-3.0f, 0.3f, 0.5f}));
+    std::printf("    glTF %d %d %d vs lit graph %d %d %d\n", plain.r, plain.g, plain.b, lit.r, lit.g, lit.b);
+    CHECK(glm::all(glm::lessThanEqual(glm::abs(lit - plain), glm::ivec3(3))));
+    (void)greenE;
+    (void)lifted;
+    (void)half;
+    F().assets->Release(plane);
+    F().assets->Release(box);
+    fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

@@ -93,11 +93,13 @@ struct GpuBatch {
     uint firstIndex;
     int  vertexOffset;
     uint instanceBase;
-    uint cameraBucket; // bit 0: double-sided (no culling), bit 1: mirrored (clockwise front faces)
-    uint shadowBucket; // 1: alpha-masked
-    uint pad0;
-    uint pad1;
+    uint  cameraBucket; // bit 0: double-sided (no culling), bit 1: mirrored (clockwise front faces);
+                        // 4: alpha-blended; 5 + 2 * material slot + mirrored: custom material
+    uint  shadowBucket; // 1: alpha-masked; 2 + material slot: custom material; ~0: casts no shadow
+    float displacement; // custom material: world position offset bound (culling boxes grow by it)
+    uint  material;     // custom material slot + 1 (0: the model's material)
 };
+#define BUCKET_NONE 0xFFFFFFFFu
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VertexBuffer   { Vertex      v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MaterialBuffer { Material    m[]; };

@@ -2,6 +2,7 @@
 #include "Engine/Assets/AssetHandle.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
+#include "Engine/Material/MaterialAsset.h"
 #include "Engine/Renderer/Environment.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/ShadowAtlas.h"
@@ -364,15 +365,32 @@ private:
     // Transparent: alpha-blended draws only, sorted back to front.
     enum class Gather : std::uint8_t { Camera, Shadow, Transparent };
     void GatherDraws(const Frustum& frustum, const glm::vec4& sphere, DrawList& out, Gather mode);
+    // Mesh passes; custom (node graph) materials bind their own pipeline per pass.
+    enum class MeshPass : std::uint8_t { Prepass, PrepassPicking, Lit, Shadow, LocalShadow };
     void DrawTransparent(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t flags);
     void DrawCpuCamera(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, bool countStats,
-                       std::uint32_t flags);
+                       std::uint32_t flags, MeshPass pass);
     void DrawCpuShadow(VkCommandBuffer cmd, const DrawList& list, VkDeviceAddress frameAddress, std::uint32_t cascade,
-                       const Pipeline& plain, const Pipeline& masked, std::uint32_t& drawCounter);
+                       const Pipeline& plain, const Pipeline& masked, std::uint32_t& drawCounter, MeshPass pass);
     // GPU path: the indirect draws of a culled view.
-    void DrawGpuCamera(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress, std::uint32_t flags);
+    void DrawGpuCamera(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress, std::uint32_t flags,
+                       MeshPass pass);
     void DrawGpuShadow(VkCommandBuffer cmd, std::uint32_t view, VkDeviceAddress frameAddress, std::uint32_t cascade,
-                       const Pipeline& plain, const Pipeline& masked);
+                       const Pipeline& plain, const Pipeline& masked, MeshPass pass);
+    [[nodiscard]] const Pipeline& StandardPipeline(MeshPass pass) const;
+
+    // Custom materials: pipelines per compiled shader set (shared by every instance of a material),
+    // built on first use, dropped when unused for a while.
+    struct MaterialPipelines {
+        Pipeline         prepass, picking, lit, blend, shadow, localShadow;
+        MaterialSettings settings{};
+        std::uint64_t    lastUsed = 0;
+        bool             failed   = false; // creation failed: the material's draws are skipped
+    };
+    void PrepareMaterialPipelines();
+    [[nodiscard]] const Pipeline* MaterialPipeline(std::uint32_t slot, MeshPass pass) const;
+    [[nodiscard]] MaterialHandle ResolveMaterial(const std::string& path);
+    void ReleaseUnusedMaterials(const Scene& scene);
     void CullGpu(VkCommandBuffer cmd, const CameraData& camera, const std::array<Cascade, kMaxCascades>& cascades,
                  std::uint32_t cascadeCount, VkExtent2D extent);
     [[nodiscard]] bool GpuPath() const;
@@ -519,6 +537,9 @@ private:
         std::uint64_t lastUsed = 0; // m_FrameCounter
     };
     std::unordered_map<std::string, DecalTextureEntry> m_DecalTextures; // kind + '|' + path
+    std::unordered_map<std::uint64_t, MaterialPipelines> m_MaterialPipelines; // MaterialShaders::key
+    std::vector<MaterialPipelines*>                      m_SlotPipelines;     // per GpuScene material slot, this frame
+    std::unordered_map<std::string, MaterialHandle>      m_MaterialRefs;      // MaterialOverrides paths held
     std::vector<GpuLight> m_Lights; // this frame's visible lights
     std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
     std::vector<Entity>   m_LightEntities;     // parallel to m_Lights

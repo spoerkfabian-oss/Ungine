@@ -3,9 +3,12 @@
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Assets/GltfLoader.h"
 #include "Engine/Core/Log.h"
+#include "Engine/Core/Platform.h"
 #include "Engine/Core/ThreadPool.h"
 #include "Engine/Events/EventBus.h"
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Renderer/ShaderCompiler.h"
+#include "Material/MaterialBuild.h"
 
 #include <cassert>
 #include <exception>
@@ -128,6 +131,11 @@ AssetManager::AssetManager(Renderer& renderer, ThreadPool& jobs, EventBus& event
       m_HotReload(desc.hotReload)
 {
     m_Cook.compress = desc.textures.compress && renderer.GetContext().SupportsBC();
+    m_MaterialShaderCache  = std::make_shared<MaterialShaderCache>();
+    m_ShaderCacheDirectory = desc.shaderCacheDirectory;
+    if (m_ShaderCacheDirectory.empty() && !m_Cook.cacheDirectory.empty())
+        m_ShaderCacheDirectory = m_Cook.cacheDirectory.parent_path() / "Shaders";
+    m_ShaderGeneration = renderer.ShaderGeneration();
     CreatePlaceholder();
     if (!m_Cook.cacheDirectory.empty()) // bounded cache, trimmed off the main thread
         EnqueueJob([this, directory = m_Cook.cacheDirectory, limit = m_Cook.cacheLimitBytes] {
@@ -960,6 +968,278 @@ std::vector<SoundInfo> AssetManager::Sounds() const
     return sounds;
 }
 
+// --- Materials -----------------------------------------------------------------------------------
+
+MaterialHandle AssetManager::LoadMaterial(const std::filesystem::path& path)
+{
+    const std::filesystem::path normalized = NormalizeMaterialPath(path);
+    std::u8string               key        = ToU8(MaterialPathKey(normalized));
+    if (const auto it = m_MaterialCache.find(key); it != m_MaterialCache.end()) {
+        MaterialEntry& e = m_Materials.entries[it->second];
+        ++e.refCount;
+        return {it->second, e.generation};
+    }
+    const std::uint32_t index = m_Materials.Allocate();
+    MaterialEntry&      e     = m_Materials.entries[index];
+    e.state    = AssetState::Loading;
+    e.refCount = 1;
+    e.key      = key;
+    e.path     = normalized;
+    e.instance = IsMaterialInstanceFile(normalized);
+    e.watched  = Watch({normalized});
+    m_MaterialCache.emplace(std::move(key), index);
+    const MaterialHandle handle{index, e.generation};
+    StartMaterialJob(handle);
+    return handle;
+}
+
+void AssetManager::StartMaterialJob(MaterialHandle handle)
+{
+    MaterialEntry& e = m_Materials.entries[handle.index];
+    e.jobRunning     = true;
+    for (WatchedFile& f : e.watched)
+        f.loaded = f.seen = ModifiedTime(f.path);
+    MaterialBuildInput input{.file                 = e.path,
+                             .providedGraphs       = m_ProvidedGraphs,
+                             .providedInstances    = m_ProvidedInstances,
+                             .shaderCacheDirectory = m_ShaderCacheDirectory};
+    EnqueueJob([this, handle, input = std::move(input), cache = m_MaterialShaderCache] {
+        MaterialResult result;
+        result.handle = handle;
+        if (m_ShuttingDown.load(std::memory_order_relaxed)) {
+            result.error = "cancelled";
+        } else {
+            try {
+                MaterialBuildOutput out = BuildMaterial(input, *cache);
+                result.material     = std::move(out.material);
+                result.dependencies = std::move(out.dependencies);
+                result.error        = std::move(out.error);
+            } catch (const std::exception& ex) {
+                result.error = ex.what();
+            }
+        }
+        std::scoped_lock lock{m_ResultMutex};
+        m_MaterialResults.push_back(std::move(result));
+        FinishJob();
+    });
+}
+
+void AssetManager::OnMaterialResult(MaterialResult& result)
+{
+    const MaterialHandle handle = result.handle;
+    MaterialEntry&       e      = m_Materials.entries[handle.index];
+    assert(e.alive && e.generation == handle.generation);
+    e.jobRunning = false;
+    if (e.orphaned) {
+        m_Materials.Free(handle.index);
+        return;
+    }
+    if (!result.dependencies.empty()) { // the whole chain is watched (a parent edit reloads instances)
+        std::vector<WatchedFile> watched = Watch(result.dependencies);
+        for (WatchedFile& w : watched)
+            for (const WatchedFile& old : e.watched)
+                if (old.path == w.path)
+                    w.loaded = w.seen = old.loaded; // a change during the job still triggers a reload
+        e.watched = std::move(watched);
+    }
+    if (!result.material || !result.error.empty()) {
+        e.error = result.error.empty() ? std::string("material build failed") : std::move(result.error);
+        ENGINE_ERROR("Failed to load material '{}': {}", ToUtf8(e.path), e.error);
+        if (e.state != AssetState::Ready) {
+            e.state = AssetState::Failed;
+            ++e.revision;
+            ++m_MaterialVersion;
+        }
+        m_Publish.push_back([this, ev = AssetFailedEvent<MaterialAsset>{handle, ToUtf8(e.path), e.error}] { m_Events.Publish(ev); });
+    } else {
+        MaterialAsset& m = *result.material;
+        for (std::size_t i = 0; i < m.slots.size(); ++i) {
+            const MaterialSlot& slot = m.slots[i];
+            const bool texture = slot.kind == MaterialSlotKind::Texture ||
+                                 (slot.kind == MaterialSlotKind::Parameter && slot.type == MaterialParameterType::Texture);
+            if (!texture)
+                continue;
+            std::uint32_t entry = static_cast<std::uint32_t>(slot.textureKind == TextureKind::Normal ? DefaultTexture::FlatNormal
+                                                                                                     : DefaultTexture::White);
+            if (!slot.texture.empty()) {
+                const TextureHandle t = LoadTexture(PathFromUtf8(slot.texture), slot.textureKind);
+                m.textures.push_back(t);
+                entry = TableEntry(t);
+            }
+            m.block[i] = glm::vec4(glm::uintBitsToFloat(entry), 0.0f, 0.0f, 0.0f);
+        }
+        if (e.pending)
+            ReleaseMaterialTextures(*e.pending);
+        e.pending = std::move(result.material);
+        if (std::find(m_PendingMaterials.begin(), m_PendingMaterials.end(), handle) == m_PendingMaterials.end())
+            m_PendingMaterials.push_back(handle);
+        return; // reloadQueued: after the swap (Update)
+    }
+    if (e.reloadQueued) {
+        e.reloadQueued = false;
+        StartMaterialJob(handle);
+    }
+}
+
+void AssetManager::ReleaseMaterialTextures(MaterialAsset& material)
+{
+    for (const TextureHandle t : material.textures)
+        Release(t);
+    material.textures.clear();
+}
+
+bool AssetManager::MaterialTexturesSettled(const MaterialAsset& material) const
+{
+    for (const TextureHandle t : material.textures) {
+        const AssetState state = State(t);
+        if (state == AssetState::Loading || state == AssetState::Uploading)
+            return false;
+    }
+    return true;
+}
+
+void AssetManager::Release(MaterialHandle handle)
+{
+    MaterialEntry* e = m_Materials.Find(handle);
+    if (!e) {
+        ENGINE_WARN("AssetManager::Release: stale or null material handle");
+        return;
+    }
+    assert(e->refCount > 0);
+    if (--e->refCount > 0)
+        return;
+    m_MaterialCache.erase(e->key);
+    if (e->material)
+        ReleaseMaterialTextures(*e->material);
+    if (e->pending)
+        ReleaseMaterialTextures(*e->pending);
+    ++m_MaterialVersion;
+    if (e->jobRunning) {
+        e->material.reset();
+        e->pending.reset();
+        e->orphaned = true;
+        return;
+    }
+    m_Materials.Free(handle.index);
+}
+
+bool AssetManager::Reload(MaterialHandle handle)
+{
+    MaterialEntry* e = m_Materials.Find(handle);
+    if (!e)
+        return false;
+    if (e->jobRunning || e->pending)
+        e->reloadQueued = true;
+    else
+        StartMaterialJob(handle);
+    return true;
+}
+
+void AssetManager::ReloadMaterialsUsing(const std::filesystem::path& file)
+{
+    for (std::uint32_t i = 0; i < m_Materials.entries.size(); ++i) {
+        const MaterialEntry& e = m_Materials.entries[i];
+        if (!e.alive || e.orphaned)
+            continue;
+        const bool uses = e.path == file || std::any_of(e.watched.begin(), e.watched.end(),
+                                                         [&](const WatchedFile& w) { return w.path == file; });
+        if (uses)
+            Reload(MaterialHandle{i, e.generation});
+    }
+}
+
+void AssetManager::ProvideMaterial(const std::filesystem::path& file, std::optional<MaterialGraph> graph)
+{
+    const std::filesystem::path normalized = NormalizeMaterialPath(file);
+    const std::string           key        = MaterialPathKey(normalized);
+    const auto                  it         = m_ProvidedGraphs.find(key);
+    if (graph) {
+        if (it != m_ProvidedGraphs.end() && it->second == *graph)
+            return;
+        m_ProvidedGraphs[key] = std::move(*graph);
+    } else {
+        if (it == m_ProvidedGraphs.end())
+            return;
+        m_ProvidedGraphs.erase(it);
+    }
+    ReloadMaterialsUsing(normalized);
+}
+
+void AssetManager::ProvideMaterialInstance(const std::filesystem::path& file, std::optional<MaterialInstanceFile> instance)
+{
+    const std::filesystem::path normalized = NormalizeMaterialPath(file);
+    const std::string           key        = MaterialPathKey(normalized);
+    const auto                  it         = m_ProvidedInstances.find(key);
+    if (instance) {
+        if (it != m_ProvidedInstances.end() && it->second == *instance)
+            return;
+        m_ProvidedInstances[key] = std::move(*instance);
+    } else {
+        if (it == m_ProvidedInstances.end())
+            return;
+        m_ProvidedInstances.erase(it);
+    }
+    ReloadMaterialsUsing(normalized);
+}
+
+const MaterialAsset* AssetManager::Get(MaterialHandle handle) const
+{
+    const MaterialEntry* e = m_Materials.Find(handle);
+    return e && e->state == AssetState::Ready ? e->material.get() : nullptr;
+}
+
+AssetState AssetManager::State(MaterialHandle handle) const
+{
+    const MaterialEntry* e = m_Materials.Find(handle);
+    return e ? e->state : AssetState::Invalid;
+}
+
+std::string AssetManager::Error(MaterialHandle handle) const
+{
+    const MaterialEntry* e = m_Materials.Find(handle);
+    return e ? e->error : std::string{};
+}
+
+std::uint32_t AssetManager::RefCount(MaterialHandle handle) const
+{
+    const MaterialEntry* e = m_Materials.Find(handle);
+    return e ? e->refCount : 0;
+}
+
+std::uint32_t AssetManager::Revision(MaterialHandle handle) const
+{
+    const MaterialEntry* e = m_Materials.Find(handle);
+    return e ? e->revision : 0;
+}
+
+std::vector<MaterialInfo> AssetManager::Materials() const
+{
+    std::vector<MaterialInfo> materials;
+    for (std::uint32_t i = 0; i < m_Materials.entries.size(); ++i) {
+        const MaterialEntry& e = m_Materials.entries[i];
+        if (!e.alive || e.orphaned)
+            continue;
+        MaterialInfo info{.handle    = {i, e.generation},
+                          .state     = e.state,
+                          .refCount  = e.refCount,
+                          .path      = ToUtf8(e.path),
+                          .error     = e.error,
+                          .revision  = e.revision,
+                          .reloading = e.jobRunning || e.pending != nullptr,
+                          .instance  = e.instance,
+                          .graphFile = {}};
+        if (const MaterialAsset* m = e.material.get()) {
+            info.graphFile      = m->graphFile;
+            info.blendMode      = m->settings.blendMode;
+            info.slots          = static_cast<std::uint32_t>(m->slots.size());
+            info.textures       = static_cast<std::uint32_t>(m->textures.size());
+            info.shaderCacheHit = m->shaderCacheHit;
+        }
+        materials.push_back(std::move(info));
+    }
+    return materials;
+}
+
 // --- Per frame -----------------------------------------------------------------------------------
 
 void AssetManager::SetHotReload(bool enabled)
@@ -1008,6 +1288,13 @@ void AssetManager::PollFiles()
             StartSoundJob({i, e.generation});
         }
     }
+    for (std::uint32_t i = 0; i < m_Materials.entries.size(); ++i) {
+        MaterialEntry& e = m_Materials.entries[i];
+        if (e.alive && !e.orphaned && !e.jobRunning && !e.pending && changed(e.watched)) {
+            ENGINE_INFO("Hot reload: '{}'", ToUtf8(e.path));
+            StartMaterialJob({i, e.generation});
+        }
+    }
 }
 
 void AssetManager::Update()
@@ -1015,14 +1302,18 @@ void AssetManager::Update()
     std::vector<ModelResult>   modelResults;
     std::vector<TextureResult> textureResults;
     std::vector<SoundResult>   soundResults;
+    std::vector<MaterialResult> materialResults;
     {
         std::scoped_lock lock{m_ResultMutex};
         modelResults.swap(m_ModelResults);
         textureResults.swap(m_TextureResults);
         soundResults.swap(m_SoundResults);
+        materialResults.swap(m_MaterialResults);
     }
     for (SoundResult& r : soundResults)
         OnSoundResult(r);
+    for (MaterialResult& r : materialResults) // acquires textures (new jobs)
+        OnMaterialResult(r);
     for (TextureResult& r : textureResults)
         OnTextureResult(r);
     for (ModelResult& r : modelResults) // may acquire textures (new jobs)
@@ -1092,6 +1383,44 @@ void AssetManager::Update()
             e->reloadQueued = false;
             StartModelJob(h, e->produce);
         }
+
+    // Materials swap in once their textures settled (no flash of default textures).
+    std::vector<MaterialHandle> restartMaterials;
+    std::erase_if(m_PendingMaterials, [&](MaterialHandle h) {
+        MaterialEntry* e = m_Materials.Find(h);
+        if (!e || !e->pending)
+            return true;
+        if (!MaterialTexturesSettled(*e->pending))
+            return false;
+        const bool reload = e->state == AssetState::Ready;
+        if (e->material)
+            ReleaseMaterialTextures(*e->material); // after the new one acquired its own (shared ones survive)
+        e->material = std::move(e->pending);
+        e->state    = AssetState::Ready;
+        e->error.clear();
+        ++e->revision;
+        ++m_MaterialVersion;
+        if (reload)
+            m_Publish.push_back([this, h] { m_Events.Publish(AssetReloadedEvent<MaterialAsset>{h}); });
+        else
+            m_Publish.push_back([this, h] { m_Events.Publish(AssetLoadedEvent<MaterialAsset>{h}); });
+        if (e->reloadQueued)
+            restartMaterials.push_back(h);
+        return true;
+    });
+    for (MaterialHandle h : restartMaterials)
+        if (MaterialEntry* e = m_Materials.Find(h); e && !e->jobRunning) {
+            e->reloadQueued = false;
+            StartMaterialJob(h);
+        }
+    // Engine shader sources changed (hot reload): every material recompiles.
+    if (m_Renderer.ShaderGeneration() != m_ShaderGeneration) {
+        m_ShaderGeneration = m_Renderer.ShaderGeneration();
+        ResetShaderSourceHash();
+        for (std::uint32_t i = 0; i < m_Materials.entries.size(); ++i)
+            if (m_Materials.entries[i].alive && !m_Materials.entries[i].orphaned)
+                Reload(MaterialHandle{i, m_Materials.entries[i].generation});
+    }
 
     std::erase_if(m_ModelGraveyard, [&](auto& g) {
         if (!uploader.IsReady(g.second))

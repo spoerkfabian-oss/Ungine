@@ -59,6 +59,7 @@ add_library(Engine STATIC
     src/UI/UiSystem.cpp
     src/Material/MaterialGraph.cpp
     src/Material/MaterialCodegen.cpp
+    src/Material/MaterialBuild.cpp
     src/Particles/ParticleEffect.cpp
     src/Particles/ParticleWorld.cpp
     src/Navigation/NavigationWorld.cpp

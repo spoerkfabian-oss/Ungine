@@ -1,6 +1,7 @@
 #include "GpuScene.h"
 #include "Engine/Assets/Animation.h"
 #include "Engine/Assets/AssetManager.h"
+#include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
@@ -77,7 +78,8 @@ void GpuScene::RebuildPipelines()
 GpuScene::~GpuScene()
 {
     m_Renderer.DeferRelease(std::move(m_Scatter));
-    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices[0], &m_JointMatrices[1]})
+    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices[0], &m_JointMatrices[1],
+                      &m_ParamBuffer, &m_BucketBuffer})
         if (*b)
             m_Renderer.DeferRelease(std::move(*b));
 }
@@ -115,8 +117,10 @@ LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm
     return choice;
 }
 
-void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets)
+void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const AssetManager& assets,
+                      const MaterialResolver& materials)
 {
+    m_Resolve = &materials;
     // Moved last frame: the previous matrix catches up (no motion unless it moves again).
     for (const std::uint32_t i : m_Moved) {
         m_MovedFlag[i] = false;
@@ -151,6 +155,18 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
     for (ModelHandle model : changed)
         if (const auto it = m_ModelUse.find(model); it != m_ModelUse.end())
             it->second.revision = assets.Revision(model);
+
+    // Custom materials loaded, reloaded, failed or released: instances that use (or ask for) one
+    // re-resolve; unchanged ones keep their draws (material key).
+    if (assets.MaterialVersion() != m_MaterialVersion) {
+        m_MaterialVersion = assets.MaterialVersion();
+        const Registry& registry = scene.GetRegistry();
+        for (std::uint32_t i = 0; i < m_Instances.size(); ++i) {
+            const Instance& inst = m_Instances[i];
+            if (inst.entity != NullEntity && (inst.materialKey != 0 || registry.Has<MaterialOverrides>(inst.entity)))
+                Upsert(scene, assets, inst.entity);
+        }
+    }
 
     if (spatial.LastSync().rebuilt) {
         for (std::uint32_t i = 0; i < m_Instances.size(); ++i)
@@ -314,6 +330,11 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
         return;
     }
     const std::uint32_t revision = assets.Revision(renderer->model);
+    const Mesh&         mesh     = model->meshes[resolved.meshIndex];
+    const auto          count    = static_cast<std::uint32_t>(mesh.submeshes.size());
+    std::vector<MaterialHandle> materials;
+    std::uint64_t               materialKey = 0, paramKey = 0;
+    ResolveMaterials(scene, assets, entity, count, materials, materialKey, paramKey);
     const glm::mat4& world    = registry.Get<WorldTransform>(entity).matrix;
     const glm::mat3  linear   = glm::mat3(world);
     const bool       mirrored = glm::determinant(linear) < 0.0f; // glTF: flips the winding
@@ -345,18 +366,26 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
     } else {
         const Instance& old = m_Instances[index];
         newGeometry = old.model != renderer->model || old.meshIndex != renderer->meshIndex ||
-                      old.mirrored != mirrored || old.revision != revision;
+                      old.mirrored != mirrored || old.revision != revision || old.materialKey != materialKey;
         if (newGeometry) {
             ReleaseDraws(index);
             UnuseModel(old.model);
             UseModel(assets, renderer->model);
+        } else if (old.paramKey != paramKey) { // only parameter values: rewrite the blocks in place
+            const GpuInstance& d = m_InstanceData[index];
+            for (std::uint32_t k = 0; k < d.drawCount; ++k)
+                if (m_DrawParamCount[d.firstDraw + k] > 0)
+                    if (const MaterialAsset* material = assets.Get(materials[k]))
+                        WriteParams(scene, assets, entity, d.firstDraw + k, k, *material);
         }
     }
-    m_Instances[index] = {.entity    = entity,
-                          .model     = renderer->model,
-                          .meshIndex = renderer->meshIndex,
-                          .revision  = revision,
-                          .mirrored  = mirrored};
+    m_Instances[index] = {.entity      = entity,
+                          .model       = renderer->model,
+                          .meshIndex   = renderer->meshIndex,
+                          .revision    = revision,
+                          .mirrored    = mirrored,
+                          .materialKey = materialKey,
+                          .paramKey    = paramKey};
 
     GpuInstance&    data   = m_InstanceData[index];
     const glm::mat3 normal = glm::transpose(glm::inverse(linear));
@@ -384,8 +413,6 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
     data.flags     = mirrored ? kInstanceMirrored : 0u;
 
     if (newGeometry) {
-        const Mesh&         mesh  = model->meshes[resolved.meshIndex];
-        const auto          count = static_cast<std::uint32_t>(mesh.submeshes.size());
         std::optional<std::uint32_t> first = m_DrawRanges.Allocate(count);
         if (!first) {
             // Visible entries address records with 22 bits (and one culling dispatch covers them).
@@ -396,6 +423,7 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
                 m_Draws.resize(capacity);
                 m_DrawSubmeshes.resize(capacity);
                 m_DrawDirty.resize(capacity, false);
+                m_DrawParamCount.resize(capacity, 0);
             }
             first = m_DrawRanges.Allocate(count);
             if (!first) {
@@ -413,11 +441,29 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
             const std::uint32_t submeshId = mesh.firstGpuSubmesh + k;
             const std::uint32_t d         = *first + k;
             m_DrawSubmeshes[d] = model->gpuSubmeshes[submeshId - model->submeshes.offset];
-            m_BlendDraws += (m_DrawSubmeshes[d].flags & kMaterialAlphaBlend) != 0 ? 1u : 0u;
+            const MaterialAsset* material = assets.Get(materials[k]);
+            std::uint32_t        slot     = ~0u;
+            std::uint32_t        params   = 0;
+            if (material) {
+                const auto size = static_cast<std::uint32_t>(material->block.size());
+                std::optional<std::uint32_t> range = m_ParamRanges.Allocate(size);
+                if (!range) {
+                    m_ParamRanges.Grow(std::max({m_ParamRanges.Capacity() * 2, m_ParamRanges.Capacity() + size, 256u}));
+                    m_ParamData.resize(m_ParamRanges.Capacity());
+                    range = m_ParamRanges.Allocate(size);
+                }
+                slot                = AcquireMaterialSlot(materials[k], *material);
+                params              = *range;
+                m_DrawParamCount[d] = size;
+            }
             m_Draws[d] = {.instance = index,
                           .submesh  = submeshId,
-                          .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored),
-                          .pad      = 0};
+                          .batch    = AcquireBatch(m_DrawSubmeshes[d], submeshId, mirrored, slot,
+                                                   material ? assets.Revision(materials[k]) : 0u),
+                          .params   = params};
+            if (material)
+                WriteParams(scene, assets, entity, d, k, *material);
+            m_BlendDraws += IsBlendDraw(d) ? 1u : 0u;
             MarkDraw(d);
         }
     }
@@ -446,8 +492,15 @@ void GpuScene::ReleaseDraws(std::uint32_t instance)
 {
     GpuInstance& data = m_InstanceData[instance];
     for (std::uint32_t d = data.firstDraw; d < data.firstDraw + data.drawCount; ++d) {
-        m_BlendDraws -= (m_DrawSubmeshes[d].flags & kMaterialAlphaBlend) != 0 ? 1u : 0u;
+        m_BlendDraws -= IsBlendDraw(d) ? 1u : 0u;
+        const std::uint32_t material = m_Batches[m_Draws[d].batch].material;
         ReleaseBatch(m_Draws[d].batch);
+        if (material != 0)
+            ReleaseMaterialSlot(material - 1);
+        if (m_DrawParamCount[d] > 0) {
+            m_ParamRanges.Free(m_Draws[d].params, m_DrawParamCount[d]);
+            m_DrawParamCount[d] = 0;
+        }
         m_Draws[d] = {};
         MarkDraw(d);
     }
@@ -456,9 +509,117 @@ void GpuScene::ReleaseDraws(std::uint32_t instance)
     data.drawCount = 0;
 }
 
-std::uint32_t GpuScene::AcquireBatch(const GpuSubmesh& submesh, std::uint32_t submeshIndex, bool mirrored)
+void GpuScene::ResolveMaterials(const Scene& scene, const AssetManager& assets, Entity entity, std::uint32_t submeshes,
+                                std::vector<MaterialHandle>& out, std::uint64_t& materialKey, std::uint64_t& paramKey) const
 {
-    const std::uint64_t key = (std::uint64_t{submeshIndex} << 1) | (mirrored ? 1u : 0u);
+    out.assign(submeshes, MaterialHandle{});
+    materialKey = paramKey = 0;
+    const MaterialOverrides* overrides = scene.GetRegistry().TryGet<MaterialOverrides>(entity);
+    if (!overrides || !m_Resolve || !*m_Resolve)
+        return;
+    const auto mix = [](std::uint64_t h, std::uint64_t v) { return (h ^ v) * 0x100000001b3ull; };
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    bool          any = false;
+    for (std::uint32_t k = 0; k < submeshes && k < overrides->materials.size(); ++k) {
+        if (overrides->materials[k].empty())
+            continue;
+        const MaterialHandle handle = (*m_Resolve)(overrides->materials[k]);
+        if (!assets.Get(handle))
+            continue; // loading / failed: the model's material meanwhile
+        out[k] = handle;
+        any    = true;
+        key    = mix(mix(mix(key, k), (std::uint64_t{handle.generation} << 32) | handle.index), assets.Revision(handle));
+    }
+    if (!any)
+        return;
+    materialKey = key | 1u;
+    std::uint64_t params = 0xcbf29ce484222325ull;
+    for (const MaterialParameterOverride& p : overrides->parameters) {
+        params = Fnv1a64(std::as_bytes(std::span(p.name.data(), p.name.size())), params);
+        params = Fnv1a64(std::as_bytes(std::span(&p.value, 1)), params);
+        params = mix(params, static_cast<std::uint32_t>(p.submesh));
+    }
+    paramKey = params;
+}
+
+void GpuScene::WriteParams(const Scene& scene, const AssetManager&, Entity entity, std::uint32_t draw,
+                           std::uint32_t submesh, const MaterialAsset& material)
+{
+    const std::uint32_t base  = m_Draws[draw].params;
+    const std::uint32_t count = std::min<std::uint32_t>(m_DrawParamCount[draw], static_cast<std::uint32_t>(material.block.size()));
+    std::copy_n(material.block.begin(), count, m_ParamData.begin() + base);
+    if (const MaterialOverrides* overrides = scene.GetRegistry().TryGet<MaterialOverrides>(entity))
+        for (const MaterialParameterOverride& p : overrides->parameters) {
+            if (p.submesh >= 0 && static_cast<std::uint32_t>(p.submesh) != submesh)
+                continue;
+            const std::uint32_t slot = material.ParameterSlot(p.name);
+            if (slot >= count)
+                continue;
+            m_ParamData[base + slot] = material.slots[slot].type == MaterialParameterType::Scalar
+                                           ? glm::vec4(p.value.x, 0.0f, 0.0f, 0.0f)
+                                           : p.value;
+        }
+    m_ParamsDirty = true;
+}
+
+std::uint32_t GpuScene::AcquireMaterialSlot(MaterialHandle handle, const MaterialAsset& material)
+{
+    std::uint32_t slot = 0;
+    if (const auto it = m_MaterialSlotOf.find(handle); it != m_MaterialSlotOf.end()) {
+        slot = it->second;
+    } else {
+        if (!m_FreeMaterialSlots.empty()) {
+            slot = m_FreeMaterialSlots.back();
+            m_FreeMaterialSlots.pop_back();
+        } else {
+            slot = static_cast<std::uint32_t>(m_MaterialSlots.size());
+            m_MaterialSlots.emplace_back();
+        }
+        m_MaterialSlotOf.emplace(handle, slot);
+    }
+    MaterialSlotInfo& info = m_MaterialSlots[slot];
+    info.handle            = handle;
+    info.settings          = material.settings; // latest revision (older batches die in this Update)
+    info.shaders           = material.shaders;
+    ++info.draws;
+    return slot;
+}
+
+void GpuScene::ReleaseMaterialSlot(std::uint32_t slot)
+{
+    MaterialSlotInfo& info = m_MaterialSlots[slot];
+    if (--info.draws > 0)
+        return;
+    m_MaterialSlotOf.erase(info.handle);
+    info = {};
+    m_FreeMaterialSlots.push_back(slot);
+}
+
+std::uint32_t GpuScene::BucketOffset(bool shadow, std::uint32_t bucket) const
+{
+    const std::size_t i = shadow ? m_BucketCameraCount + bucket : bucket;
+    return (shadow ? bucket < m_BucketData.size() - m_BucketCameraCount : bucket < m_BucketCameraCount) && i < m_BucketData.size()
+               ? m_BucketData[i]
+               : 0u;
+}
+
+std::uint32_t GpuScene::BucketCapacity(bool shadow, std::uint32_t bucket) const
+{
+    const std::size_t i = shadow ? m_BucketCameraCount + bucket : bucket;
+    return (shadow ? bucket < m_BucketCapacity.size() - m_BucketCameraCount : bucket < m_BucketCameraCount) &&
+                   i < m_BucketCapacity.size()
+               ? m_BucketCapacity[i]
+               : 0u;
+}
+
+std::uint32_t GpuScene::AcquireBatch(const GpuSubmesh& submesh, std::uint32_t submeshIndex, bool mirrored,
+                                     std::uint32_t materialSlot, std::uint32_t materialRevision)
+{
+    // Custom materials: their own batches per revision (a reload may change the buckets; the old
+    // batches die with the re-upserts of this Update).
+    const std::uint64_t material = materialSlot == ~0u ? 0u : materialSlot + 1u;
+    const std::uint64_t key      = (mirrored ? 1u : 0u) | (std::uint64_t{submeshIndex} << 1) | (material << 25) |
+                              (std::uint64_t{materialRevision & 0xFFFFFFu} << 40);
     m_BatchesDirty          = true; // capacities (instance bases) change
     if (const auto it = m_BatchOf.find(key); it != m_BatchOf.end()) {
         for (std::uint32_t l = 0; l < m_BatchSizes[it->second]; ++l)
@@ -477,19 +638,29 @@ std::uint32_t GpuScene::AcquireBatch(const GpuSubmesh& submesh, std::uint32_t su
         first = m_BatchRanges.Allocate(lods);
     }
     const std::uint32_t base = *first;
+    std::uint32_t cameraBucket = (submesh.flags & kMaterialAlphaBlend) != 0
+                                     ? kCameraBucketBlend
+                                     : ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u);
+    // Blended surfaces cast alpha-tested shadows (cutoff alphaCutoff).
+    std::uint32_t shadowBucket = (submesh.flags & (kMaterialAlphaMask | kMaterialAlphaBlend)) != 0 ? 1u : 0u;
+    float         displacement = 0.0f;
+    if (materialSlot != ~0u) {
+        const MaterialSettings& s = m_MaterialSlots[materialSlot].settings;
+        const bool blend = s.blendMode == MaterialBlendMode::Translucent || s.blendMode == MaterialBlendMode::Additive;
+        cameraBucket = blend ? kCameraBucketBlend : kCustomCameraBucketBase + 2 * materialSlot + (mirrored ? 1u : 0u);
+        shadowBucket = !blend && s.castShadows ? kShadowBuckets + materialSlot : kBucketNone;
+        displacement = std::max(s.maxDisplacement, 0.0f);
+    }
     for (std::uint32_t l = 0; l < lods; ++l) {
         const auto i = static_cast<glm::length_t>(l);
         m_Batches[base + l] = {.indexCount   = submesh.lodIndexCount[i],
                                .firstIndex   = submesh.lodFirstIndex[i],
                                .vertexOffset = submesh.vertexOffset,
                                .instanceBase = 0,
-                               .cameraBucket = (submesh.flags & kMaterialAlphaBlend) != 0
-                                                   ? kCameraBucketBlend
-                                                   : ((submesh.flags & kMaterialDoubleSided) != 0 ? 1u : 0u) | (mirrored ? 2u : 0u),
-                               // Blended surfaces cast alpha-tested shadows (cutoff alphaCutoff).
-                               .shadowBucket = (submesh.flags & (kMaterialAlphaMask | kMaterialAlphaBlend)) != 0 ? 1u : 0u,
-                               .pad0         = 0,
-                               .pad1         = 0};
+                               .cameraBucket = cameraBucket,
+                               .shadowBucket = shadowBucket,
+                               .displacement = displacement,
+                               .material     = static_cast<std::uint32_t>(material)};
         m_BatchRefs[base + l] = 1;
     }
     m_BatchKeys[base]  = key;
@@ -576,6 +747,29 @@ void GpuScene::Upload(VkCommandBuffer cmd)
             base += m_BatchRefs[b];
         }
         m_VisibleCapacity = base;
+
+        // Bucket layout: per view, the commands of bucket b start at its offset (prefix sum of
+        // the batches in the buckets before it).
+        const std::uint32_t cameraCount = CameraBucketCount();
+        const std::uint32_t shadowCount = ShadowBucketCount();
+        m_BucketCapacity.assign(cameraCount + shadowCount, 0u);
+        for (std::size_t b = 0; b < m_Batches.size(); ++b) {
+            if (m_BatchRefs[b] == 0)
+                continue;
+            if (m_Batches[b].cameraBucket < cameraCount)
+                ++m_BucketCapacity[m_Batches[b].cameraBucket];
+            if (m_Batches[b].shadowBucket < shadowCount)
+                ++m_BucketCapacity[cameraCount + m_Batches[b].shadowBucket];
+        }
+        m_BucketData.assign(cameraCount + shadowCount, 0u);
+        for (const auto& [first, count] : {std::pair{0u, cameraCount}, std::pair{cameraCount, shadowCount}}) {
+            std::uint32_t offset = 0;
+            for (std::uint32_t i = first; i < first + count; ++i) {
+                m_BucketData[i] = offset;
+                offset += m_BucketCapacity[i];
+            }
+        }
+        m_BucketCameraCount = cameraCount;
     }
 
     const bool newInstances = Ensure(m_Renderer, m_InstanceBuffer, m_InstanceData.size(), sizeof(GpuInstance), "GpuInstances");
@@ -584,17 +778,22 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     const bool newVisible   = Ensure(m_Renderer, m_Visibility, m_Draws.size(), sizeof(std::uint32_t), "GpuDrawVisibility");
     m_JointBuffer ^= 1u; // the other buffer keeps last frame's palettes
     const bool newJoints    = Ensure(m_Renderer, m_JointMatrices[m_JointBuffer], m_JointMatrixData.size(), sizeof(glm::mat4), "GpuJointMatrices");
+    const bool newBuckets   = Ensure(m_Renderer, m_BucketBuffer, m_BucketData.size(), sizeof(std::uint32_t), "GpuBuckets");
+    const bool newParams    = Ensure(m_Renderer, m_ParamBuffer, m_ParamData.size(), sizeof(glm::vec4), "GpuMaterialParams");
     m_BatchesDirty |= newBatches;
+    m_ParamsDirty |= newParams;
+    const bool bucketsDirty = (m_BatchesDirty || newBuckets) && !m_BucketData.empty();
 
     const bool fullInstances = newInstances && !m_InstanceData.empty();
     const bool fullDraws     = newDraws && !m_Draws.empty();
     const bool work = newVisible || fullInstances || fullDraws || !m_DirtyInstances.empty() || !m_DirtyDraws.empty() ||
-                      (m_BatchesDirty && !m_Batches.empty()) || newJoints || !m_JointMatrixData.empty();
+                      (m_BatchesDirty && !m_Batches.empty()) || newJoints || !m_JointMatrixData.empty() || bucketsDirty ||
+                      (m_ParamsDirty && !m_ParamData.empty());
     if (!work)
         return;
 
-    // Earlier frames' culling and vertex shaders read these buffers (WAR).
-    Barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+    // Earlier frames' culling, vertex and (material parameters) fragment shaders read these buffers (WAR).
+    Barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, // + WAW with earlier uploads
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -638,6 +837,13 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     if (m_BatchesDirty && !m_Batches.empty())
         Scatter(cmd, m_BatchBuffer.Address(), m_Batches.data(), sizeof(GpuBatch), {},
                 static_cast<std::uint32_t>(m_Batches.size()));
+    if (bucketsDirty)
+        Scatter(cmd, m_BucketBuffer.Address(), m_BucketData.data(), sizeof(std::uint32_t), {},
+                static_cast<std::uint32_t>(m_BucketData.size()));
+    if (m_ParamsDirty && !m_ParamData.empty())
+        Scatter(cmd, m_ParamBuffer.Address(), m_ParamData.data(), sizeof(glm::vec4), {},
+                static_cast<std::uint32_t>(m_ParamData.size()));
+    m_ParamsDirty = false;
     if (!m_JointMatrixData.empty())
         Scatter(cmd, m_JointMatrices[m_JointBuffer].Address(), m_JointMatrixData.data(), sizeof(glm::mat4), {},
                 static_cast<std::uint32_t>(m_JointMatrixData.size()));
@@ -645,7 +851,8 @@ void GpuScene::Upload(VkCommandBuffer cmd)
 
     Barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 }
 
