@@ -61,6 +61,14 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - `.uanim`-Asset mit Graph-Editor, 1D-/2D-Blend-Spaces, Layer + Bone-Masken, Notifies; IK: Two-Bone, Foot-IK auf Gelände, Look-At, FABRIK; Testmodell Khronos-Fuchs.
 - Fortschritt (2026-10-22): umgesetzt und lokal verifiziert – Parameter/Layer/States/Transitions (Any State, Exit Time, Trigger), phasensynchrone Blend Spaces (2D per Delaunay), Additiv-Layer, Notifies (Event/Sound/Partikel), Root Motion, vier IK-Löser, AnimationController + AnimationSystem, Blueprint-Knoten, Cooker-Prüfung, Animation-Graph-Fenster mit Live-Vorschau, Fuchs als Physics-Template-Wanderer. Fix: Skinning-Fehler aus Phase 21 (Skin-Einflüsse beim Vertex-Reorder). Grenzen in CLAUDE.md, Offene Punkte 22.
 
+### Phase 31 – TAA, Decals, SSR, Nebel (C)
+- TAA mit Motion Vectors, Clustered Decals, Hi-Z-SSR mit temporaler Akkumulation, Höhennebel + volumetrischer Froxel-Nebel mit Nebel-Volumen.
+- Fortschritt (2026-10-26): umgesetzt und lokal verifiziert – Halton-Jitter, Velocity-Target (Skinning, Partikel, Transparente), Resolve mit Varianz-Clipping + Schärfen; Decals in den Licht-Clustern (Albedo/Normal/Maske/Emissive, Winkel-/Kanten-Fade, Sortierung, Lebensdauer, Blueprint-Spawn); SSR über eine Closest-Depth-Pyramide (halbe Auflösung, temporal, Rauheits-Blur, IBL-Fallback); analytischer Höhennebel + Froxel-Gitter (Sonne mit Kaskadenschatten, Clusterlichter mit Schatten, Himmel, Nebel-Volumen, temporale Reprojektion); Szenen-Settings, Editor (Renderer-Abschnitte, Inspector, Overlay), Cooker. Grenzen in CLAUDE.md, Offene Punkte 23.
+
+### Phase 32 – Terrain (C)
+- Heightmap-Terrain mit CDLOD, Splat-Layern + Painting/Sculpting mit Undo, Foliage/Gras, Heightmap-Import/-Export, Löchern + Triplanar.
+- Fortschritt (2026-10-26): umgesetzt und lokal verifiziert – `.uterrain` (Höhen/Splat/Löcher/Foliage-Dichte, `TerrainStore` mit Änderungsrechtecken), CDLOD-Quadtree mit Morphing (Prepass/Hi-Z, Kaskaden, Lighting mit gemeinsamem `ShadeSurface`), bis 8 Layer (Albedo/Normal/ORM, triplanar an Hängen), Löcher (Render/Physik/Navmesh), Jolt-HeightField, Navmesh-Quelle pro Kachel, Foliage (Chunk-Scatter, Halme/Karten/Meshes, Wind mit Motion Vectors, Ausdünnung, Schatten), Editor (Pinsel mit Undo pro Strich, Terrain-Fenster, Inspector, Content-Typ TER, Import/Export), Cooker, Blueprint *Get Terrain Height*. Grenzen in CLAUDE.md, Offene Punkte 24.
+
 ### Phasen 31–34 (C, Reihenfolge vom Nutzer bestätigt)
 - 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
 

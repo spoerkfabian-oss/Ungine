@@ -101,7 +101,10 @@ void TransformPaths(json& entity, F&& fn)
     apply(at(entity, {"script", "graph"}));
     apply(at(entity, {"audioSource", "sound"}));
     apply(at(entity, {"particleSystem", "effect"}));
+    for (const char* key : {"albedo", "normal", "mask", "emissive"})
+        apply(at(entity, {"decal", key}));
     apply(at(entity, {"animationController", "graph"}));
+    apply(at(entity, {"terrain", "data"}));
     apply(at(entity, {"uiWidget", "image"}));
     apply(at(entity, {"levelStreamingVolume", "level"}));
     apply(at(entity, {"collider", "material"}));

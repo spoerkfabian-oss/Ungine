@@ -9,6 +9,8 @@ layout(location = 3) out vec4 outTangent;
 layout(location = 4) flat out uint outMaterial;
 layout(location = 5) flat out uint outEntity;
 layout(location = 6) flat out uint outLodFade;
+layout(location = 7) out vec4 outCurrentClip;  // motion vectors (prepass): without jitter
+layout(location = 8) out vec4 outPreviousClip;
 
 // The depth prepass and the main pass (depth test EQUAL) must produce bit-identical depth.
 invariant gl_Position;
@@ -32,4 +34,8 @@ void main()
     outEntity   = inst.entityId;
     outLodFade  = entry >> VISIBLE_LOD_SHIFT;
     gl_Position = frame.viewProj * world;
+    // Last frame's position: previous model matrix and skin palette, previous camera.
+    const vec4 previousWorld = inst.prevModel * (PrevSkinMatrix(inst, v, skin) * vec4(v.position, 1.0));
+    outCurrentClip  = frame.unjitteredViewProj * world;
+    outPreviousClip = frame.prevViewProj * previousWorld;
 }

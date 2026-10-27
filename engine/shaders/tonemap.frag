@@ -16,13 +16,14 @@ layout(push_constant) uniform TonemapPush {
     float         bloomStrength; // 0 = bloom off (the texture is not read)
     uint          autoExposure;
     uint          debugView;     // Engine::DebugView: 0 off, 1 AO, 2 normals, 3 light clusters, 4 shadow atlas,
-                                 // 5 Hi-Z, 6 culling (tint drawn by the mesh pass)
+                                 // 5 Hi-Z, 6 culling, 7 LOD (tints drawn by the mesh pass), 8 motion vectors
     uint          debugTexture;  // slot shown by the debug view (light clusters: depth; shadow atlas: atlas)
     FrameData     frame;         // light clusters view
     uint          idTexture;     // entity IDs (R32_UINT), editor outline
     uint          outlineWords;  // 0: no outline
     OutlineBits   outline;       // bit per entity slot index
     vec4          outlineColor;  // rgb, a = opacity
+    float         sharpness;     // TAA unsharp mask (0 = off)
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -121,6 +122,16 @@ void main()
     const ivec2 pixel = ivec2(gl_FragCoord.xy);
     vec3 hdr = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
                           pixel, 0).rgb;
+    if (pc.sharpness > 0.0) { // unsharp mask against the 4 neighbors (TAA softens the image a little)
+        const ivec2 size = textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]), 0);
+        vec3 sum = vec3(0.0);
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 offset = ivec2(i == 0 ? 1 : (i == 1 ? -1 : 0), i == 2 ? 1 : (i == 3 ? -1 : 0));
+            sum += texelFetch(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                              clamp(pixel + offset, ivec2(0), size - 1), 0).rgb;
+        }
+        hdr = max(hdr + (hdr - sum * 0.25) * pc.sharpness, vec3(0.0));
+    }
     if (pc.bloomStrength > 0.0) {
         const vec2 size  = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)],
                                                       uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
@@ -148,11 +159,23 @@ void main()
         outColor          = vec4(vec3(sqrt(sqrt(max(depth, 0.0)))), 1.0);
         return;
     }
+    if (pc.debugView == 8u) { // motion vectors: red/green = x/y in pixels (x 1/8), black = still
+        const vec2 v    = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                     pixel, 0).rg;
+        const vec2 size = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
+        outColor = vec4(clamp(abs(v * size) / 8.0, 0.0, 1.0), 0.0, 1.0);
+        return;
+    }
     if (pc.debugView == 1u || pc.debugView == 2u) {
         const vec3 v = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.debugTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]),
                                   pixel, 0).rgb;
         outColor = vec4(pc.debugView == 1u ? v.rrr : v * 0.5 + 0.5, 1.0);
         return;
+    }
+    if (pc.debugView == 9u) { // reflections: color x confidence (black = IBL fallback)
+        const vec2 size = vec2(textureSize(sampler2D(uTextures[nonuniformEXT(pc.hdrTexture)], uSamplers[SAMPLER_NEAREST_CLAMP]), 0));
+        const vec4 s    = SampleTextureLod(pc.debugTexture, SAMPLER_LINEAR_CLAMP, gl_FragCoord.xy / size, 0.0);
+        hdr = s.rgb * s.a;
     }
     hdr *= pc.autoExposure != 0u ? pc.state.exposure : pc.exposure;
     vec3 ldr;

@@ -1,4 +1,5 @@
 #include "Editor/Editor.h"
+#include "Engine/Terrain/TerrainData.h"
 #include "Editor/AnimGraphEditor.h"
 #include "Engine/Animation/AnimationSystem.h"
 #include "Editor/ParticleEditor.h"
@@ -83,11 +84,12 @@ ImVec4 KindColor(int kind)
     case 9: return {0.30f, 0.95f, 0.70f, 1.0f}; // sound cue
     case 10: return {1.00f, 0.55f, 0.25f, 1.0f}; // particle effect
     case 11: return {0.95f, 0.45f, 0.60f, 1.0f}; // animation graph
+    case 12: return {0.55f, 0.75f, 0.35f, 1.0f}; // terrain
     default: return {0.65f, 0.65f, 0.65f, 1.0f};
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "ANIM", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "ANIM", "TER", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -177,11 +179,11 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
 {
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
-            // pathValues: every string of the object is a path (a collider's meshMaterials).
+            // pathValues: every string of the object is a path (a collider's meshMaterials, a decal).
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
                                           it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
-                                          it.key() == "mesh" || it.key() == "previewModel")) {
+                                          it.key() == "mesh" || it.key() == "previewModel" || it.key() == "data")) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -210,7 +212,7 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                 }
             } else {
                 RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory,
-                                   it.key() == "meshMaterials");
+                                   it.key() == "meshMaterials" || it.key() == "decal"); // their strings are all paths
             }
         }
     } else if (value.is_array()) {
@@ -384,6 +386,7 @@ bool Editor::SaveAll()
     if (!m_ScenePath.empty() && m_PlayState == PlayState::Edit)
         ok = SaveScene(m_ScenePath) && ok;
     ok = m_Graphs->SaveAll() && ok;
+    ok = SaveTerrains() && ok;
     if (m_ParticleEditor->Dirty())
         ok = m_ParticleEditor->Save() && ok;
     if (m_AnimGraphEditor->Dirty())
@@ -557,6 +560,13 @@ void Editor::OpenAsset(const fs::path& file)
         } else {
             m_Status = error;
         }
+    } else if (EndsWith(name, kTerrainExtension)) { // double-click: placed centered under the camera
+        if (m_PlayState == PlayState::Edit) {
+            const glm::vec3 at = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            (void)PlaceTerrain(file, glm::vec3(at.x, 0.0f, at.z));
+        } else {
+            m_Status = "Stop playing to place terrains";
+        }
     } else if (EndsWith(name, ".uprefab")) { // double-click: an instance in front of the camera
         if (m_PlayState == PlayState::Edit)
             PlacePrefab(file, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -642,6 +652,8 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::ParticleEffect;
         else if (IsAnimGraphFile(path))
             item.kind = ContentItem::Kind::AnimGraph;
+        else if (EndsWith(lower, kTerrainExtension))
+            item.kind = ContentItem::Kind::Terrain;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -1078,8 +1090,20 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
+        std::optional<Decal> decalMoved;
+        if (const Decal* decal = registry.TryGet<Decal>(entity)) {
+            Decal moved = *decal;
+            bool  any   = false;
+            for (std::string* path : {&moved.albedo, &moved.normal, &moved.mask, &moved.emissive})
+                if (const auto relocated = RelocateReference(*path, source, target, wasDirectory)) {
+                    *path = PathToUtf8(*relocated);
+                    any   = true;
+                }
+            if (any)
+                decalMoved = std::move(moved);
+        }
         if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !graphPath && !imagePath && !prefabPath && !levelPath &&
-            !colliderMoved)
+            !colliderMoved && !decalMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -1092,6 +1116,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (prefabPath) prefab->prefab = PathToUtf8(*prefabPath);
         if (levelPath) volume->level = PathToUtf8(*levelPath);
         if (colliderMoved) registry.Get<Collider>(entity) = *colliderMoved;
+        if (decalMoved) registry.Get<Decal>(entity) = std::move(*decalMoved);
         m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
@@ -1242,6 +1267,18 @@ void Editor::DrawContentBrowser()
             } else {
                 m_Status = error;
             }
+        }
+        if (ImGui::MenuItem("Terrain")) { // 128 m, flat, one layer + an empty grass layer
+            const fs::path file = UniquePath(m_ContentDir, "NewTerrain", kTerrainExtension);
+            TerrainData    data = MakeFlatTerrain(257, 128.0f, 64.0f, 0.0f);
+            FoliageLayer   grass;
+            grass.densityMap.assign(static_cast<std::size_t>(data.splatResolution) * data.splatResolution, 0);
+            data.foliage.push_back(std::move(grass));
+            std::string error;
+            if (SaveTerrain(file, data, &error))
+                RefreshContent();
+            else
+                m_Status = error;
         }
         if (ImGui::MenuItem("Physics material")) {
             const fs::path file = UniquePath(m_ContentDir, "NewPhysicsMaterial", std::string(kPhysicsMaterialExtension));

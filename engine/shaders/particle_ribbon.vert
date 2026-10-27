@@ -9,6 +9,8 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outUv;
 layout(location = 2) out float outViewDistance;
 layout(location = 3) out vec2 outLocal; // y: -1..1 across the ribbon
+layout(location = 4) out vec4 outCurrentClip;  // motion vectors: camera only (points carry no velocity)
+layout(location = 5) out vec4 outPreviousClip;
 
 // Half-width offset at point i, perpendicular to the ribbon and the view direction.
 vec3 Side(uint i)
@@ -38,6 +40,8 @@ void main()
         outUv           = vec2(0.0);
         outViewDistance = 0.0;
         outLocal        = vec2(0.0);
+        outCurrentClip  = vec4(0.0, 0.0, 0.0, 1.0);
+        outPreviousClip = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
     // Quad a-left, b-left, b-right / a-left, b-right, a-right.
@@ -47,6 +51,8 @@ void main()
     const RibbonPoint point = atB ? b : a;
     const vec3 position = point.position + (left ? -Side(index) : Side(index));
     gl_Position     = pc.frame.viewProj * vec4(position, 1.0);
+    outCurrentClip  = pc.frame.unjitteredViewProj * vec4(position, 1.0);
+    outPreviousClip = pc.frame.prevViewProj * vec4(position, 1.0);
     outColor        = point.color;
     outUv           = vec2(point.u, left ? 0.0 : 1.0);
     outViewDistance = -(pc.frame.view * vec4(position, 1.0)).z;

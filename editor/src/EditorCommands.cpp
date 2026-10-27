@@ -374,11 +374,13 @@ void Editor::RequestSceneChange(std::function<void()> action)
 
 void Editor::NewScene()
 {
+    DiscardTerrainEdits(); // asked before (RequestSceneChange); the files keep their saved state
     if (m_Ctx.streaming)
         m_Ctx.streaming->Reset(); // previews go with the scene
     m_Ctx.scene.Clear();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset();
     ReleaseModelRefs();
@@ -451,6 +453,8 @@ bool Editor::SaveScene(const std::filesystem::path& file)
     }
     RunConstructionScripts();
     m_ScenePath = file;
+    if (!SaveTerrains())
+        m_Status = "Terrain save failed (see log)";
     SaveNavigation(file); // baked next to the scene (with what the construction scripts built)
     m_History->MarkSaved();
     m_Status = "Saved " + file.filename().string();
@@ -461,7 +465,8 @@ bool Editor::SaveScene(const std::filesystem::path& file)
 void Editor::DrawDialogs()
 {
     if (const std::optional<std::filesystem::path> path = m_FileDialog->Draw()) {
-        switch (std::exchange(m_DialogPurpose, DialogPurpose::None)) {
+        const DialogPurpose purposeOf = std::exchange(m_DialogPurpose, DialogPurpose::None);
+        switch (purposeOf) {
         case DialogPurpose::NewScript:
             if (m_Graphs->New(*path)) {
                 AssignScript(m_ScriptTarget, *path);
@@ -473,6 +478,12 @@ void Editor::DrawDialogs()
         case DialogPurpose::AssignSound: AssignSound(m_SoundTarget, *path); break;
         case DialogPurpose::AssignEffect: AssignEffect(m_EffectTarget, *path); break;
         case DialogPurpose::AssignAnimGraph: (void)AssignAnimGraph(m_AnimGraphTarget, *path); break;
+        case DialogPurpose::ImportHeightmap:
+        case DialogPurpose::ExportHeightmap:
+        case DialogPurpose::TerrainAsset:
+        case DialogPurpose::AssignTerrain:
+            HandleTerrainDialog(static_cast<int>(purposeOf), *path);
+            break;
         case DialogPurpose::AssignCueSound:
             if (m_ShowSoundCue && m_SoundCueVariant < m_SoundCueEdit.variants.size()) {
                 std::error_code ec;
@@ -739,6 +750,7 @@ void Editor::Play()
     }
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // effects start over with the game
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset(); // graphs start at their entry states
     if (m_Ctx.scripts) {
@@ -789,6 +801,7 @@ bool Editor::PlayLevel(const std::filesystem::path& scene)
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset();
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset();
     m_Selection.clear();
@@ -865,6 +878,7 @@ void Editor::Stop()
         m_Ctx.physics->Reset();
     if (m_Ctx.particles)
         m_Ctx.particles->Reset(); // spawned one-shots go, the edit scene's effects restart
+    m_Ctx.sceneRenderer.ResetHistory(); // camera cut: TAA / reflections / fog start over
     if (m_Ctx.animation)
         m_Ctx.animation->Reset(); // the restored bones show the edit pose
     if (std::exchange(m_NavOtherLevel, false))

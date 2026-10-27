@@ -42,8 +42,10 @@ constexpr std::uint32_t kRepeat   = 32u;
 
 } // namespace
 
-ParticleRenderer::ParticleRenderer(Renderer& renderer, const AssetManager& assets, VkFormat colorFormat, VkFormat depthFormat)
-    : m_Renderer(renderer), m_Assets(assets), m_ColorFormat(colorFormat), m_DepthFormat(depthFormat)
+ParticleRenderer::ParticleRenderer(Renderer& renderer, const AssetManager& assets, VkFormat colorFormat,
+                                   VkFormat velocityFormat, VkFormat depthFormat)
+    : m_Renderer(renderer), m_Assets(assets), m_ColorFormat(colorFormat), m_VelocityFormat(velocityFormat),
+      m_DepthFormat(depthFormat)
 {
     CreatePipelines();
 }
@@ -71,26 +73,32 @@ void ParticleRenderer::CreatePipelines()
         sprite[i] = GraphicsPipelineBuilder{}
                         .SetShaders(ShaderPath("particle.vert.spv"), ShaderPath("particle.frag.spv"))
                         .AddColorAttachment(m_ColorFormat)
+                        .AddColorAttachment(m_VelocityFormat)
                         .SetDepthFormat(m_DepthFormat)
                         .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
                         .SetBlend(blend)
+                        .SetAttachmentBlend(1, BlendMode::Coverage)
                         .SetDebugName(i == 0 ? "ParticleSprite" : "ParticleSpriteAdd")
                         .Build(device, layout);
         ribbon[i] = GraphicsPipelineBuilder{}
                         .SetShaders(ShaderPath("particle_ribbon.vert.spv"), ShaderPath("particle.frag.spv"))
                         .AddColorAttachment(m_ColorFormat)
+                        .AddColorAttachment(m_VelocityFormat)
                         .SetDepthFormat(m_DepthFormat)
                         .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
                         .SetBlend(blend)
+                        .SetAttachmentBlend(1, BlendMode::Coverage)
                         .SetDebugName(i == 0 ? "ParticleRibbon" : "ParticleRibbonAdd")
                         .Build(device, layout);
         mesh[i] = GraphicsPipelineBuilder{}
                       .SetShaders(ShaderPath("particle_mesh.vert.spv"), ShaderPath("particle_mesh.frag.spv"))
                       .AddColorAttachment(m_ColorFormat)
+                      .AddColorAttachment(m_VelocityFormat)
                       .SetDepthFormat(m_DepthFormat)
                       .SetDepth(true, false, VK_COMPARE_OP_GREATER_OR_EQUAL)
                       .SetCulling(VK_CULL_MODE_BACK_BIT)
                       .SetBlend(blend)
+                      .SetAttachmentBlend(1, BlendMode::Coverage)
                       .SetDebugName(i == 0 ? "ParticleMesh" : "ParticleMeshAdd")
                       .Build(device, layout);
     }

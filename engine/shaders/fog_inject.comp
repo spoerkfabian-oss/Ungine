@@ -1,0 +1,110 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+#include "shadow.glsl"
+#include "fog.glsl"
+
+// Volumetric fog, step 1: density (height fog + FogVolume boxes), in-scattered light (sun with
+// cascade shadows, punctual lights of the cluster with their shadows, sky ambient, emission) per
+// froxel at a jittered depth, blended with last frame's grid (reprojected).
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(push_constant) uniform FogPush {
+    FrameData frame;
+    uint      source;       // last frame's scattering volume (sampled)
+    uint      target;       // storage
+    uint      valid;        // history usable
+    uint      gridX;
+    uint      gridY;
+    uint      gridZ;
+    float     feedback;     // history weight
+    float     prevDistance; // grid depth of the history
+} pc;
+
+void main()
+{
+    const uvec3 id = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(id, uvec3(pc.gridX, pc.gridY, pc.gridZ))))
+        return;
+    FrameData frame = pc.frame;
+
+    // Jittered depth inside the slice (resolved by the history), froxel center in x / y.
+    const float jitter    = fract(InterleavedGradientNoise(vec2(id.xy) + vec2(float(id.z) * 5.3)) + frame.taaInfo.w * 0.618034);
+    const float w         = (float(id.z) + jitter) / float(pc.gridZ);
+    const float viewDepth = frame.fogGrid.x * w * w;
+    const vec2  uv        = (vec2(id.xy) + 0.5) / vec2(pc.gridX, pc.gridY) / frame.fogGrid.zw;
+    const vec3  dir       = FogRayDirection(frame, uv);
+    const float distance  = viewDepth / max(dot(dir, FogForward(frame)), 1e-3);
+    const vec3  pos       = frame.cameraPosition.xyz + dir * distance;
+
+    float density    = 0.0;
+    vec3  scattering = vec3(0.0); // density x albedo
+    vec3  emission   = vec3(0.0);
+    if (distance >= frame.fogHeight.z) {
+        const float d = HeightFogDensity(frame, pos);
+        density += d;
+        scattering += d * frame.fogColor.rgb;
+    }
+    FogVolumeBuffer volumes = frame.fogVolumes;
+    for (uint i = 0u; i < frame.fogInfo.z; ++i) {
+        const GpuFogVolume v = volumes.v[i];
+        const vec3         c = pos - v.bounds.xyz;
+        if (dot(c, c) > v.bounds.w * v.bounds.w)
+            continue;
+        const vec3  local  = (v.worldToLocal * vec4(pos, 1.0)).xyz;
+        const vec3  inside = v.halfExtents.xyz - abs(local);
+        const float edge   = min(inside.x, min(inside.y, inside.z));
+        if (edge <= 0.0)
+            continue;
+        const float f = v.halfExtents.w > 0.0 ? clamp(edge / v.halfExtents.w, 0.0, 1.0) : 1.0;
+        density += v.albedoDensity.a * f;
+        scattering += v.albedoDensity.rgb * (v.albedoDensity.a * f);
+        emission += v.emissive.rgb * f;
+    }
+
+    vec4 value = vec4(emission, density);
+    if (density > 0.0) {
+        const float g     = frame.fogLight.x;
+        vec3        light = FogAmbient(frame) * frame.fogLight.z;
+        if (frame.fogLight.y > 0.0)
+            light += frame.sunRadiance.rgb * (frame.fogLight.y * SunShadowVolume(frame, pos, viewDepth) *
+                                              FogPhase(dot(frame.sunDirection.xyz, -dir), g));
+        if (frame.lightInfo.x > 0u && frame.fogLight.w > 0.0) {
+            const uint cluster = ClusterIndex((vec2(id.xy) + 0.5) * FOG_TILE_SIZE, viewDepth, frame.clusterParams.zw,
+                                              frame.clusterParams.x, frame.clusterParams.y);
+            ClusterBuffer clusters = frame.clusters;
+            LightBuffer   lights   = frame.lights;
+            const uint    count    = min(clusters.counts[cluster], CLUSTER_MAX_LIGHTS);
+            const uint    first    = cluster * CLUSTER_MAX_LIGHTS;
+            for (uint i = 0u; i < count; ++i) {
+                const GpuLight l          = lights.l[clusters.indices[first + i]];
+                const vec3     toLight    = l.position - pos;
+                const float    distanceSq = dot(toLight, toLight);
+                const vec3     Ll         = toLight * inversesqrt(max(distanceSq, 1e-12));
+                float attenuation = DistanceAttenuation(distanceSq, l.range) * SpotAttenuation(-Ll, l);
+                if (attenuation <= 0.0)
+                    continue;
+                if (l.shadow != NO_SHADOW && frame.localShadowInfo.y > 0u)
+                    attenuation *= LocalShadowVolume(frame, l, pos);
+                light += l.color * (attenuation * frame.fogLight.w * FogPhase(dot(Ll, dir), g));
+            }
+        }
+        value.rgb += scattering * light;
+    }
+
+    if (pc.valid != 0u) { // temporal reprojection (perspective: clip w = view depth)
+        const vec4 prevClip = frame.prevViewProj * vec4(pos, 1.0);
+        if (prevClip.w > 1e-4) {
+            const vec2 prevUv = prevClip.xy / prevClip.w * vec2(0.5, -0.5) + 0.5;
+            const vec3 uvw    = vec3(prevUv * frame.fogGrid.zw, sqrt(prevClip.w / pc.prevDistance));
+            if (all(greaterThanEqual(uvw, vec3(0.0))) && all(lessThanEqual(uvw, vec3(1.0)))) {
+                const vec4 history = textureLod(sampler3D(uVolumeTextures[nonuniformEXT(pc.source)],
+                                                          uSamplers[SAMPLER_LINEAR_CLAMP]), uvw, 0.0);
+                value = mix(value, history, pc.feedback);
+            }
+        }
+    }
+    imageStore(uStorageVolumes[nonuniformEXT(pc.target)], ivec3(id), value);
+}

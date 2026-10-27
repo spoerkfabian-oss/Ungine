@@ -26,6 +26,7 @@ add_library(Engine STATIC
     src/Renderer/GpuProfiler.cpp
     src/Renderer/GpuScene.cpp
     src/Renderer/ParticleRenderer.cpp
+    src/Renderer/TerrainRenderer.cpp
     src/Renderer/RangeAllocator.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
@@ -47,6 +48,9 @@ add_library(Engine STATIC
     src/Scene/AabbTree.cpp
     src/Scene/Scene.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/Decals.cpp
+    src/Terrain/TerrainData.cpp
+    src/Terrain/TerrainBrush.cpp
     src/Scene/Prefab.cpp
     src/Scene/LevelStreaming.cpp
     src/Scene/SpatialIndex.cpp
@@ -106,6 +110,7 @@ set_target_properties(Engine PROPERTIES FOLDER "Engine")
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE
 set(ENGINE_SHADER_INCLUDES
     shaders/include/bindless.glsl
+    shaders/include/decals.glsl
     shaders/include/depth_normal.glsl
     shaders/include/exposure.glsl
     shaders/include/frame.glsl
@@ -118,6 +123,11 @@ set(ENGINE_SHADER_INCLUDES
     shaders/include/scene_common.glsl
     shaders/include/shadow.glsl
     shaders/include/sky.glsl
+    shaders/include/ssr.glsl
+    shaders/include/fog.glsl
+    shaders/include/shading.glsl
+    shaders/include/terrain.glsl
+    shaders/include/terrain_depth.glsl
     shaders/include/surface.glsl)
 target_sources(Engine PRIVATE ${ENGINE_SHADER_INCLUDES})
 set_source_files_properties(${ENGINE_SHADER_INCLUDES} PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -148,6 +158,25 @@ engine_add_shaders(Engine SOURCES
     shaders/particle_mesh.vert
     shaders/particle_ribbon.vert
     shaders/scatter.comp
+    shaders/taa.comp
+    shaders/ssr_hiz.comp
+    shaders/ssr_trace.comp
+    shaders/ssr_resolve.comp
+    shaders/ssr_blur.comp
+    shaders/fog_inject.comp
+    shaders/fog_integrate.comp
+    shaders/terrain.vert
+    shaders/terrain.frag
+    shaders/terrain_depth.frag
+    shaders/terrain_depth_id.frag
+    shaders/terrain_shadow.vert
+    shaders/terrain_shadow.frag
+    shaders/foliage.vert
+    shaders/foliage.frag
+    shaders/foliage_depth.frag
+    shaders/foliage_depth_id.frag
+    shaders/foliage_shadow.vert
+    shaders/foliage_shadow.frag
     shaders/shadow.vert
     shaders/shadow_mask.frag
     shaders/sky.frag

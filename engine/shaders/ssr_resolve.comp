@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+#include "ssr.glsl"
+
+// Temporal accumulation of the reflection rays: last resolve reprojected with the surface's
+// motion, clamped to the 3 x 3 neighborhood of this frame's rays, blended.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec4 Raw(ivec2 p)
+{
+    p = clamp(p, ivec2(0), ivec2(pc.size) - 1);
+    return texelFetch(sampler2D(uTextures[nonuniformEXT(pc.source)], uSamplers[SAMPLER_NEAREST_CLAMP]), p, 0);
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(pixel), pc.size)))
+        return;
+    const vec4 current = Raw(pixel);
+    vec4 lo = current, hi = current;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const vec4 c = Raw(pixel + ivec2(x, y));
+            lo = min(lo, c);
+            hi = max(hi, c);
+        }
+    vec4 result = current;
+    if (pc.mode != 0u) {
+        const vec2  uv       = (vec2(pixel) + 0.5) / vec2(pc.size);
+        const ivec2 full     = min(ivec2(uv * vec2(pc.fullSize)), ivec2(pc.fullSize) - 1);
+        const vec2  velocity = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.velocity)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                          full, 0).rg;
+        const vec2  previous = uv - velocity;
+        if (all(greaterThanEqual(previous, vec2(0.0))) && all(lessThanEqual(previous, vec2(1.0)))) {
+            const vec4 history = clamp(SampleTextureLod(pc.history, SAMPLER_LINEAR_CLAMP, previous, 0.0), lo, hi);
+            result = mix(current, history, pc.feedback);
+        }
+    }
+    imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, result);
+}

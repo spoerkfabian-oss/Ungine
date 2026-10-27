@@ -151,6 +151,26 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
     *Assign to selection* auf ein platziertes Modell (Komponente *Animation Controller*); gesteuert
     per Blueprint *Set Anim Float/Bool/Trigger*, Events per *On Anim Notify*. Beispiel: der Fuchs
     im Physics-Template (Gehen/Rennen nach Geschwindigkeit, Füße folgen dem Boden).
+21. **Bildqualität, Decals, Reflexionen, Nebel**: Im Renderer-Panel sind *Anti-aliasing (TAA)*
+    (glättet Kanten über mehrere Frames, mit Nachschärfen) und *Reflections (SSR)* (Spiegelungen
+    glatter Flächen aus dem Bild, sonst Himmel) standardmäßig an. *+ Add → Decal* projiziert eine
+    Textur (Albedo/Normal/Maske/Emissive, per Drag & Drop aus dem Content-Browser in den
+    Inspector) entlang −Z auf die Oberflächen in der Box; *Sort order* bestimmt, was oben liegt,
+    *Lifetime* lässt Decals im Spiel ausblenden (Blueprint *Spawn Decal at Location*). Unter *Fog*
+    wird Höhennebel eingeschaltet; *Volumetric* fügt Lichtstrahlen von Sonne und Lampen (mit
+    Schatten) hinzu, *+ Add → Fog Volume* setzt lokale Nebelboxen (auch leuchtend). Alle
+    Einstellungen werden mit der Szene gespeichert; die Toolbar *Volumes* zeigt Decal- und
+    Nebelboxen.
+22. **Terrain**: *+ Add → Terrain* (oder Content-Browser *+ New → Terrain*, `.uterrain` per
+    Doppelklick/Drag & Drop platzieren) legt ein 128-m-Terrain an. Im Fenster *Terrain* (bei
+    ausgewähltem Terrain) gibt es Pinsel *Raise/Lower/Smooth/Flatten* (Shift+Klick nimmt die
+    Flatten-Höhe), *Paint* (Layer in der Liste wählen), *Holes* und *Foliage*; Strg kehrt um
+    (senken/radieren), jeder Strich ist ein Undo-Schritt. Layer haben Albedo/Normal/ORM-Texturen
+    (Drag & Drop aus dem Content-Browser), Tint, Kachelung; steile Hänge werden triplanar
+    projiziert. Foliage-Layer sind prozedurale Grashalme, Textur-Karten oder Meshes (Dichte,
+    Größe, Wind, Sichtweite). Heightmaps (16-Bit-PNG/RAW) per *Import/Export*. Das Terrain
+    kollidiert (Physik), dient als Navmesh-Quelle und wird beim Speichern der Szene mitgespeichert;
+    Blueprint *Get Terrain Height* liefert Höhe und Normale.
 
 
 ## Entwicklung

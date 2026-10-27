@@ -517,6 +517,117 @@ json ParticleSystemToJson(const ParticleSystem& p, const std::string& effect)
             {"tint", ToJson(p.tint)}};
 }
 
+json DecalToJson(const Decal& d, const ModelRefs& paths)
+{
+    return {{"halfExtents", ToJson(d.halfExtents)},
+            {"albedo", paths.WritePath(d.albedo)},
+            {"normal", paths.WritePath(d.normal)},
+            {"mask", paths.WritePath(d.mask)},
+            {"emissive", paths.WritePath(d.emissive)},
+            {"color", ToJson(d.color)},
+            {"emissiveColor", ToJson(d.emissiveColor)},
+            {"roughness", d.roughness},
+            {"metallic", d.metallic},
+            {"materialOpacity", d.materialOpacity},
+            {"normalStrength", d.normalStrength},
+            {"angleFade", d.angleFade},
+            {"edgeFade", d.edgeFade},
+            {"sortOrder", d.sortOrder},
+            {"lifetime", d.lifetime},
+            {"fadeOut", d.fadeOut},
+            {"age", d.age}};
+}
+
+json FogVolumeToJson(const FogVolume& f)
+{
+    return {{"halfExtents", ToJson(f.halfExtents)},
+            {"density", f.density},
+            {"albedo", ToJson(f.albedo)},
+            {"emissive", ToJson(f.emissive)},
+            {"edgeFade", f.edgeFade}};
+}
+
+FogVolume FogVolumeFromJson(const json& j)
+{
+    FogVolume f;
+    Read(j, "halfExtents", f.halfExtents);
+    Read(j, "density", f.density);
+    Read(j, "albedo", f.albedo);
+    Read(j, "emissive", f.emissive);
+    Read(j, "edgeFade", f.edgeFade);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    f.halfExtents = glm::max(glm::abs(f.halfExtents), glm::vec3(1e-3f));
+    f.density     = std::clamp(finite(f.density, 0.1f), 0.0f, 100.0f);
+    f.albedo      = glm::clamp(f.albedo, glm::vec3(0.0f), glm::vec3(1.0f));
+    f.emissive    = glm::max(f.emissive, glm::vec3(0.0f));
+    f.edgeFade    = std::max(finite(f.edgeFade, 1.0f), 0.0f);
+    return f;
+}
+
+json TerrainToJson(const Terrain& t, const std::string& data)
+{
+    return {{"data", data},
+            {"castShadows", t.castShadows},
+            {"collision", t.collision},
+            {"navigation", t.navigation},
+            {"lodDistance", t.lodDistance},
+            {"foliageDensity", t.foliageDensity},
+            {"foliageDistance", t.foliageDistance}};
+}
+
+Terrain TerrainFromJson(const json& j)
+{
+    Terrain t;
+    Read(j, "data", t.data);
+    Read(j, "castShadows", t.castShadows);
+    Read(j, "collision", t.collision);
+    Read(j, "navigation", t.navigation);
+    Read(j, "lodDistance", t.lodDistance);
+    Read(j, "foliageDensity", t.foliageDensity);
+    Read(j, "foliageDistance", t.foliageDistance);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    t.lodDistance     = std::clamp(finite(t.lodDistance, 24.0f), 1.0f, 10000.0f);
+    t.foliageDensity  = std::clamp(finite(t.foliageDensity, 1.0f), 0.0f, 10.0f);
+    t.foliageDistance = std::clamp(finite(t.foliageDistance, 1.0f), 0.0f, 10.0f);
+    return t;
+}
+
+Decal DecalFromJson(const json& j, const ModelRefs& paths)
+{
+    Decal d;
+    Read(j, "halfExtents", d.halfExtents);
+    Read(j, "albedo", d.albedo);
+    Read(j, "normal", d.normal);
+    Read(j, "mask", d.mask);
+    Read(j, "emissive", d.emissive);
+    Read(j, "color", d.color);
+    Read(j, "emissiveColor", d.emissiveColor);
+    Read(j, "roughness", d.roughness);
+    Read(j, "metallic", d.metallic);
+    Read(j, "materialOpacity", d.materialOpacity);
+    Read(j, "normalStrength", d.normalStrength);
+    Read(j, "angleFade", d.angleFade);
+    Read(j, "edgeFade", d.edgeFade);
+    Read(j, "sortOrder", d.sortOrder);
+    Read(j, "lifetime", d.lifetime);
+    Read(j, "fadeOut", d.fadeOut);
+    Read(j, "age", d.age);
+    for (std::string* path : {&d.albedo, &d.normal, &d.mask, &d.emissive})
+        *path = paths.ReadPath(*path);
+    const auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+    d.halfExtents     = glm::max(glm::abs(d.halfExtents), glm::vec3(1e-3f));
+    d.roughness       = std::clamp(finite(d.roughness, 0.6f), 0.0f, 1.0f);
+    d.metallic        = std::clamp(finite(d.metallic, 0.0f), 0.0f, 1.0f);
+    d.materialOpacity = std::clamp(finite(d.materialOpacity, 1.0f), 0.0f, 1.0f);
+    d.normalStrength  = std::clamp(finite(d.normalStrength, 1.0f), 0.0f, 4.0f);
+    d.angleFade       = std::clamp(finite(d.angleFade, 70.0f), 0.0f, 89.0f);
+    d.edgeFade        = std::clamp(finite(d.edgeFade, 0.1f), 0.0f, 1.0f);
+    d.lifetime        = std::max(finite(d.lifetime, 0.0f), 0.0f);
+    d.fadeOut         = std::max(finite(d.fadeOut, 1.0f), 0.0f);
+    d.age             = std::max(finite(d.age, 0.0f), 0.0f);
+    return d;
+}
+
 json AnimationControllerToJson(const AnimationController& a, const std::string& graph)
 {
     return {{"graph", graph},
@@ -810,6 +921,12 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["audioSource"] = AudioSourceToJson(*source, models.WritePath(source->sound));
     if (r.Has<AudioListener>(e))
         j["audioListener"] = json::object();
+    if (const auto* decal = r.TryGet<Decal>(e))
+        j["decal"] = DecalToJson(*decal, models);
+    if (const auto* fog = r.TryGet<FogVolume>(e))
+        j["fogVolume"] = FogVolumeToJson(*fog);
+    if (const auto* terrain = r.TryGet<Terrain>(e))
+        j["terrain"] = TerrainToJson(*terrain, models.WritePath(terrain->data));
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
         j["particleSystem"] = ParticleSystemToJson(*particles, models.WritePath(particles->effect));
     if (const auto* controller = r.TryGet<AnimationController>(e))
@@ -1010,6 +1127,13 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         particles.effect         = models.ReadPath(particles.effect);
         return particles;
     });
+    ApplyOptional<Decal>(r, e, j, "decal", [&](const json& d) { return DecalFromJson(d, models); });
+    ApplyOptional<FogVolume>(r, e, j, "fogVolume", [](const json& f) { return FogVolumeFromJson(f); });
+    ApplyOptional<Terrain>(r, e, j, "terrain", [&](const json& t) {
+        Terrain terrain = TerrainFromJson(t);
+        terrain.data    = models.ReadPath(terrain.data);
+        return terrain;
+    });
     ApplyOptional<AnimationController>(r, e, j, "animationController", [&](const json& a) {
         AnimationController controller = AnimationControllerFromJson(a);
         controller.graph               = models.ReadPath(controller.graph);
@@ -1105,6 +1229,7 @@ json RendererToJson(const SceneRenderer& sr)
     const ShadowSettings& s = sr.shadows;
     const AoSettings& ao    = sr.ao;
     const LocalShadowSettings& ls = sr.localShadows;
+    const FogSettings& f    = sr.fog;
     return {
         {"lighting",
          {{"sunDirection", ToJson(sky.sunDirection)}, {"sunColor", ToJson(sky.sunColor)},
@@ -1130,6 +1255,18 @@ json RendererToJson(const SceneRenderer& sr)
           {"slopeBias", ls.slopeBias}, {"normalBias", ls.normalBias}, {"filterRadius", ls.filterRadius}}},
         {"culling", {{"gpuDriven", sr.culling.gpuDriven}, {"occlusion", sr.culling.occlusion}, {"lod", sr.culling.lod},
                      {"lodPixelError", sr.culling.lodPixelError}}}, // no debug state
+        {"taa", {{"enabled", sr.taa.enabled}, {"feedback", sr.taa.feedback}, {"sharpness", sr.taa.sharpness}}},
+        {"ssr",
+         {{"enabled", sr.ssr.enabled}, {"intensity", sr.ssr.intensity}, {"maxRoughness", sr.ssr.maxRoughness},
+          {"thickness", sr.ssr.thickness}, {"maxDistance", sr.ssr.maxDistance}, {"maxSteps", sr.ssr.maxSteps},
+          {"feedback", sr.ssr.feedback}}},
+        {"decals", {{"enabled", sr.decals.enabled}}},
+        {"fog",
+         {{"enabled", f.enabled}, {"albedo", ToJson(f.albedo)}, {"density", f.density}, {"baseHeight", f.baseHeight},
+          {"heightFalloff", f.heightFalloff}, {"startDistance", f.startDistance}, {"maxOpacity", f.maxOpacity},
+          {"anisotropy", f.anisotropy}, {"sunScale", f.sunScale}, {"ambientScale", f.ambientScale},
+          {"lightScale", f.lightScale}, {"volumetric", f.volumetric}, {"volumetricDistance", f.volumetricDistance},
+          {"temporalFeedback", f.temporalFeedback}}},
     };
 }
 
@@ -1199,6 +1336,61 @@ void RendererFromJson(const json& j, SceneRenderer& sr)
         Read(*it, "occlusion", sr.culling.occlusion);
         Read(*it, "lod", sr.culling.lod);
         Read(*it, "lodPixelError", sr.culling.lodPixelError);
+    }
+    const auto finite = [](float& v, float fallback, float lo, float hi) { v = std::isfinite(v) ? std::clamp(v, lo, hi) : fallback; };
+    if (const auto it = j.find("taa"); it != j.end()) {
+        Read(*it, "enabled", sr.taa.enabled);
+        Read(*it, "feedback", sr.taa.feedback);
+        Read(*it, "sharpness", sr.taa.sharpness);
+        finite(sr.taa.feedback, 0.9f, 0.0f, 0.98f);
+        finite(sr.taa.sharpness, 0.25f, 0.0f, 2.0f);
+    }
+    if (const auto it = j.find("ssr"); it != j.end()) {
+        SsrSettings& r = sr.ssr;
+        Read(*it, "enabled", r.enabled);
+        Read(*it, "intensity", r.intensity);
+        Read(*it, "maxRoughness", r.maxRoughness);
+        Read(*it, "thickness", r.thickness);
+        Read(*it, "maxDistance", r.maxDistance);
+        Read(*it, "maxSteps", r.maxSteps);
+        Read(*it, "feedback", r.feedback);
+        finite(r.intensity, 1.0f, 0.0f, 4.0f);
+        finite(r.maxRoughness, 0.5f, 0.0f, 1.0f);
+        finite(r.thickness, 0.3f, 0.01f, 10.0f);
+        finite(r.maxDistance, 40.0f, 0.5f, 1000.0f);
+        finite(r.feedback, 0.85f, 0.0f, 0.98f);
+        r.maxSteps = std::clamp(r.maxSteps, 8u, 256u);
+    }
+    if (const auto it = j.find("decals"); it != j.end())
+        Read(*it, "enabled", sr.decals.enabled);
+    if (const auto it = j.find("fog"); it != j.end()) {
+        FogSettings& f = sr.fog;
+        Read(*it, "enabled", f.enabled);
+        Read(*it, "albedo", f.albedo);
+        Read(*it, "density", f.density);
+        Read(*it, "baseHeight", f.baseHeight);
+        Read(*it, "heightFalloff", f.heightFalloff);
+        Read(*it, "startDistance", f.startDistance);
+        Read(*it, "maxOpacity", f.maxOpacity);
+        Read(*it, "anisotropy", f.anisotropy);
+        Read(*it, "sunScale", f.sunScale);
+        Read(*it, "ambientScale", f.ambientScale);
+        Read(*it, "lightScale", f.lightScale);
+        Read(*it, "volumetric", f.volumetric);
+        Read(*it, "volumetricDistance", f.volumetricDistance);
+        Read(*it, "temporalFeedback", f.temporalFeedback);
+        f.albedo = glm::clamp(f.albedo, glm::vec3(0.0f), glm::vec3(1.0f));
+        finite(f.density, 0.02f, 0.0f, 10.0f);
+        finite(f.baseHeight, 0.0f, -1e5f, 1e5f);
+        finite(f.heightFalloff, 0.15f, 0.0f, 10.0f);
+        finite(f.startDistance, 0.0f, 0.0f, 1e5f);
+        finite(f.maxOpacity, 1.0f, 0.0f, 1.0f);
+        finite(f.anisotropy, 0.6f, -0.95f, 0.95f);
+        finite(f.sunScale, 1.0f, 0.0f, 100.0f);
+        finite(f.ambientScale, 1.0f, 0.0f, 100.0f);
+        finite(f.lightScale, 1.0f, 0.0f, 100.0f);
+        finite(f.volumetricDistance, 64.0f, 1.0f, 1000.0f);
+        finite(f.temporalFeedback, 0.9f, 0.0f, 0.98f);
     }
 }
 

@@ -80,6 +80,11 @@ GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDepthClamp(bool e) { m_Dept
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDynamicDepthBias(bool e) { m_DynamicDepthBias = e; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDynamicCulling(bool e) { m_DynamicCulling = e; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetBlend(BlendMode m) { m_Blend = m; return *this; }
+GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetAttachmentBlend(std::uint32_t attachment, BlendMode m)
+{
+    m_AttachmentBlend.emplace_back(attachment, m);
+    return *this;
+}
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::AddColorAttachment(VkFormat f) { m_ColorFormats.push_back(f); return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDepthFormat(VkFormat f) { m_DepthFormat = f; return *this; }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetDebugName(std::string n) { m_DebugName = std::move(n); return *this; }
@@ -92,6 +97,20 @@ VkPipelineColorBlendAttachmentState MakeBlendState(BlendMode mode)
                        VK_COLOR_COMPONENT_A_BIT;
     if (mode == BlendMode::Opaque)
         return s;
+    if (mode == BlendMode::NoWrite) {
+        s.colorWriteMask = 0;
+        return s;
+    }
+    if (mode == BlendMode::Coverage) {
+        s.blendEnable         = VK_TRUE;
+        s.colorBlendOp        = VK_BLEND_OP_ADD;
+        s.alphaBlendOp        = VK_BLEND_OP_ADD;
+        s.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        s.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        return s;
+    }
 
     s.blendEnable         = VK_TRUE;
     s.colorBlendOp        = VK_BLEND_OP_ADD;
@@ -189,7 +208,10 @@ Pipeline GraphicsPipelineBuilder::Build(VkDevice device, VkPipelineLayout layout
     depth.depthCompareOp   = m_DepthTest ? m_DepthCompare : VK_COMPARE_OP_ALWAYS;
     depth.maxDepthBounds   = 1.0f;
 
-    const std::vector<VkPipelineColorBlendAttachmentState> blendStates(m_ColorFormats.size(), MakeBlendState(m_Blend));
+    std::vector<VkPipelineColorBlendAttachmentState> blendStates(m_ColorFormats.size(), MakeBlendState(m_Blend));
+    for (const auto& [attachment, mode] : m_AttachmentBlend)
+        if (attachment < blendStates.size())
+            blendStates[attachment] = MakeBlendState(mode);
     VkPipelineColorBlendStateCreateInfo blend{};
     blend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     blend.attachmentCount = static_cast<std::uint32_t>(blendStates.size());

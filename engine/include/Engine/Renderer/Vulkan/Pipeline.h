@@ -61,7 +61,9 @@ private:
 [[nodiscard]] Pipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout,
                                              const std::filesystem::path& shader, const char* debugName = nullptr);
 
-enum class BlendMode { Opaque, Alpha, Additive };
+// Coverage: color blended by the source alpha, destination alpha kept (motion vectors of
+// transparent surfaces). NoWrite: the attachment is not written (color write mask 0).
+enum class BlendMode { Opaque, Alpha, Additive, Coverage, NoWrite };
 
 // Dynamic-rendering graphics pipeline. No vertex input state: vertices are pulled via BDA.
 // Viewport/scissor are always dynamic. Defaults: triangle list, no culling, no depth, opaque.
@@ -77,7 +79,8 @@ public:
     GraphicsPipelineBuilder& SetDepth(bool test, bool write, VkCompareOp op = VK_COMPARE_OP_GREATER_OR_EQUAL);
     GraphicsPipelineBuilder& SetDepthClamp(bool enable);       // shadow maps
     GraphicsPipelineBuilder& SetDynamicDepthBias(bool enable); // shadow maps
-    GraphicsPipelineBuilder& SetBlend(BlendMode mode);
+    GraphicsPipelineBuilder& SetBlend(BlendMode mode); // every color attachment
+    GraphicsPipelineBuilder& SetAttachmentBlend(std::uint32_t attachment, BlendMode mode); // one (independentBlend)
     GraphicsPipelineBuilder& AddColorAttachment(VkFormat format);
     GraphicsPipelineBuilder& SetDepthFormat(VkFormat format);
     GraphicsPipelineBuilder& SetDebugName(std::string name);
@@ -97,6 +100,7 @@ private:
     bool                  m_DynamicDepthBias = false;
     bool                  m_DynamicCulling   = false;
     BlendMode             m_Blend            = BlendMode::Opaque;
+    std::vector<std::pair<std::uint32_t, BlendMode>> m_AttachmentBlend;
     std::vector<VkFormat> m_ColorFormats;
     VkFormat              m_DepthFormat      = VK_FORMAT_UNDEFINED;
     std::string           m_DebugName;

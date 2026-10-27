@@ -286,6 +286,28 @@ void Editor::DrawHierarchy()
             PushCreated("Create reverb zone", roots);
             Select(e);
         }
+        if (ImGui::MenuItem("Decal")) { // projecting downwards onto the surface in front of the camera
+            const Entity e = m_Ctx.scene.CreateEntity("Decal");
+            Transform&   t = m_Ctx.scene.EditTransform(e);
+            t.position     = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            t.rotation     = glm::angleAxis(glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+            registry.Emplace<Decal>(e);
+            const Entity roots[] = {e};
+            PushCreated("Create decal", roots);
+            Select(e);
+        }
+        if (ImGui::MenuItem("Terrain")) { // a new terrain file, centered under the camera
+            const glm::vec3 at = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            (void)CreateTerrain(glm::vec3(at.x, 0.0f, at.z));
+        }
+        if (ImGui::MenuItem("Fog Volume")) {
+            const Entity e = m_Ctx.scene.CreateEntity("Fog Volume");
+            m_Ctx.scene.EditTransform(e).position = PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f);
+            registry.Emplace<FogVolume>(e);
+            const Entity roots[] = {e};
+            PushCreated("Create fog volume", roots);
+            Select(e);
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Streaming Volume")) {
             const Entity e = m_Ctx.scene.CreateEntity("Streaming Volume");
@@ -1231,6 +1253,75 @@ void Editor::DrawInspector()
             registry.Remove<ParticleSystem>(e);
     }
 
+    if (Decal* decal = registry.TryGet<Decal>(e); decal && ImGui::CollapsingHeader("Decal", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Texture paths: typed, or dropped from the content browser (absolute in memory).
+        const auto isImage = [](const std::filesystem::path& file) {
+            std::string ext = PathToUtf8(file.extension());
+            std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".ktx2";
+        };
+        const auto texture = [&](const char* label, std::string& path) {
+            PropertyRow(label);
+            ImGui::InputTextWithHint("##v", "(none)", &path);
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("UNGINE_CONTENT")) {
+                    const std::filesystem::path file = PathFromUtf8(static_cast<const char*>(payload->Data));
+                    if (isImage(file))
+                        path = PathToUtf8(file.lexically_normal());
+                }
+                ImGui::EndDragDropTarget();
+            }
+            ImGui::PopID();
+        };
+        if (BeginProperties("decal")) {
+            Vec3Row("Half extents", &decal->halfExtents, 0.005f, 0.5f);
+            texture("Albedo", decal->albedo);
+            texture("Normal", decal->normal);
+            texture("Mask (G rough, B metal)", decal->mask);
+            texture("Emissive", decal->emissive);
+            PropertyRow("Color");
+            ImGui::ColorEdit4("##v", &decal->color.x, ImGuiColorEditFlags_Float);
+            ImGui::PopID();
+            PropertyRow("Emissive color");
+            ImGui::ColorEdit3("##v", &decal->emissiveColor.x, ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+            ImGui::PopID();
+            SliderFloatRow("Roughness", &decal->roughness, 0.0f, 1.0f, "%.2f");
+            SliderFloatRow("Metallic", &decal->metallic, 0.0f, 1.0f, "%.2f");
+            SliderFloatRow("Material opacity", &decal->materialOpacity, 0.0f, 1.0f, "%.2f");
+            SliderFloatRow("Normal strength", &decal->normalStrength, 0.0f, 4.0f, "%.2f");
+            SliderFloatRow("Angle fade", &decal->angleFade, 0.0f, 89.0f, "%.0f\xC2\xB0");
+            SliderFloatRow("Edge fade", &decal->edgeFade, 0.0f, 1.0f, "%.2f");
+            PropertyRow("Sort order");
+            ImGui::InputInt("##v", &decal->sortOrder);
+            ImGui::PopID();
+            DragFloatRow("Lifetime (0 = forever)", &decal->lifetime, 0.1f, 0.0f, 100000.0f, "%.1f s");
+            DragFloatRow("Fade out", &decal->fadeOut, 0.05f, 0.0f, 100.0f, "%.2f s");
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Projects along -Z of the entity onto opaque surfaces inside the box.");
+        if (ImGui::Button("Remove decal"))
+            registry.Remove<Decal>(e);
+    }
+
+    if (FogVolume* fog = registry.TryGet<FogVolume>(e); fog && ImGui::CollapsingHeader("Fog Volume", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (BeginProperties("fogvolume")) {
+            Vec3Row("Half extents", &fog->halfExtents, 0.01f, 5.0f);
+            SliderFloatRow("Density", &fog->density, 0.0f, 10.0f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
+            PropertyRow("Albedo");
+            ImGui::ColorEdit3("##v", &fog->albedo.x, ImGuiColorEditFlags_Float);
+            ImGui::PopID();
+            PropertyRow("Emissive");
+            ImGui::ColorEdit3("##v", &fog->emissive.x, ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+            ImGui::PopID();
+            DragFloatRow("Edge fade", &fog->edgeFade, 0.01f, 0.0f, 1000.0f, "%.2f");
+            ImGui::EndTable();
+        }
+        if (!m_Ctx.sceneRenderer.fog.enabled || !m_Ctx.sceneRenderer.fog.volumetric)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Needs fog + volumetric enabled (Renderer panel)");
+        if (ImGui::Button("Remove fog volume"))
+            registry.Remove<FogVolume>(e);
+    }
+
     if (AnimationController* controller = registry.TryGet<AnimationController>(e);
         controller && ImGui::CollapsingHeader("Animation Controller", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -1348,6 +1439,7 @@ void Editor::DrawInspector()
     }
 
     DrawNavigationInspector(e);
+    DrawTerrainInspector(e);
 
     ImGui::Separator();
     if (ImGui::Button("Add component"))
@@ -1428,6 +1520,12 @@ void Editor::DrawInspector()
             registry.Emplace<ParticleSystem>(e);
         if (ImGui::MenuItem("Animation Controller", nullptr, false, !registry.Has<AnimationController>(e) && registry.Has<ModelInstance>(e)))
             registry.Emplace<AnimationController>(e);
+        if (ImGui::MenuItem("Decal", nullptr, false, !registry.Has<Decal>(e)))
+            registry.Emplace<Decal>(e);
+        if (ImGui::MenuItem("Fog Volume", nullptr, false, !registry.Has<FogVolume>(e)))
+            registry.Emplace<FogVolume>(e);
+        if (ImGui::MenuItem("Terrain", nullptr, false, !registry.Has<Terrain>(e)))
+            registry.Emplace<Terrain>(e);
         ImGui::Separator();
         if (ImGui::MenuItem("Level Streaming Volume", nullptr, false, !registry.Has<LevelStreamingVolume>(e)))
             registry.Emplace<LevelStreamingVolume>(e);
@@ -1818,6 +1916,78 @@ void Editor::DrawRendererSettings()
         SliderUintRow("Steps per side", &ao.stepsPerSide, 1, 8);
         SliderFloatRow("Sharpness", &ao.sharpness, 0.0f, 100.0f, "%.1f");
         ImGui::EndTable();
+    }
+
+    const bool expandRendering = std::exchange(m_ExpandRendering, false);
+    const auto openRendering   = [&] {
+        if (expandRendering)
+            ImGui::SetNextItemOpen(true);
+    };
+    openRendering();
+    if (ImGui::CollapsingHeader("Anti-aliasing (TAA)") && BeginProperties("taa")) {
+        CheckboxRow("Enabled", &sr.taa.enabled);
+        ImGui::BeginDisabled(!sr.taa.enabled);
+        SliderFloatRow("History weight", &sr.taa.feedback, 0.5f, 0.98f, "%.2f");
+        SliderFloatRow("Sharpness", &sr.taa.sharpness, 0.0f, 1.0f, "%.2f");
+        ImGui::EndDisabled();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Debug view: Motion vectors.");
+    }
+
+    openRendering();
+    if (ImGui::CollapsingHeader("Reflections (SSR)") && BeginProperties("ssr")) {
+        SsrSettings& r = sr.ssr;
+        CheckboxRow("Enabled", &r.enabled);
+        ImGui::BeginDisabled(!r.enabled);
+        SliderFloatRow("Intensity", &r.intensity, 0.0f, 2.0f, "%.2f");
+        SliderFloatRow("Max roughness", &r.maxRoughness, 0.05f, 1.0f, "%.2f");
+        SliderFloatRow("Thickness", &r.thickness, 0.01f, 2.0f, "%.2f m");
+        DragFloatRow("Max distance", &r.maxDistance, 0.5f, 0.5f, 1000.0f, "%.1f m");
+        SliderUintRow("Max steps", &r.maxSteps, 8, 256);
+        SliderFloatRow("History weight", &r.feedback, 0.0f, 0.98f, "%.2f");
+        ImGui::EndDisabled();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Rays use last frame's image; the IBL stays the fallback. Debug view: Reflections.");
+    }
+
+    openRendering();
+    if (ImGui::CollapsingHeader("Decals") && BeginProperties("decals")) {
+        CheckboxRow("Enabled", &sr.decals.enabled);
+        PropertyRow("Visible");
+        ImGui::Text("%u (max %u, %u per cluster)", sr.Stats().decals, kMaxVisibleDecals, kClusterMaxDecals);
+        ImGui::PopID();
+        ImGui::EndTable();
+    }
+
+    openRendering();
+    if (ImGui::CollapsingHeader("Fog") && BeginProperties("fog")) {
+        FogSettings& f = sr.fog;
+        CheckboxRow("Enabled", &f.enabled);
+        ImGui::BeginDisabled(!f.enabled);
+        PropertyRow("Albedo");
+        ImGui::ColorEdit3("##v", &f.albedo.x, ImGuiColorEditFlags_Float);
+        ImGui::PopID();
+        SliderFloatRow("Density", &f.density, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+        DragFloatRow("Base height", &f.baseHeight, 0.1f, -10000.0f, 10000.0f, "%.1f m");
+        SliderFloatRow("Height falloff", &f.heightFalloff, 0.0f, 2.0f, "%.3f /m");
+        DragFloatRow("Start distance", &f.startDistance, 0.1f, 0.0f, 10000.0f, "%.1f m");
+        SliderFloatRow("Max opacity", &f.maxOpacity, 0.0f, 1.0f, "%.2f");
+        SliderFloatRow("Anisotropy", &f.anisotropy, -0.9f, 0.9f, "%.2f");
+        SliderFloatRow("Sun", &f.sunScale, 0.0f, 10.0f, "%.2f");
+        SliderFloatRow("Ambient", &f.ambientScale, 0.0f, 10.0f, "%.2f");
+        CheckboxRow("Volumetric", &f.volumetric);
+        ImGui::BeginDisabled(!f.volumetric);
+        SliderFloatRow("Lights", &f.lightScale, 0.0f, 10.0f, "%.2f");
+        DragFloatRow("Grid distance", &f.volumetricDistance, 0.5f, 1.0f, 1000.0f, "%.0f m");
+        SliderFloatRow("History weight", &f.temporalFeedback, 0.0f, 0.98f, "%.2f");
+        PropertyRow("This frame");
+        const glm::uvec3 grid = sr.Stats().fogGrid;
+        ImGui::Text("%ux%ux%u froxels, %u volumes", grid.x, grid.y, grid.z, sr.Stats().fogVolumes);
+        ImGui::PopID();
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        ImGui::EndTable();
+        ImGui::TextDisabled("Height fog everywhere; the volumetric grid adds shadowed light shafts and Fog Volumes.");
     }
 
     DrawAudioSettings();

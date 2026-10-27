@@ -374,6 +374,57 @@ struct ParticleSystem {
     bool operator==(const ParticleSystem&) const = default;
 };
 
+// Projected decal (clustered, applied before lighting): the box +-halfExtents in entity space,
+// projected along the entity's -Z axis onto whatever surface lies inside. Texture paths are
+// absolute in memory, relative to the scene in files; an empty albedo path is a plain color.
+struct Decal {
+    glm::vec3     halfExtents{0.5f, 0.5f, 0.25f};
+    std::string   albedo{};   // sRGB, alpha = coverage
+    std::string   normal{};   // tangent space (decal X/Y), optional
+    std::string   mask{};     // glTF metallic-roughness style: G roughness, B metallic (optional)
+    std::string   emissive{}; // sRGB, times emissiveColor (optional; without it emissiveColor x coverage)
+    glm::vec4     color{1.0f};          // albedo tint, a = opacity
+    glm::vec3     emissiveColor{0.0f};  // HDR
+    float         roughness       = 0.6f;
+    float         metallic        = 0.0f;
+    float         materialOpacity = 1.0f; // how far roughness / metallic follow the decal (0 = keep the surface)
+    float         normalStrength  = 1.0f;
+    float         angleFade       = 70.0f; // degrees between surface and projection axis where fading starts
+    float         edgeFade        = 0.1f;  // fraction of the box depth faded at the front / back
+    std::int32_t  sortOrder       = 0;     // higher draws on top
+    float         lifetime        = 0.0f;  // seconds, 0 = forever (UpdateDecals ages and removes them)
+    float         fadeOut         = 1.0f;  // last seconds of the lifetime: opacity to 0
+    float         age             = 0.0f;  // runtime
+
+    bool operator==(const Decal&) const = default;
+};
+
+// Local volumetric fog (SceneRenderer, FogSettings::volumetric): extra density inside the box
+// (entity space), faded towards the faces. Needs the volumetric fog of the renderer enabled.
+struct FogVolume {
+    glm::vec3 halfExtents{5.0f, 2.0f, 5.0f};
+    float     density = 0.1f;          // extinction per meter
+    glm::vec3 albedo{1.0f};            // scattering color
+    glm::vec3 emissive{0.0f};          // HDR, emitted per meter of fog
+    float     edgeFade = 1.0f;         // entity-space units faded at the faces
+
+    bool operator==(const FogVolume&) const = default;
+};
+
+// Heightmap terrain (TerrainData file, shared through TerrainStore): centered on the entity's world
+// X/Z, height 0 at its world Y; rotation and scale are ignored.
+struct Terrain {
+    std::string data{};                // .uterrain (absolute in memory, relative to the scene in files)
+    bool        castShadows     = true;
+    bool        collision       = true; // Jolt height field (PhysicsWorld)
+    bool        navigation      = true; // navmesh source inside NavMeshBounds
+    float       lodDistance     = 24.0f; // meters covered by the finest LOD; each coarser level doubles
+    float       foliageDensity  = 1.0f;  // multiplier of the layers' densities
+    float       foliageDistance = 1.0f;  // multiplier of the layers' view distances
+
+    bool operator==(const Terrain&) const = default;
+};
+
 // --- Navigation (NavigationWorld, Recast/Detour). Geometry: colliders (not triggers) of static
 // bodies or without a RigidBody. Area / profile names refer to NavSettings (project). ---
 

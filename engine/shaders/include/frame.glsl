@@ -10,6 +10,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     mat4  view;
     mat4  proj;
     mat4  invViewProj;
+    mat4  prevViewProj;       // last frame, without jitter (motion vectors)
+    mat4  unjitteredViewProj; // this frame, without jitter
     vec4  cameraPosition;
     vec4  sunDirection; // xyz: direction the light travels
     vec4  sunRadiance;  // rgb: color * intensity
@@ -38,6 +40,18 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     // GPU-driven culling
     uvec4 hizInfo;  // xy: level 0 size, z: level count (0 = no pyramid), w: debug view level
 
+    // Temporal anti-aliasing
+    vec4  taaInfo;  // xy: this frame's jitter (NDC), z: frame time (s), w: frame counter
+    uvec4 decalInfo; // x: decal count (0 = no decals this frame)
+    uvec4 ssrInfo;   // x: reflection texture slot (half resolution), y: enabled this frame
+    vec4  ssrParams; // x: intensity, zw: 1 / output size
+    // Fog (fog.glsl)
+    vec4  fogColor;  // rgb: albedo of the height fog, w: density at the base height
+    vec4  fogHeight; // x: base height, y: falloff, z: start distance, w: max opacity (analytic)
+    vec4  fogLight;  // x: anisotropy, y: sun scale, z: ambient scale, w: punctual light scale
+    uvec4 fogInfo;   // x: enabled, y: integrated volume slot, z: fog volume count, w: volumetric this frame
+    vec4  fogGrid;   // x: grid depth (m), y: slices, zw: screen UV -> grid UV
+
     LightBuffer      lights;
     ClusterBuffer    clusters;
     ShadowViewBuffer shadowViews;
@@ -49,6 +63,10 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     DrawBuffer       draws;     // GPU scene
     HiZBuffer        hiz;
     TextureTable     textureTable; // material texture entry -> bindless slot
+    JointMatrixBuffer prevJointMatrices; // last frame's skin palettes (GpuInstance.prevJointOffset)
+    DecalBuffer        decals;
+    DecalClusterBuffer decalClusters;
+    FogVolumeBuffer    fogVolumes;
 };
 
 #endif

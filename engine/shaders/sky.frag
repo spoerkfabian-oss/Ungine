@@ -1,6 +1,9 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
 #include "frame.glsl"
+#include "fog.glsl"
 #include "sky.glsl"
 
 layout(push_constant) uniform SkyPush {
@@ -18,5 +21,7 @@ void main()
 
     const vec3 toSun = normalize(-pc.frame.sunDirection.xyz);
     const vec3 sun   = pc.frame.sunRadiance.rgb;
-    outColor = vec4(SkyRadiance(dir, toSun, sun, pc.frame.sky.x) + SunDisk(dir, toSun, sun), 1.0);
+    const vec3 color = SkyRadiance(dir, toSun, sun, pc.frame.sky.x) + SunDisk(dir, toSun, sun);
+    const vec4 fog   = ComputeFog(pc.frame, vec2(inNdc.x, -inNdc.y) * 0.5 + 0.5, dir, 0.0, true);
+    outColor = vec4(color * fog.a + fog.rgb, 1.0);
 }

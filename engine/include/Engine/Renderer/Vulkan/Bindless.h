@@ -23,6 +23,7 @@ inline constexpr std::uint32_t kPushConstantSize = 128; // guaranteed minimum on
 // One global descriptor set (set 0) shared by every pipeline:
 //   binding 0: texture2D[]    binding 1: sampler[]   binding 2: image2D[] (storage, rgba16f)
 //   binding 3: textureCube[]  binding 4: image2DArray[] (storage, rgba16f; cube faces from compute)
+//   binding 5: texture3D[]    binding 6: image3D[] (storage, rgba16f; froxel volumes)
 // Buffers are accessed through buffer device addresses in push constants, not descriptors.
 class BindlessRegistry {
 public:
@@ -39,6 +40,9 @@ public:
     [[nodiscard]] std::uint32_t AddSampler(VkSampler sampler);
     [[nodiscard]] std::uint32_t AddCubeTexture(VkImageView cubeView);       // SHADER_READ_ONLY layout
     [[nodiscard]] std::uint32_t AddStorageImageArray(VkImageView arrayView); // GENERAL layout
+    [[nodiscard]] std::uint32_t AddVolumeTexture(VkImageView view3d,
+                                                 VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    [[nodiscard]] std::uint32_t AddStorageVolume(VkImageView view3d); // GENERAL layout
 
     // Frees the slot for reuse. The GPU may still read it: call through Renderer::DeferCall.
     void RemoveSampledImage(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_SampledImages.Release(index); }
@@ -50,6 +54,9 @@ public:
         std::scoped_lock lock{m_Mutex};
         m_StorageArrays.Release(index);
     }
+
+    void RemoveVolumeTexture(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_VolumeTextures.Release(index); }
+    void RemoveStorageVolume(std::uint32_t index) { std::scoped_lock lock{m_Mutex}; m_StorageVolumes.Release(index); }
 
     void Bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) const;
 
@@ -77,7 +84,8 @@ private:
     // Guards the slot allocators and descriptor writes (the set is externally synchronized).
     // Binding the set while another thread writes unused slots is allowed (UPDATE_AFTER_BIND).
     std::mutex    m_Mutex;
-    SlotAllocator m_SampledImages, m_Samplers, m_StorageImages, m_CubeTextures, m_StorageArrays;
+    SlotAllocator m_SampledImages, m_Samplers, m_StorageImages, m_CubeTextures, m_StorageArrays, m_VolumeTextures,
+                  m_StorageVolumes;
     std::array<VkSampler, static_cast<std::size_t>(DefaultSampler::Count)> m_DefaultSamplers{};
 };
 

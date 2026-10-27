@@ -1,0 +1,137 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#include "bindless.glsl"
+#include "frame.glsl"
+#include "ssr.glsl"
+
+// Screen-space reflection rays (half resolution, one full-resolution sample per 2 x 2, rotating
+// every frame): mirror ray from the view position, hierarchical traversal of the closest-depth
+// pyramid (empty space is skipped a whole cell at a time), color from last frame's image at the
+// reprojected hit. a = confidence (screen edges, distance, roughness, rays towards the camera).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float Pyramid(uint level, ivec2 cell)
+{
+    const uvec2 size = SsrLevelSize(level);
+    const uvec2 c    = uvec2(clamp(cell, ivec2(0), ivec2(size) - 1));
+    return pc.pyramid.d[SsrLevelOffset(level) + c.y * size.x + c.x];
+}
+
+// View space position -> (pixel x, pixel y, depth) at full resolution.
+vec3 ToScreen(vec3 view)
+{
+    const vec4 clip = pc.frame.proj * vec4(view, 1.0);
+    const vec3 ndc  = clip.xyz / clip.w;
+    return vec3((ndc.x * 0.5 + 0.5) * float(pc.fullSize.x), (0.5 - ndc.y * 0.5) * float(pc.fullSize.y), ndc.z);
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(pixel), pc.size)))
+        return;
+    FrameData frame = pc.frame;
+    const uint  phase = uint(frame.taaInfo.w) & 3u;
+    const ivec2 full  = min(pixel * 2 + ivec2(phase & 1u, phase >> 1u), ivec2(pc.fullSize) - 1);
+    const float depth = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.depth)], uSamplers[SAMPLER_NEAREST_CLAMP]), full, 0).r;
+    const vec4  nr    = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.normals)], uSamplers[SAMPLER_NEAREST_CLAMP]), full, 0);
+    if (depth <= 0.0 || nr.a > pc.maxRoughness) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(0.0));
+        return;
+    }
+
+    // View space position + mirror direction.
+    const vec2 uv    = (vec2(full) + 0.5) / vec2(pc.fullSize);
+    vec4       world = frame.invViewProj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    world /= world.w;
+    const vec3  view = (frame.view * world).xyz;
+    const vec3  N    = normalize(nr.xyz);
+    const vec3  R    = reflect(normalize(view), N);
+    const float nearPlane = frame.proj[3][2]; // reverse-Z, infinite far: view distance = near / depth
+
+    // Ray in screen space (depth is affine there), started off the surface, clipped to the near
+    // plane and the screen.
+    const vec3 origin = view + N * (0.01 * -view.z + 0.01);
+    vec3       end    = origin + R * pc.maxDistance;
+    if (end.z > -nearPlane * 1.01)
+        end = origin + R * ((-nearPlane * 1.01 - origin.z) / max(R.z, 1e-5));
+    const vec3 start = ToScreen(origin);
+    const vec3 d     = ToScreen(end) - start;
+    float tMax = 1.0;
+    for (int axis = 0; axis < 2; ++axis) { // stay on screen
+        if (abs(d[axis]) > 1e-6) {
+            const float bound = d[axis] > 0.0 ? float(pc.fullSize[axis]) - 0.5 : 0.5;
+            tMax = min(tMax, max((bound - start[axis]) / d[axis], 0.0));
+        }
+    }
+    const float pixels = length(d.xy);
+    if (pixels < 1.0) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(0.0));
+        return;
+    }
+
+    const int maxLevel = int(min(pc.levels, 8u)) - 1;
+    int   level = 0;
+    float t     = 1.5 / pixels; // skip the starting pixel
+    bool  hit   = false;
+    for (uint step = 0u; step < pc.mode && t <= tMax; ++step) {
+        const vec3  p    = start + d * t;
+        const float size = float(1 << level);
+        const ivec2 cell = ivec2(floor(p.xy / size));
+        const float D    = Pyramid(uint(level), cell);
+        // Where the ray leaves this cell (just beyond its boundary).
+        float tCell = 1e9;
+        for (int axis = 0; axis < 2; ++axis) {
+            if (abs(d[axis]) > 1e-6) {
+                const float edge = d[axis] > 0.0 ? (float(cell[axis]) + 1.0) * size : float(cell[axis]) * size;
+                tCell = min(tCell, (edge - start[axis]) / d[axis]);
+            }
+        }
+        tCell += 0.01 / pixels;
+        if (p.z > D) { // in front of everything in the cell
+            const float tDepth = d.z < 0.0 ? (D - start.z) / d.z : 1e9;
+            if (tDepth < tCell) {
+                t = max(t, tDepth);
+                if (level == 0) {
+                    hit = true;
+                    break;
+                }
+                --level;
+            } else {
+                t     = tCell;
+                level = min(level + 1, maxLevel);
+            }
+        } else if (level == 0) {
+            // Behind the nearest surface of this pixel: a hit if not much behind it.
+            if (nearPlane / max(p.z, 1e-9) - nearPlane / max(D, 1e-9) < pc.thickness) {
+                hit = true;
+                break;
+            }
+            t = tCell; // passed behind an object: keep walking at full resolution
+        } else {
+            --level;
+        }
+    }
+    if (!hit) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(0.0));
+        return;
+    }
+
+    // Color of the hit point last frame.
+    const vec2  hitUv    = (start.xy + d.xy * t) / vec2(pc.fullSize);
+    const vec2  velocity = texelFetch(sampler2D(uTextures[nonuniformEXT(pc.velocity)], uSamplers[SAMPLER_NEAREST_CLAMP]),
+                                      ivec2(hitUv * vec2(pc.fullSize)), 0).rg;
+    const vec2  previous = hitUv - velocity;
+    if (any(lessThan(previous, vec2(0.0))) || any(greaterThan(previous, vec2(1.0)))) {
+        imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(0.0));
+        return;
+    }
+    const vec3  color = max(SampleTextureLod(pc.source, SAMPLER_LINEAR_CLAMP, previous, 0.0).rgb, vec3(0.0));
+    const vec2  edge  = min(hitUv, 1.0 - hitUv);
+    float confidence  = clamp(min(edge.x, edge.y) / 0.08, 0.0, 1.0);          // screen edges
+    confidence       *= 1.0 - clamp((t / max(tMax, 1e-4) - 0.7) / 0.3, 0.0, 1.0); // end of the ray
+    confidence       *= 1.0 - clamp((nr.a - pc.maxRoughness * 0.6) / (pc.maxRoughness * 0.4), 0.0, 1.0);
+    confidence       *= clamp(1.0 - R.z * 2.0, 0.0, 1.0);                       // towards the camera
+    imageStore(uStorageImages[nonuniformEXT(pc.target)], pixel, vec4(color, confidence));
+}

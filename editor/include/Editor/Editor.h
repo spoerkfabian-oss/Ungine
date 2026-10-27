@@ -8,6 +8,7 @@
 #include "Engine/Renderer/Renderer.h"
 #include "Engine/Renderer/Vulkan/Image.h"
 #include "Engine/Scene/Frustum.h"
+#include "Engine/Terrain/TerrainBrush.h"
 #include "Engine/Script/ScriptGraph.h"
 #include "Engine/UI/UiSystem.h"
 
@@ -153,6 +154,7 @@ public:
     void SimulateText(std::string_view utf8);
     void FocusViewport() { m_FocusViewport = 1; } // brings the viewport tab to front next frame
     void ExpandAudioMixer() { m_ExpandAudioMixer = true; } // opens the Renderer panel's Audio sections once (UI tests)
+    void ExpandRenderingSections() { m_ExpandRendering = true; } // TAA / SSR / decals / fog sections once (UI tests)
     // The scene image of the viewport in window pixels (x, y, width, height); zero while hidden.
     [[nodiscard]] glm::vec4 ViewportRect() const { return m_ViewportRect; }
 
@@ -186,6 +188,17 @@ public:
     void SetNavigationTestPath(const glm::vec3& start, const glm::vec3& end);
     [[nodiscard]] const NavPath& NavigationTestPath() const { return m_NavPath; }
     bool SaveAll(); // scene (if it has a file) + open blueprints
+    // Terrain: a new .uterrain (Content/Terrains, saved at once) placed as an entity, + undo.
+    Entity CreateTerrain(const glm::vec3& position);
+    Entity PlaceTerrain(const std::filesystem::path& file, const glm::vec3& position); // existing .uterrain, + undo
+    // Brush of the Terrain window (tool off: the viewport selects as usual).
+    [[nodiscard]] TerrainBrush& TerrainBrushSettings() { return m_TerrainBrush; }
+    void SetTerrainToolEnabled(bool enabled) { m_TerrainToolOn = enabled; }
+    [[nodiscard]] bool TerrainToolActive() const; // enabled, editing, a terrain selected
+    // One brush stroke on the selected terrain through world points (as if dragged), one undo step.
+    bool ApplyTerrainStroke(std::span<const glm::vec3> worldPoints, float secondsPerPoint = 0.1f);
+    // Writes every edited (dirty) terrain used by the scene; false if one failed.
+    bool SaveTerrains();
     // Window close request: true if the application may quit now; with unsaved changes it asks
     // (Save all / Discard / Cancel) and closes the window itself once decided.
     bool ConfirmQuit();
@@ -274,6 +287,16 @@ private:
     void SaveNavigation(const std::filesystem::path& scene); // bakes next to a saved scene (none: removes the file)
     void LoadNavigation(const std::filesystem::path& scene); // fresh navmesh + the scene's baked file
     void UpdateNavigationTestPath();
+    void DrawTerrainTools();       // Terrain window: brushes, layers, foliage, settings, import / export
+    void DrawTerrainInspector(Entity entity);
+    bool UpdateTerrainBrush(float x, float y, float width, float height, bool clicked); // true: the click was the brush's
+    void BeginTerrainStroke(Entity terrain);
+    void TerrainDab(const glm::vec3& world, float dt);
+    void EndTerrainStroke();
+    void CommitTerrainSettings(); // layer / foliage / size edits of the window -> one undo step
+    void RebaseTerrainSettings(const std::string& path); // undo / redo / strokes changed it: the new baseline
+    void DiscardTerrainEdits();   // unsaved terrain edits go (scene change)
+    void HandleTerrainDialog(int purpose, const std::filesystem::path& file); // import / export / layer paths / assign
     [[nodiscard]] std::string StreamedLevelOf(Entity entity) const; // level file of a streamed entity, else empty
     void DrawStreamingOverlay(float x, float y, float width, float height); // volume boxes
     void DrawContentBrowser();
@@ -349,6 +372,7 @@ private:
     bool          m_ViewportVisible = false; // drawn this frame (else the scene render is skipped)
     int           m_FocusViewport   = 0; // frames until the viewport tab is brought to front (default layout)
     bool          m_ExpandAudioMixer = false;
+    bool          m_ExpandRendering  = false;
     bool          m_ViewportFocused = false;
     bool          m_PickAdditive    = false; // a pick request is pending: Ctrl was held
     // Left button pressed in the viewport: click (pick on release) or box selection (dragged).
@@ -422,6 +446,23 @@ private:
     bool m_ShowVolumes         = true;  // streaming volume boxes in the viewport
     bool m_ShowNavigation      = true;  // Navigation window (with a navigation world)
     bool m_ShowNavMesh         = true;  // navmesh overlay in the viewport
+    bool m_ShowTerrain         = true;  // Terrain window
+    bool         m_TerrainToolOn = false;
+    TerrainBrush m_TerrainBrush;
+    struct TerrainStroke {               // a held brush: the data before it, the touched area
+        Entity                       entity = NullEntity;
+        std::string                  path;
+        std::shared_ptr<TerrainData> data;
+        TerrainData                  before;
+        std::uint32_t                kinds = 0;
+        glm::vec4                    rect{1.0f, 1.0f, 0.0f, 0.0f};
+    };
+    std::optional<TerrainStroke> m_TerrainStroke;
+    std::optional<glm::vec3>     m_TerrainCursor;    // brush center on the surface (world)
+    std::string                  m_TerrainEditPath;  // terrain the window shows
+    std::optional<TerrainData>   m_TerrainCommitted; // its settings (without the big arrays) as of the last undo step
+    std::uint32_t                m_TerrainAssetSlot = 0; // file dialog target: kind (high byte) + index
+    float                        m_TerrainPlaneY    = 0.0f; // brush height over holes (no surface to hit)
     bool m_NavShowTiles        = false;
     std::uint32_t m_NavProfile = 0;     // profile shown / used by the test path
     enum class NavPick : std::uint8_t { None, Start, End } m_NavPick = NavPick::None;
@@ -437,7 +478,7 @@ private:
     struct ContentItem {
         std::filesystem::path path;
         std::string           label;
-        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, AnimGraph, Other } kind = Kind::Other;
+        enum class Kind { Folder, Scene, Blueprint, Prefab, Model, Texture, Sound, Type, PhysicsMaterial, SoundCue, ParticleEffect, AnimGraph, Terrain, Other } kind = Kind::Other;
     };
     std::filesystem::path                             m_ContentDir;     // shown directory
     std::vector<ContentItem>                          m_ContentItems;
@@ -474,7 +515,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph, ImportHeightmap, ExportHeightmap, TerrainAsset, AssignTerrain } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging

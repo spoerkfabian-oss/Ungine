@@ -1,4 +1,6 @@
 #pragma once
+#include "Engine/Assets/AssetHandle.h"
+#include "Engine/Assets/Texture.h"
 #include "Engine/ECS/Entity.h"
 #include "Engine/Renderer/Environment.h"
 #include "Engine/Renderer/Renderer.h"
@@ -15,6 +17,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,14 +29,17 @@ class Frustum;
 class GpuCulling;
 class GpuScene;
 class ParticleRenderer;
+class TerrainRenderer;
 class ParticleWorld;
 class Scene;
 
 enum class Tonemapper : std::uint32_t { PbrNeutral, Aces, None, Count }; // mirrors tonemap.frag
 
 // tonemap.frag. HiZ: occlusion pyramid (level CullingSettings::hizDebugLevel), Culling: draws that
-// only the late (occlusion) pass found visible are tinted orange.
-enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod, Count };
+// only the late (occlusion) pass found visible are tinted orange. Velocity: motion vectors.
+// Reflections: the screen-space reflection buffer (rgb, confidence as brightness overlay).
+enum class DebugView : std::uint32_t { None, AmbientOcclusion, Normals, LightClusters, ShadowAtlas, HiZ, Culling, Lod,
+                                       Velocity, Reflections, Count };
 
 [[nodiscard]] const char* ToString(Tonemapper tonemapper);
 [[nodiscard]] const char* ToString(DebugView view);
@@ -54,6 +61,50 @@ struct PostSettings {
     float      minLogLuminance = -10.0f; // histogram range (log2 luminance)
     float      maxLogLuminance = 6.0f;
     DebugView  debugView       = DebugView::None;
+};
+
+// Temporal anti-aliasing: sub-pixel jitter of the camera (Halton 2/3, 8 positions), motion vectors
+// from the depth prepass (objects incl. skinning, camera; particles from their velocity), history
+// reprojection with variance clipping, sharpening in the tone mapping pass.
+struct TaaSettings {
+    bool  enabled   = true;
+    float feedback  = 0.9f;  // history weight: higher = smoother, more ghosting on fast changes
+    float sharpness = 0.25f; // unsharp mask in the tone mapping pass (0 = off)
+};
+
+// Screen-space reflections: mirror rays through a closest-depth pyramid (half resolution), color
+// from last frame's image, temporal accumulation, roughness-dependent blur. Replaces the IBL
+// reflection where a ray found something (confidence), the IBL stays the fallback.
+struct SsrSettings {
+    bool          enabled      = true;
+    float         intensity    = 1.0f;
+    float         maxRoughness = 0.5f;  // rougher surfaces keep the IBL reflection only
+    float         thickness    = 0.3f;  // meters behind a surface that still count as a hit
+    float         maxDistance  = 40.0f; // meters
+    std::uint32_t maxSteps     = 64;    // traversal steps per ray
+    float         feedback     = 0.85f; // temporal history weight
+};
+
+// Height fog (analytic, everywhere) + volumetric fog (froxel grid in view space up to
+// volumetricDistance: sun with cascade shadows, punctual lights with their shadows, sky ambient,
+// FogVolume components, temporal reprojection). Beyond the grid the analytic height fog continues.
+struct FogSettings {
+    bool      enabled       = false;
+    glm::vec3 albedo{0.8f, 0.85f, 0.9f}; // scattering color
+    float     density       = 0.02f; // extinction per meter at baseHeight
+    float     baseHeight    = 0.0f;
+    float     heightFalloff = 0.15f; // per meter: density = d * exp(-falloff * (y - baseHeight))
+    float     startDistance = 0.0f;  // meters from the camera without fog (analytic part)
+    float     maxOpacity    = 1.0f;  // cap of the analytic fog (keeps the sky visible)
+    float     anisotropy    = 0.6f;  // Henyey-Greenstein g: > 0 scatters forward (glow around the sun)
+    float     sunScale      = 1.0f;
+    float     ambientScale  = 1.0f;  // sky irradiance
+    float     lightScale    = 1.0f;  // punctual lights (volumetric only)
+    bool      volumetric    = true;
+    float     volumetricDistance = 64.0f; // meters covered by the froxel grid
+    float     temporalFeedback   = 0.9f;  // history weight of the froxel grid
+
+    bool operator==(const FogSettings&) const = default;
 };
 
 // Ground-truth ambient occlusion (screen space, indirect light only).
@@ -112,6 +163,44 @@ struct CullingSettings {
     bool          shadowOcclusion = true;
 };
 
+// Projected decals (Decal components): clustered like the lights, applied to opaque surfaces
+// before lighting, in sort order.
+inline constexpr std::uint32_t kClusterMaxDecals = 32;   // per cluster, mirrored in lights.glsl
+inline constexpr std::uint32_t kMaxVisibleDecals = 1024; // after CPU frustum culling
+
+struct DecalSettings {
+    bool enabled = true;
+};
+
+// Mirrors GpuDecal in lights.glsl.
+struct GpuDecal {
+    glm::mat4  worldToDecal{1.0f};
+    glm::vec4  color{1.0f};
+    glm::vec4  emissive{0.0f};     // w: normal strength
+    glm::uvec4 textures{~0u};      // texture table entries: albedo, normal, mask, emissive
+    glm::vec4  params{0.0f};       // roughness, metallic, material opacity, edge fade
+    glm::vec4  fade{0.0f};         // cos start, cos end
+    glm::vec4  tangent{0.0f};      // decal +X (world)
+    glm::vec4  axis{0.0f};         // projection direction (world)
+    glm::vec4  bounds{0.0f};       // world center, radius
+};
+static_assert(sizeof(GpuDecal) == 192);
+
+// Volumetric fog boxes (FogVolume components).
+inline constexpr std::uint32_t kMaxFogVolumes  = 64;  // visible per frame
+inline constexpr std::uint32_t kFogTileSize    = 16;  // froxel width / height in pixels, mirrored in fog.glsl
+inline constexpr std::uint32_t kFogSlices      = 64;  // depth slices (quadratic distribution)
+
+// Mirrors GpuFogVolume in fog.glsl.
+struct GpuFogVolume {
+    glm::mat4 worldToLocal{1.0f};
+    glm::vec4 halfExtents{0.0f};   // xyz, w: edge fade (entity units)
+    glm::vec4 albedoDensity{0.0f}; // rgb albedo, a density
+    glm::vec4 emissive{0.0f};
+    glm::vec4 bounds{0.0f};        // world center, radius
+};
+static_assert(sizeof(GpuFogVolume) == 128);
+
 // Mirrors GpuShadowView in lights.glsl.
 struct GpuShadowView {
     glm::mat4 viewProj{1.0f};
@@ -149,6 +238,15 @@ struct SceneRenderStats {
     std::uint32_t shadowDraws = 0; // over all cascades (GPU: draws emitted by the culling pass)
     std::uint64_t triangles   = 0;
     std::uint32_t lights      = 0; // punctual lights after frustum culling (sent to the GPU)
+    std::uint32_t decals      = 0; // decals after frustum culling
+    std::uint32_t fogVolumes  = 0; // FogVolume boxes in the froxel grid this frame
+    std::uint32_t terrains         = 0; // Terrain components drawn
+    std::uint32_t terrainNodes     = 0; // CDLOD patches of the camera
+    std::uint32_t terrainTriangles = 0;
+    std::uint32_t foliageInstances = 0; // camera (uploaded)
+    std::uint32_t foliageShadowInstances = 0;
+    std::uint32_t foliageDrawCalls = 0; // prepass + shadows + lighting
+    glm::uvec3    fogGrid{0u};     // froxel grid (0 = volumetric fog off)
     std::uint32_t lightsTotal = 0; // Light components in the scene
     std::uint32_t shadowedLights = 0; // lights with atlas tiles this frame
     std::uint32_t shadowTiles    = 0; // atlas views (spot 1, point 6)
@@ -210,7 +308,8 @@ struct RenderOutput {
 //   tone mapping pass (+ bloom composite, debug views) -> swapchain image
 class SceneRenderer {
 public:
-    SceneRenderer(Renderer& renderer, const VulkanContext& ctx, const AssetManager& assets);
+    // `assets` also loads the decal textures (held until they go unused, released in the dtor).
+    SceneRenderer(Renderer& renderer, const VulkanContext& ctx, AssetManager& assets);
     ~SceneRenderer(); // defers GPU destruction through the renderer
 
     SceneRenderer(const SceneRenderer&)            = delete;
@@ -227,6 +326,10 @@ public:
     LocalShadowSettings                   localShadows;
     SelectionOverlay                      overlay;
     CullingSettings                       culling;
+    TaaSettings                           taa;
+    DecalSettings                         decals;
+    SsrSettings                           ssr;
+    FogSettings                           fog;
     // Particle effects to draw (ParticleWorld::RenderData, after its Update); null: none.
     const ParticleWorld*                  particles = nullptr;
 
@@ -236,6 +339,12 @@ public:
     // Engaged once per request: the entity (NullEntity = background / destroyed meanwhile).
     [[nodiscard]] std::optional<Entity> TakePickResult() { return std::exchange(m_PickResult, std::nullopt); }
     [[nodiscard]] const SceneRenderStats& Stats() const { return m_Stats; }
+    // Camera cut (teleport, level change, play / stop): temporal history (TAA, reflections) restarts.
+    void ResetHistory()
+    {
+        m_HistoryValid    = false;
+        m_FogHistoryValid = false;
+    }
     // Bounds of the rendered scene (BVH), synced at the start of every Render: queries and raycasts.
     [[nodiscard]] const SpatialIndex&     Spatial() const { return m_Spatial; }
 
@@ -268,7 +377,15 @@ private:
                  std::uint32_t cascadeCount, VkExtent2D extent);
     [[nodiscard]] bool GpuPath() const;
     void CollectLights(Scene& scene, const Frustum& frustum);
+    void CollectDecals(Scene& scene, const Frustum& frustum);
+    [[nodiscard]] std::uint32_t DecalTexture(const std::string& path, TextureKind kind); // table entry, ~0u: none
+    void ReleaseUnusedDecalTextures();
     void CullLights(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
+    void CollectFogVolumes(Scene& scene, const Frustum& frustum, const glm::vec3& cameraPosition);
+    void EnsureFogVolumes(VkExtent2D extent); // froxel grid for this output size
+    void ReleaseFogVolumes();
+    // After light culling (and all shadow maps), before the lighting pass.
+    void RenderFog(VkCommandBuffer cmd, VkDeviceAddress frameAddress);
     [[nodiscard]] std::uint32_t DebugTexture() const; // slot shown by the tone mapping debug view
     bool EnsureShadowAtlas(); // true: (re)created, contents undefined
     void ReleaseShadowAtlas();
@@ -284,6 +401,9 @@ private:
     void RenderAmbientOcclusion(VkCommandBuffer cmd, VkExtent2D extent, const CameraData& camera);
     void RenderMain(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress, std::uint32_t frameIndex);
     const Pipeline& TonemapPipeline(VkFormat outputFormat);
+    void RenderTaa(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
+    // Before the lighting pass: needs depth, normals + roughness, motion vectors, last frame's image.
+    void RenderSsr(VkCommandBuffer cmd, VkExtent2D extent, VkDeviceAddress frameAddress);
     void RenderBloom(VkCommandBuffer cmd);
     void RenderExposure(VkCommandBuffer cmd, std::uint32_t frameIndex, float deltaTime);
     void ReadExposure(std::uint32_t frameIndex);
@@ -291,7 +411,7 @@ private:
     void ReleaseShadowMap();
 
     Renderer&           m_Renderer;
-    const AssetManager& m_Assets;
+    AssetManager&       m_Assets;
     Environment         m_Environment;
     std::uint64_t       m_ShaderGeneration = 0; // Renderer::ShaderGeneration the pipelines were built for
     Pipeline            m_Mesh; // cull mode + front face are dynamic
@@ -302,6 +422,9 @@ private:
     Pipeline            m_BloomDown, m_BloomUp;
     Pipeline            m_Prepass, m_Gtao, m_GtaoDenoise, m_Histogram, m_ExposureAverage;
     Pipeline            m_LightCull;
+    Pipeline            m_Taa;
+    Pipeline            m_SsrHiZ, m_SsrTrace, m_SsrResolve, m_SsrBlur;
+    Pipeline            m_FogInject, m_FogIntegrate;
     Buffer              m_Clusters; // per-cluster counts + light index lists (written by light_cull.comp)
 
     // Frame targets (recreated on resize).
@@ -312,7 +435,44 @@ private:
     Image                      m_Bloom; // half resolution, one level per mip
     std::vector<ImageView>     m_BloomViews;
     std::vector<std::uint32_t> m_BloomSampled, m_BloomStorage;
-    Image                      m_Normals; // view space, written by the prepass
+    Image                      m_Normals; // view space + roughness, written by the prepass
+    Image                      m_Velocity; // UV motion since last frame, written by the prepass
+    std::uint32_t              m_VelocitySlot = 0;
+    // TAA history, ping-pong in GENERAL: this frame resolves into [m_HistoryIndex], reads the other.
+    std::array<Image, 2>         m_History;
+    std::array<std::uint32_t, 2> m_HistorySampled{}, m_HistoryStorage{};
+    std::uint32_t                m_HistoryIndex = 0;
+    bool                         m_HistoryValid = false;
+    bool                         m_HistoryLayoutReady = false;
+    std::uint32_t                m_ResolvedSlot = 0; // this frame's image for bloom / exposure / tone mapping
+    std::uint64_t                m_FrameCounter = 0;
+    std::optional<glm::mat4>     m_PrevViewProj; // last frame's camera without jitter
+    bool                         m_PrevHdrValid = false; // m_Hdr holds last frame's image (SSR without TAA)
+    // Screen-space reflections (half resolution, GENERAL): raw rays, temporal history ping-pong,
+    // blur temp; the result ends up in m_SsrRaw (sampled by the lighting pass).
+    Image                        m_SsrRaw, m_SsrTemp;
+    std::array<Image, 2>         m_SsrHistory;
+    std::uint32_t                m_SsrRawSampled = 0, m_SsrRawStorage = 0, m_SsrTempSampled = 0, m_SsrTempStorage = 0;
+    std::array<std::uint32_t, 2> m_SsrHistorySampled{}, m_SsrHistoryStorage{};
+    std::uint32_t                m_SsrIndex = 0;
+    // Volumetric fog (GENERAL): scattering + extinction per froxel (temporal ping-pong) and the
+    // integrated in-scattering + transmittance front to back.
+    std::array<Image, 2>         m_FogInjectVolume;
+    Image                        m_FogIntegrated;
+    std::array<std::uint32_t, 2> m_FogInjectSampled{}, m_FogInjectStorage{};
+    std::uint32_t                m_FogIntegratedSampled = 0, m_FogIntegratedStorage = 0;
+    std::uint32_t                m_FogIndex = 0;
+    bool                         m_FogHistoryValid = false;
+    bool                         m_FogLayoutReady  = false;
+    bool                         m_FogThisFrame    = false;
+    float                        m_FogPrevDistance = 0.0f; // grid depth of the history
+    FogSettings                  m_FogHistorySettings;     // settings the history was built with
+    std::vector<GpuFogVolume>    m_FogVolumes;
+    bool                         m_SsrHistoryValid = false;
+    bool                         m_SsrLayoutReady = false;
+    bool                         m_SsrThisFrame = false;
+    Buffer                       m_SsrPyramid;
+    std::uint32_t                m_SsrLevels = 0;
     Image                      m_AoRaw, m_Ao;
     std::uint32_t              m_NormalSlot = 0;
     std::uint32_t              m_AoRawSampled = 0, m_AoRawStorage = 0, m_AoSampled = 0, m_AoStorage = 0;
@@ -333,6 +493,7 @@ private:
     std::unique_ptr<GpuScene>   m_GpuScene;   // persistent instances / draw records (both paths draw them)
     std::unique_ptr<GpuCulling> m_GpuCulling;
     std::unique_ptr<ParticleRenderer> m_Particles;
+    std::unique_ptr<TerrainRenderer>  m_Terrain;
     bool                        m_ShadowOcclusion = false; // this frame: cascades culled against the Hi-Z
     glm::vec4                   m_LodCamera{0.0f}; // this frame's LOD selection (see SelectLod)
     std::uint32_t               m_LodForced = 0;
@@ -350,6 +511,13 @@ private:
     std::optional<glm::uvec2>            m_PickRequest;
     std::optional<Entity>                m_PickResult;
 
+    std::vector<GpuDecal> m_Decals; // this frame's visible decals, in sort order
+    Buffer                m_DecalClusters; // per-cluster counts + decal index lists (light_cull.comp)
+    struct DecalTextureEntry {
+        TextureHandle handle;
+        std::uint64_t lastUsed = 0; // m_FrameCounter
+    };
+    std::unordered_map<std::string, DecalTextureEntry> m_DecalTextures; // kind + '|' + path
     std::vector<GpuLight> m_Lights; // this frame's visible lights
     std::vector<bool>     m_LightCastsShadows; // parallel to m_Lights
     std::vector<Entity>   m_LightEntities;     // parallel to m_Lights

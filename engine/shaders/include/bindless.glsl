@@ -10,6 +10,8 @@ layout(set = 0, binding = 1) uniform sampler   uSamplers[];
 layout(set = 0, binding = 2, rgba16f) uniform image2D uStorageImages[]; // HDR targets
 layout(set = 0, binding = 3) uniform textureCube uCubeTextures[];
 layout(set = 0, binding = 4, rgba16f) uniform image2DArray uStorageArrays[]; // cube faces as layers
+layout(set = 0, binding = 5) uniform texture3D uVolumeTextures[];
+layout(set = 0, binding = 6, rgba16f) uniform image3D uStorageVolumes[]; // froxel volumes
 
 // Must match Engine::DefaultSampler
 #define SAMPLER_LINEAR_REPEAT 0u

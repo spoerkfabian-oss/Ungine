@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-22 (Phase 29 merged (PR #19, fa23918); Phase 30 animation state machine / IK implemented on `branch`, PR open; next Phase 31 TAA/decals/SSR/fog after the merge, ask first)
+- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog + Phase 32 terrain on `branch`, both in PR #21 (open, user merges); next: Phase 33 material editor – ask details first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1040,3 +1040,26 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Found while testing: foot-IK rays started inside the character's own capsule (actor now ignored; red without fix); LookAt missed when ancestors moved the tip; notifies fired once per update instead of per loop crossing; **Phase 21 bug: OptimizeMeshes reordered vertices (vertex fetch) without the skin influences → every skinned mesh with its own vertex range exploded (Fox; the banner GPU test did not catch it)** → influences remapped too, regression in MeshOptimizer_LodChainAndReordering (red without fix). Lesson: look at a screenshot of every new model.
 - Tests: CPU `tests/AnimationTests.cpp` (6), GPU `Editor_AnimationGraphWindowAndPlay`; Navigation_PhysicsTemplateWanderer now also checks the Speed parameter.
 - Open: edit mode does not animate, foot IK has no effect in the preview (no physics), linear crossfades, unwrapped exit time, no bone overlay / IK gizmo, root motion translation only.
+
+### Phase 31 rendering – decisions (user, 2026-10-25)
+- TAA with motion vectors: sub-pixel jitter, velocity buffer (incl. skinning, particles), reprojection with neighborhood clamp, sharpening, velocity debug view (no upscaling, no FXAA).
+- Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
+- SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
+- Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
+
+### Phase 32 terrain – decisions (user, 2026-10-26)
+- Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
+- Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
+- Splat layers (up to 8: albedo/normal/ORM) + editor painting and sculpting (raise/lower/smooth/flatten) with undo; foliage/grass (instanced, density maps painted, culling, wind); heightmap import/export (16-bit PNG/RAW); holes mask + triplanar on steep slopes.
+- Done (2026-10-26), in PR #21 together with Phase 31. Technical details: CLAUDE.md "Terrain (Phase 32)".
+- Key design: one shared `TerrainStore` copy per path (renderer/physics/nav/editor), edits report kinds + normalized rects (`MarkDirty`; kinds 0 = live values only); renderer uploads only changed rects; foliage scattered per 16 m chunk on the CPU but placed/culled by height/holes/slope in the shader; editor strokes = one undo step each (`CaptureTerrainRegion`), window field edits commit when no widget is active (baseline reset by the terrain undo lambdas, not by history revision).
+- Gotchas: Jolt height-field holes are per vertex (sample removed only if all 4 cells are holes); hole mask stores 1 (shader threshold > 0.001); staging memory reuse needs an execution barrier (sync-val WAR); foliage mesh frame must be a rotation (z → +facing), else lighting is mirrored; MSVC C4458 again (never name a local `settings` in PhysicsWorld.cpp – Clang/GCC do not warn).
+- Tests: CPU `tests/TerrainTests.cpp` (6), GPU `Render_TerrainCdlodLayersAndEdits`, `Render_TerrainFoliage`, `Editor_TerrainToolsAndUndo`.
+- Open: see CLAUDE.md open point 24 (single grid, fixed resolution, CPU scatter, no wind zones, binary file paths not repaired on move).
+
+### Phase 31 rendering (2026-10-26)
+Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".
+- TAA (Halton jitter, velocity target R16G16 from the prepass incl. skinning/particles/transparents, `taa.comp` resolve, unsharp mask in tonemap), Decal component + clustered decals (light_cull fills decal lists, applied before lighting), Hi-Z SSR (closest-depth pyramid, half res, temporal, roughness blur, IBL fallback), height fog + froxel volumetric fog (`fog_inject.comp` / `fog_integrate.comp`, bindless binding 5/6 = texture3D/image3D), FogVolume component, settings `taa/ssr/decals/fog` in scene files, editor sections/inspectors/overlay, Blueprint *Spawn Decal at Location*, cooker cooks decal textures with their kinds.
+- Gotchas found: llvmpipe speculatively loads from a null buffer reference even when the loop runs 0 times → never pass address 0 for lists read in loops (fog volumes get a dummy element); TAA jitter breaks pixel-exact frame comparisons (5 tests set `taa.enabled = false`); fog history must reset on settings change (else ~10 frames lag); shadow maps are now also read from compute (barrier stages extended).
+- Tests: CPU `tests/RenderingTests.cpp` (2), GPU `Render_TemporalAntiAliasing`, `Render_ClusteredDecals`, `Render_ScreenSpaceReflections`, `Render_HeightAndVolumetricFog`, `Editor_DecalsAndFogUi`.
+- Open: no TAA/SSR/fog player options, SSR only from on-screen data, decals only on opaque, fog volumes only boxes, orthographic cameras unsupported by fog reprojection.

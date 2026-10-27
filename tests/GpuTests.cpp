@@ -27,6 +27,7 @@
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Renderer/TextOverlay.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Decals.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
@@ -34,6 +35,8 @@
 #include "Engine/Scene/SpatialIndex.h"
 #include "Engine/Script/ScriptRegistry.h"
 #include "Engine/Script/ScriptSystem.h"
+#include "Engine/Terrain/TerrainBrush.h"
+#include "Engine/Terrain/TerrainData.h"
 #include "Engine/Renderer/Vulkan/VkUtils.h"
 #include "Engine/Renderer/Vulkan/VulkanContext.h"
 
@@ -391,7 +394,7 @@ TEST_CASE(Render_ClusteredLights)
     CHECK(stats.lightsTotal == 4 && stats.lights == 2);
     bool cullScope = false;
     for (const GpuTiming& t : F().renderer->Profiler().Results())
-        cullScope |= std::string_view{t.name} == "Light culling";
+        cullScope |= std::string_view{t.name} == "Light + decal culling";
     CHECK(!F().renderer->Profiler().Supported() || cullScope);
 
     renderer.post.debugView = DebugView::LightClusters;
@@ -1041,6 +1044,7 @@ TEST_CASE(Render_GpuDrivenMatchesCpu)
     scene.UpdateTransforms();
 
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.shadows.resolution = 512;
     renderer.post.autoExposure  = false; // adaptation depends on wall-clock frame times
     const glm::vec3  eye{0.0f, 2.0f, 12.0f};
@@ -1430,6 +1434,7 @@ TEST_CASE(Render_ShaderReloadRebuildsPipelines)
     scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
     scene.UpdateTransforms();
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.post.autoExposure = false;
     const std::vector<std::uint8_t> before = RenderImage(renderer, scene, FrontCamera(3.0f), 3);
 
@@ -1545,6 +1550,7 @@ TEST_CASE(Render_TransparentAndShadowOcclusion)
     scene.UpdateTransforms();
 
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     renderer.post.autoExposure       = false;
 
     renderer.shadows.resolution      = 512;
@@ -2455,6 +2461,7 @@ TEST_CASE(Render_SkinnedAnimationInstancesAndPrefabs)
 
     Scene         scene;
     SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     const glm::vec3  eye{0.55f, 0.8f, 2.2f};
     const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.55f, 0.8f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
                             .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
@@ -2983,6 +2990,7 @@ TEST_CASE(Streaming_SubLevelModelsAndRendering)
 
     Scene                           scene;
     SceneRenderer                   renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled = false; // compares frames: TAA jitter differs per frame
     const CameraData                camera = FrontCamera(4.0f);
     const std::vector<std::uint8_t> empty  = RenderImage(renderer, scene, camera, 3);
     LevelStreamer                   streamer(*F().jobs, F().assets.get(), &F().events);
@@ -4005,5 +4013,846 @@ TEST_CASE(Editor_NavigationBakeOverlayAndPlay)
         runFrames(3);
     }
     fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_TemporalAntiAliasing)
+{
+    // A box rotated 30 degrees against the sky: TAA turns its stair-stepped edges into partial
+    // coverage, converges for a still image, follows a moving box without leaving a trail
+    // (motion vectors), and the motion vector debug view shows only the moving object.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle box = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    CHECK(F().Pump([&] { return Settled(box); }));
+    Scene        scene;
+    const Entity e = scene.CreateEntity("Box");
+    scene.GetRegistry().Emplace<MeshRenderer>(e, MeshRenderer{.model = box, .meshIndex = 0});
+    scene.EditTransform(e).rotation = glm::angleAxis(glm::radians(30.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.sharpness     = 0.0f;
+    const CameraData camera = FrontCamera(3.0f);
+
+    // Edge energy: sum of squared brightness steps between neighbors. Anti-aliasing splits the
+    // hard steps of the edges into smaller ones (same total change, smaller squares).
+    const auto energy = [](const std::vector<std::uint8_t>& image) {
+        const auto lum = [&](int x, int y) {
+            const std::size_t i = (static_cast<std::size_t>(y) * 160 + static_cast<std::size_t>(x)) * 4;
+            return static_cast<double>(image[i] + image[i + 1] + image[i + 2]);
+        };
+        double sum = 0.0;
+        for (int y = 0; y < 119; ++y)
+            for (int x = 0; x < 159; ++x)
+                sum += std::pow(lum(x + 1, y) - lum(x, y), 2.0) + std::pow(lum(x, y + 1) - lum(x, y), 2.0);
+        return sum;
+    };
+    renderer.taa.enabled = false;
+    const auto aliased   = RenderImage(renderer, scene, camera, 3);
+    renderer.taa.enabled = true;
+    const auto smooth    = RenderImage(renderer, scene, camera, 24);
+    const auto next      = RenderImage(renderer, scene, camera, 1);
+    std::printf("    edge energy: aliased %.0f, TAA %.0f; converged frames differ in %zu\n", energy(aliased),
+                energy(smooth), DifferentPixels(smooth, next));
+    CHECK(energy(smooth) < energy(aliased) * 0.8);
+    CHECK(DifferentPixels(smooth, next) < 10); // still image: stable
+
+    // Moving box: 12 frames to the right, then compared with a still render at the end position.
+    for (int i = 1; i <= 12; ++i) {
+        scene.EditTransform(e).position.x = 0.05f * static_cast<float>(i);
+        scene.UpdateTransforms();
+        (void)RenderImage(renderer, scene, camera, 1);
+    }
+    renderer.post.debugView = DebugView::Velocity;
+    scene.EditTransform(e).position.x = 0.05f * 13.0f;
+    scene.UpdateTransforms();
+    const auto motion = RenderImage(renderer, scene, camera, 1);
+    renderer.post.debugView = DebugView::None;
+    std::size_t moving = 0, still = 0;
+    for (std::size_t i = 0; i + 3 < motion.size(); i += 4)
+        (motion[i] > 20 ? moving : still) += 1;
+    scene.EditTransform(e).position.x = 0.05f * 14.0f;
+    scene.UpdateTransforms();
+    const auto moved = RenderImage(renderer, scene, camera, 1);
+    SceneRenderer reference(*F().renderer, *F().context, *F().assets);
+    reference.post.autoExposure = false;
+    reference.post.bloom        = false;
+    reference.taa.enabled       = false;
+    const auto target = RenderImage(reference, scene, camera, 3);
+    // A still TAA image differs from an aliased one along the edges: the moving one should not more.
+    const std::size_t edges = DifferentPixels(smooth, aliased);
+    std::printf("    moving: %zu pixels with motion, %zu without; %zu differ from a still render (edges %zu)\n", moving,
+                still, DifferentPixels(moved, target), edges);
+    CHECK(moving > 300 && moving < 3000 && still > 15000);
+    CHECK(DifferentPixels(moved, target) < edges * 3); // softer edges while moving, no trail
+    F().assets->Release(box);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_ClusteredDecals)
+{
+    // A ground plane and a wall; decals projected straight down onto the ground: a red texture,
+    // a green one with a higher sort order overlapping it, an emissive one. The wall (90 degrees
+    // to the projection) stays untouched, a decal with a lifetime fades and is removed.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / std::format("ungine_gpu_decals_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(dir, ec);
+    WriteFile(dir / "red.png", SolidPng(255, 0, 0));
+    WriteFile(dir / "green.png", SolidPng(0, 255, 0));
+
+    const ModelHandle plane = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 10.0f});
+    const ModelHandle box   = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f});
+    CHECK(F().Pump([&] { return Settled(plane) && Settled(box); }));
+    Scene        scene;
+    Registry&    r      = scene.GetRegistry();
+    const Entity ground = scene.CreateEntity("Ground");
+    r.Emplace<MeshRenderer>(ground, MeshRenderer{.model = plane, .meshIndex = 0});
+    const Entity wall = scene.CreateEntity("Wall");
+    r.Emplace<MeshRenderer>(wall, MeshRenderer{.model = box, .meshIndex = 0});
+    scene.EditTransform(wall).position = {1.6f, 0.5f, 0.0f};
+    scene.EditTransform(wall).scale    = {0.2f, 1.0f, 2.0f};
+    const glm::quat down = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f)); // -Z projects down
+    const auto addDecal = [&](const char* name, glm::vec3 position, Decal decal) {
+        const Entity e = scene.CreateEntity(name);
+        scene.EditTransform(e).position = position;
+        scene.EditTransform(e).rotation = down;
+        r.Emplace<Decal>(e, std::move(decal));
+        return e;
+    };
+    const Entity red = addDecal("Red", {-0.6f, 0.0f, 0.0f}, Decal{.halfExtents = {0.5f, 0.5f, 0.5f}, .albedo = PathToUtf8(dir / "red.png")});
+    // Covers the right half of the red one, drawn on top (higher order) although created later only by chance.
+    addDecal("Green", {-0.1f, 0.0f, 0.0f}, Decal{.halfExtents = {0.3f, 0.3f, 0.5f}, .albedo = PathToUtf8(dir / "green.png"), .sortOrder = 1});
+    // Reaches into the wall: the wall's sides face sideways (no decal), only the ground below it.
+    addDecal("Glow", {1.0f, 0.0f, 0.0f}, Decal{.halfExtents = {0.9f, 0.3f, 1.2f}, .color = {1.0f, 1.0f, 1.0f, 0.0f},
+                                              .emissiveColor = {0.0f, 0.0f, 4.0f}});
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.taa.enabled       = false;
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    const glm::vec3  eye{0.0f, 4.0f, 3.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    // Textures load in the background: render until the red one shows.
+    std::vector<std::uint8_t> image;
+    for (int i = 0; i < 60; ++i) {
+        image = RenderImage(renderer, scene, camera, 2);
+        F().assets->Update();
+        const glm::ivec3 c = pixel(image, project({-0.85f, 0.0f, 0.0f}));
+        if (c.r > 2 * c.g + 20 && c.r > 2 * c.b + 20)
+            break;
+    }
+    const glm::ivec3 redPixel   = pixel(image, project({-0.85f, 0.0f, 0.0f}));
+    const glm::ivec3 greenPixel = pixel(image, project({-0.1f, 0.0f, 0.0f}));
+    const glm::ivec3 glowPixel  = pixel(image, project({0.8f, 0.0f, 0.0f}));
+    const glm::ivec3 plain      = pixel(image, project({-0.6f, 0.0f, 1.5f}));
+    const glm::ivec3 wallSide   = pixel(image, project({1.5f, 0.6f, 0.4f}));
+    std::printf("    red %d %d %d, green %d %d %d, glow %d %d %d, ground %d %d %d, wall %d %d %d (decals %u)\n", redPixel.r,
+                redPixel.g, redPixel.b, greenPixel.r, greenPixel.g, greenPixel.b, glowPixel.r, glowPixel.g, glowPixel.b,
+                plain.r, plain.g, plain.b, wallSide.r, wallSide.g, wallSide.b, renderer.Stats().decals);
+    CHECK(renderer.Stats().decals == 3);
+    CHECK(redPixel.r > 2 * redPixel.g + 20 && redPixel.r > 2 * redPixel.b + 20);
+    CHECK(greenPixel.g > 2 * greenPixel.r + 20); // sort order: on top of the red one
+    CHECK(glowPixel.b > plain.b + 20);
+
+    // Off: the ground under the decals is plain again; outside them and on the wall side (90
+    // degrees to the projection: faded out) nothing changed.
+    renderer.decals.enabled = false;
+    const auto       offImage = RenderImage(renderer, scene, camera, 1);
+    const glm::ivec3 off      = pixel(offImage, project({-0.85f, 0.0f, 0.0f}));
+    const auto       same     = [](glm::ivec3 a, glm::ivec3 b) { return glm::all(glm::lessThan(glm::abs(a - b), glm::ivec3(6))); };
+    CHECK(std::abs(off.r - off.g) < 30 && off.r < redPixel.r);
+    CHECK(same(plain, pixel(offImage, project({-0.6f, 0.0f, 1.5f}))));
+    CHECK(same(wallSide, pixel(offImage, project({1.5f, 0.6f, 0.4f}))));
+    const glm::ivec3 noGlow = pixel(offImage, project({0.8f, 0.0f, 0.0f}));
+    CHECK(glowPixel.b - glowPixel.r > noGlow.b - noGlow.r + 40); // bluer than without the emissive decal
+    renderer.decals.enabled = true;
+    r.Get<Decal>(red).lifetime = 1.0f;
+    r.Get<Decal>(red).fadeOut  = 0.5f;
+    UpdateDecals(scene, 0.75f); // half faded
+    const glm::ivec3 half = pixel(RenderImage(renderer, scene, camera, 1), project({-0.85f, 0.0f, 0.0f}));
+    CHECK(half.r < redPixel.r && half.r > off.r);
+    UpdateDecals(scene, 0.5f);
+    CHECK(!r.Valid(red));
+    F().assets->Release(plane);
+    F().assets->Release(box);
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_ScreenSpaceReflections)
+{
+    // A mirror-like floor in front of a red box: with SSR the floor shows the box (red), without
+    // it only the IBL (sky). Rough floors keep the IBL; the debug view shows the reflection buffer.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle mirror = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 10.0f,
+                                                             .baseColor = {0.9f, 0.9f, 0.9f, 1.0f}, .metallic = 1.0f,
+                                                             .roughness = 0.05f});
+    const ModelHandle redBox = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 1.0f,
+                                                             .baseColor = {1.0f, 0.05f, 0.05f, 1.0f}, .metallic = 0.0f,
+                                                             .roughness = 0.8f});
+    CHECK(F().Pump([&] { return Settled(mirror) && Settled(redBox); }));
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity floor = scene.CreateEntity("Floor");
+    r.Emplace<MeshRenderer>(floor, MeshRenderer{.model = mirror, .meshIndex = 0});
+    const Entity box = scene.CreateEntity("Box");
+    r.Emplace<MeshRenderer>(box, MeshRenderer{.model = redBox, .meshIndex = 0});
+    scene.EditTransform(box).position = {0.0f, 0.5f, 0.0f};
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    const glm::vec3  eye{0.0f, 1.5f, 4.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const glm::ivec2 reflection = project({0.0f, 0.0f, 0.9f}); // the floor point that mirrors the box front
+
+    renderer.ssr.enabled = false;
+    const glm::ivec3 ibl = pixel(RenderImage(renderer, scene, camera, 8), reflection);
+    renderer.ssr.enabled = true;
+    const glm::ivec3 ssr = pixel(RenderImage(renderer, scene, camera, 12), reflection);
+    renderer.post.debugView = DebugView::Reflections;
+    const glm::ivec3 buffer = pixel(RenderImage(renderer, scene, camera, 1), reflection);
+    renderer.post.debugView = DebugView::None;
+    std::printf("    floor mirror: IBL %d %d %d, SSR %d %d %d, buffer %d %d %d\n", ibl.r, ibl.g, ibl.b, ssr.r, ssr.g, ssr.b,
+                buffer.r, buffer.g, buffer.b);
+    CHECK(ssr.r > ssr.b + 40 && ssr.r > ibl.r);   // the red box in the floor
+    CHECK(ibl.b >= ibl.r);                        // without SSR: the sky
+    CHECK(buffer.r > buffer.g + 30);
+
+    // A rough floor (beyond maxRoughness) keeps the IBL only.
+    renderer.ssr.maxRoughness = 0.02f;
+    const glm::ivec3 rough = pixel(RenderImage(renderer, scene, camera, 8), reflection);
+    CHECK(std::abs(rough.r - ibl.r) < 12 && std::abs(rough.b - ibl.b) < 12);
+    F().assets->Release(mirror);
+    F().assets->Release(redBox);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_HeightAndVolumetricFog)
+{
+    // A red box 14 m away on a grey floor: height fog pulls it towards the fog color (analytic and
+    // volumetric agree), a FogVolume glows with its emission, a point light inside a fog volume
+    // lights the fog around it (froxels read the light clusters), the sky gets fogged at the horizon.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const ModelHandle floorModel = F().assets->CreatePrimitive({.shape = PrimitiveShape::Plane, .size = 60.0f,
+                                                                 .baseColor = {0.5f, 0.5f, 0.5f, 1.0f}, .metallic = 0.0f,
+                                                                 .roughness = 0.9f});
+    const ModelHandle redBox = F().assets->CreatePrimitive({.shape = PrimitiveShape::Box, .size = 3.0f,
+                                                             .baseColor = {1.0f, 0.05f, 0.05f, 1.0f}, .metallic = 0.0f,
+                                                             .roughness = 0.8f});
+    CHECK(F().Pump([&] { return Settled(floorModel) && Settled(redBox); }));
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity floor = scene.CreateEntity("Floor");
+    r.Emplace<MeshRenderer>(floor, MeshRenderer{.model = floorModel, .meshIndex = 0});
+    const Entity box = scene.CreateEntity("Box");
+    r.Emplace<MeshRenderer>(box, MeshRenderer{.model = redBox, .meshIndex = 0});
+    scene.EditTransform(box).position = {0.0f, 1.5f, -10.0f};
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 1.5f, 4.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 1.5f, -10.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const glm::ivec2 boxPixel = project({0.0f, 1.5f, -8.5f});
+    const glm::ivec2 nearFloor = project({0.0f, 0.0f, -1.0f});
+    const glm::ivec2 horizon{10, 57}; // sky just above the horizon
+
+    const auto dump = [](const std::vector<std::uint8_t>& image, const char* name) { // UNGINE_TEST_DUMP=<dir>
+        if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) {
+            const std::vector<std::byte> png = EncodePng(image, 160, 120);
+            std::ofstream(std::filesystem::path(dir) / name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        }
+    };
+    const auto plain       = RenderImage(renderer, scene, camera, 4);
+    const glm::ivec3 box0  = pixel(plain, boxPixel);
+    const glm::ivec3 near0 = pixel(plain, nearFloor);
+
+    renderer.fog.enabled       = true;
+    renderer.fog.volumetric    = false;
+    renderer.fog.density       = 0.12f;
+    renderer.fog.heightFalloff = 0.0f;
+    const auto       analytic = RenderImage(renderer, scene, camera, 4);
+    const glm::ivec3 box1     = pixel(analytic, boxPixel);
+    const glm::ivec3 near1    = pixel(analytic, nearFloor);
+    CHECK(renderer.Stats().fogGrid == glm::uvec3(0u));
+
+    renderer.fog.volumetric = true;
+    const auto       volumetric = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 box2       = pixel(volumetric, boxPixel);
+    dump(plain, "fog_plain.png");
+    dump(analytic, "fog_analytic.png");
+    dump(volumetric, "fog_volumetric.png");
+    CHECK(renderer.Stats().fogGrid == glm::uvec3(10u, 8u, 64u));
+    std::printf("    box: plain %d %d %d, analytic %d %d %d, volumetric %d %d %d; near floor %d %d %d -> %d %d %d\n",
+                box0.r, box0.g, box0.b, box1.r, box1.g, box1.b, box2.r, box2.g, box2.b, near0.r, near0.g, near0.b,
+                near1.r, near1.g, near1.b);
+    // Fog: the red box loses most of its saturation, the floor close by much less.
+    CHECK(box1.r - box1.b < (box0.r - box0.b) / 2);
+    CHECK(box2.r - box2.b < (box0.r - box0.b) / 2);
+    CHECK(std::abs(near1.r - near0.r) < std::abs(box1.b - box0.b) + 10);
+    // Analytic and volumetric (shadowed sun, same density) end up close.
+    CHECK(std::abs(box2.r - box1.r) < 40 && std::abs(box2.g - box1.g) < 40 && std::abs(box2.b - box1.b) < 40);
+
+    // Height falloff: thin fog high up, the sky far above the horizon stays untouched; the horizon fogs.
+    renderer.fog.heightFalloff = 1.0f;
+    renderer.fog.maxOpacity    = 0.8f;
+    const auto       layered = RenderImage(renderer, scene, camera, 8);
+    const auto       change  = [&](glm::ivec2 p) {
+        const glm::ivec3 d = glm::abs(pixel(layered, p) - pixel(plain, p));
+        return d.r + d.g + d.b;
+    };
+    std::printf("    height fog: sky change %d (up), %d (horizon)\n", change({20, 5}), change(horizon));
+    CHECK(change({20, 5}) * 3 < change(horizon));
+
+    // A glowing fog volume in front of the camera (no height fog).
+    renderer.fog.density       = 0.0f;
+    renderer.fog.heightFalloff = 0.0f;
+    const Entity glow = scene.CreateEntity("Glow");
+    r.Emplace<FogVolume>(glow, FogVolume{.halfExtents = {1.0f, 1.0f, 1.0f}, .density = 0.3f, .albedo = glm::vec3(1.0f),
+                                         .emissive = {0.0f, 0.6f, 0.0f}, .edgeFade = 0.2f});
+    scene.EditTransform(glow).position = {-2.0f, 1.5f, -2.0f};
+    scene.UpdateTransforms();
+    const glm::ivec2 glowPixel = project({-2.0f, 1.5f, -2.0f});
+    const glm::ivec3 before    = pixel(plain, glowPixel);
+    const auto       glowImage = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 glowing   = pixel(glowImage, glowPixel);
+    dump(glowImage, "fog_glow.png");
+    CHECK(renderer.Stats().fogVolumes == 1u);
+    std::printf("    glow volume: %d %d %d -> %d %d %d\n", before.r, before.g, before.b, glowing.r, glowing.g, glowing.b);
+    CHECK(glowing.g > before.g + 30 && glowing.g > glowing.r + 30);
+
+    // A point light inside a non-emissive fog volume scatters (darker sun so the light dominates).
+    r.Get<FogVolume>(glow).emissive = glm::vec3(0.0f);
+    r.Get<FogVolume>(glow).density  = 0.6f;
+    scene.MarkChanged(glow);
+    renderer.lighting.sky.sunIntensity = 0.3f;
+    renderer.lighting.sky.skyIntensity = 0.2f;
+    const glm::ivec3 unlit = pixel(RenderImage(renderer, scene, camera, 24), glowPixel);
+    const Entity lamp = scene.CreateEntity("Lamp");
+    r.Emplace<Light>(lamp, Light{.type = LightType::Point, .color = {1.0f, 0.8f, 0.4f}, .intensity = 8.0f, .range = 4.0f,
+                                 .castShadows = false});
+    scene.EditTransform(lamp).position = {-2.0f, 1.5f, -2.0f};
+    scene.UpdateTransforms();
+    const auto       litImage = RenderImage(renderer, scene, camera, 24);
+    const glm::ivec3 lit      = pixel(litImage, glowPixel);
+    dump(litImage, "fog_lamp.png");
+    std::printf("    lamp in fog: %d %d %d -> %d %d %d\n", unlit.r, unlit.g, unlit.b, lit.r, lit.g, lit.b);
+    CHECK(lit.r > unlit.r + 40);
+    renderer.lighting.sky = {};
+
+    // Particles / transparent pipelines and the sky still render valid images with fog (no NaN black).
+    renderer.fog.density = 0.05f;
+    const auto fogged = RenderImage(renderer, scene, camera, 4);
+    CHECK(pixel(fogged, {20, 20}).b > 20);
+    F().assets->Release(floorModel);
+    F().assets->Release(redBox);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_DecalsAndFogUi)
+{
+    // Decal / Fog Volume inspectors, the Renderer panel's TAA / SSR / decal / fog sections (with
+    // volumetric fog on), "+ Add" style creation through components, play: a timed decal fades and
+    // goes, stop brings it back.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    Scene        scene;
+    Registry&    r     = scene.GetRegistry();
+    const Entity splat = scene.CreateEntity("Splat");
+    scene.EditTransform(splat).rotation = glm::angleAxis(glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    r.Emplace<Decal>(splat, Decal{.emissiveColor = {0.0f, 1.0f, 0.0f}, .lifetime = 0.3f, .fadeOut = 0.2f});
+    const Entity mist = scene.CreateEntity("Mist");
+    r.Emplace<FogVolume>(mist, FogVolume{.density = 0.3f});
+    const std::uint64_t splatUuid = r.Get<Uuid>(splat).value;
+
+    PhysicsWorld  physics(*F().jobs, F().events, F().assets.get()); // Play needs a simulation
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    sceneRenderer.fog.enabled        = true;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .physics       = &physics,
+                   .layoutFile    = {}});
+    camera.position = {0.0f, 2.0f, 6.0f};
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 30.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 30.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    editor.Select(splat);
+    editor.ExpandRenderingSections();
+    runFrames(4);
+    editor.Select(mist);
+    runFrames(3);
+    CHECK(sceneRenderer.Stats().fogGrid.z == kFogSlices);
+    CHECK(sceneRenderer.Stats().fogVolumes == 1u);
+
+    // Edit mode keeps the timed decal; play ages and removes it; stop restores it.
+    runFrames(15);
+    CHECK(scene.FindByUuid(splatUuid) != NullEntity);
+    editor.Play();
+    runFrames(20);
+    CHECK(scene.FindByUuid(splatUuid) == NullEntity);
+    editor.Stop();
+    runFrames(2);
+    CHECK(scene.FindByUuid(splatUuid) != NullEntity);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_TerrainCdlodLayersAndEdits)
+{
+    // A 64 m terrain (129^2 samples): red layer on the left half, green on the right, a hill in the
+    // middle, a hole near the front. CDLOD patches change with the LOD distance; a height edit through
+    // the store shows up; picking finds the terrain entity.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const std::string   path = PathToUtf8(fs::temp_directory_path() / "ungine_gpu_terrain" / "Test.uterrain");
+    auto data = std::make_shared<TerrainData>(MakeFlatTerrain(129, 64.0f, 20.0f, 0.0f));
+    data->layers = {TerrainLayer{.name = "Red", .tint = {0.8f, 0.1f, 0.1f}, .roughness = 0.9f},
+                    TerrainLayer{.name = "Green", .tint = {0.1f, 0.7f, 0.1f}, .roughness = 0.9f}};
+    const std::uint32_t n = data->splatResolution;
+    for (std::uint32_t y = 0; y < n; ++y)
+        for (std::uint32_t x = 0; x < n; ++x) {
+            std::uint8_t* w = &data->splat[(static_cast<std::size_t>(y) * n + x) * kMaxTerrainLayers];
+            w[0] = x < n / 2 ? 255 : 0;
+            w[1] = x < n / 2 ? 0 : 255;
+        }
+    const auto heightAt = [&](float meters) { return static_cast<std::uint16_t>(meters / data->heightScale * 65535.0f); };
+    for (std::uint32_t z = 0; z < 129; ++z)
+        for (std::uint32_t x = 0; x < 129; ++x) {
+            const float d = glm::length(glm::vec2(static_cast<float>(x) - 64.0f, static_cast<float>(z) - 64.0f)) * 0.5f;
+            data->heights[z * 129 + x] = heightAt(6.0f * std::exp(-d * d / 40.0f));
+        }
+    data->holes.assign(129u * 129u, 0);
+    for (std::uint32_t z = 100; z < 108; ++z)
+        for (std::uint32_t x = 60; x < 68; ++x)
+            data->holes[z * 129 + x] = 1;
+    TerrainStore::Instance().Provide(path, data);
+
+    Scene        scene;
+    const Entity ground = scene.CreateEntity("Terrain");
+    scene.GetRegistry().Emplace<Terrain>(ground, Terrain{.data = path, .lodDistance = 8.0f});
+    scene.UpdateTransforms();
+
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 18.0f, 34.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.0f, 4.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const auto       image = RenderImage(renderer, scene, camera, 4);
+    if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) { // screenshot for inspection
+        const std::vector<std::byte> png = EncodePng(image, 160, 120);
+        std::ofstream(fs::path(dir) / "terrain.png", std::ios::binary)
+            .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    }
+    const glm::ivec3 left  = pixel(image, project({-12.0f, 0.0f, 12.0f}));
+    const glm::ivec3 right = pixel(image, project({12.0f, 0.0f, 12.0f}));
+    const glm::ivec3 hole  = pixel(image, project({0.0f, 0.0f, 20.0f})); // sample 64 + 40 -> in the hole
+    const glm::ivec3 hill  = pixel(image, project({0.0f, 6.0f, 0.0f}));
+    std::printf("    terrain: left %d %d %d, right %d %d %d, hole %d %d %d, hill %d %d %d, nodes %u, tris %u\n", left.r, left.g,
+                left.b, right.r, right.g, right.b, hole.r, hole.g, hole.b, hill.r, hill.g, hill.b, renderer.Stats().terrainNodes,
+                renderer.Stats().terrainTriangles);
+    CHECK(renderer.Stats().terrains == 1u && renderer.Stats().terrainNodes > 0u);
+    CHECK(left.r > left.g + 30 && right.g > right.r + 30);
+    CHECK(std::abs(hole.r - left.r) > 40 || std::abs(hole.g - left.g) > 40); // not the red ground: the hole
+    const std::uint32_t nearNodes = renderer.Stats().terrainNodes;
+
+    // A longer finest-LOD range: more (smaller) patches.
+    scene.GetRegistry().Get<Terrain>(ground).lodDistance = 200.0f;
+    (void)RenderImage(renderer, scene, camera, 1);
+    std::printf("    nodes: lodDistance 8 -> %u, 200 -> %u\n", nearNodes, renderer.Stats().terrainNodes);
+    CHECK(renderer.Stats().terrainNodes > nearNodes);
+    scene.GetRegistry().Get<Terrain>(ground).lodDistance = 8.0f;
+
+    // A height edit through the store: a tall bump at the left lifts the red ground into view.
+    const glm::ivec2 bumpPixel = project({-12.0f, 10.0f, -8.0f});
+    const glm::ivec3 beforeBump = pixel(RenderImage(renderer, scene, camera, 1), bumpPixel);
+    for (std::uint32_t z = 40; z < 56; ++z)
+        for (std::uint32_t x = 32; x < 48; ++x)
+            data->heights[z * 129 + x] = heightAt(14.0f);
+    TerrainStore::Instance().MarkDirty(path, TerrainChangeHeights, {32.0f / 128.0f, 40.0f / 128.0f, 48.0f / 128.0f, 56.0f / 128.0f});
+    const glm::ivec3 afterBump = pixel(RenderImage(renderer, scene, camera, 2), bumpPixel);
+    std::printf("    bump: %d %d %d -> %d %d %d\n", beforeBump.r, beforeBump.g, beforeBump.b, afterBump.r, afterBump.g, afterBump.b);
+    CHECK(afterBump.r > afterBump.b + 20 && afterBump.r > beforeBump.r + 50);
+
+    // Picking hits the terrain entity.
+    renderer.overlay.picking = true;
+    std::optional<Entity> picked;
+    bool                  requested = false;
+    for (int i = 0; i < 8 && !picked; ++i)
+        if (auto frame = F().renderer->BeginFrame()) {
+            if (!requested) {
+                renderer.RequestPick(frame->extent.width / 2, frame->extent.height * 3 / 4);
+                requested = true;
+            }
+            renderer.Render(*frame, scene, camera);
+            F().renderer->EndFrame(*frame);
+            picked = renderer.TakePickResult();
+        }
+    CHECK(picked.has_value() && *picked == ground);
+    TerrainStore::Instance().Clear();
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Render_TerrainFoliage)
+{
+    // A 32 m gray terrain seen from above: yellow procedural blades painted on the left half (with a
+    // hole in them), textured box meshes on the right front quarter. Instances come and go with the
+    // view distance and density map edits; blades cast sun shadows.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const std::string   path = PathToUtf8(fs::temp_directory_path() / "ungine_gpu_terrain" / "Foliage.uterrain");
+    auto data = std::make_shared<TerrainData>(MakeFlatTerrain(65, 32.0f, 10.0f, 0.0f));
+    data->layers[0].tint = glm::vec3(0.35f);
+    const std::uint32_t n = data->splatResolution;
+    FoliageLayer grass;
+    grass.name         = "Grass";
+    grass.density      = 40.0f;
+    grass.width        = 0.12f;
+    grass.height       = 0.6f;
+    grass.baseColor    = glm::vec3(0.9f, 0.75f, 0.05f);
+    grass.tipColor     = glm::vec3(1.0f, 0.85f, 0.1f);
+    grass.wind         = 0.0f;
+    grass.viewDistance = 80.0f;
+    grass.castShadows  = true;
+    grass.densityMap.assign(static_cast<std::size_t>(n) * n, 0);
+    FoliageLayer boxes = grass;
+    boxes.name        = "Boxes";
+    boxes.kind        = FoliageKind::Mesh;
+    boxes.mesh        = PathToUtf8(kBox);
+    boxes.density     = 0.6f;
+    boxes.minScale    = 0.8f;
+    boxes.maxScale    = 0.8f;
+    boxes.castShadows = false;
+    for (std::uint32_t y = 0; y < n; ++y)
+        for (std::uint32_t x = 0; x < n; ++x) {
+            grass.densityMap[static_cast<std::size_t>(y) * n + x] = x < n / 2 ? 255 : 0;
+            boxes.densityMap[static_cast<std::size_t>(y) * n + x] = x >= n / 2 && y >= n / 2 ? 255 : 0;
+        }
+    data->foliage = {grass, boxes};
+    data->holes.assign(65u * 65u, 0);
+    for (std::uint32_t z = 12; z < 20; ++z) // 6..10 m from the corner: x, z in [-10, -6]
+        for (std::uint32_t x = 12; x < 20; ++x)
+            data->holes[z * 65 + x] = 1;
+    TerrainStore::Instance().Provide(path, data);
+
+    Scene        scene;
+    const Entity ground = scene.CreateEntity("Terrain");
+    scene.GetRegistry().Emplace<Terrain>(ground, Terrain{.data = path});
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure = false;
+    renderer.post.bloom        = false;
+    renderer.taa.enabled       = false;
+    renderer.ssr.enabled       = false;
+    const glm::vec3  eye{0.0f, 26.0f, 14.0f};
+    const CameraData camera{.view       = glm::lookAt(eye, glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                            .projection = PerspectiveReverseZ(glm::radians(60.0f), 160.0f / 120.0f, 0.05f),
+                            .position   = eye};
+    const auto project = [&](glm::vec3 p) {
+        const glm::vec4 clip = camera.projection * camera.view * glm::vec4(p, 1.0f);
+        const glm::vec2 ndc  = glm::vec2(clip) / clip.w;
+        return glm::ivec2(static_cast<int>((ndc.x * 0.5f + 0.5f) * 160.0f), static_cast<int>((0.5f - ndc.y * 0.5f) * 120.0f));
+    };
+    const auto pixel = [](const std::vector<std::uint8_t>& image, glm::ivec2 p) {
+        const std::size_t i = (static_cast<std::size_t>(p.y) * 160 + static_cast<std::size_t>(p.x)) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    // Average over a few pixels around a point (blades are thin).
+    const auto area = [&](const std::vector<std::uint8_t>& image, glm::vec3 p) {
+        const glm::ivec2 c = project(p);
+        glm::ivec3       sum(0);
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                sum += pixel(image, glm::clamp(c + glm::ivec2(dx, dy), glm::ivec2(0), glm::ivec2(159, 119)));
+        return sum / 25;
+    };
+    std::vector<std::uint8_t> image;
+    for (int i = 0; i < 200; ++i) { // until the box mesh has loaded (it adds its own draws)
+        F().assets->Update();
+        image = RenderImage(renderer, scene, camera, 1);
+        if (renderer.Stats().foliageDrawCalls > 6)
+            break;
+    }
+    image = RenderImage(renderer, scene, camera, 3);
+    if (const char* dir = std::getenv("UNGINE_TEST_DUMP")) {
+        const std::vector<std::byte> png = EncodePng(image, 160, 120);
+        std::ofstream(fs::path(dir) / "foliage.png", std::ios::binary)
+            .write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    }
+    const SceneRenderStats stats      = renderer.Stats();
+    const glm::ivec3       grassPixel = area(image, {-8.0f, 0.0f, 6.0f});
+    const glm::ivec3       bare       = area(image, {8.0f, 0.0f, -6.0f});
+    const glm::ivec3       holePixel  = area(image, {-8.0f, 0.0f, -8.0f});
+    std::printf("    foliage: grass %d %d %d, bare %d %d %d, hole %d %d %d, instances %u (shadow %u), draws %u\n", grassPixel.r,
+                grassPixel.g, grassPixel.b, bare.r, bare.g, bare.b, holePixel.r, holePixel.g, holePixel.b, stats.foliageInstances,
+                stats.foliageShadowInstances, stats.foliageDrawCalls);
+    CHECK(stats.foliageInstances > 5000u && stats.foliageShadowInstances > 0u);
+    CHECK(grassPixel.r > grassPixel.b + 20 && grassPixel.g > grassPixel.b + 20); // yellow blades
+    CHECK(bare.b >= bare.r);                                                      // bluish-gray lit ground
+    CHECK(holePixel.r < 40 && holePixel.g < 40);                                  // no blades over the hole
+    // Boxes: the textured mesh changes the right front quarter.
+    int        changed = 0;
+    glm::ivec3 boxColor(0);
+    for (float x = 3.0f; x < 15.0f; x += 1.0f)
+        for (float z = 3.0f; z < 15.0f; z += 1.0f) {
+            const glm::ivec3 c = pixel(image, project({x, 0.4f, z}));
+            if (std::abs(c.r - bare.r) + std::abs(c.g - bare.g) + std::abs(c.b - bare.b) > 40) {
+                ++changed;
+                boxColor += c;
+            }
+        }
+    boxColor /= std::max(changed, 1);
+    std::printf("    boxes: %d of 144 samples changed (avg %d %d %d)\n", changed, boxColor.r, boxColor.g, boxColor.b);
+    CHECK(changed > 10);
+
+    // View distance: nothing beyond it.
+    scene.GetRegistry().Get<Terrain>(ground).foliageDistance = 0.05f; // 4 m: the camera is ~26 m away
+    (void)RenderImage(renderer, scene, camera, 1);
+    CHECK(renderer.Stats().foliageInstances == 0u && renderer.Stats().foliageDrawCalls == 0u);
+    scene.GetRegistry().Get<Terrain>(ground).foliageDistance = 1.0f;
+
+    // Density map edit (only its chunks rescatter): the left half is cleared.
+    std::ranges::fill(data->foliage[0].densityMap, std::uint8_t{0});
+    TerrainStore::Instance().MarkDirty(path, TerrainChangeFoliage, {0.0f, 0.0f, 0.5f, 1.0f});
+    image = RenderImage(renderer, scene, camera, 2);
+    const glm::ivec3 cleared = area(image, {-8.0f, 0.0f, 6.0f});
+    std::printf("    cleared: %d %d %d, instances %u\n", cleared.r, cleared.g, cleared.b, renderer.Stats().foliageInstances);
+    CHECK(cleared.b >= cleared.r);
+    TerrainStore::Instance().Clear();
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_TerrainToolsAndUndo)
+{
+    // Terrain creation (file in Content/Terrains + entity), brush strokes (raise, paint, holes,
+    // foliage) with one undo step each, the Terrain window's settings commit, physics following the
+    // sculpt, saving the scene saves the terrain, placing a .uterrain from the content browser.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir          = fs::temp_directory_path() / "ungine_gpu_terrain" / "editor";
+    std::error_code     ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path previous = fs::current_path();
+    fs::current_path(dir); // the content root without a project
+    TerrainStore::Instance().Clear();
+    {
+        Scene         scene;
+        PhysicsWorld  physics(*F().jobs, F().events, F().assets.get());
+        SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+        sceneRenderer.shadows.resolution = 512;
+        FlyCamera                camera;
+        std::vector<ModelHandle> modelRefs;
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .physics       = &physics,
+                       .layoutFile    = {}});
+        camera.position = {0.0f, 30.0f, 40.0f};
+        camera.pitch    = glm::radians(-35.0f);
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                editor.FixedUpdate(1.0f / 30.0f);
+                F().assets->Update();
+                editor.Update(1.0f / 30.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame, 0.5f);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        const Entity terrain = editor.CreateTerrain({0.0f, 0.0f, 0.0f});
+        CHECK(terrain != NullEntity && editor.Selection().size() == 1);
+        const std::string path = scene.GetRegistry().Get<Terrain>(terrain).data;
+        CHECK(fs::exists(PathFromUtf8(path)) && PathFromUtf8(path).parent_path().filename() == "Terrains");
+        runFrames(4);
+        CHECK(sceneRenderer.Stats().terrains == 1u && physics.HasBody(terrain));
+        std::shared_ptr<TerrainData> data = TerrainStore::Instance().Get(path);
+        CHECK(data != nullptr);
+        if (!data) {
+            fs::current_path(previous);
+            return;
+        }
+        const glm::vec2 center(0.5f * data->size);
+        const float     flat = TerrainHeight(*data, center);
+
+        // Tool off: strokes are refused (the viewport selects).
+        const glm::vec3 point[] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+        CHECK(!editor.ApplyTerrainStroke(point));
+        editor.SetTerrainToolEnabled(true);
+        TerrainBrush& brush = editor.TerrainBrushSettings();
+        brush               = TerrainBrush{.tool = TerrainTool::Raise, .radius = 8.0f, .strength = 1.0f};
+        CHECK(editor.ApplyTerrainStroke(point));
+        const float raised = TerrainHeight(*data, center);
+        std::printf("    terrain raise: %.2f -> %.2f\n", flat, raised);
+        CHECK(raised > flat + 1.0f && editor.CanUndo());
+        // Physics follows (rebuilt at most 4x per second outside play).
+        bool high = false;
+        for (int i = 0; i < 60 && !high; ++i) {
+            runFrames(1);
+            const auto hit = physics.Raycast({0.0f, 50.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, 100.0f);
+            high = hit && hit->entity == terrain && hit->point.y > raised - 0.1f;
+        }
+        CHECK(high);
+        CHECK(editor.Undo());
+        CHECK(std::abs(TerrainHeight(*data, center) - flat) < 1e-3f);
+        CHECK(editor.Redo());
+        CHECK(std::abs(TerrainHeight(*data, center) - raised) < 1e-3f);
+
+        // Paint (a second layer), holes, foliage: each stroke one undo step.
+        data->layers.push_back(TerrainLayer{.name = "Rock", .tint = {0.6f, 0.2f, 0.1f}});
+        runFrames(2); // the window commits the new layer as a settings step
+        CHECK(editor.Undo());
+        CHECK(data->layers.size() == 1);
+        CHECK(editor.Redo());
+        CHECK(data->layers.size() == 2);
+        brush = TerrainBrush{.tool = TerrainTool::Paint, .radius = 6.0f, .strength = 1.0f, .layer = 1};
+        const glm::vec3 side[] = {{20.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f}};
+        CHECK(editor.ApplyTerrainStroke(side));
+        const auto splatAt = [&](glm::vec2 local) {
+            const auto x = static_cast<std::size_t>(local.x / data->size * static_cast<float>(data->splatResolution));
+            const auto z = static_cast<std::size_t>(local.y / data->size * static_cast<float>(data->splatResolution));
+            return data->splat[(z * data->splatResolution + x) * kMaxTerrainLayers + 1];
+        };
+        CHECK(splatAt(center + glm::vec2(20.0f, 0.0f)) == 255);
+        brush = TerrainBrush{.tool = TerrainTool::Holes, .radius = 3.0f};
+        const glm::vec3 pit[] = {{-20.0f, 0.0f, 10.0f}};
+        CHECK(editor.ApplyTerrainStroke(pit));
+        CHECK(TerrainHole(*data, center + glm::vec2(-20.0f, 10.0f)));
+        CHECK(editor.Undo());
+        CHECK(!TerrainHole(*data, center + glm::vec2(-20.0f, 10.0f)));
+        CHECK(editor.Redo());
+        brush = TerrainBrush{.tool = TerrainTool::Foliage, .radius = 10.0f, .strength = 1.0f, .layer = 0};
+        const glm::vec3 meadow[] = {{0.0f, 0.0f, 20.0f}, {0.0f, 0.0f, 20.0f}, {0.0f, 0.0f, 20.0f}};
+        CHECK(!data->foliage.empty() && editor.ApplyTerrainStroke(meadow));
+        runFrames(4);
+        std::printf("    foliage after painting: %u instances\n", sceneRenderer.Stats().foliageInstances);
+        CHECK(sceneRenderer.Stats().foliageInstances > 100u);
+        CHECK(editor.Undo());
+        runFrames(2);
+        CHECK(sceneRenderer.Stats().foliageInstances == 0u);
+        CHECK(editor.Redo());
+
+        // Settings edit through the data (as the window's fields do): one undo step once idle.
+        data->layers[0].tint = glm::vec3(0.1f, 0.2f, 0.9f);
+        runFrames(2);
+        CHECK(editor.Undo());
+        CHECK(data->layers[0].tint != glm::vec3(0.1f, 0.2f, 0.9f));
+        CHECK(editor.Redo());
+        CHECK(data->layers[0].tint == glm::vec3(0.1f, 0.2f, 0.9f));
+
+        // Saving the scene writes the terrain (relative path in the scene).
+        CHECK(TerrainStore::Instance().Dirty(path));
+        const fs::path sceneFile = dir / "Island.scene.json";
+        CHECK(editor.SaveScene(sceneFile));
+        CHECK(!TerrainStore::Instance().Dirty(path));
+        const auto saved = LoadTerrain(PathFromUtf8(path));
+        CHECK(saved && saved->layers.size() == 2 && saved->layers[0].tint == glm::vec3(0.1f, 0.2f, 0.9f) &&
+              std::abs(TerrainHeight(*saved, center) - raised) < 1e-3f);
+        std::ifstream     in(sceneFile);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        CHECK(text.find("\"Terrains/") != std::string::npos);
+
+        // Content browser: opening a .uterrain places it; tool off → selection works again.
+        editor.OpenAsset(PathFromUtf8(path));
+        int terrains = 0;
+        scene.GetRegistry().ViewOf<Terrain>().Each([&](Entity, Terrain&) { ++terrains; });
+        CHECK(terrains == 2);
+        runFrames(3);
+        CHECK(sceneRenderer.Stats().terrains == 2u);
+        editor.SetTerrainToolEnabled(false);
+        CHECK(!editor.TerrainToolActive());
+        // Play: no brushes.
+        editor.SetTerrainToolEnabled(true);
+        const std::uint64_t terrainUuid = scene.GetRegistry().Get<Uuid>(terrain).value;
+        editor.Play();
+        runFrames(2);
+        CHECK(!editor.TerrainToolActive() && !editor.ApplyTerrainStroke(point));
+        editor.Stop();
+        runFrames(2);
+        // New scene drops unsaved terrain edits (the file keeps its saved state).
+        editor.Select(scene.FindByUuid(terrainUuid)); // stop re-created the entities
+        brush = TerrainBrush{.tool = TerrainTool::Raise, .radius = 8.0f, .strength = 1.0f};
+        CHECK(editor.ApplyTerrainStroke(point) && TerrainStore::Instance().Dirty(path));
+        editor.NewScene();
+        CHECK(!TerrainStore::Instance().Dirty(path));
+        const auto reloaded = TerrainStore::Instance().Get(path);
+        CHECK(reloaded && std::abs(TerrainHeight(*reloaded, center) - raised) < 1e-3f);
+    }
+    TerrainStore::Instance().Clear();
+    fs::current_path(previous);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }

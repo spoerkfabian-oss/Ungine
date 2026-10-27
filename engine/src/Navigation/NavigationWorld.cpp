@@ -10,6 +10,7 @@
 #include "Engine/Physics/PhysicsWorld.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Terrain/TerrainData.h"
 
 #include <DetourCommon.h>
 #include <DetourCrowd.h>
@@ -256,6 +257,11 @@ struct SourceRecord {
     bool                   hasTriangles = false; // false: loaded from a baked file, filled on the next collect
     bool                   missed       = false; // a tile was built without its triangles (mesh still loading)
     bool                   seen         = false;
+    // Terrain sources: triangles are made per tile from the height field (no copy of all of them).
+    std::shared_ptr<const TerrainData> terrain;
+    glm::vec3                          terrainOrigin{0.0f};
+    std::uint64_t                      terrainRevision = 0;
+    double                             terrainChecked  = 0.0;
 };
 
 // NavArea: convex XZ footprint + height range.
@@ -851,6 +857,98 @@ struct NavigationWorld::Impl {
         }
     }
 
+    // Terrain components (navigation on): heights + holes hashed into the signature (stable across
+    // bake files), edits mark only their rectangle dirty, checked at most twice a second.
+    void CollectTerrains(Scene& scene)
+    {
+        TerrainStore& store = TerrainStore::Instance();
+        const double  now   = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        scene.GetRegistry().ViewOf<Terrain, WorldTransform, Uuid>().Each([&](Entity e, Terrain& t, WorldTransform& wt, Uuid& id) {
+            if (!t.navigation)
+                return;
+            std::shared_ptr<TerrainData> data = store.Get(t.data);
+            if (!data)
+                return;
+            const std::uint64_t key    = id.value ^ 0x7465727261696e00ull; // apart from a collider on the same entity
+            const glm::vec3     origin = glm::vec3(wt.matrix[3]) - glm::vec3(0.5f * data->size, 0.0f, 0.5f * data->size);
+            SourceRecord&       record = sources[key];
+            record.entity              = e;
+            record.seen                = true;
+            const std::uint64_t revision = store.Revision(t.data);
+            const auto signatureOf = [&](const TerrainData& d) {
+                Hasher h;
+                h.Add(origin).Add(d.resolution).Add(d.size).Add(d.heightScale);
+                h.Add(Fnv1a64(std::as_bytes(std::span(d.heights))));
+                h.Add(Fnv1a64(std::as_bytes(std::span(d.holes))));
+                return h.Value();
+            };
+            Box box;
+            box.Add(origin);
+            box.Add(origin + glm::vec3(data->size, data->heightScale, data->size));
+            if (record.terrain != data || record.terrainOrigin != origin) {
+                const std::uint64_t signature = signatureOf(*data);
+                if (signature != record.signature || record.missed) {
+                    MarkDirty(record.bounds);
+                    MarkDirty(box);
+                }
+                record.signature       = signature;
+                record.terrain         = data;
+                record.terrainOrigin   = origin;
+                record.terrainRevision = revision;
+                record.terrainChecked  = now;
+            } else if (revision != record.terrainRevision && now - record.terrainChecked >= 0.5) {
+                const TerrainChanges changes = store.ChangesSince(t.data, record.terrainRevision);
+                if (changes.kinds & (TerrainChangeHeights | TerrainChangeHoles | TerrainChangeSettings)) {
+                    if (changes.full) {
+                        MarkDirty(box);
+                    } else {
+                        Box region;
+                        region.Add(origin + glm::vec3(changes.rect.x * data->size, 0.0f, changes.rect.y * data->size));
+                        region.Add(origin + glm::vec3(changes.rect.z * data->size, data->heightScale, changes.rect.w * data->size));
+                        region.min -= glm::vec3(data->CellSize());
+                        region.max += glm::vec3(data->CellSize());
+                        MarkDirty(region);
+                    }
+                    record.signature = signatureOf(*data);
+                }
+                record.terrainRevision = revision;
+                record.terrainChecked  = now;
+            }
+            record.missed       = false;
+            record.bounds       = box;
+            record.hasTriangles = true;
+            record.triangles.clear();
+        });
+    }
+
+    // Two triangles per terrain cell inside `clip` (holes left out), counter-clockwise from above.
+    static void AppendTerrainTriangles(const SourceRecord& s, const Box& clip, std::vector<float>& vertices,
+                                       std::vector<int>& indices)
+    {
+        const TerrainData& t    = *s.terrain;
+        const float        cell = t.CellSize();
+        const auto         lo   = [&](float v) {
+            return static_cast<std::uint32_t>(std::clamp(std::floor(v / cell), 0.0f, static_cast<float>(t.resolution - 2)));
+        };
+        const auto hi = [&](float v) {
+            return static_cast<std::uint32_t>(std::clamp(std::ceil(v / cell), 0.0f, static_cast<float>(t.resolution - 1)));
+        };
+        const std::uint32_t x0 = lo(clip.min.x - s.terrainOrigin.x), x1 = hi(clip.max.x - s.terrainOrigin.x);
+        const std::uint32_t z0 = lo(clip.min.z - s.terrainOrigin.z), z1 = hi(clip.max.z - s.terrainOrigin.z);
+        const auto vertex = [&](std::uint32_t x, std::uint32_t z) {
+            const glm::vec3 p = s.terrainOrigin + glm::vec3(static_cast<float>(x) * cell, t.HeightAtSample(x, z), static_cast<float>(z) * cell);
+            vertices.insert(vertices.end(), {p.x, p.y, p.z});
+        };
+        for (std::uint32_t z = z0; z < z1; ++z)
+            for (std::uint32_t x = x0; x < x1; ++x) {
+                if (t.HoleAtSample(x, z))
+                    continue;
+                const int base = static_cast<int>(vertices.size() / 3);
+                vertex(x, z), vertex(x, z + 1), vertex(x + 1, z), vertex(x + 1, z + 1);
+                indices.insert(indices.end(), {base, base + 1, base + 2, base + 2, base + 1, base + 3});
+            }
+    }
+
     void Collect(Scene& scene)
     {
         Registry& reg = scene.GetRegistry();
@@ -894,6 +992,7 @@ struct NavigationWorld::Impl {
             record.hasTriangles = true;
             record.seen         = true;
         });
+        CollectTerrains(scene);
         Sweep(sources);
 
         reg.ViewOf<NavArea, WorldTransform, Uuid>().Each([&](Entity, NavArea& a, WorldTransform& wt, Uuid& id) {
@@ -1192,6 +1291,10 @@ struct NavigationWorld::Impl {
             if (!s.bounds.Overlaps(clip))
                 continue;
             s.missed = s.missed || !s.hasTriangles; // rebuilt once its triangles are there
+            if (s.terrain) {
+                AppendTerrainTriangles(s, clip, in.vertices, in.indices);
+                continue;
+            }
             for (std::size_t t = 0; t + 2 < s.triangles.size(); t += 3) {
                 Box tri;
                 tri.Add(s.triangles[t]), tri.Add(s.triangles[t + 1]), tri.Add(s.triangles[t + 2]);
@@ -1849,7 +1952,9 @@ bool NavigationWorld::LoadBaked(const fs::path& file, std::string* error)
             I.profiles[p]->cache->buildNavMeshTilesAt(KeyX(key), KeyY(key), I.profiles[p]->mesh);
     for (const RecordData& r : records[0])
         I.sources[r.uuid] = SourceRecord{.entity = NullEntity, .signature = r.signature, .bounds = r.bounds,
-                                         .triangles = {}, .hasTriangles = false, .seen = false};
+                                         .triangles = {}, .hasTriangles = false, .missed = false, .seen = false,
+                                         .terrain = {}, .terrainOrigin = glm::vec3(0.0f), .terrainRevision = 0,
+                                         .terrainChecked = 0.0};
     for (const RecordData& r : records[1]) {
         AreaRecord& a = I.areas[r.uuid];
         a.signature   = r.signature;
