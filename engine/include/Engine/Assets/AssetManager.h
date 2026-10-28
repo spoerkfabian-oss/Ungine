@@ -6,6 +6,7 @@
 #include "Engine/Assets/Texture.h"
 #include "Engine/Assets/TextureCooker.h"
 #include "Engine/Audio/Sound.h"
+#include "Engine/Material/MaterialAsset.h"
 #include "Engine/Renderer/Vulkan/Upload.h"
 
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +26,7 @@
 namespace Engine {
 
 class EventBus;
+class MaterialShaderCache;
 class Renderer;
 class ThreadPool;
 
@@ -104,6 +107,8 @@ struct AssetManagerDesc {
     // Texture import. Compression is also off when the GPU cannot sample BC formats.
     TextureCookSettings  textures{.compress = true, .cacheDirectory = "asset_cache/textures", .quality = 0};
     MeshOptimizeSettings meshes{};
+    // Compiled material shaders (SPIR-V per variant); empty: "Shaders" next to the texture cache.
+    std::filesystem::path shaderCacheDirectory{};
     bool                 hotReload   = false; // poll source files and reload changed assets
     double               pollSeconds = 0.5;
 };
@@ -185,6 +190,24 @@ public:
     [[nodiscard]] std::uint32_t Revision(SoundHandle handle) const;
     [[nodiscard]] std::vector<SoundInfo> Sounds() const;
 
+    // --- Materials (.umat node graphs, .uminst instances): the instance chain is resolved, the
+    // graph compiled to shaders (cached in memory and on disk) on a worker; Ready once its
+    // textures settled. Cached by path.
+    [[nodiscard]] MaterialHandle LoadMaterial(const std::filesystem::path& path);
+    void Release(MaterialHandle handle);
+    [[nodiscard]] const MaterialAsset* Get(MaterialHandle handle) const; // nullptr unless Ready
+    [[nodiscard]] AssetState    State(MaterialHandle handle) const;
+    [[nodiscard]] std::string   Error(MaterialHandle handle) const;
+    [[nodiscard]] std::uint32_t RefCount(MaterialHandle handle) const;
+    [[nodiscard]] std::uint32_t Revision(MaterialHandle handle) const;
+    [[nodiscard]] std::vector<MaterialInfo> Materials() const;
+    // Unsaved editor content for a file (nullopt: back to the file). Reloads every material whose
+    // chain contains the file.
+    void ProvideMaterial(const std::filesystem::path& file, std::optional<MaterialGraph> graph);
+    void ProvideMaterialInstance(const std::filesystem::path& file, std::optional<MaterialInstanceFile> instance);
+    // Bumps whenever a material's content or state changes (renderers rebuild their draws).
+    [[nodiscard]] std::uint64_t MaterialVersion() const { return m_MaterialVersion; }
+
     // --- Reload / retry. Re-reads the source: a Ready asset keeps its content until the new one
     // is resident (a failed reload keeps it for good), a Failed one is retried. While a load is
     // in flight the request is queued. False without a file / recipe (CreateModel, embedded
@@ -192,6 +215,7 @@ public:
     bool Reload(ModelHandle handle);
     bool Reload(TextureHandle handle);
     bool Reload(SoundHandle handle);
+    bool Reload(MaterialHandle handle);
     void SetHotReload(bool enabled);
     [[nodiscard]] bool HotReload() const { return m_HotReload; }
 
@@ -252,6 +276,12 @@ private:
         std::shared_ptr<const SoundData> sound; // Ready (also kept by a failed reload)
     };
 
+    struct MaterialEntry : EntryBase {
+        bool                           instance = false;
+        std::unique_ptr<MaterialAsset> material; // Ready content
+        std::unique_ptr<MaterialAsset> pending;  // waits for its textures
+    };
+
     // Worker -> main thread.
     struct ModelResult {
         ModelHandle                        handle;
@@ -273,6 +303,13 @@ private:
         SoundHandle                      handle;
         std::shared_ptr<const SoundData> sound;
         std::string                      error;
+    };
+
+    struct MaterialResult {
+        MaterialHandle                     handle;
+        std::unique_ptr<MaterialAsset>     material;
+        std::vector<std::filesystem::path> dependencies;
+        std::string                        error;
     };
 
     template <class E>
@@ -313,6 +350,13 @@ private:
     void StartSoundJob(SoundHandle handle);
     void OnSoundResult(SoundResult& result);
 
+    // Materials
+    void StartMaterialJob(MaterialHandle handle);
+    void OnMaterialResult(MaterialResult& result);
+    void ReleaseMaterialTextures(MaterialAsset& material);
+    [[nodiscard]] bool MaterialTexturesSettled(const MaterialAsset& material) const;
+    void ReloadMaterialsUsing(const std::filesystem::path& file);
+
     void PollFiles();
     [[nodiscard]] static std::vector<WatchedFile> Watch(std::vector<std::filesystem::path> files);
     void EnqueueJob(std::function<void()> job);
@@ -333,6 +377,15 @@ private:
     std::unordered_map<std::u8string, std::uint32_t> m_TextureCache;
     Table<SoundEntry>                                m_Sounds;
     std::unordered_map<std::u8string, std::uint32_t> m_SoundCache;
+    Table<MaterialEntry>                             m_Materials;
+    std::unordered_map<std::u8string, std::uint32_t> m_MaterialCache;
+    std::vector<MaterialHandle>                      m_PendingMaterials;
+    std::map<std::string, MaterialGraph>             m_ProvidedGraphs;    // MaterialPathKey -> unsaved graph
+    std::map<std::string, MaterialInstanceFile>      m_ProvidedInstances;
+    std::shared_ptr<MaterialShaderCache>             m_MaterialShaderCache; // shared with running jobs
+    std::filesystem::path                            m_ShaderCacheDirectory;
+    std::uint64_t                                    m_MaterialVersion  = 0;
+    std::uint64_t                                    m_ShaderGeneration = 0; // renderer's, materials recompile on change
     std::vector<ModelHandle>                         m_PendingModels;   // content waiting to swap in
     std::vector<TextureHandle>                       m_PendingTextures;
 
@@ -352,6 +405,7 @@ private:
     std::vector<ModelResult>   m_ModelResults;   // guarded by m_ResultMutex
     std::vector<TextureResult> m_TextureResults; // guarded by m_ResultMutex
     std::vector<SoundResult>   m_SoundResults;   // guarded by m_ResultMutex
+    std::vector<MaterialResult> m_MaterialResults; // guarded by m_ResultMutex
     std::uint32_t              m_JobsInFlight = 0; // guarded by m_ResultMutex
     std::atomic<bool>          m_ShuttingDown{false};
 };

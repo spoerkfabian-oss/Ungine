@@ -137,6 +137,30 @@ add_library(recastnav STATIC ${RECAST_SOURCES})
 target_include_directories(recastnav SYSTEM PUBLIC ${RECAST_INCLUDES})
 set_target_properties(recastnav PROPERTIES FOLDER "ThirdParty")
 
+# --- glslang (engine-private): GLSL -> SPIR-V at runtime for generated material shaders ---
+set(GLSLANG_TESTS            OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL   OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES  OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER       OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT               OFF CACHE BOOL "" FORCE) # no SPIRV-Tools
+set(ENABLE_HLSL              OFF CACHE BOOL "" FORCE)
+set(ENABLE_CTEST             OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL           OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG        vulkan-sdk-1.4.357.0
+    GIT_SHALLOW    TRUE
+    SYSTEM)
+FetchContent_MakeAvailable(glslang)
+foreach(target glslang glslang-default-resource-limits OSDependent GenericCodeGen MachineIndependent SPIRV)
+    if(TARGET ${target})
+        set_target_properties(${target} PROPERTIES FOLDER "ThirdParty")
+        if(NOT MSVC)
+            target_compile_options(${target} PRIVATE -O2 -w)
+        endif()
+    endif()
+endforeach()
+
 # Texture encoding, mesh simplification and navmesh tiles run on workers even in Debug builds:
 # optimize them (GCC / Clang; MSVC Debug keeps /RTC1, which /O2 conflicts with).
 foreach(target bc7enc meshoptimizer miniaudio recastnav)

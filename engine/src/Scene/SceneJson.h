@@ -111,6 +111,9 @@ void TransformPaths(json& entity, F&& fn)
     if (json* materials = at(entity, {"collider", "meshMaterials"}); materials && materials->is_object())
         for (auto& path : *materials)
             apply(&path);
+    if (json* materials = at(entity, {"materialOverrides", "materials"}); materials && materials->is_array())
+        for (auto& path : *materials)
+            apply(&path);
 }
 
 // Rewrites entity references by UUID inside components (script entity variables, joints) in place.

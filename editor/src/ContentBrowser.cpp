@@ -3,6 +3,8 @@
 #include "Editor/AnimGraphEditor.h"
 #include "Engine/Animation/AnimationSystem.h"
 #include "Editor/ParticleEditor.h"
+#include "Editor/MaterialEditor.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Engine/Particles/ParticleEffect.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
@@ -89,7 +91,7 @@ ImVec4 KindColor(int kind)
     }
 }
 
-constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "ANIM", "TER", "FILE"};
+constexpr const char* kKindTags[] = {"DIR", "SCENE", "BP", "PFB", "MODEL", "TEX", "SND", "TYPE", "PHYS", "CUE", "PFX", "ANIM", "TER", "MAT", "MINST", "FILE"};
 
 bool IsTypeFile(const std::string& lowerName)
 {
@@ -173,6 +175,22 @@ std::optional<Collider> RelocatedCollider(const Collider* collider, const fs::pa
     return any ? std::optional<Collider>(std::move(moved)) : std::nullopt;
 }
 
+// Material overrides with their material paths moved (nullopt: none pointed there).
+std::optional<MaterialOverrides> RelocatedMaterials(const MaterialOverrides* overrides, const fs::path& from, const fs::path& to,
+                                                    bool directory)
+{
+    if (!overrides)
+        return std::nullopt;
+    MaterialOverrides moved = *overrides;
+    bool              any   = false;
+    for (std::string& file : moved.materials)
+        if (const auto path = RelocateReference(file, from, to, directory)) {
+            file = PathToUtf8(*path);
+            any  = true;
+        }
+    return any ? std::optional<MaterialOverrides>(std::move(moved)) : std::nullopt;
+}
+
 void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                         const fs::path& from, const fs::path& to, bool directory, std::size_t& count,
                         const fs::path& oldOwnerDirectory = {}, bool pathValues = false)
@@ -180,10 +198,13 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
             // pathValues: every string of the object is a path (a collider's meshMaterials, a decal).
+            // Material graphs: a texture node's param is its file; instances: the parent.
+            const bool textureNode = it.key() == "param" && value.value("type", std::string{}) == "Texture.Sample";
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
                                           it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
-                                          it.key() == "mesh" || it.key() == "previewModel" || it.key() == "data")) {
+                                          it.key() == "mesh" || it.key() == "previewModel" || it.key() == "data" ||
+                                          it.key() == "parent" || textureNode)) {
                 const std::string source = it.value().get<std::string>();
                 if (it.key() == "uri" && source.find(':') != std::string::npos)
                     continue;
@@ -212,12 +233,19 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                 }
             } else {
                 RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory,
-                                   it.key() == "meshMaterials" || it.key() == "decal"); // their strings are all paths
+                                   it.key() == "meshMaterials" || it.key() == "decal" || it.key() == "materials"); // their strings are all paths
             }
         }
     } else if (value.is_array()) {
-        for (nlohmann::json& child : value)
+        for (nlohmann::json& child : value) {
+            if (pathValues && child.is_string()) { // a list of paths (material overrides)
+                nlohmann::json wrapper = {{"file", child}};
+                RewriteStoredPaths(wrapper, ownerDirectory, from, to, directory, count, oldOwnerDirectory);
+                child = wrapper["file"];
+                continue;
+            }
             RewriteStoredPaths(child, ownerDirectory, from, to, directory, count, oldOwnerDirectory);
+        }
     }
 }
 
@@ -241,7 +269,8 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
         const bool legacyScene = EndsWith(name, ".json") && Lower(PathToUtf8(it->path().parent_path().filename())) == "scenes";
         if (!(EndsWith(name, ".scene.json") || EndsWith(name, ".uprefab") || EndsWith(name, ".ugraph") ||
               EndsWith(name, ".gltf") || EndsWith(name, std::string(kSoundCueExtension)) ||
-              EndsWith(name, std::string(kParticleEffectExtension)) || EndsWith(name, ".uanim") || legacyScene))
+              EndsWith(name, std::string(kParticleEffectExtension)) || EndsWith(name, ".uanim") || EndsWith(name, ".umat") ||
+              EndsWith(name, ".uminst") || legacyScene))
             continue;
 
         std::ifstream input(it->path(), std::ios::binary);
@@ -391,6 +420,8 @@ bool Editor::SaveAll()
         ok = m_ParticleEditor->Save() && ok;
     if (m_AnimGraphEditor->Dirty())
         ok = m_AnimGraphEditor->Save() && ok;
+    if (m_MaterialEditor->Dirty())
+        ok = m_MaterialEditor->Save() && ok;
     if (m_Ctx.project && m_ProjectDirty) {
         std::string error;
         if (m_Ctx.project->Save(&error))
@@ -406,7 +437,7 @@ bool Editor::SaveAll()
 bool Editor::ConfirmQuit()
 {
     if (m_QuitConfirmed || (!HasUnsavedChanges() && !m_Graphs->AnyDirty() && !m_ProjectDirty && !m_ParticleEditor->Dirty() &&
-                           !m_AnimGraphEditor->Dirty()))
+                           !m_AnimGraphEditor->Dirty() && !m_MaterialEditor->Dirty()))
         return true;
     m_AskQuit = true;
     return false;
@@ -542,6 +573,14 @@ void Editor::OpenAsset(const fs::path& file)
         else if (!m_ParticleEditor->IsOpen() || m_ParticleEditor->File() != absolute)
             m_ParticleEditor->Open(absolute);
         ImGui::SetWindowFocus("###particleeditor");
+    } else if (IsMaterialFile(file) || IsMaterialInstanceFile(file)) {
+        std::error_code ec;
+        const fs::path  absolute = fs::absolute(file, ec).lexically_normal();
+        if (m_MaterialEditor->Dirty() && m_MaterialEditor->File() != absolute) // one material at a time: keep the edits
+            m_Status = "Save or revert " + PathToUtf8(m_MaterialEditor->File().filename()) + " first";
+        else if (!m_MaterialEditor->IsOpen() || m_MaterialEditor->File() != absolute)
+            m_MaterialEditor->Open(absolute);
+        ImGui::SetWindowFocus("###materialeditor");
     } else if (IsAnimGraphFile(file)) {
         std::error_code ec;
         const fs::path  absolute = fs::absolute(file, ec).lexically_normal();
@@ -654,6 +693,10 @@ void Editor::RefreshContent()
             item.kind = ContentItem::Kind::AnimGraph;
         else if (EndsWith(lower, kTerrainExtension))
             item.kind = ContentItem::Kind::Terrain;
+        else if (IsMaterialFile(path))
+            item.kind = ContentItem::Kind::Material;
+        else if (IsMaterialInstanceFile(path))
+            item.kind = ContentItem::Kind::MaterialInstance;
         m_ContentItems.push_back(std::move(item));
     }
     std::ranges::sort(m_ContentItems, [](const ContentItem& a, const ContentItem& b) {
@@ -1090,6 +1133,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         const auto levelPath = volume ? RelocateReference(volume->level, source, target, wasDirectory)
                                       : std::optional<fs::path>{};
         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), source, target, wasDirectory);
+        const auto materialsMoved = RelocatedMaterials(registry.TryGet<MaterialOverrides>(entity), source, target, wasDirectory);
         std::optional<Decal> decalMoved;
         if (const Decal* decal = registry.TryGet<Decal>(entity)) {
             Decal moved = *decal;
@@ -1103,7 +1147,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
                 decalMoved = std::move(moved);
         }
         if (!meshModel && !instanceModel && !scriptPath && !audioPath && !effectPath && !graphPath && !imagePath && !prefabPath && !levelPath &&
-            !colliderMoved && !decalMoved)
+            !colliderMoved && !decalMoved && !materialsMoved)
             return;
         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
         if (meshModel) mesh->model = *meshModel;
@@ -1117,6 +1161,7 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
         if (levelPath) volume->level = PathToUtf8(*levelPath);
         if (colliderMoved) registry.Get<Collider>(entity) = *colliderMoved;
         if (decalMoved) registry.Get<Decal>(entity) = std::move(*decalMoved);
+        if (materialsMoved) registry.Get<MaterialOverrides>(entity) = std::move(*materialsMoved);
         m_Ctx.scene.MarkChanged(entity); // renderer proxies / GPU instances pick up the new model
         edits.push_back({UuidOf(entity), before});
     });
@@ -1258,6 +1303,29 @@ void Editor::DrawContentBrowser()
                 m_Status = error;
             }
         }
+        if (ImGui::MenuItem("Material")) {
+            const fs::path file = UniquePath(m_ContentDir, "NewMaterial", ".umat");
+            std::string    error;
+            if (SaveMaterialGraph(file, MakeDefaultMaterialGraph(), &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
+        }
+        if (ImGui::MenuItem("Material instance")) { // of the selected material, if any
+            const fs::path       file = UniquePath(m_ContentDir, "NewMaterialInstance", ".uminst");
+            MaterialInstanceFile instance;
+            if (IsMaterialFile(m_ContentSelected) || IsMaterialInstanceFile(m_ContentSelected))
+                instance.parent = PathToUtf8(m_ContentSelected.lexically_normal());
+            std::string error;
+            if (SaveMaterialInstance(file, instance, &error)) {
+                RefreshContent();
+                OpenAsset(file);
+            } else {
+                m_Status = error;
+            }
+        }
         if (ImGui::MenuItem("Animation graph")) {
             const fs::path file = UniquePath(m_ContentDir, "NewAnimGraph", ".uanim");
             std::string    error;
@@ -1373,6 +1441,18 @@ void Editor::DrawContentBrowser()
                     if (item.kind == ContentItem::Kind::AnimGraph && Selected() != NullEntity &&
                         ImGui::MenuItem("Assign to selection") && !AssignAnimGraph(Selected(), item.path))
                         m_Status = "The selection is not part of a model instance";
+                    if ((item.kind == ContentItem::Kind::Material || item.kind == ContentItem::Kind::MaterialInstance) &&
+                        Selected() != NullEntity && ImGui::MenuItem("Assign to selection") && !AssignMaterial(Selected(), item.path))
+                        m_Status = "The selection has no mesh";
+                    if (item.kind == ContentItem::Kind::Material && ImGui::MenuItem("Create instance")) {
+                        MaterialInstanceFile instance;
+                        instance.parent     = PathToUtf8(item.path.lexically_normal());
+                        const fs::path file = UniquePath(item.path.parent_path(), PathToUtf8(item.path.stem()) + "_Inst", ".uminst");
+                        if (SaveMaterialInstance(file, instance)) {
+                            RefreshContent();
+                            OpenAsset(file);
+                        }
+                    }
                     if (item.kind == ContentItem::Kind::ParticleEffect) {
                         if (ImGui::MenuItem("Place particle system"))
                             CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -1649,8 +1729,10 @@ void Editor::DrawContentBrowser()
                         const auto levelPath = volume ? RelocateReference(volume->level, previous, target, wasDirectory)
                                                       : std::optional<fs::path>{};
                         const auto colliderMoved = RelocatedCollider(registry.TryGet<Collider>(entity), previous, target, wasDirectory);
+                        const auto materialsMoved =
+                            RelocatedMaterials(registry.TryGet<MaterialOverrides>(entity), previous, target, wasDirectory);
                         if (!moveScript && !moveAudio && !moveImage && !movePrefab && !levelPath && !meshModel && !instanceModel &&
-                            !colliderMoved)
+                            !colliderMoved && !materialsMoved)
                             return;
                         const std::string before = SnapshotEntityState(m_Ctx.scene, entity);
                         if (moveScript)
@@ -1665,6 +1747,10 @@ void Editor::DrawContentBrowser()
                             volume->level = PathToUtf8(*levelPath);
                         if (colliderMoved)
                             registry.Get<Collider>(entity) = *colliderMoved;
+                        if (materialsMoved) {
+                            registry.Get<MaterialOverrides>(entity) = *materialsMoved;
+                            m_Ctx.scene.MarkChanged(entity);
+                        }
                         if (meshModel)
                             mesh->model = *meshModel;
                         if (instanceModel)

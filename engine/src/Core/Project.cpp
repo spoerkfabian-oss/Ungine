@@ -2,6 +2,7 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Platform.h"
+#include "Engine/Renderer/ShaderCompiler.h"
 #include "Navigation/NavJson.h"
 
 #include <nlohmann/json.hpp>
@@ -394,6 +395,11 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
             fs::copy_file(e.path(), outputDirectory / "shaders" / e.path().filename(), fs::copy_options::overwrite_existing, ec);
     if (ec)
         return fail("copying the shaders");
+    // GLSL sources: node-graph materials compile their shaders at runtime.
+    fs::copy(ShaderSourceDirectory(), outputDirectory / "shaders" / "source",
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec)
+        return fail("copying the shader sources");
     fs::copy_file(project.File(), outputDirectory / project.File().filename(), fs::copy_options::overwrite_existing, ec);
     if (ec)
         return fail("copying the project file");

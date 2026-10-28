@@ -2,6 +2,8 @@
 #include "Editor/AnimGraphEditor.h"
 #include "Engine/Animation/AnimationSystem.h"
 #include "Editor/ParticleEditor.h"
+#include "Editor/MaterialEditor.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Particles/ParticleWorld.h"
 #include "Editor/ScriptGraphEditor.h"
@@ -77,7 +79,8 @@ Editor::Editor(const EditorContext& context)
       m_ParticleEditor(std::make_unique<ParticleEditor>(
           ParticleEditor::Context{context.renderer, context.assets, *m_ImGui, context.particles})),
       m_AnimGraphEditor(std::make_unique<AnimGraphEditor>(
-          AnimGraphEditor::Context{context.renderer, context.assets, *m_ImGui, context.animation}))
+          AnimGraphEditor::Context{context.renderer, context.assets, *m_ImGui, context.animation})),
+      m_MaterialEditor(std::make_unique<MaterialEditor>(MaterialEditor::Context{context.renderer, context.assets, *m_ImGui}))
 {
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
@@ -167,6 +170,7 @@ Editor::~Editor()
     ReleaseTexturePreviews(true);
     m_ParticleEditor.reset(); // its preview texture belongs to the ImGui layer
     m_AnimGraphEditor.reset();
+    m_MaterialEditor.reset();
     m_ImGui.reset(); // waits for the device, frees pending textures, shuts the backends down
 }
 
@@ -235,6 +239,7 @@ void Editor::Update(float dt)
         DrawSoundCue();
     m_ParticleEditor->Draw(dt);
     m_AnimGraphEditor->Draw(dt);
+    m_MaterialEditor->Draw(dt);
     if (m_ShowLevels && m_Ctx.streaming)
         DrawLevels();
     if (m_ShowNavigation && m_Ctx.navigation)
@@ -374,6 +379,7 @@ void Editor::Render(const FrameContext& frame, float physicsAlpha)
 
     m_ParticleEditor->Render(frame); // preview of the particle effect window
     m_AnimGraphEditor->Render(frame);
+    m_MaterialEditor->Render(frame);
 
     GpuScope scope(&m_Ctx.renderer.Profiler(), cmd, "Editor UI");
     m_ImGui->Render(cmd, frame.view, frame.extent);
@@ -607,6 +613,20 @@ void Editor::DrawViewport()
                     PlaceTerrain(file, glm::vec3(target.x, 0.0f, target.z));
                 else
                     m_Status = "Stop playing to place terrains";
+            } else if (IsMaterialFile(file) || IsMaterialInstanceFile(file)) { // onto the mesh under the cursor
+                const ImVec2     mouse = ImGui::GetIO().MousePos;
+                const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,
+                                     1.0f - (mouse.y - origin.y) / static_cast<float>(height) * 2.0f);
+                const CameraData cam = m_Ctx.camera.GetData(static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f));
+                const glm::vec4  far = glm::inverse(cam.projection * cam.view) * glm::vec4(ndc, 0.5f, 1.0f);
+                const glm::vec3  dir = glm::normalize(glm::vec3(far) / far.w - cam.position);
+                const auto       hit = m_Ctx.sceneRenderer.Spatial().Raycast(cam.position, dir, 10000.0f);
+                if (m_PlayState != PlayState::Edit)
+                    m_Status = "Stop playing to assign materials";
+                else if (!hit || !AssignMaterial(hit->entity, file))
+                    m_Status = "Drop materials onto a mesh";
+                else
+                    Select(hit->entity);
             } else if (IsParticleEffectFile(file)) { // a new particle system on the surface under the cursor
                 const ImVec2     mouse = ImGui::GetIO().MousePos;
                 const glm::vec2  ndc((mouse.x - origin.x) / static_cast<float>(width) * 2.0f - 1.0f,

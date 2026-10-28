@@ -30,6 +30,7 @@ endforeach()
 #   bin/UngineEditor, bin/UnginePlayer, bin/UngineCook, bin/shaders/*.spv, bin/templates/, bin/samples/, bin/resources/
 install(TARGETS UngineEditor UnginePlayer UngineCook RUNTIME DESTINATION bin)
 install(DIRECTORY "${ENGINE_SHADER_OUTPUT_DIR}/" DESTINATION bin/shaders FILES_MATCHING PATTERN "*.spv")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/shaders/" DESTINATION bin/shaders/source) # runtime material shaders
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/templates/" DESTINATION bin/templates)
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/models" "${CMAKE_SOURCE_DIR}/assets/scripts" "${CMAKE_SOURCE_DIR}/assets/sounds"
         DESTINATION bin/samples)

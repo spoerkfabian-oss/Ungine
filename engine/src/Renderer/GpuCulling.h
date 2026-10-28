@@ -89,9 +89,10 @@ public:
     void CullLate(VkCommandBuffer cmd);
     void CopyStats(VkCommandBuffer cmd, std::uint32_t frameIndex);
 
-    // One indirect multi-draw per bucket; setBucket(bucket) binds state before each.
+    // One indirect multi-draw per non-empty bucket of the view (camera or shadow buckets of the
+    // GpuScene layout); setBucket(bucket) binds state before each and returns false to skip it.
     template <class F>
-    void Draw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucketCount, F&& setBucket);
+    void Draw(VkCommandBuffer cmd, std::uint32_t view, bool shadow, F&& setBucket);
 
     [[nodiscard]] VkDeviceAddress VisibleAddress() const { return m_Visible.Address(); }
     [[nodiscard]] bool            Active() const { return m_ViewCount > 0; } // culled this frame
@@ -105,17 +106,19 @@ private:
     struct CullData { // mirrors CullData in gpu_cull.comp
         VkDeviceAddress views = 0, draws = 0, instances = 0, submeshes = 0, batches = 0, counters = 0, visible = 0,
                         visibility = 0, drawCounts = 0, commands = 0, hiz = 0, stats = 0;
-        std::uint32_t drawCount = 0, batchCount = 0, batchCapacity = 0, pad = 0;
+        std::uint32_t drawCount = 0, batchCount = 0, batchCapacity = 0, bucketStride = 0;
         glm::uvec4    hizInfo{0};
         glm::uvec4    depthSize{0};
         glm::vec4     lodCamera{0.0f};
         glm::uvec4    lodInfo{0};
         glm::vec4     shadowRegionMin{0.0f};
         glm::vec4     shadowRegionMax{0.0f};
+        VkDeviceAddress bucketOffsets = 0;
+        std::uint32_t   shadowBucketBase = 0, pad = 0;
     };
-    static_assert(sizeof(CullData) == 208);
+    static_assert(sizeof(CullData) == 224);
 
-    void RecordDraw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucket);
+    void RecordDraw(VkCommandBuffer cmd, std::uint32_t view, bool shadow, std::uint32_t bucket);
     void Dispatch(VkCommandBuffer cmd, std::uint32_t phase, std::uint32_t firstView, std::uint32_t viewCount,
                   std::uint32_t threads);
 
@@ -136,19 +139,25 @@ private:
     std::uint32_t              m_BatchCapacity = 0;
     std::uint32_t              m_DrawCapacity  = 0;
     std::uint32_t              m_IndirectCalls = 0;
+    std::uint32_t              m_BucketStride  = 0;
+    std::vector<std::uint32_t> m_CameraBucketOffset, m_CameraBucketCapacity; // this frame's layout
+    std::vector<std::uint32_t> m_ShadowBucketOffset, m_ShadowBucketCapacity;
     glm::uvec2                 m_HiZSize{0};
     std::uint32_t              m_HiZLevels = 0;
     VkExtent2D                 m_HiZExtent{};
 };
 
 template <class F>
-void GpuCulling::Draw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucketCount, F&& setBucket)
+void GpuCulling::Draw(VkCommandBuffer cmd, std::uint32_t view, bool shadow, F&& setBucket)
 {
     if (view >= m_ViewCount || m_BatchCapacity == 0)
         return;
-    for (std::uint32_t bucket = 0; bucket < bucketCount; ++bucket) {
-        setBucket(bucket);
-        RecordDraw(cmd, view, bucket);
+    const std::vector<std::uint32_t>& capacity = shadow ? m_ShadowBucketCapacity : m_CameraBucketCapacity;
+    for (std::uint32_t bucket = 0; bucket < capacity.size(); ++bucket) {
+        if (capacity[bucket] == 0 || (!shadow && bucket == kCameraBucketBlend))
+            continue;
+        if (setBucket(bucket))
+            RecordDraw(cmd, view, shadow, bucket);
     }
 }
 
