@@ -2883,15 +2883,19 @@ void Editor::DrawMaterialSlots(Entity e)
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("UNGINE_CONTENT")) {
                 const std::filesystem::path file = PathFromUtf8(static_cast<const char*>(payload->Data));
-                if ((IsMaterialFile(file) || IsMaterialInstanceFile(file)) && !IsStreamed(e))
+                if ((IsMaterialFile(file) || IsMaterialInstanceFile(file)) && !IsStreamed(e)) {
                     AssignMaterial(e, file, static_cast<int>(k));
+                    current = registry.TryGet<MaterialOverrides>(e); // the component may have moved
+                }
             }
             ImGui::EndDragDropTarget();
         }
         if (!path.empty()) {
             ImGui::SameLine();
-            if (ImGui::SmallButton("x") && !IsStreamed(e))
+            if (ImGui::SmallButton("x") && !IsStreamed(e)) {
                 AssignMaterial(e, {}, static_cast<int>(k));
+                current = registry.TryGet<MaterialOverrides>(e);
+            }
         }
         ImGui::PopID();
     }

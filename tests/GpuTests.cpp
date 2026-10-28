@@ -5082,7 +5082,8 @@ TEST_CASE(Render_CustomMaterials)
     glm::ivec3 lit{0};
     for (int i = 0; i < 200; ++i) {
         F().assets->Update();
-        const bool ready = std::any_of(F().assets->Materials().begin(), F().assets->Materials().end(), [](const MaterialInfo& m) {
+        const std::vector<MaterialInfo> infos = F().assets->Materials();
+        const bool ready = std::any_of(infos.begin(), infos.end(), [](const MaterialInfo& m) {
             return m.path.ends_with("Lit.umat") && m.state == AssetState::Ready;
         });
         lit = pixel(RenderImage(renderer, scene, camera, 2), project({-3.0f, 0.3f, 0.5f}));
