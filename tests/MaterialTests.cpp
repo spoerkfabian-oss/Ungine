@@ -340,7 +340,11 @@ TEST_CASE(Material_OverridesFilesNodesAndTemplate)
         CHECK(LoadSceneFile(file, loaded, nullptr).empty());
         bool found = false;
         loaded.GetRegistry().ViewOf<MaterialOverrides>().Each([&](Entity, const MaterialOverrides& m) {
-            found = m == scene.GetRegistry().Get<MaterialOverrides>(e);
+            // Paths compared normalized (Windows: the loaded path uses other separators).
+            const MaterialOverrides& original = scene.GetRegistry().Get<MaterialOverrides>(e);
+            found = m.parameters == original.parameters && m.materials.size() == original.materials.size();
+            for (std::size_t i = 0; found && i < m.materials.size(); ++i)
+                found = PathFromUtf8(m.materials[i]).lexically_normal() == PathFromUtf8(original.materials[i]).lexically_normal();
         });
         CHECK(found);
         const std::string before = SnapshotEntityState(scene, e);
