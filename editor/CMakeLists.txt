@@ -9,6 +9,7 @@ add_library(Editor STATIC
     src/ImGuiLayer.cpp
     src/Panels.cpp
     src/ParticleEditor.cpp
+    src/MaterialEditor.cpp
     src/AnimGraphEditor.cpp
     src/Navigation.cpp
     src/TerrainTools.cpp

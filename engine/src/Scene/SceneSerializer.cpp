@@ -538,6 +538,40 @@ json DecalToJson(const Decal& d, const ModelRefs& paths)
             {"age", d.age}};
 }
 
+json MaterialOverridesToJson(const MaterialOverrides& m, const ModelRefs& paths)
+{
+    json materials = json::array();
+    for (const std::string& path : m.materials)
+        materials.push_back(paths.WritePath(path));
+    json parameters = json::array();
+    for (const MaterialParameterOverride& p : m.parameters)
+        parameters.push_back({{"name", p.name}, {"value", ToJson(p.value)}, {"submesh", p.submesh}});
+    return {{"materials", std::move(materials)}, {"parameters", std::move(parameters)}};
+}
+
+MaterialOverrides MaterialOverridesFromJson(const json& j, const ModelRefs& paths)
+{
+    MaterialOverrides m;
+    if (const auto it = j.find("materials"); it != j.end() && it->is_array())
+        for (const json& path : *it)
+            m.materials.push_back(path.is_string() ? paths.ReadPath(path.get<std::string>()) : std::string{});
+    if (const auto it = j.find("parameters"); it != j.end() && it->is_array())
+        for (const json& p : *it) {
+            MaterialParameterOverride o;
+            Read(p, "name", o.name);
+            Read(p, "value", o.value);
+            Read(p, "submesh", o.submesh);
+            if (o.name.empty())
+                continue;
+            for (int c = 0; c < 4; ++c)
+                if (!std::isfinite(o.value[c]))
+                    o.value[c] = 0.0f;
+            o.submesh = std::max(o.submesh, -1);
+            m.parameters.push_back(std::move(o));
+        }
+    return m;
+}
+
 json FogVolumeToJson(const FogVolume& f)
 {
     return {{"halfExtents", ToJson(f.halfExtents)},
@@ -925,6 +959,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         j["decal"] = DecalToJson(*decal, models);
     if (const auto* fog = r.TryGet<FogVolume>(e))
         j["fogVolume"] = FogVolumeToJson(*fog);
+    if (const auto* materials = r.TryGet<MaterialOverrides>(e))
+        j["materialOverrides"] = MaterialOverridesToJson(*materials, models);
     if (const auto* terrain = r.TryGet<Terrain>(e))
         j["terrain"] = TerrainToJson(*terrain, models.WritePath(terrain->data));
     if (const auto* particles = r.TryGet<ParticleSystem>(e))
@@ -1129,6 +1165,8 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
     });
     ApplyOptional<Decal>(r, e, j, "decal", [&](const json& d) { return DecalFromJson(d, models); });
     ApplyOptional<FogVolume>(r, e, j, "fogVolume", [](const json& f) { return FogVolumeFromJson(f); });
+    ApplyOptional<MaterialOverrides>(r, e, j, "materialOverrides",
+                                     [&](const json& m) { return MaterialOverridesFromJson(m, models); });
     ApplyOptional<Terrain>(r, e, j, "terrain", [&](const json& t) {
         Terrain terrain = TerrainFromJson(t);
         terrain.data    = models.ReadPath(terrain.data);

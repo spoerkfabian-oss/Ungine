@@ -699,6 +699,49 @@ bool Editor::AssignAnimGraph(Entity entity, const std::filesystem::path& graph)
     return true;
 }
 
+bool Editor::AssignMaterial(Entity entity, const std::filesystem::path& material, int submesh)
+{
+    Registry& r = m_Ctx.scene.GetRegistry();
+    if (!r.Valid(entity) || IsStreamed(entity))
+        return false;
+    std::error_code   ec;
+    const std::string path = material.empty() ? std::string{} : PathToUtf8(std::filesystem::absolute(material, ec).lexically_normal());
+    std::vector<StateEdit> edits;
+    std::vector<Entity>    stack{entity};
+    while (!stack.empty()) {
+        const Entity e = stack.back();
+        stack.pop_back();
+        if (const Hierarchy* h = r.TryGet<Hierarchy>(e))
+            stack.insert(stack.end(), h->children.begin(), h->children.end());
+        const MeshRenderer* mesh = r.TryGet<MeshRenderer>(e);
+        if (!mesh || IsStreamed(e))
+            continue;
+        std::size_t count = 1;
+        if (const Model* model = m_Ctx.assets.Get(mesh->model); model && mesh->meshIndex < model->meshes.size())
+            count = model->meshes[mesh->meshIndex].submeshes.size();
+        std::string       before    = SnapshotEntityState(m_Ctx.scene, e);
+        MaterialOverrides overrides = r.Has<MaterialOverrides>(e) ? r.Get<MaterialOverrides>(e) : MaterialOverrides{};
+        if (submesh < 0) {
+            overrides.materials.assign(std::max(overrides.materials.size(), count), path);
+        } else {
+            overrides.materials.resize(std::max(overrides.materials.size(), static_cast<std::size_t>(submesh) + 1));
+            overrides.materials[static_cast<std::size_t>(submesh)] = path;
+        }
+        while (!overrides.materials.empty() && overrides.materials.back().empty()) // trailing "model material" slots
+            overrides.materials.pop_back();
+        if (overrides.materials.empty() && overrides.parameters.empty())
+            r.Remove<MaterialOverrides>(e);
+        else
+            r.EmplaceOrReplace<MaterialOverrides>(e, std::move(overrides));
+        m_Ctx.scene.MarkChanged(e);
+        edits.push_back({UuidOf(e), std::move(before)});
+    }
+    if (edits.empty())
+        return false;
+    PushStateChange(path.empty() ? "Reset material" : "Assign material", std::move(edits));
+    return true;
+}
+
 Entity Editor::CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position)
 {
     std::error_code ec;

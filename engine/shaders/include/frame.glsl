@@ -51,6 +51,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     vec4  fogLight;  // x: anisotropy, y: sun scale, z: ambient scale, w: punctual light scale
     uvec4 fogInfo;   // x: enabled, y: integrated volume slot, z: fog volume count, w: volumetric this frame
     vec4  fogGrid;   // x: grid depth (m), y: slices, zw: screen UV -> grid UV
+    vec4  materialTime; // x: time (s), y: last frame's time (custom materials)
 
     LightBuffer      lights;
     ClusterBuffer    clusters;
@@ -67,6 +68,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     DecalBuffer        decals;
     DecalClusterBuffer decalClusters;
     FogVolumeBuffer    fogVolumes;
+    MaterialParamBuffer materialParams; // GPU scene: custom material parameter blocks
 };
 
 #endif

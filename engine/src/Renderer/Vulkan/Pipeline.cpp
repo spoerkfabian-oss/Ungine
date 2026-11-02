@@ -59,6 +59,17 @@ GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetShaders(std::filesystem::pa
 {
     m_VertexShader   = std::move(vertex);
     m_FragmentShader = std::move(fragment);
+    m_VertexCode.clear();
+    m_FragmentCode.clear();
+    return *this;
+}
+GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetShaderCode(std::vector<std::uint32_t> vertex,
+                                                                std::vector<std::uint32_t> fragment)
+{
+    m_VertexCode   = std::move(vertex);
+    m_FragmentCode = std::move(fragment);
+    m_VertexShader.clear();
+    m_FragmentShader.clear();
     return *this;
 }
 GraphicsPipelineBuilder& GraphicsPipelineBuilder::SetTopology(VkPrimitiveTopology t) { m_Topology = t; return *this; }
@@ -155,13 +166,23 @@ Pipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout, const s
 
 Pipeline GraphicsPipelineBuilder::Build(VkDevice device, VkPipelineLayout layout) const
 {
-    if (m_VertexShader.empty())
+    if (m_VertexShader.empty() && m_VertexCode.empty())
         throw std::runtime_error("GraphicsPipelineBuilder: no vertex shader set");
 
+    const auto fromCode = [device](const std::vector<std::uint32_t>& code) {
+        VkShaderModuleCreateInfo info{};
+        info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        info.codeSize = code.size() * sizeof(std::uint32_t);
+        info.pCode    = code.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &module));
+        return module;
+    };
     // Modules are only needed until pipeline creation.
-    const ShaderModuleGuard vs{device, LoadShaderModule(device, m_VertexShader)};
-    const ShaderModuleGuard fs{device, m_FragmentShader.empty() ? VK_NULL_HANDLE
-                                                                : LoadShaderModule(device, m_FragmentShader)};
+    const ShaderModuleGuard vs{device, !m_VertexCode.empty() ? fromCode(m_VertexCode) : LoadShaderModule(device, m_VertexShader)};
+    const ShaderModuleGuard fs{device, !m_FragmentCode.empty()   ? fromCode(m_FragmentCode)
+                                       : m_FragmentShader.empty() ? VK_NULL_HANDLE
+                                                                  : LoadShaderModule(device, m_FragmentShader)};
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     VkPipelineShaderStageCreateInfo stage{};

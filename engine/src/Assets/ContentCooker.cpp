@@ -1,5 +1,6 @@
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Terrain/TerrainData.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Engine/Audio/SoundCue.h"
 #include "Engine/Animation/AnimGraph.h"
 #include "Engine/Particles/ParticleEffect.h"
@@ -677,6 +678,78 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             else
                 use(foliage.texture, "foliage texture", TextureKind::Color);
         }
+    }
+
+    // Materials: textures with their kinds (parameters, texture nodes, instance overrides); graph
+    // problems and broken instance chains are reported. Shaders compile at runtime (sources ship).
+    for (const fs::path& file : files) {
+        const bool graphFile = IsMaterialFile(file), instanceFile = IsMaterialInstanceFile(file);
+        if (!graphFile && !instanceFile)
+            continue;
+        const auto use = [&](const std::string& path, TextureKind kind) {
+            if (path.empty())
+                return;
+            const fs::path  target = PathFromUtf8(path).lexically_normal();
+            std::error_code ec;
+            if (!fs::is_regular_file(target, ec))
+                report.warnings.push_back(std::format("'{}': missing texture '{}'", entryPath(file), path));
+            else if (!inContent(target))
+                report.warnings.push_back(std::format("'{}': texture '{}' is outside Content/ and not packaged", entryPath(file), path));
+            else if (const auto bytes = readShared(target)) {
+                usedImages.insert(PathToUtf8(target));
+                addTexture(bytes, kind, PathToUtf8(target.filename()));
+            }
+        };
+        std::string error;
+        if (graphFile) {
+            const auto graph = LoadMaterialGraph(file, &error);
+            if (!graph) {
+                report.warnings.push_back(error);
+                continue;
+            }
+            for (const MaterialParameter& p : graph->parameters)
+                if (p.type == MaterialParameterType::Texture)
+                    use(p.texture, p.textureKind);
+            for (const MaterialNode& n : graph->nodes)
+                if (n.type == "Texture.Sample")
+                    use(n.param, n.textureKind);
+            for (const MaterialProblem& p : GenerateMaterialCode(*graph).problems)
+                if (p.error)
+                    report.warnings.push_back(std::format("'{}': {}{}", entryPath(file),
+                                                          p.node ? std::format("node {}: ", p.node) : std::string{}, p.message));
+            continue;
+        }
+        // Instance: walk to the graph (texture kinds come from its parameters).
+        std::optional<MaterialInstanceFile> instance = LoadMaterialInstance(file, &error);
+        if (!instance) {
+            report.warnings.push_back(error);
+            continue;
+        }
+        std::optional<MaterialGraph> graph;
+        fs::path                     parent = PathFromUtf8(instance->parent);
+        for (int depth = 0; depth < 16 && !graph; ++depth) {
+            std::error_code ec;
+            if (instance->parent.empty() || !fs::is_regular_file(parent, ec)) {
+                report.warnings.push_back(std::format("'{}': missing parent material '{}'", entryPath(file), PathToUtf8(parent)));
+                break;
+            }
+            if (!inContent(parent))
+                report.warnings.push_back(std::format("'{}': parent '{}' is outside Content/ and not packaged", entryPath(file),
+                                                      PathToUtf8(parent)));
+            if (IsMaterialFile(parent)) {
+                graph = LoadMaterialGraph(parent, &error);
+            } else {
+                const auto next = LoadMaterialInstance(parent, &error);
+                if (!next)
+                    break;
+                parent = PathFromUtf8(next->parent);
+            }
+        }
+        for (const MaterialParameterValue& o : instance->overrides)
+            if (o.type == MaterialParameterType::Texture) {
+                const MaterialParameter* p = graph ? graph->FindParameter(o.name) : nullptr;
+                use(o.texture, p ? p->textureKind : TextureKind::Color);
+            }
     }
 
     // Scenes and prefabs: UI images are color textures; references to missing files are reported.

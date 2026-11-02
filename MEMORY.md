@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-26 (Phase 30 merged (PR #20, 0bf373e); Phase 31 TAA/decals/SSR/fog + Phase 32 terrain on `branch`, both in PR #21 (open, user merges); next: Phase 33 material editor – ask details first)
+- Last updated: 2026-10-27 (Phase 33 material editor implemented on `branch`, PR open; Phase 31 + 32 merged via PR #21, 83cdfcb; next after merge: Phase 34 nested prefabs + settings undo – ask details first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1027,6 +1027,8 @@ If an audit finds no concrete defect:
 - Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) merged (PR #17, 2026-10-14).
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
 - Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) merged (PR #19, fa23918, 2026-10-22).
+- Phase 30 merged (PR #20); Phase 31 + 32 merged (PR #21, 83cdfcb, 2026-10-27).
+- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) implemented on `branch` (2026-10-27), PR pending.
 
 ### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
 - State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
@@ -1046,6 +1048,19 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
+
+### Phase 33 material editor – decisions (user, 2026-10-27)
+- Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
+- Also: material instances (override parameters of a base material, settable per Blueprint at runtime), blend/shading models (Opaque/Masked/Translucent/Additive, Unlit, Two-Sided, Emissive), vertex animation (world position offset with velocity for TAA), per-submesh material overrides on MeshRenderer (drag & drop in the editor).
+- glTF materials stay the default; `.umat` only as override.
+
+### Phase 33 material editor (2026-10-27)
+Technical details: CLAUDE.md "Materialien (Phase 33)".
+- New deps/modules: glslang (FetchContent `vulkan-sdk-1.4.357.0`, engine-private) + `Renderer/ShaderCompiler.h` (runtime GLSL→SPIR-V, virtual includes, defines); `Engine/Material/` (MaterialGraph `.umat`/`.uminst`, node registry, codegen, MaterialAsset); `src/Material/MaterialBuild` (worker: instance chain, codegen, compile with memory + disk cache); `AssetManager::LoadMaterial/ProvideMaterial*/MaterialVersion`; component `MaterialOverrides`; editor `MaterialEditor` window; Blueprint nodes Set Material / Set Material Scalar|Vector Parameter / Clear Material Parameters; Basic template `Content/Materials/Pulse.umat` + `Pulse_Warm.uminst`.
+- Key design: generated code is injected into the **existing** engine shaders via `#ifdef CUSTOM_MATERIAL` (mesh.vert, depth_normal*.frag, mesh*.frag, shadow*.vert/frag) → lit materials use the same `ShadeSurface` as glTF (a lit graph with glTF values renders identical ±1). Parameter values never change the code (instances share shaders). GPU scene: material slots, batch key includes slot + material revision, **dynamic buckets** (camera 5 + 2·slot + mirrored, shadow 2 + slot, `kBucketNone`), bucket offsets = prefix sums uploaded for `gpu_cull.comp`, `GpuDraw::params` = per-draw parameter block (material block + entity overrides). Shader sources ship in `shaders/source` (build copy, install, packaging).
+- Gotchas: glslang with SPIR-V 1.6 turns `discard` into DemoteToHelperInvocation (feature not enabled) → target SPIR-V 1.5; ImGui 1.92.9 swapped `AddRect` thickness/flags (old order is deleted); editor UI tests need the GLFW window large enough for floating windows (320×240 default); ImGui windows opened at 1180×680 lie off-screen in tests. Segfault in the GPU suite (CI + local, "after Streaming_LevelLoaderSwitch") was really `Render_CustomMaterials`: `any_of(F().assets->Materials().begin(), F().assets->Materials().end())` = two different temporaries (UB) – stdout is buffered in a pipe, so the last printed `[ OK ]` lies about where a crash happened; find it with ASan (build-asan needs `-fno-sanitize=vptr`, glslang has no RTTI; FetchContent sources via `FETCHCONTENT_SOURCE_DIR_<NAME uppercased, hyphens kept>`). Editor `DrawMaterialSlots`: re-fetch the component pointer after `AssignMaterial`. MSVC C4456 (inner `slot` hid an outer local in GpuScene) → before pushing, scan changed .cpp files with GCC `-fsyntax-only -Wshadow` via build/compile_commands.json (ignore lambda-boundary hits; MSVC does not flag those). Test readback buffers can reuse memory of a freed index buffer → sync-val WAR only in the full suite (fix: execution barrier ALL_COMMANDS → COPY before the copy in `RenderImage`).
+- Tests: CPU `tests/MaterialTests.cpp` (4: files/instances, codegen/slots/variants, every node compiles in every template via glslang, overrides/scene files/undo/Blueprint nodes/template material), GPU `Render_CustomMaterials` (unlit/instance/entity override/WPO/masked/translucent, GPU == CPU path pixel-exact, picking through the material prepass, live Provide, removal, lit graph == glTF), `Editor_MaterialEditorAndAssignment` (assign + undo, window/preview, live edit, problems, palette by mouse, save, instance window, scene file paths).
+- Open: see CLAUDE.md open point 25 (runtime compile/first-use pipeline hitch, no material functions/static switches, entity params only scalar/vector, no custom materials on terrain/foliage/particles, translucent without shadows).
 
 ### Phase 32 terrain – decisions (user, 2026-10-26)
 - Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).

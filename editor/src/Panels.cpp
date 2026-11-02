@@ -1,5 +1,7 @@
 // Editor panels: Hierarchy, Inspector, Renderer settings, Stats, Assets.
 #include "Editor/Editor.h"
+#include "Editor/MaterialEditor.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Editor/AnimGraphEditor.h"
 #include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Navigation/NavigationWorld.h"
@@ -560,6 +562,7 @@ void Editor::DrawInspector()
             }
         }
         ImGui::EndTable();
+        DrawMaterialSlots(e);
         if (ImGui::Button("Remove component"))
             registry.Remove<MeshRenderer>(e);
     }
@@ -2845,5 +2848,113 @@ void Editor::DrawNavigationInspector(Entity e)
     }
 }
 
+
+} // namespace Engine
+
+namespace Engine {
+
+// Mesh Renderer: one custom material slot per submesh (drop a .umat / .uminst, "x" back to the
+// model's own) and the parameters of those materials, overridable per entity.
+void Editor::DrawMaterialSlots(Entity e)
+{
+    Registry&           registry = m_Ctx.scene.GetRegistry();
+    const MeshRenderer* mesh     = registry.TryGet<MeshRenderer>(e);
+    const Model*        model    = mesh ? m_Ctx.assets.Get(mesh->model) : nullptr;
+    if (!model || mesh->meshIndex >= model->meshes.size())
+        return;
+    const Mesh& m = model->meshes[mesh->meshIndex];
+    ImGui::SeparatorText("Materials");
+    const MaterialOverrides* current = registry.TryGet<MaterialOverrides>(e);
+    for (std::size_t k = 0; k < m.submeshes.size(); ++k) {
+        ImGui::PushID(static_cast<int>(k));
+        const std::uint32_t gltf = m.submeshes[k].material;
+        const std::string   name = gltf < model->previewMaterials.size() && !model->previewMaterials[gltf].name.empty()
+                                       ? model->previewMaterials[gltf].name
+                                       : "material " + std::to_string(gltf);
+        const std::string path = current && k < current->materials.size() ? current->materials[k] : std::string{};
+        ImGui::TextDisabled("%zu", k);
+        ImGui::SameLine();
+        const std::string label = path.empty() ? "(" + name + ")" : PathToUtf8(PathFromUtf8(path).filename());
+        if (ImGui::Button((label + "##slot").c_str(), ImVec2(std::max(ImGui::GetContentRegionAvail().x - 60.0f, 60.0f), 0.0f)) &&
+            !path.empty())
+            OpenAsset(PathFromUtf8(path));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", path.empty() ? "The model's material - drop a .umat / .uminst here" : path.c_str());
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("UNGINE_CONTENT")) {
+                const std::filesystem::path file = PathFromUtf8(static_cast<const char*>(payload->Data));
+                if ((IsMaterialFile(file) || IsMaterialInstanceFile(file)) && !IsStreamed(e)) {
+                    AssignMaterial(e, file, static_cast<int>(k));
+                    current = registry.TryGet<MaterialOverrides>(e); // the component may have moved
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (!path.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x") && !IsStreamed(e)) {
+                AssignMaterial(e, {}, static_cast<int>(k));
+                current = registry.TryGet<MaterialOverrides>(e);
+            }
+        }
+        ImGui::PopID();
+    }
+    current = registry.TryGet<MaterialOverrides>(e);
+    if (!current)
+        return;
+    // Parameters of the assigned materials (scalar / vector): per-entity values.
+    std::vector<MaterialParameter> parameters;
+    const std::vector<MaterialInfo> infos = m_Ctx.assets.Materials();
+    for (const std::string& path : current->materials) {
+        if (path.empty())
+            continue;
+        std::error_code ec;
+        const std::filesystem::path wanted = std::filesystem::weakly_canonical(PathFromUtf8(path), ec);
+        for (const MaterialInfo& info : infos)
+            if (std::filesystem::weakly_canonical(PathFromUtf8(info.path), ec) == wanted)
+                if (const MaterialAsset* asset = m_Ctx.assets.Get(info.handle))
+                    for (const MaterialParameter& p : asset->parameters)
+                        if (p.type != MaterialParameterType::Texture &&
+                            std::none_of(parameters.begin(), parameters.end(), [&](const MaterialParameter& q) { return q.name == p.name; }))
+                            parameters.push_back(p);
+    }
+    if (parameters.empty() && current->parameters.empty())
+        return;
+    ImGui::SeparatorText("Material parameters");
+    MaterialOverrides edited = *current;
+    bool              changed = false;
+    for (const MaterialParameter& p : parameters) {
+        ImGui::PushID(p.name.c_str());
+        auto it = std::find_if(edited.parameters.begin(), edited.parameters.end(),
+                               [&](const MaterialParameterOverride& o) { return o.name == p.name && o.submesh < 0; });
+        bool on = it != edited.parameters.end();
+        if (ImGui::Checkbox("##on", &on)) {
+            if (on)
+                edited.parameters.push_back({p.name, p.value, -1});
+            else
+                edited.parameters.erase(it);
+            changed = true;
+            ImGui::PopID();
+            break;
+        }
+        ImGui::SameLine();
+        if (!on) {
+            ImGui::TextDisabled("%s", p.name.c_str());
+        } else if (p.type == MaterialParameterType::Scalar) {
+            changed |= ImGui::SliderFloat(p.name.c_str(), &it->value.x, p.range.x, p.range.y);
+        } else {
+            changed |= ImGui::ColorEdit4(p.name.c_str(), &it->value.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+        }
+        ImGui::PopID();
+    }
+    // Values set for names the materials do not have (blueprints, renamed parameters).
+    for (const MaterialParameterOverride& o : edited.parameters)
+        if (std::none_of(parameters.begin(), parameters.end(), [&](const MaterialParameter& p) { return p.name == o.name; }))
+            ImGui::TextDisabled("%s (not in the materials%s)", o.name.c_str(), o.submesh >= 0 ? ", one submesh" : "");
+    if (changed && !IsStreamed(e)) { // the inspector's snapshot comparison records the undo step
+        registry.Get<MaterialOverrides>(e) = std::move(edited);
+        m_Ctx.scene.MarkChanged(e);
+    }
+}
 
 } // namespace Engine

@@ -30,3 +30,14 @@ function(engine_add_shaders target)
     set_target_properties(${target}_Shaders PROPERTIES FOLDER "Shaders")
     add_dependencies(${target} ${target}_Shaders)
 endfunction()
+
+# GLSL sources next to the SPIR-V (shaders/source/): generated material shaders are compiled at
+# runtime (glslang) from the same mesh / shadow templates and includes.
+function(engine_copy_shader_sources target)
+    add_custom_target(${target}_ShaderSources
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ENGINE_SHADER_OUTPUT_DIR}/source"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/engine/shaders" "${ENGINE_SHADER_OUTPUT_DIR}/source"
+        COMMENT "Copying shader sources")
+    set_target_properties(${target}_ShaderSources PROPERTIES FOLDER "Shaders")
+    add_dependencies(${target} ${target}_ShaderSources)
+endfunction()

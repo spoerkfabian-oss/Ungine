@@ -151,6 +151,12 @@
         "rolloff": 1.0,
         "doppler": 1.0,
         "occlusion": true
+      },
+      "materialOverrides": {
+        "materials": [
+          "../Materials/Pulse_Warm.uminst"
+        ],
+        "parameters": []
       }
     },
     {
@@ -232,6 +238,12 @@
       "collider": {
         "shape": "sphere",
         "radius": 0.4
+      },
+      "materialOverrides": {
+        "materials": [
+          "../Materials/Pulse.umat"
+        ],
+        "parameters": []
       }
     },
     {

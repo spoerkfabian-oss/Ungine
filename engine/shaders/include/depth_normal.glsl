@@ -5,6 +5,12 @@
 #include "mesh_common.glsl"
 #include "pbr.glsl"
 #include "surface.glsl"
+#ifdef CUSTOM_MATERIAL
+#include "material_common.glsl"
+#include "material.generated.glsl"
+#include "material_surface.glsl"
+layout(location = 9) flat in vec3 inObjectPosition;
+#endif
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -27,6 +33,14 @@ void main()
 {
     if (LodFadeDiscard(inLodFade, gl_FragCoord.xy)) // LOD cross-fade (the lighting pass drops the same pixels)
         discard;
+#ifdef CUSTOM_MATERIAL
+    const mat3           tbn = SurfaceFrame(inNormal, inTangent, inWorldPos, inUV);
+    const MaterialResult r   = EvaluatePixelMaterial(inWorldPos, tbn[2], inUV, inObjectPosition, inMaterial);
+    if (MaterialMaskDiscard(r, inMaterial))
+        discard;
+    const vec3  N         = MaterialShadingNormal(r, tbn);
+    const float roughness = clamp(r.roughness, 0.045, 1.0);
+#else
     const Material m = pc.frame.materials.m[inMaterial];
     if ((m.flags & MATERIAL_ALPHA_MASK) != 0u) {
         const float alpha = m.baseColorFactor.a * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV).a;
@@ -36,6 +50,7 @@ void main()
     const vec3 N = PerturbedNormal(m, SurfaceFrame(inNormal, inTangent, inWorldPos, inUV), inUV);
     const float roughness = clamp(m.roughness * SampleMaterial(m.metallicRoughnessTexture, m.samplerIndex, inUV).g,
                                   0.045, 1.0);
+#endif
     outNormal    = vec4(normalize(mat3(pc.frame.view) * N), roughness);
     outVelocity  = MotionVector(inCurrentClip, inPreviousClip);
 #ifdef WRITE_ENTITY_ID

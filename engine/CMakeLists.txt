@@ -31,6 +31,7 @@ add_library(Engine STATIC
     src/Renderer/Renderer.cpp
     src/Renderer/SceneRenderer.cpp
     src/Renderer/TextOverlay.cpp
+    src/Renderer/ShaderCompiler.cpp
     src/Renderer/ShaderReload.cpp
     src/Renderer/ShadowAtlas.cpp
     src/Renderer/ShadowCascades.cpp
@@ -56,6 +57,9 @@ add_library(Engine STATIC
     src/Scene/SpatialIndex.cpp
     src/UI/UiLayout.cpp
     src/UI/UiSystem.cpp
+    src/Material/MaterialGraph.cpp
+    src/Material/MaterialCodegen.cpp
+    src/Material/MaterialBuild.cpp
     src/Particles/ParticleEffect.cpp
     src/Particles/ParticleWorld.cpp
     src/Navigation/NavigationWorld.cpp
@@ -82,6 +86,7 @@ target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
     PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio recastnav
+            glslang glslang-default-resource-limits
             $<$<PLATFORM_ID:Windows>:shell32>)
 
 # Project templates (installed next to the executables, see the root CMakeLists).
@@ -102,9 +107,11 @@ target_compile_definitions(Engine PUBLIC
 target_compile_definitions(Engine PRIVATE
     ENGINE_GLSLC="${GLSLC_EXECUTABLE}"
     ENGINE_SHADER_INCLUDE_DIR="${ENGINE_SHADER_INCLUDE_DIR}"
+    ENGINE_SHADER_SOURCE_DIR="${CMAKE_SOURCE_DIR}/engine/shaders"
     ENGINE_SHADER_OPTIMIZE=$<IF:$<CONFIG:Debug>,0,1>)
 
 engine_set_warnings(Engine)
+engine_copy_shader_sources(Engine)
 set_target_properties(Engine PROPERTIES FOLDER "Engine")
 
 # Shared GLSL includes (bindless.glsl, ...) show up in the IDE

@@ -6,6 +6,12 @@
 #include "mesh_common.glsl"
 #include "shading.glsl"
 #include "surface.glsl"
+#ifdef CUSTOM_MATERIAL
+#include "material_common.glsl"
+#include "material.generated.glsl"
+#include "material_surface.glsl"
+layout(location = 9) flat in vec3 inObjectPosition;
+#endif
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -27,6 +33,47 @@ void main()
 {
     if (LodFadeDiscard(inLodFade, gl_FragCoord.xy)) // same pixels as in the prepass
         discard;
+    FrameData frame = pc.frame;
+#ifdef MESH_BLEND
+    const bool opaque = false;
+#else
+    const bool opaque = true;
+#endif
+    vec3  color;
+    float alpha = 1.0;
+#ifdef CUSTOM_MATERIAL
+    const mat3           tbn = SurfaceFrame(inNormal, inTangent, inWorldPos, inUV);
+    const MaterialResult r   = EvaluatePixelMaterial(inWorldPos, tbn[2], inUV, inObjectPosition, inMaterial);
+    if (MaterialMaskDiscard(r, inMaterial))
+        discard;
+    alpha = clamp(r.opacity, 0.0, 1.0);
+#ifdef MATERIAL_UNLIT
+    color = max(r.emissive, vec3(0.0));
+#if MATERIAL_BLEND_MODE == MATERIAL_ADDITIVE // fog only dims additive light
+    {
+        const vec3  toPoint  = inWorldPos - frame.cameraPosition.xyz;
+        const float distance = length(toPoint);
+        color *= ComputeFog(frame, gl_FragCoord.xy * frame.ssrParams.zw, toPoint / max(distance, 1e-6), distance, false).a;
+    }
+#else
+    color = ApplyFog(frame, color, gl_FragCoord.xy * frame.ssrParams.zw, inWorldPos);
+#endif
+#else
+    SurfaceSample surface;
+    surface.worldPos   = inWorldPos;
+    surface.geomNormal = tbn[2];
+    surface.N          = MaterialShadingNormal(r, tbn);
+    surface.base       = clamp(r.baseColor, 0.0, 1.0);
+    surface.metallic   = clamp(r.metallic, 0.0, 1.0);
+    surface.roughness  = clamp(r.roughness, 0.045, 1.0);
+    surface.emissive   = max(r.emissive, vec3(0.0));
+    surface.occlusion  = clamp(r.occlusion, 0.0, 1.0);
+    color = ShadeSurface(frame, surface, opaque);
+#endif
+#if MATERIAL_BLEND_MODE == MATERIAL_ADDITIVE
+    color *= alpha; // premultiplied (ONE / ONE)
+#endif
+#else
     const Material m    = pc.frame.materials.m[inMaterial];
     vec4           base = m.baseColorFactor * SampleMaterial(m.baseColorTexture, m.samplerIndex, inUV);
 
@@ -50,12 +97,8 @@ void main()
     surface.roughness  = clamp(m.roughness * mr.g, 0.045, 1.0); // floor avoids aliasing sun highlights
     surface.emissive   = m.emissiveFactor.rgb * SampleMaterial(m.emissiveTexture, m.samplerIndex, inUV).rgb;
     surface.occlusion  = 1.0 + m.occlusionStrength * (SampleMaterial(m.occlusionTexture, m.samplerIndex, inUV).r - 1.0);
-
-    FrameData frame = pc.frame;
-#ifdef MESH_BLEND
-    vec3 color = ShadeSurface(frame, surface, false);
-#else
-    vec3 color = ShadeSurface(frame, surface, true);
+    color = ShadeSurface(frame, surface, opaque);
+    alpha = base.a;
 #endif
     if ((pc.flags & MESH_TINT_LATE) != 0u) // culling debug view: found by the occlusion (late) pass
         color = color * vec3(0.4, 0.25, 0.1) + vec3(0.6, 0.25, 0.02) * frame.sky.x;
@@ -66,8 +109,8 @@ void main()
         color = lod == 0u ? color : color * t + t * 0.08 * frame.sky.x;
     }
 #ifdef MESH_BLEND
-    outColor    = vec4(color, base.a); // straight alpha, blended over the opaque image
-    outVelocity = vec4(MotionVector(inCurrentClip, inPreviousClip), 0.0, base.a);
+    outColor    = vec4(color, alpha); // straight alpha, blended over the opaque image (additive: ONE / ONE)
+    outVelocity = vec4(MotionVector(inCurrentClip, inPreviousClip), 0.0, alpha);
 #else
     outColor = vec4(color, 1.0);
 #endif

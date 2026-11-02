@@ -11,6 +11,7 @@
 #include "Engine/Physics/Ragdoll.h"
 #include "Engine/Core/GameOptions.h"
 #include "Engine/Core/Platform.h"
+#include "Engine/Material/MaterialGraph.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/LevelStreaming.h"
 #include "Engine/Scene/Prefab.h"
@@ -132,6 +133,53 @@ std::optional<Entity> Target(ScriptContext& c, int pin)
         return std::nullopt;
     }
     return e;
+}
+
+// Mesh entities of a target's subtree (itself included): material nodes on a model root reach
+// every mesh of the model.
+template <class F>
+std::uint32_t ForEachMeshBelow(ScriptContext& c, Entity root, F&& fn)
+{
+    Registry&           registry = c.GetScene().GetRegistry();
+    std::uint32_t       count    = 0;
+    std::vector<Entity> stack{root};
+    while (!stack.empty()) {
+        const Entity e = stack.back();
+        stack.pop_back();
+        if (!registry.Valid(e))
+            continue;
+        if (registry.Has<MeshRenderer>(e)) {
+            fn(e);
+            ++count;
+        }
+        if (const Hierarchy* h = registry.TryGet<Hierarchy>(e))
+            stack.insert(stack.end(), h->children.begin(), h->children.end());
+    }
+    return count;
+}
+
+void SetMaterialParameter(ScriptContext& c, Entity target, const std::string& name, glm::vec4 value, std::int32_t submesh)
+{
+    if (name.empty())
+        return c.Error("Parameter name is empty");
+    Registry& registry = c.GetScene().GetRegistry();
+    const std::uint32_t meshes = ForEachMeshBelow(c, target, [&](Entity e) {
+        if (!registry.Has<MaterialOverrides>(e))
+            registry.Emplace<MaterialOverrides>(e, MaterialOverrides{});
+        MaterialOverrides& o = registry.Get<MaterialOverrides>(e);
+        auto it = std::find_if(o.parameters.begin(), o.parameters.end(), [&](const MaterialParameterOverride& p) {
+            return p.name == name && p.submesh == submesh;
+        });
+        if (it == o.parameters.end())
+            o.parameters.push_back({name, value, submesh});
+        else if (it->value != value)
+            it->value = value;
+        else
+            return; // unchanged: no GPU update
+        c.GetScene().MarkChanged(e);
+    });
+    if (meshes == 0)
+        c.Error("Target has no mesh (Mesh Renderer) in its hierarchy");
 }
 
 // The entity with the AnimationController: the target itself or the first one below it (the
@@ -1477,6 +1525,77 @@ std::vector<NodeDesc> BuildRegistry()
                                "else it fades out and is destroyed. Angle in degrees."),
                      {{"Normal", glm::vec3(0.0f, 1.0f, 0.0f)}, {"Size", 1.0f}, {"Lifetime", 10.0f}, {"Color", glm::vec3(1.0f)}}));
 
+    // Materials (MaterialOverrides on every mesh of the target's hierarchy). Parameters reach
+    // node-graph materials (.umat / .uminst) only; glTF materials have none.
+    add(WithDefaults(Action("Material.SetScalar", "Set Material Scalar Parameter", "Rendering",
+                            {In("Target", P::Entity), In("Name", P::String), In("Value", P::Float), In("Submesh", P::Int)},
+                            [](ScriptContext& c) {
+                                if (const auto e = Target(c, 2))
+                                    SetMaterialParameter(c, *e, c.InString(3), glm::vec4(c.InFloat(4), 0.0f, 0.0f, 0.0f), c.InInt(5));
+                            }, "Overrides a scalar parameter of the target's materials (Submesh -1: all)"),
+                     {{"Submesh", std::int32_t{-1}}}));
+    add(WithDefaults(Action("Material.SetVector", "Set Material Vector Parameter", "Rendering",
+                            {In("Target", P::Entity), In("Name", P::String), In("Color", P::Vec3), In("Alpha", P::Float),
+                             In("Submesh", P::Int)},
+                            [](ScriptContext& c) {
+                                if (const auto e = Target(c, 2))
+                                    SetMaterialParameter(c, *e, c.InString(3), glm::vec4(c.InVec3(4), c.InFloat(5)), c.InInt(6));
+                            }, "Overrides a vector / color parameter of the target's materials (Submesh -1: all)"),
+                     {{"Color", glm::vec3(1.0f)}, {"Alpha", 1.0f}, {"Submesh", std::int32_t{-1}}}));
+    add(WithDefaults(Action("Material.Set", "Set Material", "Rendering",
+                            {In("Target", P::Entity), In("Material", P::String), In("Submesh", P::Int)},
+                            [](ScriptContext& c) {
+                                const auto e = Target(c, 2);
+                                if (!e)
+                                    return;
+                                std::string path = c.InString(3);
+                                if (!path.empty()) {
+                                    const std::filesystem::path file = PathFromUtf8(path);
+                                    if (!IsMaterialFile(file) && !IsMaterialInstanceFile(file))
+                                        return c.Error("'" + path + "' is not a material (.umat / .uminst)");
+                                    path = PathToUtf8(std::filesystem::absolute(file).lexically_normal());
+                                }
+                                const std::int32_t submesh  = c.InInt(4);
+                                Registry&          registry = c.GetScene().GetRegistry();
+                                const std::uint32_t meshes = ForEachMeshBelow(c, *e, [&](Entity m) {
+                                    std::size_t count = 1; // submeshes of the mesh (without assets: the slots known)
+                                    if (AssetManager* assets = c.Assets())
+                                        if (const Model* model = assets->Get(registry.Get<MeshRenderer>(m).model)) {
+                                            const std::uint32_t mesh = registry.Get<MeshRenderer>(m).meshIndex;
+                                            if (mesh < model->meshes.size())
+                                                count = model->meshes[mesh].submeshes.size();
+                                        }
+                                    if (!registry.Has<MaterialOverrides>(m))
+                                        registry.Emplace<MaterialOverrides>(m, MaterialOverrides{});
+                                    MaterialOverrides& o = registry.Get<MaterialOverrides>(m);
+                                    if (submesh < 0) {
+                                        o.materials.resize(std::max(o.materials.size(), count));
+                                        std::fill(o.materials.begin(), o.materials.end(), path);
+                                    } else {
+                                        o.materials.resize(std::max(o.materials.size(), static_cast<std::size_t>(submesh) + 1));
+                                        o.materials[static_cast<std::size_t>(submesh)] = path;
+                                    }
+                                    c.GetScene().MarkChanged(m);
+                                });
+                                if (meshes == 0)
+                                    c.Error("Target has no mesh (Mesh Renderer) in its hierarchy");
+                            }, "Replaces the material of the target's meshes with a .umat / .uminst (empty: the "
+                               "model's own; Submesh -1: all)"),
+                     {{"Submesh", std::int32_t{-1}}}));
+    add(Action("Material.ClearParameters", "Clear Material Parameters", "Rendering", {In("Target", P::Entity)},
+               [](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   if (!e)
+                       return;
+                   Registry& registry = c.GetScene().GetRegistry();
+                   ForEachMeshBelow(c, *e, [&](Entity m) {
+                       if (MaterialOverrides* o = registry.TryGet<MaterialOverrides>(m); o && !o->parameters.empty()) {
+                           o->parameters.clear();
+                           c.GetScene().MarkChanged(m);
+                       }
+                   });
+               }, "Removes the parameter values set on the target's meshes (the materials' own apply again)"));
+
     // Terrains: height and normal of the ground below / above a location (holes: not found).
     add(Pure("Terrain.GetHeight", "Get Terrain Height", "Terrain",
              {In("Location", P::Vec3), Out("Height", P::Float), Out("Normal", P::Vec3), Out("Found", P::Bool), Out("Terrain", P::Entity)},
@@ -2079,13 +2198,14 @@ std::vector<NodeDesc> BuildRegistry()
                                      : kind == "Decal"     ? r.Has<Decal>(e)
                                      : kind == "FogVolume" ? r.Has<FogVolume>(e)
                                      : kind == "Terrain"   ? r.Has<Terrain>(e)
+                                     : kind == "MaterialOverrides" ? r.Has<MaterialOverrides>(e)
                                                            : false;
                            }
                            c.Out(1, has);
                        }),
                   ParamKind::Choice, "Component", "Mesh",
                   {"Mesh", "Light", "RigidBody", "Collider", "Character", "Camera", "AudioSource", "Script", "Tags", "NavAgent",
-                   "AnimationController", "Decal", "FogVolume", "Terrain"}));
+                   "AnimationController", "Decal", "FogVolume", "Terrain", "MaterialOverrides"}));
     add(Pure("Entity.GetRight", "Get Right Vector", "Transform", {In("Target", P::Entity), Out("Right", P::Vec3)},
              [](ScriptContext& c) {
                  if (const auto e = Target(c, 0))

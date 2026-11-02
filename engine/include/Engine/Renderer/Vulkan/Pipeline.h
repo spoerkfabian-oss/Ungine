@@ -70,6 +70,8 @@ enum class BlendMode { Opaque, Alpha, Additive, Coverage, NoWrite };
 class GraphicsPipelineBuilder {
 public:
     GraphicsPipelineBuilder& SetShaders(std::filesystem::path vertex, std::filesystem::path fragment = {});
+    // SPIR-V in memory (generated material shaders); replaces SetShaders. Empty fragment: depth only.
+    GraphicsPipelineBuilder& SetShaderCode(std::vector<std::uint32_t> vertex, std::vector<std::uint32_t> fragment = {});
     GraphicsPipelineBuilder& SetTopology(VkPrimitiveTopology topology);
     GraphicsPipelineBuilder& SetPolygonMode(VkPolygonMode mode);
     GraphicsPipelineBuilder& SetCulling(VkCullModeFlags cull, VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE);
@@ -89,6 +91,7 @@ public:
 
 private:
     std::filesystem::path m_VertexShader, m_FragmentShader;
+    std::vector<std::uint32_t> m_VertexCode, m_FragmentCode;
     VkPrimitiveTopology   m_Topology         = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPolygonMode         m_PolygonMode      = VK_POLYGON_MODE_FILL;
     VkCullModeFlags       m_CullMode         = VK_CULL_MODE_NONE;

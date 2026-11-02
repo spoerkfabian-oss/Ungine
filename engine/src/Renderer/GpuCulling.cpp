@@ -145,17 +145,33 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
     m_LateViews = 1;
     while (kCameraLateView + m_LateViews < m_ViewCount && (m_Views[kCameraLateView + m_LateViews].flags & kCullViewShadowOcclusion) != 0)
         ++m_LateViews;
+    // Every batch sits in one camera and at most one shadow bucket: a view needs batchCapacity
+    // commands; bucket b of a view starts at the scene's bucket offset.
+    const std::uint32_t cameraBuckets = scene.CameraBucketCount();
+    const std::uint32_t shadowBuckets = scene.ShadowBucketCount();
+    m_BucketStride = std::max(cameraBuckets, shadowBuckets);
+    m_CameraBucketOffset.resize(cameraBuckets);
+    m_CameraBucketCapacity.resize(cameraBuckets);
+    m_ShadowBucketOffset.resize(shadowBuckets);
+    m_ShadowBucketCapacity.resize(shadowBuckets);
+    for (std::uint32_t b = 0; b < cameraBuckets; ++b) {
+        m_CameraBucketOffset[b]   = scene.BucketOffset(false, b);
+        m_CameraBucketCapacity[b] = scene.BucketCapacity(false, b);
+    }
+    for (std::uint32_t b = 0; b < shadowBuckets; ++b) {
+        m_ShadowBucketOffset[b]   = scene.BucketOffset(true, b);
+        m_ShadowBucketCapacity[b] = scene.BucketCapacity(true, b);
+    }
     for (std::uint32_t v = 0; v < m_ViewCount; ++v) {
         m_Views[v].listBase    = v * listSize;
         m_Views[v].counterBase = v * m_BatchCapacity;
-        m_Views[v].commandBase = v * kCameraBuckets * m_BatchCapacity;
+        m_Views[v].commandBase = v * m_BatchCapacity;
     }
     constexpr VkBufferUsageFlags kIndirect = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     Ensure(m_Renderer, m_Visible, VkDeviceSize{m_ViewCount} * listSize * 4, 0, "CullVisible");
     Ensure(m_Renderer, m_Counters, VkDeviceSize{m_ViewCount} * m_BatchCapacity * 4, 0, "CullCounters");
-    Ensure(m_Renderer, m_Commands, VkDeviceSize{m_ViewCount} * kCameraBuckets * m_BatchCapacity * kCommandStride,
-           kIndirect, "CullCommands");
-    Ensure(m_Renderer, m_DrawCounts, VkDeviceSize{m_ViewCount} * kCameraBuckets * 4, kIndirect, "CullDrawCounts");
+    Ensure(m_Renderer, m_Commands, VkDeviceSize{m_ViewCount} * m_BatchCapacity * kCommandStride, kIndirect, "CullCommands");
+    Ensure(m_Renderer, m_DrawCounts, VkDeviceSize{m_ViewCount} * m_BucketStride * 4, kIndirect, "CullDrawCounts");
 
     const VkDeviceAddress viewAddress = [&] {
         const TransientAllocation a = m_Renderer.AllocateTransient(m_Views.size() * sizeof(GpuCullView), 16);
@@ -177,20 +193,23 @@ void GpuCulling::CullEarly(VkCommandBuffer cmd, const GpuScene& scene, std::span
                         .drawCount     = m_DrawCapacity,
                         .batchCount    = m_BatchCapacity,
                         .batchCapacity = m_BatchCapacity,
-                        .pad           = 0,
+                        .bucketStride  = m_BucketStride,
                         .hizInfo       = glm::uvec4(m_HiZSize, m_HiZLevels, 0u),
                         .depthSize     = glm::uvec4(depthExtent.width, depthExtent.height, 0u, 0u),
                         .lodCamera     = lod.camera,
                         .lodInfo       = glm::uvec4(lod.forced, 0u, 0u, 0u),
                         .shadowRegionMin = glm::vec4(lod.shadowRegionMin, 0.0f),
-                        .shadowRegionMax = glm::vec4(lod.shadowRegionMax, 0.0f)};
+                        .shadowRegionMax = glm::vec4(lod.shadowRegionMax, 0.0f),
+                        .bucketOffsets   = scene.BucketAddress(),
+                        .shadowBucketBase = scene.ShadowBucketBase(),
+                        .pad             = 0};
     m_CullData = m_Renderer.PushTransient(m_Data, 16);
 
     // Earlier frames: indirect reads, vertex shader reads of the lists, culling (WAR / WAW), stats copy.
     Barrier(cmd, kDrawStages | kCompute | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | kCompute, VK_ACCESS_2_TRANSFER_WRITE_BIT | kRW);
     vkCmdFillBuffer(cmd, m_Counters.Handle(), 0, VkDeviceSize{m_ViewCount} * m_BatchCapacity * 4, 0);
-    vkCmdFillBuffer(cmd, m_DrawCounts.Handle(), 0, VkDeviceSize{m_ViewCount} * kCameraBuckets * 4, 0);
+    vkCmdFillBuffer(cmd, m_DrawCounts.Handle(), 0, VkDeviceSize{m_ViewCount} * m_BucketStride * 4, 0);
     vkCmdFillBuffer(cmd, m_StatsBuffer.Handle(), 0, VK_WHOLE_SIZE, 0);
     Barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, kCompute, kRW);
 
@@ -272,13 +291,14 @@ void GpuCulling::CopyStats(VkCommandBuffer cmd, std::uint32_t frameIndex)
     m_ReadbackValid[frameIndex] = true;
 }
 
-void GpuCulling::RecordDraw(VkCommandBuffer cmd, std::uint32_t view, std::uint32_t bucket)
+void GpuCulling::RecordDraw(VkCommandBuffer cmd, std::uint32_t view, bool shadow, std::uint32_t bucket)
 {
-    const GpuCullView& v = m_Views[view];
-    vkCmdDrawIndexedIndirectCount(cmd, m_Commands.Handle(),
-                                  VkDeviceSize{v.commandBase + bucket * m_BatchCapacity} * kCommandStride,
-                                  m_DrawCounts.Handle(), VkDeviceSize{view * kCameraBuckets + bucket} * 4,
-                                  m_BatchCapacity, kCommandStride);
+    const GpuCullView&  v        = m_Views[view];
+    const std::uint32_t offset   = shadow ? m_ShadowBucketOffset[bucket] : m_CameraBucketOffset[bucket];
+    const std::uint32_t capacity = shadow ? m_ShadowBucketCapacity[bucket] : m_CameraBucketCapacity[bucket];
+    vkCmdDrawIndexedIndirectCount(cmd, m_Commands.Handle(), VkDeviceSize{v.commandBase + offset} * kCommandStride,
+                                  m_DrawCounts.Handle(), (VkDeviceSize{view} * m_BucketStride + bucket) * 4, capacity,
+                                  kCommandStride);
     ++m_IndirectCalls;
 }
 

@@ -34,7 +34,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define STAT_SHADOW_OCCLUDED 9u // cascades: casters whose shadow nobody sees
 #define STAT_COUNT     10u
 
-#define CAMERA_BUCKETS 4u // cameraBucket 4 = alpha-blended (no indirect command)
+#define CAMERA_BUCKET_BLEND 4u // alpha-blended: no indirect command (sorted CPU pass)
 
 struct CullView {
     mat4 viewProj;
@@ -42,7 +42,7 @@ struct CullView {
     vec4 sphere;    // VIEW_SPHERE: center, radius
     uint listBase;
     uint counterBase;
-    uint commandBase; // bucket b starts at commandBase + b * batchCapacity
+    uint commandBase; // bucket b starts at commandBase + bucketOffsets[b] (camera; shadow: + shadowBucketBase)
     uint flags;
 };
 
@@ -67,20 +67,23 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Cu
     UintBuffer     counters;   // per view: visible draws per batch
     UintBuffer     visible;    // per view: draw records grouped by batch
     UintBuffer     visibility; // per draw record: visible after the last late pass
-    UintBuffer     drawCounts; // per view: commands per bucket (4)
+    UintBuffer     drawCounts; // per view: commands per bucket (bucketStride)
     CommandBuffer  commands;
     HiZBuffer      hiz;
     UintBuffer     stats;
     uint  drawCount;
     uint  batchCount;
     uint  batchCapacity;
-    uint  pad;
+    uint  bucketStride; // draw count slots per view
     uvec4 hizInfo;   // xy: level 0 size, z: level count
     uvec4 depthSize; // xy: depth target size (pixels)
     vec4  lodCamera; // xyz: camera position, w: pixels per unit of error at distance 1 / threshold
     uvec4 lodInfo;   // x: forced LOD + 1 (0: by distance)
     vec4  shadowRegionMin; // VIEW_SHADOW_OCCLUSION: camera frustum up to the shadow distance (world box)
     vec4  shadowRegionMax;
+    UintBuffer bucketOffsets;   // camera buckets, then shadow buckets: first command of the bucket
+    uint       shadowBucketBase; // index of shadow bucket 0 in bucketOffsets
+    uint       pad;
 };
 
 layout(push_constant) uniform CullPush {
@@ -188,11 +191,13 @@ void BuildCommand(uint batchIndex, uint viewIndex)
     if (count == 0u)
         return;
     const GpuBatch batch  = data.batches.b[batchIndex];
-    const uint     bucket = (view.flags & VIEW_SHADOW) != 0u ? batch.shadowBucket : batch.cameraBucket;
-    if (bucket >= CAMERA_BUCKETS)
-        return; // alpha-blended: drawn sorted by the transparent pass (CPU)
-    const uint     index  = atomicAdd(data.drawCounts.u[viewIndex * 4u + bucket], 1u);
-    data.commands.c[view.commandBase + bucket * data.batchCapacity + index] =
+    const bool     shadow = (view.flags & VIEW_SHADOW) != 0u;
+    const uint     bucket = shadow ? batch.shadowBucket : batch.cameraBucket;
+    if (bucket == BUCKET_NONE || (!shadow && bucket == CAMERA_BUCKET_BLEND))
+        return; // casts no shadow / alpha-blended: drawn sorted by the transparent pass (CPU)
+    const uint     first  = data.bucketOffsets.u[(shadow ? data.shadowBucketBase : 0u) + bucket];
+    const uint     index  = atomicAdd(data.drawCounts.u[viewIndex * data.bucketStride + bucket], 1u);
+    data.commands.c[view.commandBase + first + index] =
         DrawCommand(batch.indexCount, count, batch.firstIndex, batch.vertexOffset, view.listBase + batch.instanceBase);
     atomicAdd(data.stats.u[STAT_COMMANDS], 1u);
     if ((view.flags & VIEW_SHADOW) == 0u)
@@ -229,7 +234,9 @@ void main()
             const vec3 c      = (boundsMin + boundsMax) * 0.5;
             const vec3 e      = (boundsMax - boundsMin) * 0.5;
             const vec3 center = (inst.model * vec4(c, 1.0)).xyz;
-            const vec3 extent = mat3(abs(inst.model[0].xyz), abs(inst.model[1].xyz), abs(inst.model[2].xyz)) * e;
+            // Custom materials may displace vertices (world position offset): grow the box.
+            const vec3 extent = mat3(abs(inst.model[0].xyz), abs(inst.model[1].xyz), abs(inst.model[2].xyz)) * e +
+                                vec3(data.batches.b[draw.batch].displacement);
             const bool inside = (skinned && !skinBoundsValid) || InFrustum(view, center, extent);
             const bool occlusion = (!skinned || skinBoundsValid) && (view.flags & VIEW_OCCLUSION) != 0u;
             const float scale = max(max(length(inst.model[0].xyz), length(inst.model[1].xyz)), length(inst.model[2].xyz));
@@ -256,7 +263,10 @@ void main()
             } else if (late) {
                 if (!inside) {
                     data.visibility.u[index] = 0u;
-                } else if ((!skinned || skinBoundsValid) && Occluded(view, inst.model, boundsMin, boundsMax)) {
+                } else if ((!skinned || skinBoundsValid) &&
+                           (data.batches.b[draw.batch].displacement > 0.0
+                                ? Occluded(view, mat4(1.0), center - extent, center + extent) // world box incl. displacement
+                                : Occluded(view, inst.model, boundsMin, boundsMax))) {
                     data.visibility.u[index] = 0u;
                     atomicAdd(sStats[STAT_OCCLUDED], 1u);
                 } else {

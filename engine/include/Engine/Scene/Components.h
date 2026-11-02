@@ -56,6 +56,22 @@ struct MeshRenderer {
     std::uint32_t meshIndex = 0;
 };
 
+// Custom materials of a MeshRenderer (MaterialGraph.h): a .umat / .uminst per submesh of its mesh
+// ("" or missing: the model's glTF material) and parameter values on top of the material's
+// (scalar: x, vector: rgba; also set by blueprints at runtime). Call MarkChanged after edits.
+struct MaterialParameterOverride {
+    std::string  name{};
+    glm::vec4    value{0.0f};
+    std::int32_t submesh = -1; // -1: every submesh
+    bool operator==(const MaterialParameterOverride&) const = default;
+};
+
+struct MaterialOverrides {
+    std::vector<std::string>               materials{}; // absolute in memory, relative to the scene in files
+    std::vector<MaterialParameterOverride> parameters{};
+    bool operator==(const MaterialOverrides&) const = default;
+};
+
 // Root entity of an instantiated model (InstantiateModel). Its node entities carry ModelNodeRef;
 // RefreshModelInstances re-syncs them when the model is reloaded with a different structure.
 struct ModelInstance {
