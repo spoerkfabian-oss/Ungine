@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-27 (Phase 33 material editor implemented on `branch`, PR open; Phase 31 + 32 merged via PR #21, 83cdfcb; next after merge: Phase 34 nested prefabs + settings undo – ask details first)
+- Last updated: 2026-11-02 (Phase 33 material editor merged via PR #22, 1726841; next: Phase 34 nested prefabs + settings undo – ask details first)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1028,7 +1028,7 @@ If an audit finds no concrete defect:
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
 - Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) merged (PR #19, fa23918, 2026-10-22).
 - Phase 30 merged (PR #20); Phase 31 + 32 merged (PR #21, 83cdfcb, 2026-10-27).
-- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) implemented on `branch` (2026-10-27), PR pending.
+- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) merged (PR #22, 2026-11-02).
 
 ### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
 - State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
