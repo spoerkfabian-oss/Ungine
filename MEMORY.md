@@ -1049,6 +1049,12 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
 
+### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)
+- Prefabs: nested (prefab instances inside prefabs, overrides per level, Apply chooses the target level) + variants (.uprefab with base prefab + overrides). Not: reparenting members / adding-removing components or children as overrides.
+- Settings undo in the scene history: renderer settings, project settings (audio mixer, input, navigation, save/loading screen), physics settings, and editor view (camera/toolbar overlay toggles).
+- Editor view camera: undo only for discrete jumps (Focus F, Game-cam on/off, camera fields in the renderer panel like FOV/speed); free flight is not undoable; toolbar toggles (overlays, debug view) always.
+- Asset windows (Blueprint, Material, Particle, Animation) keep their own undo (no global history).
+
 ### Phase 33 material editor – decisions (user, 2026-10-27)
 - Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
 - Also: material instances (override parameters of a base material, settable per Blueprint at runtime), blend/shading models (Opaque/Masked/Translucent/Additive, Unlit, Two-Sided, Emissive), vertex animation (world position offset with velocity for TAA), per-submesh material overrides on MeshRenderer (drag & drop in the editor).
