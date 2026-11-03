@@ -5430,3 +5430,121 @@ TEST_CASE(Editor_SettingsUndoAndNestedPrefabs)
     fs::remove_all(root, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
+
+// Blueprint inheritance in the editor: child blueprint from the content browser, the Class section
+// (parent, inherited variables with defaults, Override), Call Parent in the palette, play.
+TEST_CASE(Editor_BlueprintInheritance)
+{
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      dir = fs::temp_directory_path() / ("ungine_gpu_p35_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    ScriptRegistry::Clear();
+
+    Scene         scene;
+    Registry&     r = scene.GetRegistry();
+    ScriptSystem  scripts(F().events, nullptr, nullptr, F().assets.get());
+    SceneRenderer sceneRenderer(*F().renderer, *F().context, *F().assets);
+    sceneRenderer.shadows.resolution = 512;
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    Editor editor({.window        = *F().window,
+                   .renderer      = *F().renderer,
+                   .scene         = scene,
+                   .assets        = *F().assets,
+                   .sceneRenderer = sceneRenderer,
+                   .camera        = camera,
+                   .modelRefs     = modelRefs,
+                   .scripts       = &scripts,
+                   .layoutFile    = {}});
+    const auto runFrames = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            F().window->PollEvents();
+            F().events.Flush();
+            editor.FixedUpdate(1.0f / 60.0f);
+            F().assets->Update();
+            editor.Update(1.0f / 60.0f);
+            if (auto frame = F().renderer->BeginFrame()) {
+                editor.Render(*frame, 0.5f);
+                F().renderer->EndFrame(*frame);
+            }
+        }
+    };
+    const auto printed = [&](std::string_view text) {
+        return std::ranges::any_of(scripts.Messages(), [&](const ScriptMessage& m) { return m.text == text; });
+    };
+
+    // Parent on disk: Speed 1, Describe() -> "enemy", BeginPlay prints Describe and Speed.
+    const fs::path baseFile = dir / "Enemy.ugraph";
+    {
+        ScriptGraph g;
+        g.variables.push_back({"Speed", PinType::Float, 1.0f, false});
+        CHECK(g.AddFunction("Describe"));
+        g.FindFunction("Describe")->outputs = {{"Text", PinType::String}};
+        g.FunctionSignatureChanged("Describe");
+        for (ScriptNode& n : g.nodes)
+            if (n.type == "Function.Return")
+                n.defaults["Text"] = std::string("enemy");
+        const std::uint32_t begin = g.AddNode("Event.BeginPlay", {});
+        const std::uint32_t call  = g.AddNode("Function.Call", {200.0f, 0.0f}, "Describe");
+        const std::uint32_t p1    = g.AddNode("Debug.Print", {400.0f, 0.0f});
+        const std::uint32_t get   = g.AddNode("Variable.Get", {400.0f, 150.0f}, "Speed");
+        const std::uint32_t p2    = g.AddNode("Debug.Print", {600.0f, 0.0f});
+        CHECK(g.Connect(begin, "Out", call, "In").empty() && g.Connect(call, "Then", p1, "In").empty() &&
+              g.Connect(call, "Text", p1, "Text").empty() && g.Connect(p1, "Then", p2, "In").empty() &&
+              g.Connect(get, "Value", p2, "Text").empty());
+        SaveScriptGraph(baseFile, g);
+    }
+
+    // Child blueprint (content browser): opened with the parent resolved, no own events.
+    const fs::path childFile = editor.CreateChildBlueprint(baseFile);
+    CHECK(childFile == dir / "Enemy_Child.ugraph" && fs::exists(childFile));
+    ScriptGraphEditor& bp = editor.Blueprints();
+    CHECK(bp.Graph() && bp.Graph()->parent == "Enemy.ugraph" && bp.Graph()->inherited && bp.ParentError().empty());
+    if (!bp.Graph() || !bp.Graph()->inherited)
+        return;
+    CHECK(std::ranges::none_of(bp.Diagnostics(), &ScriptDiagnostic::error));
+    runFrames(4); // Class section drawn
+
+    // Override Describe (parent + "!"), Speed default 3, undo / redo keep the inheritance.
+    bp.Edit("Override", [](ScriptGraph& g) {
+        CHECK(g.OverrideFunction("Describe"));
+        g.defaults["Speed"] = 3.0f;
+        std::uint32_t parentCall = 0, ret = 0;
+        for (const ScriptNode& n : g.nodes) {
+            if (n.type == "Function.CallParent")
+                parentCall = n.id;
+            if (n.type == "Function.Return")
+                ret = n.id;
+        }
+        const std::uint32_t append = g.AddNode("String.Append", {300.0f, 150.0f}, {}, "Describe");
+        g.FindNode(append)->defaults["B"] = std::string("!");
+        CHECK(g.Connect(parentCall, "Text", append, "A").empty() && g.Connect(append, "Result", ret, "Text").empty());
+    });
+    CHECK(std::ranges::none_of(bp.Diagnostics(), &ScriptDiagnostic::error));
+    CHECK(bp.Undo() && bp.Graph()->inherited && bp.Graph()->functions.empty());
+    CHECK(bp.Redo() && bp.Graph()->inherited && bp.Graph()->functions.size() == 1);
+    bp.OpenScope("Describe");
+    runFrames(3);
+    bp.OpenScope({});
+    // A broken parent shows up as an error; back to the real one.
+    CHECK(!bp.SetParentClass(dir / "Missing.ugraph") && !bp.ParentError().empty());
+    CHECK(std::ranges::any_of(bp.Diagnostics(), &ScriptDiagnostic::error));
+    CHECK(bp.Undo() && bp.ParentError().empty() && bp.Graph()->parent == "Enemy.ugraph");
+    CHECK(!bp.SetParentClass(childFile)); // not its own parent
+    CHECK(bp.Save());
+
+    // Play: the child runs the parent's BeginPlay with its own Describe and default.
+    const Entity orc = scene.CreateEntity("Orc");
+    r.Emplace<ScriptComponent>(orc, ScriptComponent{PathToUtf8(childFile)});
+    runFrames(2);
+    editor.Play();
+    runFrames(3);
+    CHECK(printed("enemy!") && printed("3") && !printed("1"));
+    CHECK(scripts.InstancesOf(baseFile).size() == 1);
+    editor.Stop();
+    runFrames(2);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}

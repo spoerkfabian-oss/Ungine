@@ -1461,6 +1461,8 @@ void Editor::DrawContentBrowser()
                     }
                     if (item.kind == ContentItem::Kind::Prefab && ImGui::MenuItem("Create variant"))
                         (void)CreatePrefabVariantOf(item.path);
+                    if (item.kind == ContentItem::Kind::Blueprint && ImGui::MenuItem("Create child blueprint"))
+                        (void)CreateChildBlueprint(item.path);
                     if (item.kind == ContentItem::Kind::ParticleEffect) {
                         if (ImGui::MenuItem("Place particle system"))
                             CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -2510,6 +2512,30 @@ fs::path Editor::CreatePrefabVariantOf(const fs::path& base)
     }
     m_Status = "Variant " + PathToUtf8(file.filename());
     RefreshContent();
+    return file;
+}
+
+fs::path Editor::CreateChildBlueprint(const fs::path& parent)
+{
+    const fs::path file = UniquePath(parent.parent_path(), PathToUtf8(parent.stem()) + "_Child", ".ugraph");
+    try {
+        const ScriptGraph base = LoadScriptGraph(parent);
+        if (base.library)
+            throw std::runtime_error("A library cannot be a parent class");
+        ScriptGraph child;
+        child.parent = ScriptParentPath(file, parent);
+        SaveScriptGraph(file, child);
+    } catch (const std::exception& e) {
+        m_Status = e.what();
+        ENGINE_ERROR("{}", m_Status);
+        return {};
+    }
+    m_Status = "Child blueprint " + PathToUtf8(file.filename());
+    RefreshContent();
+    if (m_Graphs->Open(file)) {
+        m_ShowBlueprint = true;
+        m_Graphs->Focus();
+    }
     return file;
 }
 
