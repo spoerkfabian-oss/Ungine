@@ -69,8 +69,15 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
    Teilbaum als `.uprefab` (z. B. `Content/Prefabs/`). Prefabs per Doppelklick oder Ziehen aus dem
    Content-Browser platzieren; Änderungen an einer Instanz sind *Overrides* (Inspector: einzeln
    zurücksetzen), *Apply to prefab* überträgt sie auf alle Instanzen, *Unlink* löst die Verbindung.
-   Blueprints erzeugen Prefabs zur Laufzeit mit *Spawn Prefab*. *Print String* erscheint im Player
-   oben links auf dem Bildschirm.
+   Prefabs lassen sich verschachteln (Instanzen in einem Teilbaum bleiben beim *Create prefab…*
+   eigene Prefabs; der Inspector zeigt unter *From* die Ebenen, *Apply to…* schreibt in das äußere
+   oder ein inneres Prefab). *Varianten*: Content-Browser → Rechtsklick auf ein Prefab → *Create
+   variant* bzw. *Create prefab variant…* auf einer Instanz – eine Variante übernimmt alle Änderungen
+   ihrer Basis außer den eigenen Overrides. Blueprints erzeugen Prefabs zur Laufzeit mit *Spawn
+   Prefab*. *Print String* erscheint im Player oben links auf dem Bildschirm.
+   Undo (Strg+Z) deckt auch Renderer-, Physik- und Projekt-Settings sowie die Viewport-Ansicht
+   (Overlays, Debug-Ansicht, Kamerafelder, Fokus mit F) ab; Ansicht und Projekt-Settings markieren
+   die Szene nicht als geändert.
 11. **Blueprints 3**: Content → *+ New* → *Enum*, *Struct*, *Interface* (bearbeitet im Fenster
    *Blueprint types*) und *Blueprint library* (Funktionen/Makros für alle Blueprints, Aufruf als
    `Bibliothek.Funktion`). Variablen-Typen: Arrays, Maps (`Map<string, int>`), Enums, Structs. In der

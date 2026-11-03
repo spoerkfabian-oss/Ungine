@@ -1588,19 +1588,25 @@ std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::pat
                     addModel(*model, dir);
     };
     std::unordered_set<std::string> prefabs;
-    for (const json& entity : *entities) {
-        addEntity(entity, prepared->baseDir);
+    // Entities of the scene and of the prefabs it instantiates (nested prefabs included).
+    std::vector<std::pair<json, std::filesystem::path>> pending;
+    for (const json& entity : *entities)
+        pending.emplace_back(entity, prepared->baseDir);
+    while (!pending.empty()) {
+        const auto [entity, dir] = std::move(pending.back());
+        pending.pop_back();
+        addEntity(entity, dir);
         const auto prefab = entity.is_object() ? entity.find("prefab") : entity.end();
         if (!entity.is_object() || prefab == entity.end() || !prefab->is_object())
             continue;
         if (const auto overrides = prefab->find("overrides"); overrides != prefab->end() && overrides->is_object())
             for (const json& patch : *overrides)
-                addEntity(patch, prepared->baseDir);
+                addEntity(patch, dir);
         std::filesystem::path prefabFile = FromUtf8(prefab->value("file", std::string()));
         if (prefabFile.empty())
             continue;
         if (prefabFile.is_relative())
-            prefabFile = prepared->baseDir / prefabFile;
+            prefabFile = dir / prefabFile;
         if (!prefabs.insert(ToUtf8(prefabFile.lexically_normal())).second)
             continue;
         const std::optional<std::string> text = Vfs::ReadText(prefabFile);
@@ -1610,7 +1616,7 @@ std::shared_ptr<const PreparedScene> PrepareSceneFile(const std::filesystem::pat
             const json prefabJson = json::parse(*text);
             if (const auto list = prefabJson.find("entities"); list != prefabJson.end() && list->is_array())
                 for (const json& member : *list)
-                    addEntity(member, prefabFile.parent_path());
+                    pending.emplace_back(member, prefabFile.parent_path());
         } catch (const json::exception&) {
         }
     }
@@ -1856,4 +1862,22 @@ bool ApplyEntityStateDiff(Scene& scene, Entity target, const std::string& before
     BindModelNodeRefsToInstances(scene);
     return true;
 }
+std::string RendererSettingsText(const SceneRenderer& renderer) { return RendererToJson(renderer).dump(); }
+
+void ApplyRendererSettingsText(SceneRenderer& renderer, const std::string& text)
+{
+    const json j = json::parse(text, nullptr, false);
+    if (j.is_object())
+        RendererFromJson(j, renderer);
+}
+
+std::string PhysicsSettingsText(const PhysicsSettings& settings) { return PhysicsSettingsToJson(settings).dump(); }
+
+void ApplyPhysicsSettingsText(PhysicsSettings& settings, const std::string& text)
+{
+    const json j = json::parse(text, nullptr, false);
+    if (j.is_object())
+        PhysicsSettingsFromJson(j, settings);
+}
+
 } // namespace Engine

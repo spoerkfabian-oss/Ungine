@@ -14,6 +14,7 @@ struct EditCommand {
     std::string           label;
     std::function<void()> undo;
     std::function<void()> redo;
+    bool                  sceneChange = true; // false: not saved with the scene (editor view, project settings)
 };
 
 // Linear undo/redo stack. Commands are pushed after they were executed; pushing drops the redo
@@ -32,8 +33,8 @@ public:
     [[nodiscard]] const std::string& UndoLabel() const;
     [[nodiscard]] const std::string& RedoLabel() const;
 
-    // Unsaved changes: the position differs from the one at the last MarkSaved (or Clear).
-    [[nodiscard]] bool Dirty() const { return m_Position != m_SavedPosition; }
+    // Unsaved changes: scene changes between the position and the one at the last MarkSaved (or Clear).
+    [[nodiscard]] bool Dirty() const;
     void               MarkSaved() { m_SavedPosition = m_Position; }
     // Changes with every Push / Undo / Redo / Clear (follow-up work such as construction scripts).
     [[nodiscard]] std::uint64_t Revision() const { return m_Revision; }

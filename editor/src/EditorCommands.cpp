@@ -13,6 +13,7 @@
 #include "Engine/Core/Project.h"
 #include "Engine/Core/Window.h"
 #include "Engine/Physics/PhysicsWorld.h"
+#include "Engine/Navigation/NavigationWorld.h"
 #include "Engine/Script/ScriptSystem.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Engine/Renderer/SceneRenderer.h"
@@ -45,6 +46,140 @@ void Editor::PushCommand(EditCommand command)
 {
     if (m_PlayState == PlayState::Edit) // play-mode changes are discarded by Stop
         m_History->Push(std::move(command));
+}
+
+// --- Settings undo -----------------------------------------------------------------------------
+
+Editor::ViewState Editor::CaptureView() const
+{
+    ViewState v;
+    v.lights     = m_ShowLightIcons;
+    v.bvh        = m_ShowBvh;
+    v.colliders  = m_ShowColliders;
+    v.audio      = m_ShowAudio;
+    v.particles  = m_ShowParticles;
+    v.volumes    = m_ShowVolumes;
+    v.navMesh    = m_ShowNavMesh;
+    v.gameCamera = m_GameCamera;
+    v.bvhDepth   = m_BvhDepth;
+    v.debugView  = static_cast<std::uint32_t>(m_Ctx.sceneRenderer.post.debugView);
+    return v;
+}
+
+void Editor::ApplyView(const ViewState& v)
+{
+    m_ShowLightIcons = v.lights;
+    m_ShowBvh        = v.bvh;
+    m_ShowColliders  = v.colliders;
+    m_ShowAudio      = v.audio;
+    m_ShowParticles  = v.particles;
+    m_ShowVolumes    = v.volumes;
+    m_ShowNavMesh    = v.navMesh;
+    m_GameCamera     = v.gameCamera;
+    m_BvhDepth       = v.bvhDepth;
+    m_Ctx.sceneRenderer.post.debugView = static_cast<DebugView>(v.debugView);
+    m_ViewBaseline   = v;
+}
+
+Editor::CameraFields Editor::CaptureCameraFields() const
+{
+    return {m_Ctx.camera.fovY, m_Ctx.camera.nearPlane, m_Ctx.camera.moveSpeed};
+}
+
+Editor::CameraPose Editor::CaptureCameraPose() const
+{
+    return {m_Ctx.camera.position, m_Ctx.camera.yaw, m_Ctx.camera.pitch};
+}
+
+void Editor::ResetSettingsBaselines()
+{
+    m_RendererBaseline = RendererSettingsText(m_Ctx.sceneRenderer);
+    m_PhysicsBaseline  = m_Ctx.physics ? PhysicsSettingsText(m_Ctx.physics->settings) : std::string();
+    m_ProjectBaseline  = m_Ctx.project ? std::make_shared<ProjectSettings>(m_Ctx.project->settings) : nullptr;
+    m_ViewBaseline     = CaptureView();
+}
+
+void Editor::TrackSettings()
+{
+    if (m_PlayState != PlayState::Edit || !m_ViewBaseline) { // play-mode changes are no steps
+        ResetSettingsBaselines();
+        return;
+    }
+    if (ImGui::IsAnyItemActive())
+        return; // a drag / text edit in progress: one step when it ends
+
+    if (std::string now = RendererSettingsText(m_Ctx.sceneRenderer); now != m_RendererBaseline) {
+        const auto apply = [this](const std::string& text) {
+            ApplyRendererSettingsText(m_Ctx.sceneRenderer, text);
+            m_RendererBaseline = RendererSettingsText(m_Ctx.sceneRenderer);
+        };
+        PushCommand({"Renderer settings", [apply, before = m_RendererBaseline] { apply(before); }, [apply, now] { apply(now); }});
+        m_RendererBaseline = std::move(now);
+    }
+    if (m_Ctx.physics)
+        if (std::string now = PhysicsSettingsText(m_Ctx.physics->settings); now != m_PhysicsBaseline) {
+            const auto apply = [this](const std::string& text) {
+                if (!m_Ctx.physics)
+                    return;
+                ApplyPhysicsSettingsText(m_Ctx.physics->settings, text);
+                m_PhysicsBaseline = PhysicsSettingsText(m_Ctx.physics->settings);
+            };
+            PushCommand({"Physics settings", [apply, before = m_PhysicsBaseline] { apply(before); }, [apply, now] { apply(now); }});
+            m_PhysicsBaseline = std::move(now);
+        }
+    if (m_Ctx.project && m_ProjectBaseline && !(m_Ctx.project->settings == *m_ProjectBaseline)) {
+        const auto apply = [this](const ProjectSettings& settings) {
+            if (!m_Ctx.project)
+                return;
+            m_Ctx.project->settings = settings;
+            if (m_Ctx.audio)
+                m_Ctx.audio->Apply(settings.audio);
+            if (m_Ctx.navigation) {
+                NavSettings next = settings.navigation;
+                SanitizeNavSettings(next);
+                if (!(next == m_Ctx.navigation->Settings()))
+                    m_Ctx.navigation->SetSettings(next);
+            }
+            m_ProjectDirty    = true; // saved with File > Save all
+            m_ProjectBaseline = std::make_shared<ProjectSettings>(settings);
+        };
+        PushCommand({"Project settings", [apply, before = *m_ProjectBaseline] { apply(before); },
+                     [apply, now = m_Ctx.project->settings] { apply(now); }, false});
+        m_ProjectBaseline = std::make_shared<ProjectSettings>(m_Ctx.project->settings);
+    }
+    if (const ViewState now = CaptureView(); !(now == *m_ViewBaseline)) {
+        PushCommand({"Viewport view", [this, before = *m_ViewBaseline] { ApplyView(before); }, [this, now] { ApplyView(now); }, false});
+        m_ViewBaseline = now;
+    }
+}
+
+void Editor::PushCameraJump(std::string label, const CameraPose& before)
+{
+    const auto apply = [this](const CameraPose& pose) {
+        m_Ctx.camera.position = pose.position;
+        m_Ctx.camera.yaw      = pose.yaw;
+        m_Ctx.camera.pitch    = pose.pitch;
+    };
+    PushCommand({std::move(label), [apply, before] { apply(before); }, [apply, after = CaptureCameraPose()] { apply(after); }, false});
+}
+
+void Editor::TrackCameraFieldEdit(const CameraFields& before)
+{
+    if (ImGui::IsItemActivated())
+        m_CameraEditBefore = before; // the values when the widget was grabbed
+    if (!ImGui::IsItemDeactivatedAfterEdit())
+        return;
+    const CameraFields start = m_CameraEditBefore.value_or(before);
+    m_CameraEditBefore.reset();
+    const CameraFields after = CaptureCameraFields();
+    if (after == start)
+        return;
+    const auto apply = [this](const CameraFields& f) {
+        m_Ctx.camera.fovY      = f.fovY;
+        m_Ctx.camera.nearPlane = f.nearPlane;
+        m_Ctx.camera.moveSpeed = f.moveSpeed;
+    };
+    PushCommand({"Camera settings", [apply, start] { apply(start); }, [apply, after] { apply(after); }, false});
 }
 
 bool Editor::Undo()
@@ -301,25 +436,37 @@ Entity Editor::PlacePrefab(const std::filesystem::path& file, const glm::vec3& p
     return e;
 }
 
-bool Editor::RunPrefabOp(PrefabOp op, Entity entity, const std::string& key)
+bool Editor::RunPrefabOp(PrefabOp op, Entity entity, const std::string& key, std::size_t level)
 {
     const Entity root = PrefabInstanceRoot(m_Ctx.scene, entity);
     if (root == NullEntity)
         return false;
     Registry&                  registry = m_Ctx.scene.GetRegistry();
     std::vector<std::uint64_t> affected{UuidOf(root)};
-    if (op == PrefabOp::Apply) { // every instance of the prefab is rebuilt
-        const std::string file = registry.Get<PrefabInstance>(root).prefab;
+    std::string                target; // Apply: the prefab written
+    if (op == PrefabOp::Apply) { // every instance of that prefab or of one nesting it is rebuilt
+        const std::vector<PrefabLevel> levels = PrefabLevels(m_Ctx.scene, entity);
+        if (level >= levels.size())
+            return false;
+        target = levels[level].file;
         registry.ViewOf<PrefabInstance>().Each([&](Entity e, PrefabInstance& instance) {
-            if (e != root && instance.prefab == file)
+            if (e == root)
+                return;
+            const std::string file = PathToUtf8(PathFromUtf8(instance.prefab).lexically_normal());
+            if (file == target || [&] {
+                const auto nested = PrefabNestedFiles(PathFromUtf8(instance.prefab));
+                return std::ranges::find(nested, target) != nested.end();
+            }())
                 affected.push_back(UuidOf(e));
         });
     }
     std::string before = SnapshotEntities(m_Ctx.scene, OutermostRoots(affected));
-    const char* label  = op == PrefabOp::Apply ? "Apply to prefab" : op == PrefabOp::Revert ? "Revert to prefab" : "Unlink prefab";
+    const std::string label = op == PrefabOp::Apply ? "Apply to " + PathToUtf8(PathFromUtf8(target).filename())
+                              : op == PrefabOp::Revert ? std::string("Revert to prefab")
+                                                       : std::string("Unlink prefab");
     try {
         switch (op) {
-        case PrefabOp::Apply: ApplyPrefabInstance(m_Ctx.scene, &m_Ctx.assets, root, m_Ctx.modelRefs); break;
+        case PrefabOp::Apply: ApplyPrefabLevel(m_Ctx.scene, &m_Ctx.assets, entity, level, m_Ctx.modelRefs); break;
         case PrefabOp::Revert: RevertPrefabOverrides(m_Ctx.scene, &m_Ctx.assets, entity, key, m_Ctx.modelRefs); break;
         case PrefabOp::Unlink: UnlinkPrefabInstance(m_Ctx.scene, root); break;
         }
@@ -332,6 +479,8 @@ bool Editor::RunPrefabOp(PrefabOp op, Entity entity, const std::string& key)
     ValidateSelection();
     m_Ctx.scene.UpdateTransforms();
     m_Status = label;
+    if (op == PrefabOp::Apply)
+        RefreshContent();
     return true;
 }
 
@@ -339,7 +488,7 @@ void Editor::ApplyPendingEdits()
 {
     if (const auto op = std::exchange(m_PendingPrefabOp, std::nullopt))
         if (const Entity e = m_Ctx.scene.FindByUuid(op->uuid); e != NullEntity)
-            RunPrefabOp(op->op, e, op->key);
+            RunPrefabOp(op->op, e, op->key, op->level);
     if (!m_PendingDelete.empty()) {
         m_Selection = std::exchange(m_PendingDelete, {});
         ValidateSelection();
@@ -390,6 +539,7 @@ void Editor::NewScene()
     m_InspectorEdit.reset();
     m_ScenePath.clear();
     LoadNavigation({});
+    ResetSettingsBaselines();
     m_Status = "New scene";
 }
 
@@ -425,6 +575,7 @@ bool Editor::OpenScene(const std::filesystem::path& file)
         return false;
     m_ScenePath = file;
     LoadNavigation(file); // its baked navmesh (tiles of later changes are rebuilt)
+    ResetSettingsBaselines(); // the scene's renderer / physics settings and camera: no undo step
     m_Status    = "Opened " + file.filename().string();
     m_Ctx.scene.UpdateTransforms();
     ENGINE_INFO("Opened scene '{}'", file.string());
@@ -940,6 +1091,7 @@ void Editor::Stop()
     m_PlayState     = PlayState::Edit;
     m_ConstructedRevision = ~std::uint64_t{0}; // constructed entities of the snapshot: rebuilt
     m_StepRequested = false;
+    ResetSettingsBaselines();
     m_Status        = "Stopped";
 }
 

@@ -31,6 +31,8 @@ struct ProjectSettings {
     AudioSettings audio;        // mixer (bus volumes / mutes), occlusion
     InputMap      input;        // input actions / axes for blueprints
     NavSettings   navigation;   // navmesh voxels / tiles, agent profiles, area types
+
+    bool operator==(const ProjectSettings&) const = default;
 };
 
 struct ProjectTemplate {

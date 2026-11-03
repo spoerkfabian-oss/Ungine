@@ -21,6 +21,7 @@
 #include "Engine/Physics/PhysicsMaterial.h"
 #include "Engine/Renderer/SceneRenderer.h"
 #include "Engine/Scene/Camera.h"
+#include "Engine/Scene/Prefab.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/SceneSerializer.h"
 #include "Engine/Script/ScriptNodes.h"
@@ -1401,8 +1402,13 @@ void Editor::DrawContentBrowser()
                             OpenAsset(item.path);
                     }
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", PathToUtf8(item.path).c_str());
+                if (ImGui::IsItemHovered()) {
+                    const std::string base = item.kind == ContentItem::Kind::Prefab ? PrefabBase(item.path) : std::string();
+                    if (base.empty())
+                        ImGui::SetTooltip("%s", PathToUtf8(item.path).c_str());
+                    else
+                        ImGui::SetTooltip("%s\nVariant of %s", PathToUtf8(item.path).c_str(), PathToUtf8(PathFromUtf8(base).filename()).c_str());
+                }
                 if (item.kind != ContentItem::Kind::Folder && ImGui::BeginDragDropSource()) {
                     const std::string payload = PathToUtf8(item.path);
                     ImGui::SetDragDropPayload(kContentPayload, payload.c_str(), payload.size() + 1);
@@ -1453,6 +1459,8 @@ void Editor::DrawContentBrowser()
                             OpenAsset(file);
                         }
                     }
+                    if (item.kind == ContentItem::Kind::Prefab && ImGui::MenuItem("Create variant"))
+                        (void)CreatePrefabVariantOf(item.path);
                     if (item.kind == ContentItem::Kind::ParticleEffect) {
                         if (ImGui::MenuItem("Place particle system"))
                             CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -2487,6 +2495,22 @@ void Editor::DrawSoundCue()
             ImGui::SetTooltip("Save first: the preview plays the saved cue");
     }
     ImGui::End();
+}
+
+fs::path Editor::CreatePrefabVariantOf(const fs::path& base)
+{
+    const fs::path file =
+        UniquePath(base.parent_path(), PathToUtf8(base.stem()) + "_Variant", std::string(kPrefabExtension));
+    try {
+        CreatePrefabVariant(file, base);
+    } catch (const std::exception& e) {
+        m_Status = e.what();
+        ENGINE_ERROR("{}", m_Status);
+        return {};
+    }
+    m_Status = "Variant " + PathToUtf8(file.filename());
+    RefreshContent();
+    return file;
 }
 
 } // namespace Engine

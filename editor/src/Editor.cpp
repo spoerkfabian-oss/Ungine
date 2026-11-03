@@ -188,6 +188,7 @@ float Editor::ViewportAspect() const
 bool Editor::CanUndo() const { return m_History->CanUndo(); }
 bool Editor::CanRedo() const { return m_History->CanRedo(); }
 bool Editor::HasUnsavedChanges() const { return m_History->Dirty(); }
+const std::string& Editor::UndoLabel() const { return m_History->UndoLabel(); }
 
 void Editor::Update(float dt)
 {
@@ -256,6 +257,7 @@ void Editor::Update(float dt)
 
     HandleHotkeys();
     ApplyPendingEdits();
+    TrackSettings();
     UpdatePendingInstances();
     UpdateContentImport(); // also with the content browser closed
     // Prefab files changed on disk (another editor, version control): instances follow.
@@ -1635,6 +1637,7 @@ void Editor::FocusSelected()
     const Entity primary = Selected();
     if (primary == NullEntity)
         return;
+    const CameraPose before = CaptureCameraPose();
     // Frame the selection's bounds (keeping the viewing direction); without meshes, the pivot.
     glm::vec3 target   = glm::vec3(m_Ctx.scene.GetRegistry().Get<WorldTransform>(primary).matrix[3]);
     float     distance = std::clamp(glm::length(target - m_Ctx.camera.position), 1.0f, 10.0f);
@@ -1646,6 +1649,7 @@ void Editor::FocusSelected()
     }
     m_Ctx.camera.position = target - m_Ctx.camera.Forward() * distance;
     m_Ctx.camera.LookAt(target);
+    PushCameraJump("Focus", before);
 }
 
 // --- Selection --------------------------------------------------------------------------------

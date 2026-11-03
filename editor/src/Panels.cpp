@@ -436,7 +436,8 @@ void Editor::DrawHierarchyNode(Entity entity)
         if (streamed && ImGui::MenuItem("Open level"))
             RequestSceneChange([this, file = PathFromUtf8(StreamedLevelOf(entity))] { OpenScene(file); });
         ImGui::Separator();
-        if (ImGui::MenuItem("Create prefab...", nullptr, false, editable && m_PlayState == PlayState::Edit)) {
+        if (ImGui::MenuItem(prefabRoot == entity ? "Create prefab variant..." : "Create prefab...", nullptr, false,
+                            editable && m_PlayState == PlayState::Edit)) {
             m_PrefabTarget  = entity;
             m_DialogPurpose = DialogPurpose::CreatePrefab;
             std::error_code ec;
@@ -449,8 +450,14 @@ void Editor::DrawHierarchyNode(Entity entity)
             const bool edit = editable && m_PlayState == PlayState::Edit;
             if (prefabRoot != entity && ImGui::MenuItem("Select prefab root"))
                 Select(prefabRoot);
-            if (ImGui::MenuItem("Apply to prefab", nullptr, false, edit))
-                m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+            const std::vector<PrefabLevel> levels = PrefabLevels(m_Ctx.scene, entity);
+            if (levels.size() <= 1) {
+                if (ImGui::MenuItem("Apply to prefab", nullptr, false, edit))
+                    m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}};
+            } else if (ImGui::BeginMenu("Apply to", edit)) {
+                DrawPrefabApplyLevels(entity, levels);
+                ImGui::EndMenu();
+            }
             if (ImGui::MenuItem(prefabRoot == entity ? "Revert instance" : "Revert entity", nullptr, false, edit))
                 m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Revert, UuidOf(entity), {}};
             if (ImGui::MenuItem("Unlink prefab", nullptr, false, edit))
@@ -1614,6 +1621,26 @@ void Editor::DrawPrefabHeader(Entity entity)
     ImGui::TextColored(ImVec4(0.45f, 0.72f, 1.0f, 1.0f), "Prefab %s", PathToUtf8(PathFromUtf8(instance.prefab).filename()).c_str());
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", instance.prefab.c_str());
+    if (const std::string base = PrefabBase(PathFromUtf8(instance.prefab)); !base.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(variant of %s)", PathToUtf8(PathFromUtf8(base).filename()).c_str());
+    }
+    // Nested prefabs this entity comes from (outermost first).
+    const std::vector<PrefabLevel> levels = PrefabLevels(m_Ctx.scene, entity);
+    if (levels.size() > 1) {
+        ImGui::TextDisabled("From:");
+        for (std::size_t i = 0; i < levels.size(); ++i) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(i == 0 ? "" : ">");
+            ImGui::SameLine();
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton(PathToUtf8(PathFromUtf8(levels[i].file).filename()).c_str()) && levels[i].root != NullEntity)
+                Select(levels[i].root);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\nClick: select this level's instance root", levels[i].file.c_str());
+            ImGui::PopID();
+        }
+    }
     if (!instance.built && instance.unresolved)
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "The prefab file is missing: the instance keeps its saved data");
     if (root != entity) {
@@ -1639,6 +1666,20 @@ void Editor::DrawPrefabHeader(Entity entity)
             ImGui::PopID();
         }
     }
+    if (levels.size() > 1) { // apply into one of the nested prefabs
+        ImGui::BeginDisabled(!edit);
+        if (ImGui::Button("Apply to..."))
+            ImGui::OpenPopup("applyLevels");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Writes this entity's nested instance into the chosen prefab; every instance depending on it updates");
+        if (ImGui::BeginPopup("applyLevels")) {
+            DrawPrefabApplyLevels(entity, levels);
+            ImGui::EndPopup();
+        }
+        if (root == entity)
+            ImGui::SameLine();
+    }
     if (root == entity) {
         const std::size_t changes = PrefabOverrides(m_Ctx.scene, &m_Ctx.assets, root).size();
         ImGui::BeginDisabled(!edit);
@@ -1658,6 +1699,19 @@ void Editor::DrawPrefabHeader(Entity entity)
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
+}
+
+void Editor::DrawPrefabApplyLevels(Entity entity, const std::vector<PrefabLevel>& levels)
+{
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+        const std::string name  = PathToUtf8(PathFromUtf8(levels[i].file).filename());
+        const std::string label = i == 0 ? name + "  (the whole instance)" : name;
+        if (ImGui::MenuItem(label.c_str(), nullptr, false, levels[i].root != NullEntity))
+            m_PendingPrefabOp = PendingPrefabOp{PrefabOp::Apply, UuidOf(entity), {}, i};
+        if (i > 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Component values of the nested instance only (added / removed entities apply to %s)",
+                              PathToUtf8(PathFromUtf8(levels[0].file).filename()).c_str());
+    }
 }
 
 const ScriptGraph* Editor::GraphFor(const std::string& file)
@@ -2040,12 +2094,16 @@ void Editor::DrawRendererSettings()
     }
 
     if (ImGui::CollapsingHeader("Camera") && BeginProperties("camera")) {
-        FlyCamera& cam = m_Ctx.camera;
+        FlyCamera&         cam    = m_Ctx.camera;
+        const CameraFields before = CaptureCameraFields(); // each edit: one undo step of the editor view
         PropertyRow("Field of view");
         ImGui::SliderAngle("##v", &cam.fovY, 20.0f, 120.0f);
+        TrackCameraFieldEdit(before);
         ImGui::PopID();
         DragFloatRow("Near plane", &cam.nearPlane, 0.001f, 0.001f, 10.0f);
+        TrackCameraFieldEdit(before);
         DragFloatRow("Move speed", &cam.moveSpeed, 0.05f, 0.1f, 100.0f, "%.2f m/s");
+        TrackCameraFieldEdit(before);
         ImGui::EndTable();
     }
     ImGui::End();

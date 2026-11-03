@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-10-27 (Phase 33 material editor implemented on `branch`, PR open; Phase 31 + 32 merged via PR #21, 83cdfcb; next after merge: Phase 34 nested prefabs + settings undo – ask details first)
+- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo implemented on `branch`; PR to open and babysit until CI green; roadmap C complete after its merge)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1028,7 +1028,7 @@ If an audit finds no concrete defect:
 - Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
 - Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) merged (PR #19, fa23918, 2026-10-22).
 - Phase 30 merged (PR #20); Phase 31 + 32 merged (PR #21, 83cdfcb, 2026-10-27).
-- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) implemented on `branch` (2026-10-27), PR pending.
+- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) merged (PR #22, 2026-11-02).
 
 ### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
 - State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
@@ -1048,6 +1048,13 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
+
+### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)
+- Prefabs: nested (prefab instances inside prefabs, overrides per level, Apply chooses the target level) + variants (.uprefab with base prefab + overrides). Not: reparenting members / adding-removing components or children as overrides.
+- Settings undo in the scene history: renderer settings, project settings (audio mixer, input, navigation, save/loading screen), physics settings, and editor view (camera/toolbar overlay toggles).
+- Editor view camera: undo only for discrete jumps (Focus F, Game-cam on/off, camera fields in the renderer panel like FOV/speed); free flight is not undoable; toolbar toggles (overlays, debug view) always.
+- Asset windows (Blueprint, Material, Particle, Animation) keep their own undo (no global history).
+- Implementation notes (2026-11-03): prefab files v2 store nested instances like scene files and are *expanded on load* (scene format unchanged; one PrefabInstance per outermost instance). Cache entries carry transitive dependencies; InvalidatePrefab after every write. Self-nesting on write is flattened with a warning (the lifecycle fuzz depends on that). Inner-level Apply goes through a scratch instance + WriteAndLink and only transfers component values. Settings undo = per-frame baseline compare (TrackSettings) + EditCommand::sceneChange (History::Dirty counts scene changes only). Camera fields are tracked per widget (the fly camera updates in app code, so a per-frame diff cannot tell wheel speed changes apart).
 
 ### Phase 33 material editor – decisions (user, 2026-10-27)
 - Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
