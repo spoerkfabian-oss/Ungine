@@ -1259,28 +1259,6 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
         if (isPure(n.id) && color[n.id] == 0 && cyclic(n.id))
             error(n.id, "Cycle through pure nodes");
 
-    // Functions calling each other in a cycle (no recursion: a function's nodes exist once).
-    std::unordered_map<std::string, int> visit; // 0 new, 1 on stack, 2 done
-    std::function<bool(const std::string&)> recursive = [&](const std::string& fn) {
-        int& v = visit[fn];
-        if (v == 1)
-            return true;
-        if (v == 2)
-            return false;
-        v = 1;
-        for (const ScriptNode& n : graph.nodes)
-            if (n.function == fn && (n.type == "Function.Call" || n.type == "Function.CallPure") &&
-                graph.FindFunction(n.param) && recursive(n.param)) {
-                error(n.id, "Recursive call of '" + n.param + "'");
-                return true;
-            }
-        visit[fn] = 2;
-        return false;
-    };
-    for (const ScriptFunction& f : graph.functions)
-        if (visit[f.name] == 0)
-            recursive(f.name);
-
     // Macros using themselves (their copies would never end).
     std::unordered_map<std::string, int> macroVisit;
     std::function<bool(const std::string&)> macroCycle = [&](const std::string& name) {

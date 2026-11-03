@@ -120,7 +120,7 @@ TEST_CASE(Blueprint_FunctionsRunAndEdit)
         CHECK(HasError(ev.g, "inside a function"));
         Graph rec = g;
         rec.Node("Function.Call", "AddScaled", "AddScaled");
-        CHECK(HasError(rec.g, "Recursive"));
+        CHECK(!HasError(rec.g, "Recursive")); // recursion is allowed (Blueprint3 tests run it)
         Graph kind = g;
         kind.Node("Function.Call", "Double");
         CHECK(HasError(kind.g, "is pure"));

@@ -97,3 +97,103 @@ TEST_CASE(Blueprint3_NestedContainersAndMapKeys)
     CHECK(ValuesEqual(r.Var("nested.ugraph", e, "Grid"), g));
     r.scripts.End(r.scene);
 }
+
+TEST_CASE(Blueprint3_RecursiveFunctions)
+{
+    ScriptRegistry::Clear();
+    ScriptRegistry::AddInterface({"Counter", {{"Down", {{"N", PinType::Int}}, {{"Sum", PinType::Int}}}}, {}});
+    Graph b;
+    // Fact(N) = N < 2 ? 1 : N * Fact(N - 1)   (impure, Branch + Return)
+    CHECK(b.g.AddFunction("Fact"));
+    b.g.FindFunction("Fact")->inputs  = {{"N", PinType::Int}};
+    b.g.FindFunction("Fact")->outputs = {{"Result", PinType::Int}};
+    b.g.FunctionSignatureChanged("Fact");
+    const std::uint32_t entry  = b.Find("Function.Entry", "Fact");
+    const std::uint32_t ret1   = b.Find("Function.Return", "Fact");
+    const std::uint32_t branch = b.Node("Flow.Branch", {}, "Fact");
+    const std::uint32_t less   = b.Node("Compare.LessInt", {}, "Fact");
+    b.Set(less, "B", std::int32_t{2});
+    b.Link(entry, "N", less, "A");
+    b.Link(less, "Result", branch, "Condition");
+    b.Link(entry, "Then", branch, "In");
+    b.Link(branch, "True", ret1, "In");
+    b.Set(ret1, "Result", std::int32_t{1});
+    const std::uint32_t sub  = b.Node("Math.SubtractInt", {}, "Fact");
+    b.Set(sub, "B", std::int32_t{1});
+    b.Link(entry, "N", sub, "A");
+    const std::uint32_t self = b.Node("Function.Call", "Fact", "Fact");
+    b.Link(sub, "Result", self, "N");
+    b.Link(branch, "False", self, "In");
+    const std::uint32_t mul  = b.Node("Math.MultiplyInt", {}, "Fact");
+    b.Link(entry, "N", mul, "A"); // the outer call's N after the inner call returned
+    b.Link(self, "Result", mul, "B");
+    const std::uint32_t ret2 = b.Node("Function.Return", "Fact", "Fact");
+    b.Link(self, "Then", ret2, "In");
+    b.Link(mul, "Result", ret2, "Result");
+
+    // Interface implementation calling itself on its own entity: Sum = N + Down(N - 1), Down(0) = 0.
+    b.g.interfaces = {"Counter"};
+    CHECK(b.g.AddFunction("Down"));
+    b.g.FindFunction("Down")->inputs  = {{"N", PinType::Int}};
+    b.g.FindFunction("Down")->outputs = {{"Sum", PinType::Int}};
+    b.g.FunctionSignatureChanged("Down");
+    const std::uint32_t dEntry = b.Find("Function.Entry", "Down");
+    const std::uint32_t dRet0  = b.Find("Function.Return", "Down");
+    const std::uint32_t dBr    = b.Node("Flow.Branch", {}, "Down");
+    const std::uint32_t dLess  = b.Node("Compare.LessInt", {}, "Down");
+    b.Set(dLess, "B", std::int32_t{1});
+    b.Link(dEntry, "N", dLess, "A");
+    b.Link(dLess, "Result", dBr, "Condition");
+    b.Link(dEntry, "Then", dBr, "In");
+    b.Link(dBr, "True", dRet0, "In");
+    const std::uint32_t dSub = b.Node("Math.SubtractInt", {}, "Down");
+    b.Set(dSub, "B", std::int32_t{1});
+    b.Link(dEntry, "N", dSub, "A");
+    const std::uint32_t dCall = b.Node("Interface.Call", "Counter.Down", "Down");
+    b.Link(dSub, "Result", dCall, "N");
+    b.Link(dBr, "False", dCall, "In");
+    const std::uint32_t dAdd = b.Node("Math.AddInt", {}, "Down");
+    b.Link(dEntry, "N", dAdd, "A");
+    b.Link(dCall, "Sum", dAdd, "B");
+    const std::uint32_t dRet = b.Node("Function.Return", "Down", "Down");
+    b.Link(dCall, "Then", dRet, "In");
+    b.Link(dAdd, "Result", dRet, "Sum");
+
+    // Pure function without an end: stopped at the depth limit, reported, no crash.
+    CHECK(b.g.AddFunction("Forever"));
+    b.g.FindFunction("Forever")->inputs  = {{"N", PinType::Int}};
+    b.g.FindFunction("Forever")->outputs = {{"R", PinType::Int}};
+    b.g.SetFunctionPure("Forever", true);
+    b.g.FunctionSignatureChanged("Forever");
+    const std::uint32_t fCall = b.Node("Function.CallPure", "Forever", "Forever");
+    b.Link(b.Find("Function.Entry", "Forever"), "N", fCall, "N");
+    b.Link(fCall, "R", b.Find("Function.Return", "Forever"), "R");
+
+    const std::uint32_t begin = b.Node("Event.BeginPlay");
+    const std::uint32_t call  = b.Node("Function.Call", "Fact");
+    b.Set(call, "N", std::int32_t{5});
+    const std::uint32_t p1 = Print(b);
+    b.Link(begin, "Out", call, "In");
+    b.Link(call, "Then", p1, "In");
+    b.Link(call, "Result", p1, "Text");
+    const std::uint32_t down = b.Node("Interface.Call", "Counter.Down");
+    b.Set(down, "N", std::int32_t{4});
+    const std::uint32_t p2 = Print(b);
+    b.Link(p1, "Then", down, "In");
+    b.Link(down, "Then", p2, "In");
+    b.Link(down, "Sum", p2, "Text");
+    const std::uint32_t forever = b.Node("Function.CallPure", "Forever");
+    const std::uint32_t p3      = Print(b);
+    b.Link(p2, "Then", p3, "In");
+    b.Link(forever, "R", p3, "Text");
+    CHECK(b.Valid());
+
+    Runner r;
+    (void)r.Add("Rec", "rec.ugraph", b.g);
+    r.scripts.Begin(r.scene);
+    CHECK(r.Printed("120") && r.Printed("10"));
+    CHECK(r.scripts.Stats().errors >= 1); // the endless pure recursion
+    // Still usable afterwards (depth counters went back to zero).
+    r.Run(0.2f);
+    r.scripts.End(r.scene);
+}

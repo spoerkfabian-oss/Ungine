@@ -128,6 +128,7 @@ struct CompiledFunction {
     std::vector<ScriptVariable>          locals;
     std::unordered_map<std::string, int> localIndex;
     std::size_t                          outputs = 0;
+    std::vector<int>                     nodes; // node indices of the function (saved around recursive calls)
 };
 
 struct Program {
@@ -194,6 +195,8 @@ std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector
         c.desc  = FindScriptNodeType(n.type);
         c.pins  = NodePins(p->graph, n);
         c.scope = n.function.empty() ? -1 : functionIndex.at(n.function);
+        if (c.scope >= 0)
+            p->functions[static_cast<std::size_t>(c.scope)].nodes.push_back(static_cast<int>(p->nodes.size()));
         c.id       = n.id;
         c.function = n.function;
         if (const auto o = origins.find(n.id); o != origins.end()) {
@@ -261,7 +264,7 @@ struct ScriptSystem::Impl {
         std::shared_ptr<const Program>         program;
         std::vector<ScriptValue>               variables;
         std::vector<std::vector<ScriptValue>>  locals;  // per function
-        std::vector<char>                      active;  // per function: on the call stack
+        std::vector<int>                       active;  // per function: how often it is on the call stack
         std::vector<std::vector<ScriptValue>>  outputs; // per node, per pin
         std::vector<ScriptContext::NodeState>  states;
         std::vector<std::uint64_t>             evalStamp; // per node: the execution its pure outputs were computed for
@@ -296,11 +299,19 @@ struct ScriptSystem::Impl {
         int          node = 0;
         std::int32_t data = 0;
     };
+    // The function's pin values and locals of the outer call, kept while it calls itself again
+    // (recursion: a function's nodes exist once).
+    struct SavedScope {
+        std::vector<std::vector<ScriptValue>> outputs; // per node of the function
+        std::vector<std::uint64_t>            stamps;
+        std::vector<ScriptValue>              locals;
+    };
     struct CallFrame {
-        int                       callNode = 0; // -1: called from another script (CallFunctionOn)
-        int                       function = 0;
-        std::vector<Continuation> stack;             // the caller's
-        std::vector<ScriptValue>* results = nullptr; // callNode -1: the function's outputs
+        int                         callNode = 0; // -1: called from another script (CallFunctionOn)
+        int                         function = 0;
+        std::vector<Continuation>   stack;             // the caller's
+        std::vector<ScriptValue>*   results = nullptr; // callNode -1: the function's outputs
+        std::shared_ptr<SavedScope> saved;             // a recursive call: the outer call's values
     };
     // A running chain: where it is and what comes after.
     struct ChainState {
@@ -1111,21 +1122,26 @@ struct ScriptSystem::Impl {
         const CompiledNode&     call = p.nodes[static_cast<std::size_t>(st.node)];
         const auto              f    = static_cast<std::size_t>(call.callFunction);
         const CompiledFunction& fn   = p.functions[f];
-        if (inst.active[f]) {
-            RuntimeError(inst, st.node, "Recursive call of '" + fn.name + "' (not supported)");
+        if (functionDepth >= kMaxCallDepth) {
+            RuntimeError(inst, st.node, "Calls nested too deep (recursion without an end?) in '" + fn.name + "'");
             return Enter::Failed;
         }
         Exec        own(*this, scene, inst);
         Exec&       ctx   = caller ? *caller : own;
         const int   saved = ctx.node;
         ctx.node          = st.node;
+        std::vector<ScriptValue> args;
         for (std::size_t i = 0; i < call.argPins.size(); ++i)
-            inst.outputs[static_cast<std::size_t>(fn.entry)][i + 1] = ctx.In(call.argPins[i]);
+            args.push_back(ctx.In(call.argPins[i]));
         ctx.node = saved;
+        std::shared_ptr<SavedScope> outer = SaveScope(inst, f);
+        for (std::size_t i = 0; i < args.size(); ++i)
+            inst.outputs[static_cast<std::size_t>(fn.entry)][i + 1] = std::move(args[i]);
         for (std::size_t i = 0; i < fn.locals.size(); ++i)
             inst.locals[f][i] = fn.locals[i].value;
-        inst.active[f] = 1;
-        st.calls.push_back({st.node, static_cast<int>(f), std::move(st.stack)});
+        ++inst.active[f];
+        ++functionDepth;
+        st.calls.push_back({st.node, static_cast<int>(f), std::move(st.stack), nullptr, std::move(outer)});
         st.stack.clear();
         MarkNode(inst, fn.entry);
         int next = 0, entry = 0;
@@ -1137,13 +1153,39 @@ struct ScriptSystem::Impl {
         return Enter::Entered;
     }
 
-    // Leaves the innermost function: the caller's loop stack comes back. Returns the call node.
+    // A function about to be entered while it runs already: its current values (of the outer call).
+    static std::shared_ptr<SavedScope> SaveScope(const Instance& inst, std::size_t f)
+    {
+        if (inst.active[f] == 0)
+            return nullptr;
+        auto                    saved = std::make_shared<SavedScope>();
+        const CompiledFunction& fn    = inst.program->functions[f];
+        for (int node : fn.nodes) {
+            saved->outputs.push_back(inst.outputs[static_cast<std::size_t>(node)]);
+            saved->stamps.push_back(inst.evalStamp[static_cast<std::size_t>(node)]);
+        }
+        saved->locals = inst.locals[f];
+        return saved;
+    }
+
+    // Leaves the innermost function: the caller's loop stack comes back (and, after a recursive
+    // call, the outer call's values). Returns the call node.
     int PopFrame(Instance& inst, ChainState& st)
     {
         CallFrame frame = std::move(st.calls.back());
         st.calls.pop_back();
-        st.stack = std::move(frame.stack);
-        inst.active[static_cast<std::size_t>(frame.function)] = 0;
+        st.stack      = std::move(frame.stack);
+        const auto f  = static_cast<std::size_t>(frame.function);
+        inst.active[f] = std::max(inst.active[f] - 1, 0);
+        functionDepth      = functionDepth > 0 ? functionDepth - 1 : 0;
+        if (frame.saved) {
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (std::size_t i = 0; i < fn.nodes.size(); ++i) {
+                inst.outputs[static_cast<std::size_t>(fn.nodes[i])]   = std::move(frame.saved->outputs[i]);
+                inst.evalStamp[static_cast<std::size_t>(fn.nodes[i])] = frame.saved->stamps[i];
+            }
+            inst.locals[f] = std::move(frame.saved->locals);
+        }
         return frame.callNode;
     }
 
@@ -1258,14 +1300,21 @@ struct ScriptSystem::Impl {
                         if (frame.callNode < 0) {
                             for (std::size_t i = 0; i < frame.results->size(); ++i)
                                 (*frame.results)[i] = ctx.In(static_cast<int>(i) + 1);
+                            st.stack.clear();
+                            from = PopFrame(inst, st);
                         } else {
-                            const CompiledNode& callNode = p.nodes[static_cast<std::size_t>(frame.callNode)];
+                            // Read before leaving: a recursive call's frame restores the outer
+                            // call's values, the call node (part of them) gets the results after.
+                            const CompiledNode&      callNode = p.nodes[static_cast<std::size_t>(frame.callNode)];
+                            std::vector<ScriptValue> results;
                             for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
-                                inst.outputs[static_cast<std::size_t>(frame.callNode)]
-                                            [static_cast<std::size_t>(callNode.resultPins[i])] = ctx.In(static_cast<int>(i) + 1);
+                                results.push_back(ctx.In(static_cast<int>(i) + 1));
+                            st.stack.clear();
+                            from = PopFrame(inst, st);
+                            for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
+                                inst.outputs[static_cast<std::size_t>(from)][static_cast<std::size_t>(callNode.resultPins[i])] =
+                                    std::move(results[i]);
                         }
-                        st.stack.clear();
-                        from = PopFrame(inst, st);
                         if (nested && st.calls.size() == base)
                             return true;
                         out = 1; // "Then" of the call
@@ -1321,10 +1370,11 @@ struct ScriptSystem::Impl {
         const auto              f  = static_cast<std::size_t>(function);
         const CompiledFunction& fn = p.functions[f];
         const ScriptFunction&   sf = p.graph.functions[f];
-        if (inst.active[f]) {
-            PrintMessage("Recursive call of '" + fn.name + "' (not supported)", 3.0f, true);
+        if (functionDepth >= kMaxCallDepth) {
+            PrintMessage("Calls nested too deep (recursion without an end?) in '" + fn.name + "'", 3.0f, true);
             return false;
         }
+        std::shared_ptr<SavedScope> outer = SaveScope(inst, f);
         const auto fit = [](const ScriptValue& v, PinType t) {
             return ValueFits(v, t) ? v : CanConvert(TypeOf(v), t) ? Convert(v, t) : DefaultValue(t);
         };
@@ -1336,9 +1386,10 @@ struct ScriptSystem::Impl {
             results.push_back(DefaultValue(out.type));
         for (std::size_t i = 0; i < fn.locals.size(); ++i)
             inst.locals[f][i] = fn.locals[i].value;
-        inst.active[f] = 1;
+        ++inst.active[f];
+        ++functionDepth;
         ChainState st;
-        st.calls.push_back({-1, function, {}, &results});
+        st.calls.push_back({-1, function, {}, &results, std::move(outer)});
         MarkNode(inst, fn.entry);
         int next = 0, entry = 0;
         if (!Follow(inst, fn.entry, 0, next, entry)) {
@@ -1376,8 +1427,10 @@ struct ScriptSystem::Impl {
         const auto resume = [&](SuspendedChain chain, bool skip) {
             const auto it = instances.find(chain.entity);
             if (it == instances.end() || it->second->serial != chain.serial || !it->second->program ||
-                !scene.GetRegistry().Valid(it->second->entity))
+                !scene.GetRegistry().Valid(it->second->entity)) {
+                functionDepth -= std::min(functionDepth, chain.state.calls.size()); // its frames are gone
                 return;
+            }
             const std::uint64_t chainId = chain.state.id;
             chain.state.skipBreak = skip;
             const bool finished = RunState(scene, *it->second, chain.state, false);
@@ -1501,6 +1554,7 @@ struct ScriptSystem::Impl {
         levelEvents.clear();
         paused.reset();
         queued.clear();
+        functionDepth = 0;
         stepMode = StepMode::None;
         if (assets)
             for (ModelHandle h : spawned)
@@ -1532,6 +1586,8 @@ struct ScriptSystem::Impl {
     double         time        = 0.0;
     float          frameDt     = 0.0f;
     std::uint32_t  maxSteps    = 100000;
+    std::size_t    functionDepth = 0; // function calls on all chains (recursion limit)
+    static constexpr std::size_t kMaxCallDepth = 256;
     int            callDepth   = 0;
     std::uint32_t  evalCounter = 0; // Exec stamps (pure evaluation cache)
     std::uint64_t  nextSerial  = 0;
@@ -1889,6 +1945,7 @@ void ScriptSystem::End(Scene& scene)
         return;
     w.paused.reset(); // the debugger lets go: EndPlay runs to completion
     w.queued.clear();
+    w.functionDepth = 0; // frames of the dropped chains
     w.stepMode = Impl::StepMode::None;
     w.breakpoints.clear();
     std::vector<std::uint64_t> keys;
@@ -1902,6 +1959,7 @@ void ScriptSystem::End(Scene& scene)
             if (w.paused) { // a breakpoint inside EndPlay: ignored now
                 w.paused.reset();
                 w.queued.clear();
+                w.functionDepth = 0;
             }
         }
     w.Clear();

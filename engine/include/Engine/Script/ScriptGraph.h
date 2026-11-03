@@ -67,7 +67,8 @@ struct ScriptParam {
 };
 
 // A function of the graph. Impure functions are called from exec chains (Call node with exec pins),
-// pure ones whenever an output is read. No latent nodes (Delay) and no recursion.
+// pure ones whenever an output is read. No latent nodes (Delay). Functions may call
+// themselves (recursion, up to 256 nested calls).
 struct ScriptFunction {
     std::string                 name;
     std::vector<ScriptParam>    inputs;  // Entry node outputs / Call node inputs
@@ -224,7 +225,7 @@ struct ScriptDiagnostic {
 
 // Unknown node types, missing / mistyped variables, duplicate names, links to missing pins, between
 // incompatible types or across scopes, several links on single-link pins, cycles through pure nodes,
-// function errors (unknown, Entry count, events / latent nodes inside, recursion, call purity);
+// function errors (unknown, Entry count, events / latent nodes inside, call purity);
 // warnings for events without anything connected. A graph with errors does not run.
 [[nodiscard]] std::vector<ScriptDiagnostic> ValidateScriptGraph(const ScriptGraph& graph);
 
