@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo merged via PR #23; roadmap C complete – ask the user what comes next)
+- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo merged via PR #23; roadmap C complete; next: Phase 35 blueprint inheritance/recursion/nested containers, 36 latent-in-functions + nodes, 37 CI installers)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1048,6 +1048,12 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
 - SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
 - Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
+
+### Phases 35–37 – decisions (user, 2026-11-03)
+- Phase 35: Blueprint inheritance like UE (graph with a parent graph: inherits variables with overridable defaults, functions, events, dispatchers, timelines; override functions/events, "Call Parent"; interfaces inherited; "Cast To" / "Is A" nodes) + recursion (functions, interface calls) + nested containers (array of arrays/maps, more map key types).
+- Phase 36: latent nodes in functions / async (Delay, Timeline, AI Move To etc. inside functions and interface calls) + more nodes/comfort (node libraries, refactoring tools, dispatcher signature checks).
+- Phase 37: Ungine as an installable executable like Unity/UE: CI builds Release installers (Windows Setup.exe via NSIS + portable ZIP, Linux TGZ) and attaches them to a GitHub release/artifact.
+- One PR per phase as before.
 
 ### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)
 - Prefabs: nested (prefab instances inside prefabs, overrides per level, Apply chooses the target level) + variants (.uprefab with base prefab + overrides). Not: reparenting members / adding-removing components or children as overrides.
