@@ -43,6 +43,9 @@ Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
 4. **Blueprint**-Tab: Knoten per Rechtsklick suchen, Pins ziehen zum Verbinden, Variablen links,
    Details/Parameter darunter. Script einer Entity zuweisen: Inspector → *Add component* →
    *Script (Blueprint)*.
+   Vererbung: Content-Browser → Rechtsklick auf einen Blueprint → *Create child blueprint* (oder
+   *Class → Parent* im Blueprint-Tab); geerbte Funktionen per *Override*, Defaults geerbter
+   Variablen unter *Inherited variables*, die Eltern-Fassung per *Call Parent* (Palette).
 5. **Play** (Strg+P) simuliert Physik und Blueprints im Editor; *Stop* stellt die Szene wieder her.
 6. **Build → Build & Run** (Strg+B) speichert alles und startet das Spiel im **UnginePlayer**;
    **Build → Package project…** erzeugt einen eigenständigen Spielordner (`<Name>.exe`, Shader,

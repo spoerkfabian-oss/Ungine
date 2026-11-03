@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo merged via PR #23; roadmap C complete; next: Phase 35 blueprint inheritance/recursion/nested containers, 36 latent-in-functions + nodes, 37 CI installers)
+- Last updated: 2026-11-03 (Phase 35 blueprint inheritance + recursion + nested containers implemented on `branch`, PR open; next: 36 latent-in-functions + nodes, 37 CI installers)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1054,6 +1054,7 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Phase 36: latent nodes in functions / async (Delay, Timeline, AI Move To etc. inside functions and interface calls) + more nodes/comfort (node libraries, refactoring tools, dispatcher signature checks).
 - Phase 37: Ungine as an installable executable like Unity/UE: CI builds Release installers (Windows Setup.exe via NSIS + portable ZIP, Linux TGZ) and attaches them to a GitHub release/artifact.
 - One PR per phase as before.
+- Phase 35 progress (2026-11-03): done and verified locally – nested container types (`PinType::inner`, interned), float/vec3 map keys, recursion (saved frames, depth 256), inheritance (`parent`/`defaults`, `ResolveScriptParent`, flatten before expansion with "Super<n>:" renames, Call Parent nodes, Class.IsA/CastTo, `Program::classes`), editor Class section + "Create child blueprint". Limits in CLAUDE.md, Offene Punkte 13.
 
 ### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)
 - Prefabs: nested (prefab instances inside prefabs, overrides per level, Apply chooses the target level) + variants (.uprefab with base prefab + overrides). Not: reparenting members / adding-removing components or children as overrides.
