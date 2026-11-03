@@ -73,49 +73,98 @@ std::vector<PinType> BaseTypes(bool keysOnly)
     return types;
 }
 
-// Type picker: container (single / array / map), value type, map key type. True when changed.
+// A type as its container layers (outermost first: array, or map with its key) around a base type.
+struct TypeLayers {
+    std::vector<std::pair<PinContainer, PinType>> layers;
+    PinType                                       base;
+};
+TypeLayers Decompose(PinType type)
+{
+    TypeLayers t;
+    for (int depth = 0; IsContainer(type) && depth < 16; ++depth) {
+        t.layers.emplace_back(type.container, KeyType(type));
+        type = ElementType(type);
+    }
+    t.base = type;
+    return t;
+}
+PinType Compose(const TypeLayers& t)
+{
+    PinType type = t.base;
+    for (auto it = t.layers.rbegin(); it != t.layers.rend(); ++it)
+        type = it->first == PinContainer::Array ? ArrayOf(type) : PinType::Map(it->second, type);
+    return type;
+}
+
+// Type picker: container layers (single / array / map at each level, up to 4 deep, map keys), then
+// the value type. True when changed.
 bool TypeCombo(const char* id, PinType& type, float width)
 {
-    bool changed = false;
+    constexpr std::size_t kMaxDepth = 4;
+    bool                  changed   = false;
     ImGui::SetNextItemWidth(width);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(type)));
     const bool open = ImGui::BeginCombo(id, DisplayName(type).c_str(), ImGuiComboFlags_HeightLarge);
     ImGui::PopStyleColor();
     if (!open)
         return false;
-    int container = static_cast<int>(type.container);
-    bool pickContainer = ImGui::RadioButton("Single", &container, 0); // all three drawn (no short circuit)
-    ImGui::SameLine();
-    pickContainer |= ImGui::RadioButton("Array", &container, 1);
-    ImGui::SameLine();
-    pickContainer |= ImGui::RadioButton("Map", &container, 2);
-    if (pickContainer) {
-        const PinType value = ElementType(type);
-        type    = container == 1 ? ArrayOf(value) : container == 2 ? PinType::Map(PinType::String, value) : value;
-        changed = true;
-    }
-    if (IsMap(type)) {
-        ImGui::SeparatorText("Key");
-        for (PinType key : BaseTypes(true)) {
-            ImGui::PushID(ToString(key).c_str());
-            if (ImGui::Selectable(DisplayName(key).c_str(), KeyType(type) == key, ImGuiSelectableFlags_NoAutoClosePopups)) {
-                type    = PinType::Map(key, ElementType(type));
-                changed = true;
+    TypeLayers t = Decompose(type);
+    for (std::size_t level = 0; level <= t.layers.size() && level < kMaxDepth; ++level) {
+        ImGui::PushID(static_cast<int>(level));
+        if (level > 0)
+            ImGui::TextDisabled("of");
+        if (level > 0)
+            ImGui::SameLine();
+        int  container = level < t.layers.size() ? static_cast<int>(t.layers[level].first) : 0;
+        bool pick      = ImGui::RadioButton("Single", &container, 0); // all three drawn (no short circuit)
+        ImGui::SameLine();
+        pick |= ImGui::RadioButton("Array", &container, 1);
+        ImGui::SameLine();
+        pick |= ImGui::RadioButton("Map", &container, 2);
+        if (pick) {
+            if (container == 0) {
+                t.layers.resize(level);
+            } else {
+                const PinType key = level < t.layers.size() ? t.layers[level].second : PinType::String;
+                if (level < t.layers.size())
+                    t.layers[level] = {static_cast<PinContainer>(container), key};
+                else
+                    t.layers.emplace_back(static_cast<PinContainer>(container), PinType::String);
             }
-            ImGui::PopID();
+            changed = true;
         }
-        ImGui::SeparatorText("Value");
+        if (level < t.layers.size() && t.layers[level].first == PinContainer::Map) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::BeginCombo("key", DisplayName(t.layers[level].second).c_str())) {
+                for (PinType key : BaseTypes(true)) {
+                    ImGui::PushID(ToString(key).c_str());
+                    if (ImGui::Selectable(DisplayName(key).c_str(), t.layers[level].second == key)) {
+                        t.layers[level].second = key;
+                        changed                = true;
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        ImGui::PopID();
+        if (level >= t.layers.size())
+            break;
     }
+    ImGui::SeparatorText(t.layers.empty() ? "Type" : "Value");
     for (PinType base : BaseTypes(false)) {
         ImGui::PushID(ToString(base).c_str());
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(base)));
-        if (ImGui::Selectable(DisplayName(base).c_str(), ElementType(type) == base)) {
-            type    = IsArray(type) ? ArrayOf(base) : IsMap(type) ? PinType::Map(KeyType(type), base) : base;
+        if (ImGui::Selectable(DisplayName(base).c_str(), t.base == base)) {
+            t.base  = base;
             changed = true;
         }
         ImGui::PopStyleColor();
         ImGui::PopID();
     }
+    if (changed)
+        type = Compose(t);
     ImGui::EndCombo();
     return changed;
 }
@@ -412,9 +461,11 @@ bool MapWidget(const char* id, ScriptValue& value, PinType type, float width)
             auto&       items = MutableMap(value, key, element).items;
             ScriptValue k     = DefaultValue(key);
             for (std::int32_t n = 1; items.contains(k) && n < 10000; ++n)
-                k = key.kind == PinKind::String ? ScriptValue(std::string("key") + std::to_string(n))
-                    : key.kind == PinKind::Bool ? ScriptValue(true)
-                                                : ScriptValue(n);
+                k = key.kind == PinKind::String  ? ScriptValue(std::string("key") + std::to_string(n))
+                    : key.kind == PinKind::Bool  ? ScriptValue(true)
+                    : key.kind == PinKind::Float ? ScriptValue(static_cast<float>(n))
+                    : key.kind == PinKind::Vec3  ? ScriptValue(glm::vec3(static_cast<float>(n), 0.0f, 0.0f))
+                                                 : ScriptValue(n);
             if (!items.contains(k)) {
                 items[k] = DefaultValue(element);
                 changed  = true;

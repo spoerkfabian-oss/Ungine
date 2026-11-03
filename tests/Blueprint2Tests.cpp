@@ -48,7 +48,8 @@ TEST_CASE(Blueprint2_TypesValuesAndRegistry)
         const auto t = PinTypeFromString(name);
         CHECK(t && ToString(*t) == name);
     }
-    CHECK(!PinTypeFromString("map:float:int") && !PinTypeFromString("struct:") && !PinTypeFromString("nonsense"));
+    CHECK(!PinTypeFromString("map:struct:Item:int") && !PinTypeFromString("map:intArray:int") && !PinTypeFromString("struct:") &&
+          !PinTypeFromString("nonsense") && !PinTypeFromString("array:exec") && !PinTypeFromString("map:int:exec"));
     CHECK(DisplayName(*PinTypeFromString("map:string:struct:Item")) == "Map<string, Item>" &&
           DisplayName(PinType::Struct("Item")) == "Item" && DisplayName(ArrayOf(PinType::Enum("Color"))) == "Color[]");
     CHECK(CanConvert(PinType::Enum("Color"), PinType::Int) && CanConvert(PinType::Int, PinType::Enum("Color")) &&

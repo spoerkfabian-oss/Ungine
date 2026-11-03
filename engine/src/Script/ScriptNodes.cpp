@@ -278,11 +278,12 @@ PinType VariableElement(const ScriptGraph& graph, const ScriptNode& node)
     return IsArray(t) ? ElementType(t) : PinType::Float;
 }
 
-// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3); float if it names none.
+// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3, "intArray" -> int[]); float
+// if it names none.
 PinType ElementParam(const std::string& param)
 {
     const auto t = PinTypeFromString(SplitTypeAndCount(param, 0).first);
-    return t && t->kind != PinKind::Exec && !IsContainer(*t) ? *t : PinType::Float;
+    return t && t->kind != PinKind::Exec ? *t : PinType::Float;
 }
 
 // Any value type named by a param (scalars and containers).
