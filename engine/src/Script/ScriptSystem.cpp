@@ -119,6 +119,7 @@ struct CompiledNode {
     std::uint32_t id   = 0;
     std::string   function;
     std::uint32_t use = 0;
+    int           useFile = 0; // Program::files index of `use`
 };
 
 struct CompiledFunction {
@@ -143,7 +144,8 @@ struct Program {
     std::map<std::string, std::vector<int>> events; // node type -> event nodes (event graph only)
     // Graph files of the nodes (debugger keys): 0 = this graph, then the libraries copied in.
     std::vector<std::string> files;
-    std::vector<std::string> fileLibraries; // library name per file ("" for this graph)
+    std::vector<std::string> fileLibraries; // library name per file ("" for this graph and parent classes)
+    std::vector<std::string> classes;       // this graph's key, then its parent classes' (nearest first)
 };
 
 // Debugger key of a library: its file (ScriptSystem::Key), or a name for libraries made in code.
@@ -203,14 +205,17 @@ std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector
             c.id       = o->second.node;
             c.function = o->second.function;
             c.use      = o->second.use;
-            if (!o->second.library.empty()) {
-                const auto f = std::ranges::find(p->fileLibraries, o->second.library);
-                c.file       = static_cast<int>(f - p->fileLibraries.begin());
-                if (f == p->fileLibraries.end()) {
-                    p->files.push_back(LibraryKey(o->second.library));
-                    p->fileLibraries.push_back(o->second.library);
-                }
-            }
+            const auto fileIndex = [&](const std::string& fileKey, const std::string& library) {
+                const std::string k = !library.empty() ? LibraryKey(library) : fileKey.empty() ? p->key : fileKey;
+                const auto        f = std::ranges::find(p->files, k);
+                if (f != p->files.end())
+                    return static_cast<int>(f - p->files.begin());
+                p->files.push_back(k);
+                p->fileLibraries.push_back(library);
+                return static_cast<int>(p->files.size()) - 1;
+            };
+            c.file    = fileIndex(o->second.file, o->second.library);
+            c.useFile = fileIndex(o->second.useFile, {});
         }
         c.source.resize(c.pins.size());
         c.target.resize(c.pins.size());
@@ -473,6 +478,12 @@ struct ScriptSystem::Impl {
             if (it == other->program->functionIndex.end())
                 return false;
             return m_Impl.CallFunction(m_Scene, *other, it->second, args, results);
+        }
+        bool IsA(Entity target, const std::string& graphPath) override
+        {
+            const Instance* other = m_Impl.Find(target);
+            return other && other->program &&
+                   std::ranges::find(other->program->classes, ScriptSystem::Key(graphPath)) != other->program->classes.end();
         }
         bool Implements(Entity target, const std::string& interfaceName) override
         {
@@ -836,24 +847,44 @@ struct ScriptSystem::Impl {
                 diagnostics.push_back({0, e.what(), true});
             }
         }
-        if (diagnostics.empty())
-            diagnostics = ValidateScriptGraph(graph);
+        if (diagnostics.empty()) {
+            // Parent classes: unsaved editor versions first.
+            const std::string problem = ResolveScriptParent(graph, graphPath, [&](const std::filesystem::path& f) {
+                const auto o = overrides.find(ScriptSystem::Key(f));
+                return o != overrides.end() ? std::optional<ScriptGraph>(o->second) : std::nullopt;
+            });
+            if (!problem.empty())
+                diagnostics.push_back({0, problem, true});
+            else
+                diagnostics = ValidateScriptGraph(graph);
+        }
         if (!breakpoints.contains(key))
             breakpoints[key] = BreakpointsOf(graph);
+        std::vector<std::string> classes{key};
+        for (const ScriptGraph* g = &graph; g->inherited; g = g->inherited.get()) { // breakpoints saved in parents
+            const std::string parentKey = ScriptSystem::Key(g->inheritedFile);
+            if (!breakpoints.contains(parentKey))
+                breakpoints[parentKey] = BreakpointsOf(*g->inherited);
+        }
         // Macros and library functions: copied in. Problems the copies cause (e.g. recursion through
         // a macro) are reported at their origin.
         std::unordered_map<std::uint32_t, ScriptOrigin> origins;
         if (std::ranges::none_of(diagnostics, &ScriptDiagnostic::error)) {
             ScriptGraph expanded = graph;
+            FlattenScriptInheritance(expanded, origins, [](const std::filesystem::path& f) { return ScriptSystem::Key(f); },
+                                     classes);
             if (std::string problem = ExpandScriptGraph(expanded, origins); !problem.empty()) {
                 diagnostics.push_back({0, std::move(problem), true});
             } else {
                 for (const ScriptDiagnostic& d : ValidateExpandedScriptGraph(expanded)) {
                     const auto       o = origins.find(d.node);
                     ScriptDiagnostic mapped =
-                        o == origins.end()             ? d
-                        : o->second.library.empty() ? ScriptDiagnostic{o->second.node, d.message, d.error}
-                                                     : ScriptDiagnostic{o->second.use, "Library '" + o->second.library + "': " + d.message, d.error};
+                        o == origins.end() ? d
+                        : !o->second.library.empty()
+                            ? ScriptDiagnostic{o->second.use, "Library '" + o->second.library + "': " + d.message, d.error}
+                        : !o->second.file.empty()
+                            ? ScriptDiagnostic{0, "Parent class '" + std::filesystem::path(o->second.file).filename().string() + "': " + d.message, d.error}
+                            : ScriptDiagnostic{o->second.node, d.message, d.error};
                     if (std::ranges::none_of(diagnostics, [&](const ScriptDiagnostic& x) {
                             return x.node == mapped.node && x.message == mapped.message;
                         }))
@@ -862,7 +893,8 @@ struct ScriptSystem::Impl {
                 graph = std::move(expanded);
             }
         }
-        auto program = Compile(key, std::move(graph), diagnostics, origins);
+        auto program     = Compile(key, std::move(graph), diagnostics, origins);
+        program->classes = std::move(classes);
         for (std::size_t i = 1; i < program->files.size(); ++i) // breakpoints saved in libraries
             if (const ScriptLibrary* lib = ScriptRegistry::FindLibrary(program->fileLibraries[i]);
                 lib && !breakpoints.contains(program->files[i]))
@@ -1094,7 +1126,7 @@ struct ScriptSystem::Impl {
         const CompiledNode& c = p.nodes[static_cast<std::size_t>(node)];
         debug[p.files[static_cast<std::size_t>(c.file)]].nodeTimes[c.id] = time;
         if (c.use) // a copy of a macro: its Macro node runs too
-            debug[p.key].nodeTimes[c.use] = time;
+            debug[p.files[static_cast<std::size_t>(c.useFile)]].nodeTimes[c.use] = time;
     }
 
     // Exec output (node, pin) -> next (node, input pin); records the link for the debugger.
@@ -1209,7 +1241,7 @@ struct ScriptSystem::Impl {
         // Entering a copy of a macro whose Macro node has a breakpoint, else the node's own.
         Breakpoint* use = nullptr;
         if (c.use && c.use != st.lastUse)
-            if (const auto own = breakpoints.find(inst.program->key); own != breakpoints.end())
+            if (const auto own = breakpoints.find(inst.program->files[static_cast<std::size_t>(c.useFile)]); own != breakpoints.end())
                 if (const auto b = own->second.find(c.use); b != own->second.end())
                     use = &b->second;
         Breakpoint* node = nullptr;
@@ -1977,7 +2009,7 @@ void ScriptSystem::Provide(const std::filesystem::path& file, std::optional<Scri
         m_Impl->overrides[key] = std::move(*graph);
     else
         m_Impl->overrides.erase(key);
-    m_Impl->programs.erase(key); // scripts created from now on use it
+    m_Impl->programs.clear(); // scripts created from now on use it (child classes too)
 }
 
 const ScriptDebugInfo* ScriptSystem::Debug(const std::filesystem::path& file) const
@@ -2124,7 +2156,7 @@ std::optional<ScriptDebugFrame> ScriptSystem::PausedAt() const
     ScriptDebugFrame result = frame(w.paused->state.node);
     if (w.paused->state.atUse) { // stopped on a Macro node: it is what the graph shows
         const CompiledNode& c = p.nodes[static_cast<std::size_t>(w.paused->state.node)];
-        result.file           = p.key;
+        result.file           = p.files[static_cast<std::size_t>(c.useFile)];
         result.node           = c.use;
         result.function       = c.node->function;
     }
@@ -2183,7 +2215,7 @@ std::vector<Entity> ScriptSystem::InstancesOf(const std::filesystem::path& file)
     const std::string   key = Key(file);
     std::vector<Entity> out;
     for (const auto& [k, inst] : m_Impl->instances)
-        if (inst->program && inst->program->key == key)
+        if (inst->program && std::ranges::find(inst->program->classes, key) != inst->program->classes.end())
             out.push_back(inst->entity);
     std::ranges::sort(out, {}, [](Entity e) { return static_cast<std::uint64_t>(e); });
     return out;
@@ -2193,7 +2225,8 @@ std::optional<ScriptWatch> ScriptSystem::Watch(const std::filesystem::path& file
 {
     const Impl& w  = *m_Impl;
     const auto  it = w.instances.find(EntityKey(entity));
-    if (it == w.instances.end() || !it->second->program || it->second->program->key != Key(file))
+    const std::string key = Key(file);
+    if (it == w.instances.end() || !it->second->program || std::ranges::find(it->second->program->classes, key) == it->second->program->classes.end())
         return std::nullopt;
     const Impl::Instance& inst = *it->second;
     const Program&        p    = *inst.program;
@@ -2212,7 +2245,7 @@ std::optional<ScriptWatch> ScriptSystem::Watch(const std::filesystem::path& file
     }
     for (std::size_t n = 0; n < p.nodes.size(); ++n) {
         const CompiledNode& c = p.nodes[n];
-        if (c.file != 0) // copied from a library
+        if (p.files[static_cast<std::size_t>(c.file)] != key) // copied from a library / another class
             continue;
         for (std::size_t pin = 0; pin < c.pins.size(); ++pin)
             if (c.pins[pin].output && c.pins[pin].type != PinType::Exec)

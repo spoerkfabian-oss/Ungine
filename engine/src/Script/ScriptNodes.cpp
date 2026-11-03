@@ -1804,7 +1804,77 @@ std::vector<NodeDesc> BuildRegistry()
             return pins;
         };
         add(WithParam(std::move(pure), ParamKind::Function, "Function", ""));
+
+        // Inheritance: the parent class's version of the overridden function / event (compiled
+        // into calls of the renamed parent version; never executed themselves).
+        const auto parentFunctionPins = [](bool exec) {
+            return [exec](const ScriptGraph& g, const ScriptNode& n) {
+                std::vector<PinInfo> pins;
+                if (exec)
+                    pins = {ExecIn(), ExecOut()};
+                const ScriptFunction* f = g.inherited ? g.inherited->FindFunction(n.param) : nullptr;
+                if (f) {
+                    for (const ScriptParam& p : f->inputs)
+                        pins.push_back(In(p.name, p.type));
+                    for (const ScriptParam& p : f->outputs)
+                        pins.push_back(Out(p.name, p.type));
+                }
+                return pins;
+            };
+        };
+        NodeDesc parent = Flow("Function.CallParent", "Call Parent Function", {}, [](ScriptContext&, int) { return 1; },
+                               "Runs the parent class's version of this function");
+        parent.category    = "Functions";
+        parent.hidden      = true;
+        parent.resolvePins = parentFunctionPins(true);
+        add(WithParam(std::move(parent), ParamKind::Function, "Function", ""));
+        NodeDesc parentPure = Pure("Function.CallParentPure", "Call Parent Function", "Functions", {}, [](ScriptContext&) {},
+                                   "The parent class's version of this pure function");
+        parentPure.hidden      = true;
+        parentPure.resolvePins = parentFunctionPins(false);
+        add(WithParam(std::move(parentPure), ParamKind::Function, "Function", ""));
+
+        NodeDesc parentEvent = Flow("Flow.CallParentEvent", "Call Parent Event", {}, [](ScriptContext&, int) { return 1; },
+                                    "Runs the parent class's handlers of this event (its outputs as inputs)");
+        parentEvent.category    = "Functions";
+        parentEvent.hidden      = true;
+        parentEvent.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            ScriptNode           event;
+            const std::size_t    colon = n.param.find(':');
+            event.type                 = n.param.substr(0, colon);
+            event.param                = colon == std::string::npos ? std::string() : n.param.substr(colon + 1);
+            const NodeDesc* desc       = FindScriptNodeType(event.type);
+            if (desc && desc->kind == NodeKind::Event && desc->resolvePins)
+                for (const PinInfo& p : desc->resolvePins(g, event))
+                    if (p.type != P::Exec)
+                        pins.push_back(In(p.name, p.type));
+            if (desc && desc->kind == NodeKind::Event && !desc->resolvePins)
+                for (const PinInfo& p : desc->pins)
+                    if (p.type != P::Exec)
+                        pins.push_back(In(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(parentEvent), ParamKind::Text, "Event", ""));
     }
+
+    // Classes (Blueprint inheritance): the param is the class graph (.ugraph, like the Script
+    // component's path); a script is of a class when its graph is that one or inherits from it.
+    add(WithParam(Pure("Class.IsA", "Is A", "Classes", {In("Target", P::Entity), Out("Result", P::Bool)},
+                       [](ScriptContext& c) { c.Out(1, c.IsA(c.InEntity(0), c.Param())); },
+                       "Is the target's script of this Blueprint class (or a child class of it)?"),
+                  ParamKind::Text, "Class", ""));
+    add([](NodeDesc d) { d.category = "Classes"; return d; }(WithParam(Flow("Class.CastTo", "Cast To",
+                       {ExecIn(), In("Target", P::Entity), ExecOut("Success"), ExecOut("Failed"), Out("As", P::Entity)},
+                       [](ScriptContext& c, int) {
+                           const Entity target = c.InEntity(1);
+                           const bool   is     = c.IsA(target, c.Param());
+                           c.Out(4, is ? target : NullEntity);
+                           return is ? 2 : 3;
+                       },
+                       "Continues with Success (As = the target) when the target's script is of this Blueprint class "
+                       "or a child class, else with Failed"),
+                  ParamKind::Text, "Class", "")));
 
     // Arrays. Read nodes take the element type as param (adapts when an array is connected);
     // nodes that change an array work on an array variable.

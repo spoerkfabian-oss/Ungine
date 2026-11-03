@@ -3,6 +3,8 @@
 
 #include "Engine/Script/ScriptRegistry.h"
 
+#include <map>
+
 using namespace BlueprintTest;
 
 namespace {
@@ -196,4 +198,177 @@ TEST_CASE(Blueprint3_RecursiveFunctions)
     // Still usable afterwards (depth counters went back to zero).
     r.Run(0.2f);
     r.scripts.End(r.scene);
+}
+
+TEST_CASE(Blueprint3_Inheritance)
+{
+    ScriptRegistry::Clear();
+    ScriptRegistry::AddInterface({"Named", {{"GetName", {}, {{"Name", PinType::String}}}}, {}});
+    std::map<std::string, ScriptGraph> files; // in-memory graph files for ResolveScriptParent
+    const auto loader = [&](const std::filesystem::path& f) -> std::optional<ScriptGraph> {
+        const auto it = files.find(f.lexically_normal().generic_string());
+        return it != files.end() ? std::optional<ScriptGraph>(it->second) : std::nullopt;
+    };
+
+    // Base: Health 100, Describe() -> "base", GetName (interface), BeginPlay prints B, Describe, Health.
+    Graph base;
+    base.g.variables.push_back({"Health", PinType::Int, std::int32_t{100}, false});
+    base.g.interfaces = {"Named"};
+    CHECK(base.g.AddFunction("Describe"));
+    base.g.FindFunction("Describe")->outputs = {{"Text", PinType::String}};
+    base.g.FunctionSignatureChanged("Describe");
+    base.Set(base.Find("Function.Return", "Describe"), "Text", std::string("base"));
+    CHECK(base.g.AddFunction("GetName"));
+    base.g.FindFunction("GetName")->outputs = {{"Name", PinType::String}};
+    base.g.FunctionSignatureChanged("GetName");
+    {
+        const std::uint32_t begin = base.Node("Event.BeginPlay");
+        const std::uint32_t p1    = Print(base, "B");
+        const std::uint32_t call  = base.Node("Function.Call", "Describe");
+        const std::uint32_t p2    = Print(base);
+        const std::uint32_t get   = base.Node("Variable.Get", "Health");
+        const std::uint32_t p3    = Print(base);
+        base.Link(begin, "Out", p1, "In");
+        base.Link(p1, "Then", call, "In");
+        base.Link(call, "Then", p2, "In");
+        base.Link(call, "Text", p2, "Text");
+        base.Link(p2, "Then", p3, "In");
+        base.Link(get, "Value", p3, "Text");
+    }
+    CHECK(base.Valid());
+    files["base.ugraph"] = base.g;
+
+    // Child: Health default 50, Describe overridden (parent + "+child"), BeginPlay overridden
+    // (C, parent's BeginPlay, IsA / Cast To / inherited interface, "C done").
+    Graph child;
+    child.g.parent             = "base.ugraph";
+    child.g.defaults["Health"] = std::int32_t{50};
+    CHECK(ResolveScriptParent(child.g, "child.ugraph", loader).empty() && child.g.inherited);
+    CHECK(!child.g.AddFunction("Describe")); // the name is taken by the parent
+    CHECK(child.g.OverrideFunction("Describe") && !child.g.OverrideFunction("Describe"));
+    {
+        const std::uint32_t parentCall = child.Find("Function.CallParent", "Describe");
+        const std::uint32_t ret        = child.Find("Function.Return", "Describe");
+        const std::uint32_t append     = child.Node("String.Append", {}, "Describe");
+        child.Link(parentCall, "Text", append, "A");
+        child.Set(append, "B", std::string("+child"));
+        child.Link(append, "Result", ret, "Text");
+    }
+    const std::uint32_t cBegin = child.Node("Event.BeginPlay");
+    {
+        const std::uint32_t c1   = Print(child, "C");
+        const std::uint32_t sup  = child.Node("Flow.CallParentEvent", "Event.BeginPlay");
+        const std::uint32_t isA  = child.Node("Class.IsA", "base.ugraph");
+        const std::uint32_t isA2 = child.Node("Class.IsA", "grand.ugraph");
+        const std::uint32_t c2   = Print(child);
+        const std::uint32_t c3   = Print(child);
+        const std::uint32_t cast = child.Node("Class.CastTo", "child.ugraph");
+        const std::uint32_t c4   = Print(child, "cast ok");
+        const std::uint32_t impl = child.Node("Interface.Implements", "Named");
+        const std::uint32_t c5   = Print(child);
+        const std::uint32_t c6   = Print(child, "C done");
+        child.Link(cBegin, "Out", c1, "In");
+        child.Link(c1, "Then", sup, "In");
+        child.Link(sup, "Then", c2, "In");
+        child.Link(isA, "Result", c2, "Text");
+        child.Link(c2, "Then", c3, "In");
+        child.Link(isA2, "Result", c3, "Text");
+        child.Link(c3, "Then", cast, "In");
+        child.Link(cast, "Success", c4, "In");
+        child.Link(c4, "Then", c5, "In");
+        child.Link(impl, "Result", c5, "Text");
+        child.Link(c5, "Then", c6, "In");
+    }
+    CHECK(child.Valid());
+    // JSON keeps parent + defaults (not the resolved chain).
+    const ScriptGraph reloaded = ScriptGraphFromJson(ScriptGraphToJson(child.g));
+    CHECK(reloaded.parent == "base.ugraph" && !reloaded.inherited && reloaded.defaults.size() == 1 &&
+          ValuesEqual(reloaded.defaults.at("Health"), ScriptValue(std::int32_t{50})));
+    CHECK(HasError(reloaded, "is not loaded"));
+    files["child.ugraph"] = child.g;
+
+    // Grandchild: no own BeginPlay (the child's runs), Describe overridden again, Health 7.
+    Graph grand;
+    grand.g.parent             = "child.ugraph";
+    grand.g.defaults["Health"] = std::int32_t{7};
+    CHECK(ResolveScriptParent(grand.g, "grand.ugraph", loader).empty());
+    CHECK(ScriptParentChain(grand.g).size() == 2);
+    CHECK(grand.g.OverrideFunction("Describe"));
+    {
+        const std::uint32_t append = grand.Node("String.Append", {}, "Describe");
+        grand.Link(grand.Find("Function.CallParent", "Describe"), "Text", append, "A");
+        grand.Set(append, "B", std::string("+grand"));
+        grand.Link(append, "Result", grand.Find("Function.Return", "Describe"), "Text");
+    }
+    CHECK(grand.Valid());
+
+    {
+        Runner r;
+        (void)r.Add("Base", "base.ugraph", base.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.Printed("B") && r.Printed("base") && r.Printed("100") && !r.Printed("C"));
+        r.scripts.End(r.scene);
+    }
+    {
+        Runner r;
+        r.scripts.Provide("base.ugraph", base.g);
+        const Entity e = r.Add("Child", "child.ugraph", child.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.scripts.Stats().errors == 0);
+        CHECK(r.Printed("C") && r.Printed("B") && r.Printed("base+child") && r.Printed("50") && !r.Printed("100"));
+        CHECK(r.Printed("true") && r.Printed("false") && r.Printed("cast ok") && r.Printed("C done"));
+        CHECK(ValuesEqual(r.Var("child.ugraph", e, "Health"), ScriptValue(std::int32_t{50})));
+        // The debugger finds the instance under its parent class too.
+        CHECK(r.scripts.InstancesOf("base.ugraph").size() == 1 && r.scripts.Watch("base.ugraph", e).has_value());
+        r.scripts.End(r.scene);
+    }
+    {
+        Runner r;
+        r.scripts.Provide("base.ugraph", base.g);
+        r.scripts.Provide("child.ugraph", child.g);
+        (void)r.Add("Grand", "grand.ugraph", grand.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.scripts.Stats().errors == 0);
+        CHECK(r.Printed("C") && r.Printed("B") && r.Printed("base+child+grand") && r.Printed("7") && r.Printed("C done"));
+        CHECK(!r.Printed("false")); // IsA grand.ugraph is true here
+        r.scripts.End(r.scene);
+    }
+
+    // Errors.
+    {
+        Graph bad;
+        bad.g.parent = "base.ugraph";
+        CHECK(ResolveScriptParent(bad.g, "bad.ugraph", loader).empty());
+        bad.g.variables.push_back({"Health", PinType::Int, std::int32_t{1}, false});
+        bad.g.defaults["Nope"] = 1.0f;
+        CHECK(HasError(bad.g, "already defined in the parent class") && HasError(bad.g, "no such variable"));
+        bad.g.variables.clear();
+        bad.g.defaults.clear();
+        CHECK(bad.g.OverrideFunction("Describe"));
+        bad.g.FindFunction("Describe")->outputs.push_back({"Extra", PinType::Int});
+        CHECK(HasError(bad.g, "overrides the parent's version"));
+        bad.g.FindFunction("Describe")->outputs.pop_back();
+        const std::uint32_t sup = bad.Node("Flow.CallParentEvent", "Event.BeginPlay");
+        CHECK(HasError(bad.g, "does not override the event"));
+        bad.g.RemoveNode(sup);
+        (void)bad.Node("Flow.CallParentEvent", "Event.Tick");
+        CHECK(HasError(bad.g, "No parent class handles"));
+    }
+    {
+        Graph a, b2;
+        a.g.parent  = "b.ugraph";
+        b2.g.parent = "a.ugraph";
+        files["a.ugraph"] = a.g;
+        files["b.ugraph"] = b2.g;
+        CHECK(ResolveScriptParent(a.g, "a.ugraph", loader).find("cycle") != std::string::npos);
+        Graph missing;
+        missing.g.parent = "nowhere.ugraph";
+        CHECK(!ResolveScriptParent(missing.g, "m.ugraph", loader).empty() && !missing.g.inherited);
+        Runner r;
+        (void)r.Add("Missing", "m.ugraph", missing.g);
+        r.scripts.Begin(r.scene);
+        CHECK(r.scripts.Debug("m.ugraph") && !r.scripts.Debug("m.ugraph")->diagnostics.empty());
+        r.scripts.End(r.scene);
+    }
+    CHECK(ScriptParentPath("Content/Scripts/Enemies/Orc.ugraph", "Content/Scripts/Enemy.ugraph") == "../Enemy.ugraph");
 }

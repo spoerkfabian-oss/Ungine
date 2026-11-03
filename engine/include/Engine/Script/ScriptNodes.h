@@ -136,6 +136,9 @@ public:
     virtual bool CallFunctionOn(Entity target, const std::string& function, std::vector<ScriptValue> args,
                                 std::vector<ScriptValue>& results) = 0;
     [[nodiscard]] virtual bool Implements(Entity target, const std::string& interfaceName) = 0;
+    // Is the target's script graph `graphPath` (relative to the working directory, like the
+    // Script component) or a child class of it?
+    [[nodiscard]] virtual bool IsA(Entity target, const std::string& graphPath) = 0;
     // Event dispatchers. CallDispatcher runs every custom event bound to this script's dispatcher;
     // Bind adds (removes) this script's custom event `event` to (from) the target script's
     // dispatcher; UnbindAll clears it. False: the target has no script with that dispatcher.

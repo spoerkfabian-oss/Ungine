@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <map>
 #include <optional>
 #include <string>
@@ -140,6 +142,16 @@ struct ScriptGraph {
     std::vector<std::string>     interfaces;  // implemented interfaces (ScriptRegistry)
     std::vector<ScriptTimeline>  timelines;
     bool                         library = false; // function / macro library (no events or variables)
+    // Inheritance (like UE Blueprint classes): the parent class graph (path relative to this graph's
+    // file, empty: none) and overridden defaults of inherited variables. The child inherits
+    // variables, functions, macros, events, dispatchers, timelines and interfaces; a function of the
+    // same name overrides the parent's (same signature), an event node of the same type + param
+    // replaces the parent's handlers; "Call Parent" nodes run the parent's version.
+    std::string                        parent;
+    std::map<std::string, ScriptValue> defaults;
+    // Resolved parent chain (ResolveScriptParent; not saved): lookups fall back to it.
+    std::shared_ptr<const ScriptGraph> inherited;
+    std::filesystem::path              inheritedFile; // file of `inherited`
     std::vector<std::uint32_t>   breakpoints; // node ids (debugger; saved with the graph)
     std::map<std::uint32_t, ScriptBreakpointOptions> breakpointOptions; // of some breakpoints
     std::uint32_t                nextId = 1; // nodes and comments
@@ -155,7 +167,9 @@ struct ScriptGraph {
     [[nodiscard]] const ScriptEventDecl* FindDispatcher(std::string_view name) const;
     [[nodiscard]] const ScriptTimeline*  FindTimeline(std::string_view name) const;
     [[nodiscard]] ScriptTimeline*        FindTimeline(std::string_view name);
-    // A function or macro of that name (both share the scope names of nodes).
+    // A function or macro of that name (both share the scope names of nodes). The const lookups
+    // (variables, functions, macros, events, dispatchers, timelines) include inherited ones; the
+    // non-const ones only this graph's own.
     [[nodiscard]] bool HasScope(std::string_view name) const;
     [[nodiscard]] ScriptFunction*       FindFunction(std::string_view name);
     [[nodiscard]] const ScriptFunction* FindFunction(std::string_view name) const;
@@ -184,6 +198,9 @@ struct ScriptGraph {
     // to pins that no longer exist. SetFunctionPure converts the call nodes.
     bool AddFunction(const std::string& name, glm::vec2 entryPosition = {0.0f, 0.0f});
     bool RenameFunction(const std::string& from, const std::string& to);
+    // Overrides an inherited function: same signature, Entry -> Call Parent -> Return (pure: Entry
+    // -> Return). False when there is no such inherited function or it is overridden already.
+    bool OverrideFunction(const std::string& name, glm::vec2 entryPosition = {0.0f, 0.0f});
     void RemoveFunction(const std::string& name); // its nodes and comments and every call
     void SetFunctionPure(const std::string& name, bool pure);
     // Macros: AddMacro creates the macro (exec "In" -> "Out") with its Inputs / Outputs nodes;
@@ -203,6 +220,22 @@ struct ScriptGraph {
 };
 
 [[nodiscard]] bool IsValidScriptName(std::string_view name); // letters, digits, '_', ' ' (not empty)
+
+// Inheritance. Loads the parent chain of `graph` (saved as `file`) into graph.inherited (depth
+// <= 16, cycles and missing / broken parents are errors). `load` supplies graphs by file (unsaved
+// editor versions; nullopt: read the file). Returns an error message, empty on success (also
+// without a parent: inherited is reset then).
+using ScriptGraphLoader = std::function<std::optional<ScriptGraph>(const std::filesystem::path&)>;
+[[nodiscard]] std::string ResolveScriptParent(ScriptGraph& graph, const std::filesystem::path& file,
+                                              const ScriptGraphLoader& load = {});
+// Parent path as stored in `child` (relative to the child's file) for the graph at `parentFile`.
+[[nodiscard]] std::string ScriptParentPath(const std::filesystem::path& childFile, const std::filesystem::path& parentFile);
+// The parent chain's files (nearest first) of a resolved graph.
+[[nodiscard]] std::vector<std::filesystem::path> ScriptParentChain(const ScriptGraph& graph);
+// Event key of an event node (overrides match it): type, plus ":" + param when it has one.
+[[nodiscard]] std::string ScriptEventKey(const ScriptNode& node);
+// True when an ancestor's event graph handles the event key (an override can call it).
+[[nodiscard]] bool InheritedHandlesEvent(const ScriptGraph& graph, std::string_view key);
 
 // Pins of a node as the registry resolves them (some depend on the param or the variable's type).
 // Unknown node types have none.

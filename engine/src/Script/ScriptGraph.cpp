@@ -78,13 +78,24 @@ ScriptNode*           ScriptGraph::FindNode(std::uint32_t id) { return FindById(
 const ScriptNode*     ScriptGraph::FindNode(std::uint32_t id) const { return FindById(nodes, id); }
 ScriptComment*        ScriptGraph::FindComment(std::uint32_t id) { return FindById(comments, id); }
 ScriptVariable*       ScriptGraph::FindVariable(std::string_view name) { return FindByName(variables, name); }
-const ScriptVariable* ScriptGraph::FindVariable(std::string_view name) const { return FindByName(variables, name); }
 ScriptMacro*          ScriptGraph::FindMacro(std::string_view name) { return FindByName(macros, name); }
-const ScriptMacro*    ScriptGraph::FindMacro(std::string_view name) const { return FindByName(macros, name); }
-const ScriptEventDecl* ScriptGraph::FindEvent(std::string_view name) const { return FindByName(events, name); }
-const ScriptEventDecl* ScriptGraph::FindDispatcher(std::string_view name) const { return FindByName(dispatchers, name); }
-const ScriptTimeline* ScriptGraph::FindTimeline(std::string_view name) const { return FindByName(timelines, name); }
 ScriptTimeline*       ScriptGraph::FindTimeline(std::string_view name) { return FindByName(timelines, name); }
+// Const lookups: this graph first, then the parent chain.
+#define ENGINE_INHERITED_FIND(Type, Name, list)                                         \
+    const Type* ScriptGraph::Name(std::string_view name) const                           \
+    {                                                                                    \
+        for (const ScriptGraph* g = this; g; g = g->inherited.get())                     \
+            if (const Type* found = FindByName(g->list, name))                           \
+                return found;                                                            \
+        return nullptr;                                                                  \
+    }
+ENGINE_INHERITED_FIND(ScriptVariable, FindVariable, variables)
+ENGINE_INHERITED_FIND(ScriptMacro, FindMacro, macros)
+ENGINE_INHERITED_FIND(ScriptEventDecl, FindEvent, events)
+ENGINE_INHERITED_FIND(ScriptEventDecl, FindDispatcher, dispatchers)
+ENGINE_INHERITED_FIND(ScriptTimeline, FindTimeline, timelines)
+ENGINE_INHERITED_FIND(ScriptFunction, FindFunction, functions)
+#undef ENGINE_INHERITED_FIND
 
 glm::vec3 EvaluateTrack(const ScriptTimelineTrack& track, float time)
 {
@@ -108,7 +119,6 @@ glm::vec3 EvaluateTrack(const ScriptTimelineTrack& track, float time)
 }
 bool ScriptGraph::HasScope(std::string_view name) const { return FindFunction(name) || FindMacro(name); }
 ScriptFunction*       ScriptGraph::FindFunction(std::string_view name) { return FindByName(functions, name); }
-const ScriptFunction* ScriptGraph::FindFunction(std::string_view name) const { return FindByName(functions, name); }
 
 const ScriptVariable* ScriptGraph::FindVariableInScope(std::string_view function, std::string_view name) const
 {
@@ -121,7 +131,11 @@ const ScriptVariable* ScriptGraph::FindVariableInScope(std::string_view function
 
 ScriptVariable* ScriptGraph::FindVariableInScope(std::string_view function, std::string_view name)
 {
-    return const_cast<ScriptVariable*>(std::as_const(*this).FindVariableInScope(function, name));
+    if (!function.empty())
+        if (ScriptFunction* f = FindFunction(function))
+            if (ScriptVariable* local = FindByName(f->locals, name))
+                return local;
+    return FindVariable(name);
 }
 
 std::uint32_t ScriptGraph::AddNode(const std::string& type, glm::vec2 position, std::string param, std::string function)
@@ -320,6 +334,31 @@ bool ScriptGraph::AddFunction(const std::string& name, glm::vec2 entryPosition)
     const std::uint32_t entry = AddNode("Function.Entry", entryPosition, name, name);
     const std::uint32_t ret   = AddNode("Function.Return", entryPosition + glm::vec2(400.0f, 0.0f), name, name);
     Connect(entry, "Then", ret, "In");
+    return true;
+}
+
+bool ScriptGraph::OverrideFunction(const std::string& name, glm::vec2 entryPosition)
+{
+    const ScriptFunction* base = inherited ? inherited->FindFunction(name) : nullptr;
+    if (!base || FindByName(functions, name) || FindByName(macros, name))
+        return false;
+    ScriptFunction f = *base;
+    f.locals.clear();
+    functions.push_back(std::move(f));
+    const std::uint32_t entry = AddNode("Function.Entry", entryPosition, name, name);
+    const std::uint32_t ret   = AddNode("Function.Return", entryPosition + glm::vec2(600.0f, 0.0f), name, name);
+    if (base->pure) {
+        Connect(entry, "Then", ret, "In");
+        return true;
+    }
+    // Like UE: the override starts by calling the parent's version and returns its results.
+    const std::uint32_t call = AddNode("Function.CallParent", entryPosition + glm::vec2(300.0f, 0.0f), name, name);
+    Connect(entry, "Then", call, "In");
+    Connect(call, "Then", ret, "In");
+    for (const ScriptParam& p : base->inputs)
+        Connect(entry, p.name, call, p.name);
+    for (const ScriptParam& p : base->outputs)
+        Connect(call, p.name, ret, p.name);
     return true;
 }
 
@@ -738,6 +777,14 @@ std::string ScriptGraphToJson(const ScriptGraph& graph)
     }
     if (graph.library)
         root["library"] = true;
+    if (!graph.parent.empty())
+        root["parent"] = graph.parent;
+    if (!graph.defaults.empty()) {
+        json defaults = json::object();
+        for (const auto& [name, value] : graph.defaults)
+            defaults[name] = {{"type", ToString(TypeOf(value))}, {"value", ScriptValueToJson(value)}};
+        root["defaults"] = std::move(defaults);
+    }
     if (!graph.breakpoints.empty())
         root["breakpoints"] = graph.breakpoints;
     if (!graph.breakpointOptions.empty()) {
@@ -782,6 +829,11 @@ ScriptGraph ScriptGraphFromJson(const std::string& text)
         for (const json& i : root.value("interfaces", json::array()))
             graph.interfaces.push_back(i.get<std::string>());
         graph.library = root.value("library", false);
+        graph.parent  = root.value("parent", std::string());
+        if (const auto d = root.find("defaults"); d != root.end() && d->is_object())
+            for (auto it = d->begin(); it != d->end(); ++it)
+                if (const auto type = PinTypeFromString(it->value("type", std::string())); type && type->kind != PinKind::Exec)
+                    graph.defaults[it.key()] = ScriptValueFromJson(it->at("value"), *type);
         for (const json& t : root.value("timelines", json::array())) {
             ScriptTimeline timeline;
             timeline.name     = t.at("name").get<std::string>();
@@ -945,6 +997,35 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
         }
     };
     checkVariables(graph.variables, "");
+    // Inheritance (the parent chain is resolved by ResolveScriptParent; its own errors are its own).
+    if (!graph.parent.empty() && !graph.inherited)
+        error(0, "Parent class '" + graph.parent + "' is not loaded");
+    if (graph.library && !graph.parent.empty())
+        error(0, "A library cannot have a parent class");
+    if (const ScriptGraph* base = graph.inherited.get()) {
+        for (const ScriptVariable& v : graph.variables)
+            if (base->FindVariable(v.name))
+                error(0, "Variable '" + v.name + "' is already defined in the parent class (change its default instead)");
+        for (const auto& [name, value] : graph.defaults) {
+            const ScriptVariable* v = base->FindVariable(name);
+            if (!v)
+                error(0, "Default for '" + name + "': the parent class has no such variable");
+            else if (!ValueFits(value, v->type) && !CanConvert(TypeOf(value), v->type))
+                error(0, "Default for '" + name + "' does not fit its type " + DisplayName(v->type));
+        }
+        for (const ScriptFunction& f : graph.functions)
+            if (const ScriptFunction* b = base->FindFunction(f.name);
+                b && (!SameParams(f.inputs, b->inputs) || !SameParams(f.outputs, b->outputs) || f.pure != b->pure))
+                error(0, "Function '" + f.name + "' overrides the parent's version: inputs, outputs and pure must stay the same");
+        for (const ScriptMacro& m : graph.macros)
+            if (base->FindMacro(m.name) || base->FindFunction(m.name))
+                error(0, "Macro '" + m.name + "': the parent class already uses the name");
+        for (const ScriptTimeline& t : graph.timelines)
+            if (base->FindTimeline(t.name))
+                error(0, "Timeline '" + t.name + "' is already defined in the parent class");
+    } else if (!graph.defaults.empty() && graph.parent.empty()) {
+        error(0, "Variable defaults without a parent class");
+    }
     if (graph.library) {
         if (!graph.variables.empty() || !graph.events.empty() || !graph.dispatchers.empty() || !graph.interfaces.empty())
             error(0, "A library has only functions and macros (no variables, events, dispatchers or interfaces)");
@@ -965,8 +1046,10 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
         const char*                     what = list == &graph.events ? "Event" : "Dispatcher";
         std::unordered_set<std::string> names;
         for (const ScriptEventDecl& e : *list) {
-            if (!IsValidScriptName(e.name) || !names.insert(e.name).second)
+            if ((!expanded && !IsValidScriptName(e.name)) || !names.insert(e.name).second)
                 error(0, std::string(what) + " names must be unique names ('" + e.name + "')");
+            if (graph.inherited && (list == &graph.events ? graph.inherited->FindEvent(e.name) : graph.inherited->FindDispatcher(e.name)))
+                error(0, std::string(what) + " '" + e.name + "' is already defined in the parent class");
             checkParams(e.params, std::string(what) + " '" + e.name + "'", false);
         }
     }
@@ -1053,8 +1136,9 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
             error(n.id, "Unknown node type '" + n.type + "'");
             continue;
         }
-        const ScriptFunction* scope = n.function.empty() ? nullptr : graph.FindFunction(n.function);
-        const ScriptMacro*    macro = n.function.empty() || scope ? nullptr : graph.FindMacro(n.function);
+        // Scopes are this graph's own functions / macros (inherited ones are not edited here).
+        const ScriptFunction* scope = n.function.empty() ? nullptr : FindByName(graph.functions, n.function);
+        const ScriptMacro*    macro = n.function.empty() || scope ? nullptr : FindByName(graph.macros, n.function);
         if (!n.function.empty() && !scope && !macro)
             error(n.id, "Unknown function / macro '" + n.function + "'");
         if (desc->paramKind == ParamKind::Variable) {
@@ -1119,7 +1203,26 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
             break;
         default: break;
         }
-        if (desc->paramKind == ParamKind::Function) {
+        if (n.type == "Function.CallParent" || n.type == "Function.CallParentPure") {
+            const ScriptFunction* base = graph.inherited ? graph.inherited->FindFunction(n.param) : nullptr;
+            if (!scope || n.param != n.function)
+                error(n.id, "Call Parent belongs into the overriding function itself");
+            else if (!base)
+                error(n.id, "The parent class has no function '" + n.param + "'");
+            else if ((n.type == "Function.CallParentPure") != base->pure)
+                error(n.id, base->pure ? "The parent's '" + n.param + "' is pure: use a pure Call Parent"
+                                       : "The parent's '" + n.param + "' is not pure: use Call Parent with exec pins");
+        } else if (n.type == "Flow.CallParentEvent") {
+            if (!n.function.empty())
+                error(n.id, "Call Parent Event belongs into the event graph");
+            else if (!InheritedHandlesEvent(graph, n.param))
+                error(n.id, "No parent class handles the event '" + n.param + "'");
+            else if (std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) {
+                         const NodeDesc* d = FindScriptNodeType(e.type);
+                         return e.function.empty() && d && d->kind == NodeKind::Event && ScriptEventKey(e) == n.param;
+                     }))
+                error(n.id, "This graph does not override the event '" + n.param + "' (the parent's version runs anyway)");
+        } else if (desc->paramKind == ParamKind::Function) {
             const ScriptFunction* f = graph.FindFunction(n.param);
             if (!f)
                 error(n.id, "Unknown function '" + n.param + "'");
@@ -1188,12 +1291,17 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
                                               : std::string();
                 if (event.empty())
                     error(n.id, "No custom event to bind (Event)");
-                else if (std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) { return e.type == "Event.Custom" && e.param == event; }))
+                else if (std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) { return e.type == "Event.Custom" && e.param == event; }) &&
+                         !InheritedHandlesEvent(graph, "Event.Custom:" + event))
                     out.push_back({n.id, "This graph has no Custom Event '" + event + "' to bind", false});
             }
         }
         if (desc->paramKind == ParamKind::Timeline && !graph.FindTimeline(n.param))
             error(n.id, "Unknown timeline '" + n.param + "'");
+        if (n.type == "Class.IsA" || n.type == "Class.CastTo") {
+            if (!n.param.ends_with(".ugraph"))
+                error(n.id, "The class is a Blueprint graph file (.ugraph)");
+        }
         if ((desc->paramKind == ParamKind::Text || desc->paramKind == ParamKind::InputAction ||
              desc->paramKind == ParamKind::InputAxis) && n.param.empty())
             error(n.id, desc->paramLabel + " is empty");
