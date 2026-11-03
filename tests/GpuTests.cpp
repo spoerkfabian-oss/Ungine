@@ -5274,3 +5274,159 @@ TEST_CASE(Editor_MaterialEditorAndAssignment)
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
+
+TEST_CASE(Editor_SettingsUndoAndNestedPrefabs)
+{
+    // Settings in the scene history: renderer / physics settings (scene changes), project settings
+    // and the editor view (no scene change), camera jumps; none while playing or from loading a
+    // scene. Nested prefabs: the inspector shows the levels, Apply into the nested prefab, variants.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      root = fs::temp_directory_path() / std::format("ungine_settings_undo_{}", std::random_device{}());
+    const auto          templates = ProjectTemplates();
+    const auto blank = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Blank"; });
+    CHECK(blank != templates.end());
+    if (blank == templates.end())
+        return;
+    std::optional<Project> project = Project::Create(root, "UndoGame", *blank);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+
+    Scene                    scene;
+    Registry&                r = scene.GetRegistry();
+    PhysicsWorld             physics(*F().jobs, F().events, F().assets.get());
+    SceneRenderer            sceneRenderer(*F().renderer, *F().context, *F().assets);
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .physics       = &physics,
+                       .project       = &*project,
+                       .layoutFile    = {}});
+        const auto runFrames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                F().window->PollEvents();
+                F().events.Flush();
+                editor.FixedUpdate(1.0f / 60.0f);
+                F().assets->Update();
+                editor.Update(1.0f / 60.0f);
+                if (auto frame = F().renderer->BeginFrame()) {
+                    editor.Render(*frame);
+                    F().renderer->EndFrame(*frame);
+                }
+            }
+        };
+        runFrames(3);
+        CHECK(!editor.CanUndo());
+
+        // Renderer settings: one step, part of the scene.
+        const float exposure = sceneRenderer.post.exposure;
+        sceneRenderer.post.exposure = exposure + 1.5f;
+        runFrames(2);
+        CHECK(editor.UndoLabel() == "Renderer settings" && editor.HasUnsavedChanges());
+        CHECK(editor.Undo() && sceneRenderer.post.exposure == exposure && !editor.HasUnsavedChanges());
+        CHECK(editor.Redo() && sceneRenderer.post.exposure == exposure + 1.5f);
+        runFrames(2);
+        CHECK(editor.UndoLabel() == "Renderer settings" && !editor.CanRedo()); // the undo / redo made no new step
+
+        // Physics settings.
+        physics.settings.gravity.y = -3.0f;
+        runFrames(2);
+        CHECK(editor.UndoLabel() == "Physics settings");
+        CHECK(editor.Undo() && physics.settings.gravity.y == -9.81f && editor.Redo() && physics.settings.gravity.y == -3.0f);
+
+        // Save: project settings and the view are no scene changes.
+        const fs::path sceneFile = content / "Scenes" / "Undo.scene.json";
+        CHECK(editor.SaveScene(sceneFile) && !editor.HasUnsavedChanges());
+        project->settings.saveVersion = 7;
+        project->settings.audio.volume[0] = 0.25f;
+        runFrames(2);
+        CHECK(editor.UndoLabel() == "Project settings" && !editor.HasUnsavedChanges());
+        sceneRenderer.post.debugView = DebugView::Normals;
+        runFrames(2);
+        CHECK(editor.UndoLabel() == "Viewport view" && !editor.HasUnsavedChanges());
+        CHECK(editor.Undo() && sceneRenderer.post.debugView == DebugView::None);
+        CHECK(editor.Undo() && project->settings.saveVersion == 1 && project->settings.audio.volume[0] == 1.0f);
+        CHECK(!editor.HasUnsavedChanges() && editor.Redo() && project->settings.saveVersion == 7);
+
+        // Camera: a jump (Focus) is a step; flying is not.
+        const Entity box = scene.CreateEntity("Target");
+        scene.EditTransform(box).position = {10.0f, 0.0f, -10.0f};
+        scene.UpdateTransforms();
+        runFrames(2);
+        camera.position = {0.0f, 2.0f, 5.0f};
+        runFrames(1);
+        const glm::vec3 flown = camera.position;
+        editor.Select(box);
+        editor.FocusSelected();
+        CHECK(editor.UndoLabel() == "Focus" && glm::length(camera.position - flown) > 1.0f);
+        CHECK(editor.Undo() && camera.position == flown && editor.Redo() && camera.position != flown);
+
+        // Play: settings changes are no steps, neither is Stop.
+        const std::string beforePlay = editor.UndoLabel();
+        editor.Play();
+        runFrames(2);
+        sceneRenderer.post.exposure = exposure - 1.0f;
+        runFrames(2);
+        editor.Stop();
+        runFrames(2);
+        CHECK(editor.UndoLabel() == beforePlay);
+        sceneRenderer.post.exposure = exposure;
+        runFrames(2);
+
+        // Opening a scene loads its settings without a step.
+        CHECK(editor.SaveScene(sceneFile));
+        sceneRenderer.post.exposure = exposure + 3.0f;
+        runFrames(2);
+        CHECK(editor.OpenScene(sceneFile));
+        runFrames(2);
+        CHECK(!editor.CanUndo() && sceneRenderer.post.exposure == exposure);
+
+        // Nested prefabs: a lamp inside a room.
+        const Entity lamp = scene.CreateEntity("Lamp");
+        r.Emplace<Light>(lamp, Light{});
+        const Entity shade = scene.CreateEntity("Shade", lamp);
+        r.Emplace<Tags>(shade, Tags{.values = {"shade"}});
+        CHECK(editor.CreatePrefabFrom(lamp, content / "Prefabs" / "Lamp.uprefab"));
+        const Entity room = scene.CreateEntity("Room");
+        CHECK(scene.SetParent(lamp, room));
+        CHECK(editor.CreatePrefabFrom(room, content / "Prefabs" / "Room.uprefab"));
+        CHECK(PrefabLevels(scene, shade).size() == 2 && !r.Has<PrefabInstance>(lamp));
+        editor.Select(shade);
+        runFrames(3); // inspector: levels + "Apply to..."
+
+        // Apply into the nested lamp prefab: an undo restores the scene (the file stays written).
+        r.Get<Tags>(shade).values = {"shade", "applied"};
+        editor.RunPrefabOp(Editor::PrefabOp::Apply, shade, {}, 1);
+        runFrames(1);
+        CHECK(editor.UndoLabel() == "Apply to Lamp.uprefab");
+        {
+            std::vector<ModelHandle> none;
+            Scene                    check;
+            const Entity lampCopy = InstantiatePrefab(check, nullptr, content / "Prefabs" / "Lamp.uprefab", NullEntity, Transform{}, none);
+            const Entity shadeCopy = check.GetRegistry().Get<Hierarchy>(lampCopy).children.at(0);
+            CHECK(check.GetRegistry().Get<Tags>(shadeCopy).Has("applied"));
+        }
+        CHECK(PrefabOverrides(scene, F().assets.get(), room).empty());
+
+        // A variant of the room, placed and edited.
+        const fs::path variant = editor.CreatePrefabVariantOf(content / "Prefabs" / "Room.uprefab");
+        CHECK(fs::exists(variant) && fs::path(PrefabBase(variant)).filename() == "Room.uprefab");
+        const Entity placed = editor.PlacePrefab(variant, {0.0f, 0.0f, -4.0f});
+        CHECK(placed != NullEntity && r.Get<PrefabInstance>(placed).prefab.ends_with("Room_Variant.uprefab"));
+        CHECK(r.Get<Hierarchy>(placed).children.size() == 1);
+        editor.Select(placed);
+        runFrames(3);
+        CHECK(editor.Undo() && !r.Valid(placed));
+    }
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}

@@ -90,4 +90,10 @@ void                      ApplyEntityState(Scene& scene, Entity entity, const st
 // did not touch keep the target's; name and identity stay. Returns true if the target changed.
 bool ApplyEntityStateDiff(Scene& scene, Entity target, const std::string& before, const std::string& after);
 
+// Renderer / physics settings as scene files store them (JSON text, no debug flags): editor undo.
+[[nodiscard]] std::string RendererSettingsText(const SceneRenderer& renderer);
+void                      ApplyRendererSettingsText(SceneRenderer& renderer, const std::string& text);
+[[nodiscard]] std::string PhysicsSettingsText(const PhysicsSettings& settings);
+void                      ApplyPhysicsSettingsText(PhysicsSettings& settings, const std::string& text);
+
 } // namespace Engine

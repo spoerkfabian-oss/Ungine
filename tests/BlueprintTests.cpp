@@ -632,3 +632,149 @@ TEST_CASE(Prefab_InstancesOverridesApplyRevertAndFiles)
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+namespace {
+Entity ChildNamed(const Scene& scene, Entity parent, std::string_view name)
+{
+    for (const Entity c : Children(scene, parent))
+        if (scene.GetRegistry().Get<Name>(c).value == name)
+            return c;
+    return NullEntity;
+}
+} // namespace
+
+TEST_CASE(Prefab_NestedInstancesLevelsAndVariants)
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("ungine_nested_prefab_" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    const fs::path lampFile = dir / "Lamp.uprefab";
+    const fs::path roomFile = dir / "Rooms" / "Room.uprefab";
+    const AssetManager*      none = nullptr;
+    std::vector<ModelHandle> models;
+    Scene                    scene;
+    Registry&                r = scene.GetRegistry();
+
+    // Lamp: a light with a bulb below it.
+    const Entity looseLamp = scene.CreateEntity("Lamp");
+    {
+        Light light;
+        light.intensity = 2.0f;
+        r.Emplace<Light>(looseLamp, light);
+        const Entity bulb = scene.CreateEntity("Bulb", looseLamp);
+        r.Emplace<Light>(bulb, Light{});
+        CreatePrefab(lampFile, scene, none, looseLamp);
+    }
+    CHECK(r.Has<PrefabInstance>(looseLamp));
+
+    // Room: a table and a lamp instance whose bulb is brighter.
+    const Entity room  = scene.CreateEntity("Room");
+    const Entity table = scene.CreateEntity("Table", room);
+    Transform    at;
+    at.position = {0.0f, 2.0f, 0.0f};
+    const Entity roomLamp = InstantiatePrefab(scene, nullptr, lampFile, room, at, models);
+    const Entity roomBulb = Children(scene, roomLamp)[0];
+    r.Get<Light>(roomBulb).intensity = 5.0f;
+    CreatePrefab(roomFile, scene, none, room);
+    const std::string roomText = ReadText(roomFile);
+    CHECK(roomText.find("\"../Lamp.uprefab\"") != std::string::npos && roomText.find("\"Bulb\"") == std::string::npos);
+    CHECK(r.Has<PrefabInstance>(room) && !r.Has<PrefabInstance>(roomLamp));
+    CHECK(r.Get<PrefabLink>(roomBulb).instance == UuidOf(scene, room) && PrefabOverrides(scene, none, room).empty());
+    {
+        const auto levels = PrefabLevels(scene, roomBulb);
+        CHECK(levels.size() == 2 && levels[0].root == room && levels[1].root == roomLamp);
+        CHECK(fs::path(levels[1].file).filename() == "Lamp.uprefab" && PrefabLevels(scene, table).size() == 1);
+        CHECK(PrefabNestedFiles(roomFile).size() == 1 && PrefabBase(roomFile).empty());
+    }
+
+    // A second room: the nested lamp with the room's override.
+    const Entity room2     = InstantiatePrefab(scene, nullptr, roomFile, NullEntity, Transform{}, models);
+    const Entity room2Lamp = ChildNamed(scene, room2, "Lamp");
+    CHECK(room2Lamp != NullEntity && ChildNamed(scene, room2, "Table") != NullEntity);
+    const Entity room2Bulb = Children(scene, room2Lamp)[0];
+    CHECK(r.Get<Light>(room2Bulb).intensity == 5.0f && r.Get<Light>(room2Lamp).intensity == 2.0f);
+    CHECK(r.Get<Transform>(room2Lamp).position.y == 2.0f && PrefabOverrides(scene, none, room2).empty());
+
+    // The lamp prefab changes: rooms follow, the room's override stays.
+    r.Get<Light>(Children(scene, looseLamp)[0]).color = {0.0f, 1.0f, 0.0f};
+    r.Get<Light>(Children(scene, looseLamp)[0]).intensity = 1.0f;
+    ApplyPrefabInstance(scene, nullptr, looseLamp, models);
+    CHECK(r.Get<Light>(room2Bulb).color == glm::vec3(0.0f, 1.0f, 0.0f) && r.Get<Light>(room2Bulb).intensity == 5.0f);
+    CHECK(r.Get<Light>(roomBulb).color == glm::vec3(0.0f, 1.0f, 0.0f) && PrefabOverrides(scene, none, room).empty());
+
+    // Apply to the inner level: the lamp gets the name, the room's intensity override still wins.
+    r.Get<Name>(room2Bulb).value         = "Glow";
+    r.Get<Light>(room2Bulb).intensity    = 9.0f;
+    ApplyPrefabLevel(scene, nullptr, room2Bulb, 1, models);
+    CHECK(r.Get<Name>(Children(scene, looseLamp)[0]).value == "Glow" && r.Get<Name>(roomBulb).value == "Glow");
+    CHECK(r.Get<Light>(Children(scene, looseLamp)[0]).intensity == 9.0f && r.Get<Light>(roomBulb).intensity == 5.0f);
+    CHECK(r.Get<Name>(room2Bulb).value == "Glow" && r.Get<Light>(room2Bulb).intensity == 9.0f);
+    CHECK(HasKeys(PrefabOverriddenKeys(scene, none, room2Bulb), {"light"}));
+
+    // Apply to the room: the other room follows.
+    ApplyPrefabLevel(scene, nullptr, room2Bulb, 0, models);
+    CHECK(r.Get<Light>(roomBulb).intensity == 9.0f && PrefabOverrides(scene, none, room2).empty());
+    CHECK(ReadText(roomFile).find("\"../Lamp.uprefab\"") != std::string::npos); // still nested
+
+    // Scene files keep overrides against the expanded prefab.
+    r.Get<Light>(room2Lamp).range = 4.0f;
+    const fs::path level = dir / "Level.scene";
+    SaveSceneFile(level, scene, none);
+    {
+        Scene loaded;
+        (void)LoadSceneFile(level, loaded, static_cast<AssetManager*>(nullptr));
+        const Entity l = loaded.FindByUuid(UuidOf(scene, room2Lamp));
+        const Entity b = loaded.FindByUuid(UuidOf(scene, room2Bulb));
+        CHECK(l != NullEntity && b != NullEntity && loaded.GetRegistry().Get<Light>(l).range == 4.0f);
+        CHECK(loaded.GetRegistry().Get<Light>(b).intensity == 9.0f && PrefabLevels(loaded, b).size() == 2);
+    }
+
+    // Variants: the base's content plus their own overrides and entities.
+    const fs::path variantFile = dir / "Rooms" / "RoomDark.uprefab";
+    CreatePrefabVariant(variantFile, roomFile);
+    CHECK(fs::path(PrefabBase(variantFile)).filename() == "Room.uprefab");
+    const Entity dark = InstantiatePrefab(scene, nullptr, variantFile, NullEntity, Transform{}, models);
+    CHECK(ChildNamed(scene, dark, "Table") != NullEntity && ChildNamed(scene, dark, "Lamp") != NullEntity);
+    const Entity darkLamp = ChildNamed(scene, dark, "Lamp");
+    r.Get<Light>(darkLamp).intensity = 0.5f;
+    (void)scene.CreateEntity("Rug", dark);
+    {
+        const auto levels = PrefabLevels(scene, Children(scene, darkLamp)[0]);
+        CHECK(levels.size() == 3 && fs::path(levels[1].file).filename() == "Room.uprefab" && levels[2].root == darkLamp);
+    }
+    ApplyPrefabInstance(scene, nullptr, dark, models);
+    CHECK(ReadText(variantFile).find("\"Rug\"") != std::string::npos && ChildNamed(scene, room2, "Rug") == NullEntity);
+    CHECK(r.Get<Light>(room2Lamp).intensity == 2.0f && PrefabOverrides(scene, none, dark).empty());
+    const Entity dark2 = InstantiatePrefab(scene, nullptr, variantFile, NullEntity, Transform{}, models);
+    CHECK(ChildNamed(scene, dark2, "Rug") != NullEntity && r.Get<Light>(ChildNamed(scene, dark2, "Lamp")).intensity == 0.5f);
+
+    // The base changes: variants follow.
+    (void)scene.CreateEntity("Chair", room);
+    ApplyPrefabInstance(scene, nullptr, room, models);
+    CHECK(ChildNamed(scene, room2, "Chair") != NullEntity && ChildNamed(scene, dark, "Chair") != NullEntity);
+    CHECK(ChildNamed(scene, dark2, "Chair") != NullEntity && ChildNamed(scene, dark, "Rug") != NullEntity);
+    CHECK(r.Get<Light>(darkLamp).intensity == 0.5f);
+
+    // A prefab made from an instance root is a variant of its prefab.
+    const fs::path copyFile = dir / "RoomCopy.uprefab";
+    CreatePrefab(copyFile, scene, none, room2);
+    CHECK(fs::path(PrefabBase(copyFile)).filename() == "Room.uprefab" && r.Get<PrefabInstance>(room2).prefab.ends_with("RoomCopy.uprefab"));
+    CHECK(PrefabLevels(scene, room2Bulb).size() == 3 && PrefabOverrides(scene, none, room2).empty());
+
+    // A prefab cannot contain itself: such an instance is flattened, a variant of itself refused.
+    const Entity inner = InstantiatePrefab(scene, nullptr, roomFile, ChildNamed(scene, room, "Table"), Transform{}, models);
+    ApplyPrefabInstance(scene, nullptr, room, models);
+    CHECK(r.Valid(inner) && !r.Has<PrefabInstance>(inner) && PrefabNestedFiles(roomFile).size() == 1);
+    CHECK(ChildNamed(scene, ChildNamed(scene, room2, "Table"), "Room") != NullEntity); // the variant follows its base
+    bool refused = false;
+    try {
+        CreatePrefabVariant(roomFile, variantFile);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused && PrefabBase(roomFile).empty());
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+

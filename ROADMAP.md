@@ -73,6 +73,10 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Node-Graph-Materialien mit generiertem GLSL und eigener Pipeline pro Material, Live-Vorschau; Instanzen; Blend-/Shading-Modelle; World Position Offset mit Motion Vectors; Zuweisung pro Submesh; glTF-Materialien bleiben Standard.
 - Fortschritt (2026-10-27): umgesetzt und lokal verifiziert – `.umat` (~55 Knoten, Parameter, Settings) + `.uminst`, Codegen in die bestehenden Mesh-/Schatten-Shader, Laufzeit-Kompilierung per glslang (Speicher-/Disk-Cache), Material-Assets im AssetManager (Instanz-Ketten, Texturen, Hot-Reload, Provide), dynamische Culling-Buckets pro Material-Pipeline, Parameterblöcke pro Draw, `MaterialOverrides` + Blueprint-Knoten, Material-Fenster (Canvas, Palette, Vorschau, Undo), Inspector-Slots + Drag & Drop, Cooker/Packaging, Beispielmaterial im Basic-Template. Grenzen in CLAUDE.md, Offene Punkte 25.
 
+### Phase 34 – Verschachtelte Prefabs + Settings-Undo (C)
+- Prefab-Instanzen in Prefabs (Overrides pro Ebene, Apply mit wählbarer Zielebene), Prefab-Varianten; Undo für Renderer-/Physik-/Projekt-Settings und die Editor-Ansicht (Kamera nur Sprünge) in der Szenen-History; Asset-Fenster behalten ihr eigenes Undo.
+- Fortschritt (2026-11-03): umgesetzt und lokal verifiziert – Prefab-Dateien v2 speichern verschachtelte Instanzen wie Szenendateien (Wurzel + Member + Merge-Patches) und werden beim Laden expandiert (Abhängigkeiten im Cache, Zyklen erkannt bzw. beim Schreiben geflacht), Szenenformat unverändert, `PrefabLevels`/`ApplyPrefabLevel`, Varianten (`CreatePrefabVariant`, Instanz-Wurzel → Variante), Level-Streaming lädt Modelle verschachtelter Prefabs vor; Editor: Ebenen im Inspector, *Apply to…*, *Create variant*; Settings-Tracker pro Frame (Renderer/Physik als Szenenänderung, Projekt/Ansicht ohne Dirty-Stern), Fokus/Kamerafelder als Schritte. Grenzen in CLAUDE.md, Offene Punkte 16/26.
+
 ### Phasen 31–34 (C, Reihenfolge vom Nutzer bestätigt)
 - 31 TAA/Decals/SSR/Nebel, 32 Terrain, 33 Material-Editor, 34 verschachtelte Prefabs + Settings-Undo.
 

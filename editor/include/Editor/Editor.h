@@ -35,6 +35,8 @@
 namespace Engine {
 
 class AssetManager;
+struct PrefabLevel;
+struct ProjectSettings;
 class AudioSystem;
 class FileDialog;
 class FlyCamera;
@@ -141,6 +143,7 @@ public:
     [[nodiscard]] bool CanUndo() const;
     [[nodiscard]] bool CanRedo() const;
     [[nodiscard]] bool HasUnsavedChanges() const;
+    [[nodiscard]] const std::string& UndoLabel() const; // "" if nothing to undo
 
     // Play mode: Play snapshots the scene and starts the simulation, Stop restores the snapshot
     // (selection kept by UUID). No undo history while playing; scene files are locked.
@@ -238,8 +241,14 @@ public:
     Entity PlacePrefab(const std::filesystem::path& file, const glm::vec3& position);
     enum class PrefabOp { Apply, Revert, Unlink };
     // Apply / Unlink: the instance of `entity`; Revert: `key` of `entity` (empty: all of it, or the
-    // whole instance for its root).
-    bool RunPrefabOp(PrefabOp op, Entity entity, const std::string& key = {});
+    // whole instance for its root). Apply `level`: the prefab of PrefabLevels(entity)[level] (0 =
+    // the instance's own, higher = the nested prefab the entity comes from).
+    bool RunPrefabOp(PrefabOp op, Entity entity, const std::string& key = {}, std::size_t level = 0);
+    // Frames the selection in the editor camera (F; an undo step of the editor view).
+    void FocusSelected();
+
+    // A new variant of the prefab `base` next to it ("<name>_Variant.uprefab"); empty on failure.
+    std::filesystem::path CreatePrefabVariantOf(const std::filesystem::path& base);
 
 private:
     enum class GizmoOperation { Translate, Rotate, Scale };
@@ -280,6 +289,7 @@ private:
     void ReleaseTexturePreviews(bool all); // all: shutdown; else those not shown this frame / outdated
     void DrawDialogs();
     void DrawPrefabHeader(Entity entity);         // inspector: prefab of the entity, overrides, actions
+    void DrawPrefabApplyLevels(Entity entity, const std::vector<PrefabLevel>& levels); // menu items: Apply to each level
     void DrawScriptVariables(ScriptComponent& script); // inspector: exposed variables of the graph
     // The graph of a script file: the open editor document (unsaved edits) or the file (cached by mtime).
     [[nodiscard]] const ScriptGraph* GraphFor(const std::string& file);
@@ -321,7 +331,6 @@ private:
     void UpdatePendingInstances(); // models opened from the content browser: instantiate when ready
     void HandleHotkeys();
     void EnsureViewportTarget(std::uint32_t width, std::uint32_t height);
-    void FocusSelected();
     void ApplyPendingEdits(); // deletes / reparents requested while the hierarchy was drawn
     void UpdateSelectionOverlay();
 
@@ -330,6 +339,37 @@ private:
     [[nodiscard]] std::vector<Entity> SelectionRoots() const; // selected, without selected ancestors and streamed entities
     void                              SelectFromClick(Entity entity, bool additive);
     void                              ValidateSelection();
+
+    // Settings undo: renderer / physics settings (saved with the scene), project settings and the
+    // editor view (viewport overlays, debug view, camera fields and jumps; not part of the scene).
+    // Compared every frame after the panels; a change becomes one step once no widget is active.
+    struct ViewState {
+        bool          lights = true, bvh = false, colliders = true, audio = true, particles = true;
+        bool          volumes = true, navMesh = true, gameCamera = false;
+        int           bvhDepth  = 8;
+        std::uint32_t debugView = 0;
+        bool          operator==(const ViewState&) const = default;
+    };
+    struct CameraFields {
+        float fovY = 0.0f, nearPlane = 0.0f, moveSpeed = 0.0f;
+        bool  operator==(const CameraFields&) const = default;
+    };
+    struct CameraPose {
+        glm::vec3 position{0.0f};
+        float     yaw = 0.0f, pitch = 0.0f;
+    };
+    [[nodiscard]] ViewState    CaptureView() const;
+    void                       ApplyView(const ViewState& view);
+    [[nodiscard]] CameraFields CaptureCameraFields() const;
+    [[nodiscard]] CameraPose   CaptureCameraPose() const;
+    void                       TrackSettings();
+    void                       ResetSettingsBaselines(); // the scene was loaded / replaced: no step
+    void                       PushCameraJump(std::string label, const CameraPose& before);
+    void                       TrackCameraFieldEdit(const CameraFields& before); // after each camera field widget
+    std::string                      m_RendererBaseline, m_PhysicsBaseline;
+    std::shared_ptr<ProjectSettings> m_ProjectBaseline;
+    std::optional<ViewState>         m_ViewBaseline;
+    std::optional<CameraFields>      m_CameraEditBefore;
 
     // Commands
     void   PushCommand(EditCommand command);
@@ -393,6 +433,7 @@ private:
         PrefabOp      op;
         std::uint64_t uuid = 0;
         std::string   key;
+        std::size_t   level = 0;
     };
     std::optional<PendingPrefabOp> m_PendingPrefabOp; // after the panels (they read the entities)
     double                         m_PrefabPollTime = 0.0; // last RefreshPrefabInstances (ImGui time)

@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-11-02 (Phase 33 material editor merged via PR #22, 1726841; next: Phase 34 nested prefabs + settings undo – ask details first)
+- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo implemented on `branch`; PR to open and babysit until CI green; roadmap C complete after its merge)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1054,6 +1054,7 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Settings undo in the scene history: renderer settings, project settings (audio mixer, input, navigation, save/loading screen), physics settings, and editor view (camera/toolbar overlay toggles).
 - Editor view camera: undo only for discrete jumps (Focus F, Game-cam on/off, camera fields in the renderer panel like FOV/speed); free flight is not undoable; toolbar toggles (overlays, debug view) always.
 - Asset windows (Blueprint, Material, Particle, Animation) keep their own undo (no global history).
+- Implementation notes (2026-11-03): prefab files v2 store nested instances like scene files and are *expanded on load* (scene format unchanged; one PrefabInstance per outermost instance). Cache entries carry transitive dependencies; InvalidatePrefab after every write. Self-nesting on write is flattened with a warning (the lifecycle fuzz depends on that). Inner-level Apply goes through a scratch instance + WriteAndLink and only transfers component values. Settings undo = per-frame baseline compare (TrackSettings) + EditCommand::sceneChange (History::Dirty counts scene changes only). Camera fields are tracked per widget (the fly camera updates in app code, so a per-frame diff cannot tell wheel speed changes apart).
 
 ### Phase 33 material editor – decisions (user, 2026-10-27)
 - Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
