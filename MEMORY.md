@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo implemented on `branch`; PR to open and babysit until CI green; roadmap C complete after its merge)
+- Last updated: 2026-11-03 (Phase 34 nested prefabs + variants + settings undo merged via PR #23; roadmap C complete – ask the user what comes next)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
