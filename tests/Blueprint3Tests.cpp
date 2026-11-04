@@ -539,3 +539,105 @@ TEST_CASE(Blueprint3_DispatcherSignatures)
     CHECK(r.scripts.Stats().errors == 1);
     r.scripts.End(r.scene);
 }
+
+TEST_CASE(Blueprint3_UtilityNodes)
+{
+    ScriptRegistry::Clear();
+    Graph         b;
+    std::uint32_t last = b.Node("Event.BeginPlay");
+    const char*   out  = "Out";
+    // Prints the output pin of `node` after the previous print.
+    const auto print = [&](std::uint32_t node, const char* pin) {
+        const std::uint32_t p = Print(b);
+        b.Link(last, out, p, "In");
+        b.Link(node, pin, p, "Text");
+        last = p;
+        out  = "Then";
+    };
+    const std::uint32_t map = b.Node("Math.MapRange");
+    b.Set(map, "Value", 5.0f);
+    b.Set(map, "In Max", 10.0f);
+    b.Set(map, "Out Max", 100.0f);
+    print(map, "Result"); // 50
+    const std::uint32_t wrap = b.Node("Math.Wrap");
+    b.Set(wrap, "Value", 370.0f);
+    print(wrap, "Result"); // 10
+    const std::uint32_t snap = b.Node("Math.Snap");
+    b.Set(snap, "Value", 7.4f);
+    b.Set(snap, "Grid", 2.0f);
+    print(snap, "Result"); // 8
+    const std::uint32_t fmt = b.Node("String.Format");
+    b.Set(fmt, "Format", std::string("{0}-{1}!"));
+    b.Set(fmt, "0", std::string("a"));
+    b.Set(fmt, "1", std::string("bc"));
+    print(fmt, "Result"); // a-bc!
+    const std::uint32_t split = b.Node("String.Split");
+    b.Set(split, "Text", std::string("x,y,z"));
+    const std::uint32_t join = b.Node("String.Join");
+    b.Set(join, "Separator", std::string("+"));
+    b.Link(split, "Parts", join, "Parts");
+    print(join, "Result"); // x+y+z
+    const std::uint32_t toInt = b.Node("String.ToInt");
+    b.Set(toInt, "Text", std::string("42"));
+    const std::uint32_t add = b.Node("Math.AddInt");
+    b.Link(toInt, "Value", add, "A");
+    b.Set(add, "B", std::int32_t{1});
+    print(add, "Result"); // 43
+    const std::uint32_t bad = b.Node("String.ToInt");
+    b.Set(bad, "Text", std::string("4x"));
+    print(bad, "Success"); // false
+    const std::uint32_t make = b.Node("Array.Make", "int:3");
+    b.Set(make, "0", std::int32_t{3});
+    b.Set(make, "1", std::int32_t{1});
+    b.Set(make, "2", std::int32_t{2});
+    const std::uint32_t sort = b.Node("Array.Sort");
+    b.Link(make, "Array", sort, "Array");
+    b.Set(sort, "Descending", true);
+    const std::uint32_t first = b.Node("Array.Get");
+    b.Link(sort, "Result", first, "Array");
+    print(first, "Item"); // 3
+    const std::uint32_t reverse = b.Node("Array.Reverse");
+    b.Link(sort, "Result", reverse, "Array");
+    const std::uint32_t first2 = b.Node("Array.Get");
+    b.Link(reverse, "Result", first2, "Array");
+    const std::uint32_t mul = b.Node("Math.MultiplyInt");
+    b.Link(first2, "Item", mul, "A");
+    b.Set(mul, "B", std::int32_t{100});
+    print(mul, "Result"); // 100
+    const std::uint32_t floats = b.Node("Array.Make", "float:3");
+    b.Set(floats, "0", 1.0f);
+    b.Set(floats, "1", 2.0f);
+    b.Set(floats, "2", 3.5f);
+    const std::uint32_t sum = b.Node("Array.SumFloat");
+    b.Link(floats, "Array", sum, "Array");
+    print(sum, "Value"); // 6.5
+    const std::uint32_t angle = b.Node("Vector.Angle");
+    b.Set(angle, "A", glm::vec3(1.0f, 0.0f, 0.0f));
+    b.Set(angle, "B", glm::vec3(0.0f, 1.0f, 0.0f));
+    const std::uint32_t round = b.Node("Convert.Round");
+    b.Link(angle, "Degrees", round, "Value");
+    print(round, "Result"); // 90
+    const std::uint32_t reflect = b.Node("Vector.Reflect");
+    b.Set(reflect, "Direction", glm::vec3(1.0f, -7.0f, 0.0f));
+    b.Set(reflect, "Normal", glm::vec3(0.0f, 2.0f, 0.0f));
+    const std::uint32_t brk = b.Node("Vector.Break");
+    b.Link(reflect, "Result", brk, "Vector");
+    print(brk, "Y"); // 7
+    // Async Load Model: no asset manager here -> Failed.
+    const std::uint32_t load = b.Node("Asset.LoadModelAsync");
+    b.Set(load, "File", std::string("missing.glb"));
+    b.Link(last, out, load, "In");
+    const std::uint32_t failed = Print(b, "load failed");
+    b.Link(load, "Failed", failed, "In");
+    CHECK(b.Valid());
+
+    Runner r;
+    (void)r.Add("Utils", "utils.ugraph", b.g);
+    r.scripts.Begin(r.scene);
+    for (const char* text : {"50", "10", "8", "a-bc!", "x+y+z", "43", "false", "3", "100", "6.5", "90", "7", "load failed"}) {
+        CHECK(r.Printed(text));
+        if (!r.Printed(text))
+            std::printf("  missing print: %s\n", text);
+    }
+    r.scripts.End(r.scene);
+}
