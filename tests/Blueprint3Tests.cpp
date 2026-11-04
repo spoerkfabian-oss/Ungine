@@ -614,9 +614,9 @@ TEST_CASE(Blueprint3_UtilityNodes)
     const std::uint32_t angle = b.Node("Vector.Angle");
     b.Set(angle, "A", glm::vec3(1.0f, 0.0f, 0.0f));
     b.Set(angle, "B", glm::vec3(0.0f, 1.0f, 0.0f));
-    const std::uint32_t round = b.Node("Convert.Round");
-    b.Link(angle, "Degrees", round, "Value");
-    print(round, "Result"); // 90
+    const std::uint32_t rounded = b.Node("Convert.Round");
+    b.Link(angle, "Degrees", rounded, "Value");
+    print(rounded, "Result"); // 90
     const std::uint32_t reflect = b.Node("Vector.Reflect");
     b.Set(reflect, "Direction", glm::vec3(1.0f, -7.0f, 0.0f));
     b.Set(reflect, "Normal", glm::vec3(0.0f, 2.0f, 0.0f));

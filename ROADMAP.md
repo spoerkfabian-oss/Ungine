@@ -90,5 +90,6 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Vererbung wie UE (Elternklasse, Variablen-Defaults, Overrides mit Call Parent, geerbte Interfaces, Is A / Cast To), Rekursion, verschachtelte Container + weitere Map-Schlüssel.
 - Fortschritt (2026-11-03): umgesetzt und lokal verifiziert – siehe CLAUDE.md „Blueprints erweitert (Phase 35)“, Grenzen in Offene Punkte 13.
 
-### Phase 36 – Latent in Funktionen/Async + Knoten/Komfort (D, geplant)
+### Phase 36 – Latent in Funktionen/Async + Knoten/Komfort (D)
+- Fortschritt (2026-11-04): umgesetzt und lokal verifiziert (gestapelt in PR #24) – Latent-Knoten in Funktionen, Dispatcher-Signaturen, Refactoring (Umbenennen in Kindklassen, Move to parent class, Klassenpfade), ~55 Hilfsknoten + Async Load Model.
 ### Phase 37 – Installer per CI (D, geplant): Windows-Setup (NSIS) + ZIP, Linux-TGZ als Release-Artefakte.
