@@ -2842,6 +2842,22 @@ TEST_CASE(Editor_ContentImportAndReferenceRepair)
             CHECK(editor.CanUndo()); // the reference repair is one undo step
         }
 
+        // Blueprint class paths (Is A / Cast To, relative to the project root) and parent paths follow.
+        {
+            fs::create_directories(content / "Scripts", ec);
+            ScriptGraph enemy;
+            SaveScriptGraph(content / "Scripts" / "Enemy.ugraph", enemy);
+            ScriptGraph user;
+            user.parent = "Enemy.ugraph";
+            user.AddNode("Class.IsA", {}, "Content/Scripts/Enemy.ugraph");
+            SaveScriptGraph(content / "Scripts" / "User.ugraph", user);
+            fs::create_directories(content / "Scripts" / "AI", ec);
+            CHECK(editor.MoveContent(content / "Scripts" / "Enemy.ugraph", content / "Scripts" / "AI" / "Enemy.ugraph"));
+            const ScriptGraph back = LoadScriptGraph(content / "Scripts" / "User.ugraph");
+            CHECK(back.parent == "AI/Enemy.ugraph");
+            CHECK(!back.nodes.empty() && back.nodes[0].param == "Content/Scripts/AI/Enemy.ugraph");
+        }
+
         // Folder move keeps relative glTF dependencies; moving the .gltf alone rewrites its URIs.
         CHECK(editor.MoveContent(content / "Models" / "quad", content / "Models" / "QuadFolder"));
         CHECK(editor.MoveContent(content / "Models" / "QuadFolder" / "quad.gltf", content / "Models" / "quad.gltf"));
@@ -5532,6 +5548,41 @@ TEST_CASE(Editor_BlueprintInheritance)
     CHECK(bp.Undo() && bp.ParentError().empty() && bp.Graph()->parent == "Enemy.ugraph");
     CHECK(!bp.SetParentClass(childFile)); // not its own parent
     CHECK(bp.Save());
+
+    // Refactoring: renaming Speed in the parent follows into the child (open) and a grandchild file.
+    const fs::path grandFile = dir / "Orc.ugraph";
+    {
+        ScriptGraph g;
+        g.parent = "Enemy_Child.ugraph";
+        g.AddNode("Variable.Get", {}, "Speed");
+        SaveScriptGraph(grandFile, g);
+    }
+    bp.SetSearchRoot(dir);
+    CHECK(bp.Open(baseFile) && bp.Graph() && bp.Graph()->FindVariable("Speed"));
+    bp.Edit("Rename", [](ScriptGraph& g) { g.RenameVariable("Speed", "Pace"); });
+    CHECK(bp.RenameInChildClasses(false, "Speed", "Pace") == 2);
+    CHECK(LoadScriptGraph(grandFile).nodes.at(0).param == "Pace");
+    CHECK(bp.Open(childFile) && bp.Graph()->defaults.contains("Pace") && !bp.Graph()->defaults.contains("Speed"));
+    CHECK(std::ranges::none_of(bp.Diagnostics(), &ScriptDiagnostic::error));
+    // Move to parent: a variable and a function; a function using a child-only variable stays.
+    bp.Edit("Add", [](ScriptGraph& g) {
+        g.variables.push_back({"Armor", PinType::Int, std::int32_t{2}, false});
+        g.variables.push_back({"Secret", PinType::Int, std::int32_t{0}, false});
+        CHECK(g.AddFunction("Shout") && g.AddFunction("Peek"));
+        g.AddNode("Variable.Get", {}, "Secret", "Peek");
+    });
+    CHECK(bp.MoveToParentClass(false, "Armor").empty());
+    CHECK(bp.MoveToParentClass(true, "Shout").empty());
+    CHECK(bp.MoveToParentClass(true, "Peek").find("Cannot move") != std::string::npos);
+    const ScriptGraph* parentGraph = bp.Find(baseFile);
+    CHECK(parentGraph && std::ranges::any_of(parentGraph->variables, [](const ScriptVariable& v) { return v.name == "Armor"; }) &&
+          std::ranges::any_of(parentGraph->functions, [](const ScriptFunction& f) { return f.name == "Shout"; }));
+    CHECK(std::ranges::none_of(bp.Graph()->variables, [](const ScriptVariable& v) { return v.name == "Armor"; }) &&
+          std::ranges::none_of(bp.Graph()->functions, [](const ScriptFunction& f) { return f.name == "Shout"; }) &&
+          std::ranges::any_of(bp.Graph()->functions, [](const ScriptFunction& f) { return f.name == "Peek"; }));
+    CHECK(std::ranges::none_of(bp.Diagnostics(), &ScriptDiagnostic::error));
+    runFrames(3);
+    CHECK(bp.SaveAll());
 
     // Play: the child runs the parent's BeginPlay with its own Describe and default.
     const Entity orc = scene.CreateEntity("Orc");

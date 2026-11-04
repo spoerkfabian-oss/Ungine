@@ -796,6 +796,197 @@ const ScriptGraph* ScriptGraphEditor::Find(const std::filesystem::path& file) co
             return &doc->graph;
     return nullptr;
 }
+namespace {
+
+// A member renamed in a parent class, applied to a graph inheriting it (its own nodes).
+bool RenameInherited(ScriptGraph& g, bool function, const std::string& from, const std::string& to)
+{
+    bool changed = false;
+    if (function) {
+        if (std::ranges::any_of(g.functions, [&](const ScriptFunction& f) { return f.name == from; })) {
+            changed = g.RenameFunction(from, to) || changed; // the override follows
+        }
+        for (ScriptNode& n : g.nodes)
+            if ((n.type == "Function.Call" || n.type == "Function.CallPure" || n.type == "Function.CallParent" ||
+                 n.type == "Function.CallParentPure") && n.param == from) {
+                n.param = to;
+                changed = true;
+            }
+        return changed;
+    }
+    for (ScriptNode& n : g.nodes) {
+        const NodeDesc* d = FindScriptNodeType(n.type);
+        if (!d || d->paramKind != ParamKind::Variable || n.param != from)
+            continue;
+        const ScriptFunction* scope = nullptr;
+        for (const ScriptFunction& f : g.functions)
+            if (f.name == n.function)
+                scope = &f;
+        if (scope && std::ranges::any_of(scope->locals, [&](const ScriptVariable& l) { return l.name == from; }))
+            continue; // a local of the same name
+        n.param = to;
+        changed = true;
+    }
+    if (const auto it = g.defaults.find(from); it != g.defaults.end()) {
+        g.defaults[to] = it->second;
+        g.defaults.erase(from);
+        changed = true;
+    }
+    return changed;
+}
+
+} // namespace
+
+std::size_t ScriptGraphEditor::RenameInChildClasses(bool function, const std::string& from, const std::string& to)
+{
+    Document* active = ActiveDoc();
+    if (!active || from == to)
+        return 0;
+    const std::string parentKey = ScriptSystem::Key(active->path);
+    const auto        loader    = [&](const std::filesystem::path& f) -> std::optional<ScriptGraph> {
+        for (const auto& doc : m_Docs)
+            if (ScriptSystem::Key(doc->path) == ScriptSystem::Key(f))
+                return doc->graph;
+        return std::nullopt;
+    };
+    const auto inherits = [&](ScriptGraph graph, const std::filesystem::path& file) {
+        if (graph.parent.empty() || !ResolveScriptParent(graph, file, loader).empty())
+            return false;
+        return std::ranges::any_of(ScriptParentChain(graph),
+                                   [&](const std::filesystem::path& p) { return ScriptSystem::Key(p) == parentKey; });
+    };
+    std::size_t                     count = 0;
+    std::unordered_set<std::string> open;
+    for (const auto& doc : m_Docs) {
+        open.insert(ScriptSystem::Key(doc->path));
+        if (doc.get() == active || !inherits(doc->graph, doc->path))
+            continue;
+        std::string before = ScriptGraphToJson(doc->graph);
+        if (RenameInherited(doc->graph, function, from, to)) {
+            PushUndo(*doc, std::move(before), doc->revision);
+            Changed(*doc);
+            ++count;
+        }
+    }
+    std::error_code ec;
+    if (!m_SearchRoot.empty())
+        for (std::filesystem::recursive_directory_iterator it(m_SearchRoot, std::filesystem::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec) || it->path().extension() != ".ugraph" || open.contains(ScriptSystem::Key(it->path())))
+                continue;
+            try {
+                ScriptGraph graph = LoadScriptGraph(it->path());
+                if (!inherits(graph, it->path()) || !RenameInherited(graph, function, from, to))
+                    continue;
+                graph.inherited.reset();
+                SaveScriptGraph(it->path(), graph);
+                ++count;
+            } catch (const std::exception& e) {
+                m_LastError = e.what();
+            }
+        }
+    return count;
+}
+
+std::string ScriptGraphEditor::MoveToParentClass(bool function, const std::string& name)
+{
+    Document* doc = ActiveDoc();
+    if (!doc || !doc->graph.inherited)
+        return m_LastError = "This blueprint has no parent class";
+    const std::filesystem::path parentFile = doc->graph.inheritedFile;
+    Document*                   parentDoc  = nullptr;
+    for (const auto& d : m_Docs)
+        if (ScriptSystem::Key(d->path) == ScriptSystem::Key(parentFile))
+            parentDoc = d.get();
+    ScriptGraph parent;
+    try {
+        parent = parentDoc ? parentDoc->graph : LoadScriptGraph(parentFile);
+    } catch (const std::exception& e) {
+        return m_LastError = e.what();
+    }
+    const ScriptGraph&         child = doc->graph;
+    std::vector<std::uint32_t> moved;
+    if (!function) {
+        const auto v = std::ranges::find(child.variables, name, &ScriptVariable::name);
+        if (v == child.variables.end())
+            return m_LastError = "No variable '" + name + "' in this blueprint";
+        if (std::ranges::any_of(parent.variables, [&](const ScriptVariable& x) { return x.name == name; }))
+            return m_LastError = "The parent class already has a variable '" + name + "'";
+        parent.variables.push_back(*v);
+    } else {
+        const auto f = std::ranges::find(child.functions, name, &ScriptFunction::name);
+        if (f == child.functions.end())
+            return m_LastError = "No function '" + name + "' in this blueprint";
+        if (child.inherited->FindFunction(name))
+            return m_LastError = "'" + name + "' overrides the parent's function";
+        if (parent.HasScope(name))
+            return m_LastError = "The parent class already uses the name '" + name + "'";
+        parent.functions.push_back(*f);
+        std::unordered_map<std::uint32_t, std::uint32_t> ids;
+        for (const ScriptNode& n : child.nodes)
+            if (n.function == name) {
+                ScriptNode copy = n;
+                copy.id         = parent.nextId++;
+                ids[n.id]       = copy.id;
+                moved.push_back(copy.id);
+                parent.nodes.push_back(std::move(copy));
+            }
+        for (const ScriptLink& l : child.links)
+            if (ids.contains(l.fromNode) && ids.contains(l.toNode))
+                parent.links.push_back({ids[l.fromNode], l.fromPin, ids[l.toNode], l.toPin});
+        for (ScriptComment c : child.comments)
+            if (c.function == name) {
+                c.id = parent.nextId++;
+                parent.comments.push_back(std::move(c));
+            }
+    }
+    // The parent must stay valid: the moved function may only use what the parent has.
+    ScriptGraph check = parent;
+    (void)ResolveScriptParent(check, parentFile, [&](const std::filesystem::path& f) -> std::optional<ScriptGraph> {
+        for (const auto& d : m_Docs)
+            if (ScriptSystem::Key(d->path) == ScriptSystem::Key(f))
+                return d->graph;
+        return std::nullopt;
+    });
+    for (const ScriptDiagnostic& d : ValidateScriptGraph(check))
+        if (d.error && (std::ranges::find(moved, d.node) != moved.end() ||
+                        (d.node == 0 && d.message.find("'" + name + "'") != std::string::npos)))
+            return m_LastError = "Cannot move '" + name + "' to the parent class: " + d.message;
+
+    if (parentDoc) {
+        PushUndo(*parentDoc, ScriptGraphToJson(parentDoc->graph), parentDoc->revision);
+        parent.inherited     = parentDoc->graph.inherited;
+        parent.inheritedFile = parentDoc->graph.inheritedFile;
+        parentDoc->graph     = std::move(parent);
+        Changed(*parentDoc);
+    } else {
+        try {
+            SaveScriptGraph(parentFile, parent);
+        } catch (const std::exception& e) {
+            return m_LastError = e.what();
+        }
+    }
+    Edit(function ? "Move function to parent" : "Move variable to parent", [&](ScriptGraph& g) {
+        if (!function) {
+            std::erase_if(g.variables, [&](const ScriptVariable& v) { return v.name == name; });
+            return;
+        }
+        std::erase_if(g.functions, [&](const ScriptFunction& f) { return f.name == name; });
+        std::unordered_set<std::uint32_t> gone;
+        for (const ScriptNode& n : g.nodes)
+            if (n.function == name)
+                gone.insert(n.id);
+        std::erase_if(g.links, [&](const ScriptLink& l) { return gone.contains(l.fromNode) || gone.contains(l.toNode); });
+        std::erase_if(g.nodes, [&](const ScriptNode& n) { return gone.contains(n.id); });
+        std::erase_if(g.comments, [&](const ScriptComment& c) { return c.function == name; });
+        std::erase_if(g.breakpoints, [&](std::uint32_t id) { return gone.contains(id); });
+    });
+    if (function && doc->scope == name)
+        OpenScope({});
+    ResolveParent(*doc);
+    return {};
+}
+
 const std::filesystem::path* ScriptGraphEditor::Path() const { return ActiveDoc() ? &ActiveDoc()->path : nullptr; }
 bool ScriptGraphEditor::Dirty() const { return ActiveDoc() && ActiveDoc()->revision != ActiveDoc()->savedRevision; }
 bool ScriptGraphEditor::AnyDirty() const
@@ -1581,7 +1772,7 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
         ImGui::TextDisabled("Functions and macros for every blueprint\n(<file name>.<name>); no event graph.");
     else if (ImGui::Selectable("Event Graph", doc.scope.empty()))
         OpenScope({});
-    std::optional<std::string> removeFunction;
+    std::optional<std::string> removeFunction, moveFunction;
     for (const ScriptFunction& f : g.functions) {
         ImGui::PushID(f.name.c_str());
         const std::string label = (f.pure ? "f(x) " : "f() ") + f.name;
@@ -1596,10 +1787,14 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
                 OpenSearch(f.name, true);
             if (ImGui::MenuItem("Delete function"))
                 removeFunction = f.name;
+            if (g.inherited && !g.inherited->FindFunction(f.name) && ImGui::MenuItem("Move to parent class"))
+                moveFunction = f.name;
             ImGui::EndPopup();
         }
         ImGui::PopID();
     }
+    if (moveFunction)
+        (void)MoveToParentClass(true, *moveFunction);
     if (removeFunction) {
         const std::string name = *removeFunction;
         if (doc.scope == name)
@@ -1660,6 +1855,8 @@ void ScriptGraphEditor::DrawFunctions(Document& doc)
             const std::string from = f->name;
             Edit("Rename function", [&](ScriptGraph& graph) { graph.RenameFunction(from, name); });
             doc.scope = name;
+            if (const std::size_t n = RenameInChildClasses(true, from, name))
+                m_LastError = "Renamed in " + std::to_string(n) + " child blueprint(s) too";
         }
         return; // f may be stale
     }
@@ -1850,8 +2047,20 @@ void ScriptGraphEditor::DrawSidebar(Document& doc)
         if (ImGui::IsItemDeactivatedAfterEdit() && name != v.name) {
             const std::string from = v.name;
             Edit("Rename variable", [&](ScriptGraph& graph) { graph.RenameVariable(from, name); });
+            if (const std::size_t n = RenameInChildClasses(false, from, name))
+                m_LastError = "Renamed in " + std::to_string(n) + " child blueprint(s) too";
             ImGui::PopID();
             break; // references changed
+        }
+        if (g.inherited && ImGui::BeginPopupContextItem("varctx")) {
+            if (ImGui::MenuItem("Move to parent class")) {
+                const std::string var = v.name;
+                ImGui::EndPopup();
+                ImGui::PopID();
+                (void)MoveToParentClass(false, var);
+                break;
+            }
+            ImGui::EndPopup();
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Get")) {

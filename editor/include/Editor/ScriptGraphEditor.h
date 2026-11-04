@@ -71,6 +71,12 @@ public:
     // loading the parent chain (empty: fine). Open graphs stand in for their files.
     bool SetParentClass(const std::filesystem::path& parent);
     [[nodiscard]] std::string ParentError();
+    // Refactoring with inheritance: renames a variable / function of the active graph in every graph
+    // inheriting from it (open graphs as undo steps, project files below the search root rewritten;
+    // returns how many changed), moves an own variable / function into the parent class (the open
+    // parent as an undo step, else its file; returns the problem, empty on success).
+    std::size_t RenameInChildClasses(bool function, const std::string& from, const std::string& to);
+    std::string MoveToParentClass(bool function, const std::string& name);
 
     // Selection of the active graph (node ids).
     [[nodiscard]] const std::vector<std::uint32_t>& SelectedNodes() const;

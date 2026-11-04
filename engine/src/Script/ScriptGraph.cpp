@@ -49,7 +49,8 @@ auto FindByName(Range& range, std::string_view name)
 
 bool IsFunctionNode(const std::string& type)
 {
-    return type == "Function.Entry" || type == "Function.Return" || type == "Function.Call" || type == "Function.CallPure";
+    return type == "Function.Entry" || type == "Function.Return" || type == "Function.Call" || type == "Function.CallPure" ||
+           type == "Function.CallParent" || type == "Function.CallParentPure";
 }
 
 // Enums / structs must be registered (ScriptRegistry).
