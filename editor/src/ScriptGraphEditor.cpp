@@ -2938,8 +2938,8 @@ void ScriptGraphEditor::DrawCreateMenu(Document& doc)
     for (const NodeDesc& d : ScriptNodeTypes()) {
         if (d.hidden)
             continue; // Entry / Return / calls are offered per function below
-        if (scopeFunction && (d.kind == NodeKind::Event || d.latent))
-            continue; // functions run synchronously, without events
+        if (scopeFunction && (d.kind == NodeKind::Event || d.repeats || (d.latent && scopeFunction->pure)))
+            continue; // no events / timelines in functions, no latent nodes in pure ones
         if (inMacro && d.kind == NodeKind::Event)
             continue;
         if (d.paramKind == ParamKind::Variable) { // one entry per variable (locals of the scope first)

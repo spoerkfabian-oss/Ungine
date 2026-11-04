@@ -2739,6 +2739,7 @@ std::vector<NodeDesc> BuildRegistry()
         d.category    = "Timeline";
         d.hidden      = true;
         d.latent      = true;
+        d.repeats     = true;
         d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
             std::vector<PinInfo> pins{ExecIn("Play"),         ExecIn("Play from Start"), ExecIn("Stop"),
                                       ExecIn("Reverse"),      ExecIn("Reverse from End"), ExecIn("Set New Time"),
@@ -2816,6 +2817,7 @@ std::vector<NodeDesc> BuildRegistry()
                           "Animates Value from From to To over Duration seconds: Update every frame, then Completed");
         f.category = "Tween";
         f.latent   = true;
+        f.repeats  = true;
         add(WithParam(WithDefaults(std::move(f), {{"To", 1.0f}, {"Duration", 1.0f}}), ParamKind::Choice, "Ease", "Linear", eases));
         add(WithParam(Pure("Math.Ease", "Ease", "Math|Float", {In("Alpha", P::Float), Out("Result", P::Float)},
                            [](ScriptContext& c) { c.Out(1, ScriptEase(c.Param(), c.InFloat(0))); },

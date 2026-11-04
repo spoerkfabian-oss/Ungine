@@ -1054,6 +1054,7 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - Phase 36: latent nodes in functions / async (Delay, Timeline, AI Move To etc. inside functions and interface calls) + more nodes/comfort (node libraries, refactoring tools, dispatcher signature checks).
 - Phase 37: Ungine as an installable executable like Unity/UE: CI builds Release installers (Windows Setup.exe via NSIS + portable ZIP, Linux TGZ) and attaches them to a GitHub release/artifact.
 - One PR per phase as before.
+- Phase 36 decisions (user, 2026-11-04): stacked on `branch` (same PR #24, user merges later). Scope: latent nodes in functions (caller waits; interface calls run the rest async), dispatcher signature checks, refactoring tools (Is-A/Cast-To paths on move, rename across child graphs, move variable/function to parent class), more nodes (math/vector/string/array utilities, async asset load).
 - Phase 35 progress (2026-11-03): done and verified locally – nested container types (`PinType::inner`, interned), float/vec3 map keys, recursion (saved frames, depth 256), inheritance (`parent`/`defaults`, `ResolveScriptParent`, flatten before expansion with "Super<n>:" renames, Call Parent nodes, Class.IsA/CastTo, `Program::classes`), editor Class section + "Create child blueprint". Limits in CLAUDE.md, Offene Punkte 13.
 
 ### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)

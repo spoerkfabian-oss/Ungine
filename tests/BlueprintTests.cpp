@@ -112,8 +112,10 @@ TEST_CASE(Blueprint_FunctionsRunAndEdit)
 
     // Errors: latent / events inside functions, recursion, call kind.
     {
-        Graph bad = g;
+        Graph bad = g; // latent nodes wait in impure functions, not in pure ones
         bad.Node("Flow.Delay", {}, "AddScaled");
+        CHECK(!HasError(bad.g, "latent"));
+        bad.g.FindFunction("AddScaled")->pure = true;
         CHECK(HasError(bad.g, "latent"));
         Graph ev = g;
         ev.Node("Event.Tick", {}, "AddScaled");

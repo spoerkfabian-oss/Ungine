@@ -469,8 +469,8 @@ std::string ScriptGraph::Collapse(const std::vector<std::uint32_t>& ids, const s
             return "The nodes must belong to the same graph / function";
         if (desc->kind == NodeKind::Event || n->type == "Function.Return" || n->type == "Macro.Outputs")
             return "Events, function entries / returns and macro tunnels cannot be collapsed";
-        if (!macro && desc->latent)
-            return desc->title + " is latent: collapse to a macro instead";
+        if (!macro && desc->repeats)
+            return desc->title + " fires its outputs many times: collapse to a macro instead";
         impure |= desc->kind == NodeKind::Impure;
     }
 
@@ -1237,8 +1237,10 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
             error(n.id, desc->title + " cannot be used inside a function");
         if (macro && desc->kind == NodeKind::Event && n.type != "Macro.Inputs")
             error(n.id, desc->title + " cannot be used inside a macro");
-        if (scope && desc->latent)
-            error(n.id, desc->title + " is latent: not allowed inside a function");
+        if (scope && desc->repeats)
+            error(n.id, desc->title + " fires its outputs many times: not allowed inside a function (use a macro)");
+        else if (scope && desc->latent && scope->pure)
+            error(n.id, desc->title + " is latent: not allowed inside a pure function");
         switch (desc->paramKind) {
         case ParamKind::Macro:
             if (n.type != "Macro.Use") {
@@ -1246,8 +1248,8 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
                     error(n.id, "Macro Inputs / Outputs nodes belong into their own macro");
             } else if (!ResolveMacro(graph, n.param).first) {
                 error(n.id, "Unknown macro '" + n.param + "'");
-            } else if (scope && MacroIsLatent(graph, n.param)) {
-                error(n.id, "Macro '" + n.param + "' contains latent nodes: not allowed inside a function");
+            } else if (scope && scope->pure && MacroIsLatent(graph, n.param)) {
+                error(n.id, "Macro '" + n.param + "' contains latent nodes: not allowed inside a pure function");
             }
             break;
         case ParamKind::LibraryFunction: {

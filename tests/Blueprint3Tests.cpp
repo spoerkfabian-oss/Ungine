@@ -372,3 +372,123 @@ TEST_CASE(Blueprint3_Inheritance)
     }
     CHECK(ScriptParentPath("Content/Scripts/Enemies/Orc.ugraph", "Content/Scripts/Enemy.ugraph") == "../Enemy.ugraph");
 }
+
+TEST_CASE(Blueprint3_LatentNodesInFunctions)
+{
+    ScriptRegistry::Clear();
+    ScriptRegistry::AddInterface({"Waiter", {{"Later", {}, {{"Done", PinType::Bool}}}}, {}});
+    Graph b;
+    // AddLater(N) = N + 1, after a Delay; the local L keeps N across the wait (two calls overlap).
+    CHECK(b.g.AddFunction("AddLater"));
+    {
+        ScriptFunction& f = *b.g.FindFunction("AddLater");
+        f.inputs          = {{"N", PinType::Int}};
+        f.outputs         = {{"R", PinType::Int}};
+        f.locals          = {{"L", PinType::Int, std::int32_t{0}, false}};
+        b.g.FunctionSignatureChanged("AddLater");
+        const std::uint32_t entry = b.Find("Function.Entry", "AddLater");
+        const std::uint32_t ret   = b.Find("Function.Return", "AddLater");
+        const std::uint32_t set   = b.Node("Variable.Set", "L", "AddLater");
+        const std::uint32_t delay = b.Node("Flow.Delay", {}, "AddLater");
+        const std::uint32_t get   = b.Node("Variable.Get", "L", "AddLater");
+        const std::uint32_t add   = b.Node("Math.AddInt", {}, "AddLater");
+        b.Set(delay, "Duration", 0.5f);
+        b.Set(add, "B", std::int32_t{1});
+        std::erase_if(b.g.links, [&](const ScriptLink& l) { return l.fromNode == entry && l.toNode == ret; });
+        b.Link(entry, "Then", set, "In");
+        b.Link(entry, "N", set, "Value");
+        b.Link(set, "Then", delay, "In");
+        b.Link(delay, "Completed", ret, "In");
+        b.Link(get, "Value", add, "A");
+        b.Link(add, "Result", ret, "R");
+    }
+    // Moved(): a tween to (0, 0, 5) - the caller continues when it completes.
+    CHECK(b.g.AddFunction("Moved"));
+    {
+        const std::uint32_t entry = b.Find("Function.Entry", "Moved");
+        const std::uint32_t ret   = b.Find("Function.Return", "Moved");
+        const std::uint32_t tween = b.Node("Tween.MoveTo", "Linear", "Moved");
+        b.Set(tween, "Location", glm::vec3(0.0f, 0.0f, 5.0f));
+        b.Set(tween, "Duration", 0.3f);
+        std::erase_if(b.g.links, [&](const ScriptLink& l) { return l.fromNode == entry && l.toNode == ret; });
+        b.Link(entry, "Then", tween, "In");
+        b.Link(tween, "Completed", ret, "In");
+    }
+    // Debounce(): a Retriggerable Delay - per call (each call has its own countdown).
+    CHECK(b.g.AddFunction("Debounce"));
+    {
+        const std::uint32_t entry = b.Find("Function.Entry", "Debounce");
+        const std::uint32_t ret   = b.Find("Function.Return", "Debounce");
+        const std::uint32_t delay = b.Node("Flow.RetriggerableDelay", {}, "Debounce");
+        b.Set(delay, "Duration", 0.3f);
+        std::erase_if(b.g.links, [&](const ScriptLink& l) { return l.fromNode == entry && l.toNode == ret; });
+        b.Link(entry, "Then", delay, "In");
+        b.Link(delay, "Completed", ret, "In");
+    }
+    // Waiter.Later (interface): waits too - an interface caller does not, the rest runs afterwards.
+    b.g.interfaces = {"Waiter"};
+    CHECK(b.g.AddFunction("Later"));
+    {
+        b.g.FindFunction("Later")->outputs = {{"Done", PinType::Bool}};
+        b.g.FunctionSignatureChanged("Later");
+        const std::uint32_t entry = b.Find("Function.Entry", "Later");
+        const std::uint32_t ret   = b.Find("Function.Return", "Later");
+        const std::uint32_t delay = b.Node("Flow.Delay", {}, "Later");
+        const std::uint32_t p     = Print(b, "later done", "Later");
+        b.Set(delay, "Duration", 0.2f);
+        b.Set(ret, "Done", true);
+        std::erase_if(b.g.links, [&](const ScriptLink& l) { return l.fromNode == entry && l.toNode == ret; });
+        b.Link(entry, "Then", delay, "In");
+        b.Link(delay, "Completed", p, "In");
+        b.Link(p, "Then", ret, "In");
+    }
+    // Two BeginPlay chains overlap in AddLater (1 -> 2, 5 -> 6), then Debounce and Moved.
+    for (const std::int32_t n : {1, 5}) {
+        const std::uint32_t begin = b.Node("Event.BeginPlay");
+        const std::uint32_t call  = b.Node("Function.Call", "AddLater");
+        const std::uint32_t p     = Print(b);
+        const std::uint32_t deb   = b.Node("Function.Call", "Debounce");
+        const std::uint32_t p2    = Print(b, n == 1 ? "first debounced" : "second debounced");
+        b.Set(call, "N", n);
+        b.Link(begin, "Out", call, "In");
+        b.Link(call, "Then", p, "In");
+        b.Link(call, "R", p, "Text");
+        b.Link(p, "Then", deb, "In");
+        b.Link(deb, "Then", p2, "In");
+    }
+    {
+        const std::uint32_t begin = b.Node("Event.BeginPlay");
+        const std::uint32_t moved = b.Node("Function.Call", "Moved");
+        const std::uint32_t p     = Print(b, "moved");
+        const std::uint32_t later = b.Node("Interface.Call", "Waiter.Later");
+        const std::uint32_t p2    = Print(b);
+        b.Link(begin, "Out", later, "In");
+        b.Link(later, "Then", p2, "In");
+        b.Link(later, "Done", p2, "Text"); // false: the interface caller does not wait
+        b.Link(p2, "Then", moved, "In");
+        b.Link(moved, "Then", p, "In");
+    }
+    CHECK(b.Valid());
+    // Pure functions stay synchronous.
+    {
+        Graph pure = b;
+        pure.g.FindFunction("AddLater")->pure = true;
+        CHECK(HasError(pure.g, "latent"));
+    }
+
+    Runner r;
+    const Entity e = r.Add("Waiter", "latent.ugraph", b.g);
+    r.scripts.Begin(r.scene);
+    CHECK(r.Printed("false") && !r.Printed("2") && !r.Printed("moved"));
+    r.Run(0.2f);
+    CHECK(!r.Printed("2") && !r.Printed("6") && !r.Printed("moved"));
+    r.Run(0.5f);
+    CHECK(r.Printed("later done") && r.Printed("moved"));
+    CHECK(std::abs(r.scene.GetRegistry().Get<Transform>(e).position.z - 5.0f) < 1e-3f);
+    CHECK(r.Printed("2") && r.Printed("6")); // each call kept its own N
+    r.Run(0.6f);
+    CHECK(r.Printed("second debounced") && r.Printed("first debounced")); // latent nodes wait per call
+    CHECK(r.scripts.Stats().errors == 0);
+    // The functions are free again afterwards (no stale call stacks).
+    r.scripts.End(r.scene);
+}

@@ -263,6 +263,7 @@ struct ScriptSystem::Impl {
         double       next     = 0.0;
         bool         loop     = false;
     };
+    struct Parked;
     struct Instance {
         Entity                                 entity = NullEntity;
         std::uint64_t                          serial = 0; // distinguishes re-created instances
@@ -282,6 +283,8 @@ struct ScriptSystem::Impl {
         };
         std::unordered_map<std::string, std::vector<Binding>> bindings; // dispatcher -> bound custom events
         std::vector<int>                                      ticking;  // nodes run with kScriptTick per update
+        // Ticking nodes inside functions: the call stack waiting for their completion.
+        std::unordered_map<int, std::shared_ptr<Parked>> parkedTicks;
         // Instance-editable entity variables whose target was not in the scene (an unloaded
         // streamed level): variable index -> UUID, resolved when a level loads.
         std::vector<std::pair<std::size_t, std::uint64_t>> pendingRefs;
@@ -310,6 +313,7 @@ struct ScriptSystem::Impl {
         std::vector<std::vector<ScriptValue>> outputs; // per node of the function
         std::vector<std::uint64_t>            stamps;
         std::vector<ScriptValue>              locals;
+        std::vector<ScriptContext::NodeState> states; // latent nodes wait per call
     };
     struct CallFrame {
         int                         callNode = 0; // -1: called from another script (CallFunctionOn)
@@ -317,6 +321,14 @@ struct ScriptSystem::Impl {
         std::vector<Continuation>   stack;             // the caller's
         std::vector<ScriptValue>*   results = nullptr; // callNode -1: the function's outputs
         std::shared_ptr<SavedScope> saved;             // a recursive call: the outer call's values
+    };
+    // A chain stopped at a latent node inside functions (Delay, AI Move To, tweens...): its call
+    // stack and the functions' values, so the caller continues when the node completes.
+    struct Parked {
+        std::uint64_t                                    id = 0; // the chain's id
+        std::vector<Continuation>                        stack;
+        std::vector<CallFrame>                           calls;
+        std::vector<std::pair<std::size_t, SavedScope>>  scopes; // per function on the stack: its current values
     };
     // A running chain: where it is and what comes after.
     struct ChainState {
@@ -329,16 +341,18 @@ struct ScriptSystem::Impl {
         bool                      skipBreak = false; // resuming at a breakpoint
         std::uint32_t             lastUse   = 0;     // Macro node (CompiledNode::use) of the last node run
         bool                      atUse     = false; // paused on entering a macro copy: report its Macro node
+        std::shared_ptr<Parked>   restore;           // resumed at a latent node in a function: its call stack
     };
     struct SuspendedChain { // paused by the debugger, or queued while it pauses
         std::uint64_t entity = 0, serial = 0;
         ChainState    state;
     };
     struct Waiting {
-        std::uint64_t entity = 0, serial = 0;
-        int           node   = 0;
-        std::int32_t  data   = 0;
-        double        wake   = 0.0;
+        std::uint64_t           entity = 0, serial = 0;
+        int                     node   = 0;
+        std::int32_t            data   = 0;
+        double                  wake   = 0.0;
+        std::shared_ptr<Parked> parked; // inside functions: the call stack that continues afterwards
     };
     struct QueuedCollision {
         CollisionEvent event;
@@ -1195,6 +1209,7 @@ struct ScriptSystem::Impl {
         for (int node : fn.nodes) {
             saved->outputs.push_back(inst.outputs[static_cast<std::size_t>(node)]);
             saved->stamps.push_back(inst.evalStamp[static_cast<std::size_t>(node)]);
+            saved->states.push_back(inst.states[static_cast<std::size_t>(node)]);
         }
         saved->locals = inst.locals[f];
         return saved;
@@ -1215,10 +1230,67 @@ struct ScriptSystem::Impl {
             for (std::size_t i = 0; i < fn.nodes.size(); ++i) {
                 inst.outputs[static_cast<std::size_t>(fn.nodes[i])]   = std::move(frame.saved->outputs[i]);
                 inst.evalStamp[static_cast<std::size_t>(fn.nodes[i])] = frame.saved->stamps[i];
+                inst.states[static_cast<std::size_t>(fn.nodes[i])]    = std::move(frame.saved->states[i]);
             }
             inst.locals[f] = std::move(frame.saved->locals);
         }
         return frame.callNode;
+    }
+
+    // A latent node inside functions stops the chain: the call stack waits with it (the functions
+    // are no longer running meanwhile, other calls may use them).
+    std::shared_ptr<Parked> Park(Instance& inst, ChainState& st)
+    {
+        auto parked = std::make_shared<Parked>();
+        parked->id  = st.id;
+        for (const CallFrame& frame : st.calls) {
+            const auto f = static_cast<std::size_t>(frame.function);
+            if (std::ranges::any_of(parked->scopes, [&](const auto& s) { return s.first == f; }))
+                continue;
+            SavedScope              scope;
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (int node : fn.nodes) {
+                scope.outputs.push_back(inst.outputs[static_cast<std::size_t>(node)]);
+                scope.stamps.push_back(inst.evalStamp[static_cast<std::size_t>(node)]);
+                scope.states.push_back(inst.states[static_cast<std::size_t>(node)]);
+                // Latent nodes wait per call: the next call starts them afresh.
+                if (const NodeDesc* d = inst.program->nodes[static_cast<std::size_t>(node)].desc; d && d->latent)
+                    inst.states[static_cast<std::size_t>(node)] = {};
+            }
+            scope.locals = inst.locals[f];
+            parked->scopes.emplace_back(f, std::move(scope));
+        }
+        for (const CallFrame& frame : st.calls) {
+            const auto f   = static_cast<std::size_t>(frame.function);
+            inst.active[f] = std::max(inst.active[f] - 1, 0);
+            functionDepth  = functionDepth > 0 ? functionDepth - 1 : 0;
+        }
+        parked->stack = std::move(st.stack);
+        parked->calls = std::move(st.calls);
+        st.stack.clear();
+        st.calls.clear();
+        return parked;
+    }
+
+    // The latent node completes: its call stack and the functions' values come back.
+    void Restore(Instance& inst, ChainState& st, Parked parked)
+    {
+        for (auto& [f, scope] : parked.scopes) {
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (std::size_t i = 0; i < fn.nodes.size() && i < scope.outputs.size(); ++i) {
+                inst.outputs[static_cast<std::size_t>(fn.nodes[i])]   = std::move(scope.outputs[i]);
+                inst.evalStamp[static_cast<std::size_t>(fn.nodes[i])] = scope.stamps[i];
+                inst.states[static_cast<std::size_t>(fn.nodes[i])]    = std::move(scope.states[i]);
+            }
+            inst.locals[f] = std::move(scope.locals);
+        }
+        for (const CallFrame& frame : parked.calls) {
+            ++inst.active[static_cast<std::size_t>(frame.function)];
+            ++functionDepth;
+        }
+        st.id    = parked.id;
+        st.stack = std::move(parked.stack);
+        st.calls = std::move(parked.calls);
     }
 
     bool ShouldBreak(Instance& inst, ChainState& st)
@@ -1288,6 +1360,11 @@ struct ScriptSystem::Impl {
         const std::size_t   base  = nested ? st.calls.size() - 1 : 0;
         const Program&      p     = *inst.program;
         std::uint32_t       steps = 0;
+        bool resumed = false; // the first node is a latent node completing inside functions
+        if (st.restore && !nested) {
+            Restore(inst, st, std::move(*std::exchange(st.restore, nullptr)));
+            resumed = !st.calls.empty();
+        }
         for (;;) {
             if (++steps > maxSteps) {
                 RuntimeError(inst, st.node, "Too many steps in one event (infinite loop?) - chain aborted");
@@ -1324,7 +1401,24 @@ struct ScriptSystem::Impl {
                 if (ctx.suspended && constructing)
                     RuntimeError(inst, st.node, "Latent nodes do not run in the construction script");
                 else if (ctx.suspended)
-                    waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds});
+                    waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds, nullptr});
+                // Inside functions (called from a chain): the callers wait for the latent node.
+                if (!nested && !st.calls.empty() && out == kScriptStop && ctx.pushed.empty() && !constructing) {
+                    if (ctx.suspended) {
+                        waiting.back().parked = Park(inst, st);
+                        return true;
+                    }
+                    if (std::ranges::find(inst.ticking, st.node) != inst.ticking.end()) {
+                        inst.parkedTicks[st.node] = Park(inst, st);
+                        return true;
+                    }
+                    if (std::exchange(resumed, false)) { // did not complete (a newer trigger won): the callers stop
+                        while (!st.calls.empty())
+                            PopFrame(inst, st);
+                        return true;
+                    }
+                }
+                resumed = false;
                 if (out == kScriptReturn) {
                     out = kScriptStop;
                     if (!st.calls.empty()) { // hand the outputs to the caller, back after the call
@@ -1435,11 +1529,18 @@ struct ScriptSystem::Impl {
     }
 
     // A new chain: queued while the debugger pauses.
-    void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
+    void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data,
+                  std::shared_ptr<Parked> parked = nullptr)
     {
         if (!scene.GetRegistry().Valid(inst.entity)) // destroyed this frame (its instance goes at the end of Update)
             return;
         ChainState st;
+        if (!parked && entry == kScriptTick) // a tween inside a function: continues with its call stack
+            if (const auto it = inst.parkedTicks.find(node); it != inst.parkedTicks.end()) {
+                parked = std::move(it->second);
+                inst.parkedTicks.erase(it);
+            }
+        st.restore = std::move(parked);
         st.id        = ++nextChain;
         st.lastUse   = entry < 0 ? inst.program->nodes[static_cast<std::size_t>(node)].use : 0; // resumed inside a macro copy
         st.node      = node;
@@ -1733,7 +1834,7 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     for (const Impl::Waiting& t : due) {
         const auto it = w.instances.find(t.entity);
         if (it != w.instances.end() && it->second->serial == t.serial && it->second->program)
-            w.RunChain(scene, *it->second, t.node, kScriptResume, t.data);
+            w.RunChain(scene, *it->second, t.node, kScriptResume, t.data, t.parked);
     }
 
     // Instances may be added / removed by scripts meanwhile: iterate over a copy of the keys.

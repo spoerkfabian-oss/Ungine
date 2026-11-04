@@ -194,7 +194,8 @@ struct NodeDesc {
     std::string              paramDefault;
     std::vector<std::string> paramChoices; // ParamKind::Choice
     ParamInference           inference     = ParamInference::None;
-    bool                     latent        = false; // suspends (not allowed in functions)
+    bool                     latent        = false; // suspends (in functions the callers wait; not in pure functions)
+    bool                     repeats       = false; // fires an output many times (timelines): not in functions
     bool                     arrayVariable = false; // ParamKind::Variable: needs an array variable
     bool                     mapVariable   = false; // ParamKind::Variable: needs a map variable
     bool                     hidden        = false; // not offered in the node palette (function nodes)
