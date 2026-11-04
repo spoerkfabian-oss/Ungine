@@ -1293,8 +1293,15 @@ std::vector<ScriptDiagnostic> Validate(const ScriptGraph& graph, bool expanded)
                                               : std::string();
                 if (event.empty())
                     error(n.id, "No custom event to bind (Event)");
-                else if (std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) { return e.type == "Event.Custom" && e.param == event; }) &&
-                         !InheritedHandlesEvent(graph, "Event.Custom:" + event))
+                const ScriptEventDecl* self = !event.empty() && !linked("Target") && n.type == "Dispatcher.Bind"
+                                                  ? graph.FindDispatcher(n.param)
+                                                  : nullptr;
+                if (self)
+                    if (std::string problem = DispatcherSignatureMismatch(*self, graph.FindEvent(event)); !problem.empty())
+                        error(n.id, problem);
+                if (!event.empty() &&
+                    std::ranges::none_of(graph.nodes, [&](const ScriptNode& e) { return e.type == "Event.Custom" && e.param == event; }) &&
+                    !InheritedHandlesEvent(graph, "Event.Custom:" + event))
                     out.push_back({n.id, "This graph has no Custom Event '" + event + "' to bind", false});
             }
         }

@@ -232,6 +232,10 @@ using ScriptGraphLoader = std::function<std::optional<ScriptGraph>(const std::fi
 [[nodiscard]] std::string ScriptParentPath(const std::filesystem::path& childFile, const std::filesystem::path& parentFile);
 // The parent chain's files (nearest first) of a resolved graph.
 [[nodiscard]] std::vector<std::filesystem::path> ScriptParentChain(const ScriptGraph& graph);
+// Binding a custom event to a dispatcher: the event takes the dispatcher's arguments (same count,
+// each convertible). `event` null: a custom event without declared parameters. Returns the
+// problem, empty when they fit.
+[[nodiscard]] std::string DispatcherSignatureMismatch(const ScriptEventDecl& dispatcher, const ScriptEventDecl* event);
 // Event key of an event node (overrides match it): type, plus ":" + param when it has one.
 [[nodiscard]] std::string ScriptEventKey(const ScriptNode& node);
 // True when an ancestor's event graph handles the event key (an override can call it).

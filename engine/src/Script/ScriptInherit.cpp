@@ -203,6 +203,21 @@ std::vector<std::filesystem::path> ScriptParentChain(const ScriptGraph& graph)
     return chain;
 }
 
+std::string DispatcherSignatureMismatch(const ScriptEventDecl& dispatcher, const ScriptEventDecl* event)
+{
+    static const std::vector<ScriptParam> none;
+    const std::vector<ScriptParam>&       params = event ? event->params : none;
+    const std::string                     name   = event ? "'" + event->name + "'" : std::string("the event");
+    if (params.size() != dispatcher.params.size())
+        return "Dispatcher '" + dispatcher.name + "' passes " + std::to_string(dispatcher.params.size()) +
+               " argument(s), " + name + " takes " + std::to_string(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i)
+        if (!CanConvert(dispatcher.params[i].type, params[i].type))
+            return "Dispatcher '" + dispatcher.name + "', argument " + std::to_string(i + 1) + ": " +
+                   DisplayName(dispatcher.params[i].type) + " does not fit " + name + "'s " + DisplayName(params[i].type);
+    return {};
+}
+
 std::string ScriptEventKey(const ScriptNode& node) { return node.param.empty() ? node.type : node.type + ":" + node.param; }
 
 bool InheritedHandlesEvent(const ScriptGraph& graph, std::string_view key)

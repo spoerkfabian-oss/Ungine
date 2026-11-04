@@ -536,9 +536,18 @@ struct ScriptSystem::Impl {
             const auto same = [&](const Instance::Binding& b) {
                 return b.entity == EntityKey(m_Instance.entity) && b.serial == m_Instance.serial && b.event == event;
             };
-            if (!bind)
+            if (!bind) {
                 std::erase_if(list, same);
-            else if (std::ranges::none_of(list, same))
+                return true;
+            }
+            // The event must take the dispatcher's arguments (refused otherwise).
+            if (std::string problem = DispatcherSignatureMismatch(*other->program->graph.FindDispatcher(dispatcher),
+                                                                  m_Instance.program->graph.FindEvent(event));
+                !problem.empty()) {
+                Error(problem);
+                return true; // reported
+            }
+            if (std::ranges::none_of(list, same))
                 list.push_back({EntityKey(m_Instance.entity), m_Instance.serial, event});
             return true;
         }

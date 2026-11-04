@@ -492,3 +492,50 @@ TEST_CASE(Blueprint3_LatentNodesInFunctions)
     // The functions are free again afterwards (no stale call stacks).
     r.scripts.End(r.scene);
 }
+
+TEST_CASE(Blueprint3_DispatcherSignatures)
+{
+    ScriptRegistry::Clear();
+    Graph b;
+    b.g.dispatchers.push_back({"OnHit", {{"Damage", PinType::Float}}});
+    b.g.events.push_back({"Good", {{"Amount", PinType::Int}}}); // float -> int converts
+    b.g.events.push_back({"Bad", {{"Who", PinType::Entity}}});
+    // Self binding (target unconnected): checked when validating.
+    const std::uint32_t begin = b.Node("Event.BeginPlay");
+    const std::uint32_t bind  = b.Node("Dispatcher.Bind", "OnHit");
+    b.Set(bind, "Event", std::string("Good"));
+    b.Link(begin, "Out", bind, "In");
+    const std::uint32_t good = b.Node("Event.Custom", "Good");
+    const std::uint32_t pg   = Print(b);
+    b.Link(good, "Out", pg, "In");
+    b.Link(good, "Amount", pg, "Text");
+    const std::uint32_t badEv = b.Node("Event.Custom", "Bad");
+    b.Link(badEv, "Out", Print(b, "bad ran"), "In");
+    const std::uint32_t call = b.Node("Dispatcher.Call", "OnHit");
+    b.Set(call, "Damage", 7.0f);
+    b.Link(bind, "Then", call, "In");
+    CHECK(b.Valid());
+    {
+        Graph bad = b;
+        bad.Set(bind, "Event", std::string("Bad"));
+        CHECK(HasError(bad.g, "does not fit"));
+        bad.Set(bind, "Event", std::string("Plain")); // undeclared: no parameters
+        CHECK(HasError(bad.g, "passes 1 argument(s)"));
+    }
+    // Through a connected target the check happens when binding: refused, reported.
+    const std::uint32_t self  = b.Node("Entity.Self");
+    const std::uint32_t bind2 = b.Node("Dispatcher.Bind", "OnHit");
+    b.Set(bind2, "Event", std::string("Bad"));
+    b.Link(self, "Self", bind2, "Target");
+    b.g.links.erase(std::ranges::find_if(b.g.links, [&](const ScriptLink& l) { return l.fromNode == bind && l.toNode == call; }));
+    b.Link(bind, "Then", bind2, "In");
+    b.Link(bind2, "Then", call, "In");
+    CHECK(b.Valid());
+
+    Runner r;
+    (void)r.Add("Hitter", "disp.ugraph", b.g);
+    r.scripts.Begin(r.scene);
+    CHECK(r.Printed("7") && !r.Printed("bad ran"));
+    CHECK(r.scripts.Stats().errors == 1);
+    r.scripts.End(r.scene);
+}
