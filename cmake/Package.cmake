@@ -15,6 +15,8 @@ endif()
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "Ungine")
 set(CPACK_PACKAGE_EXECUTABLES "UngineEditor" "Ungine Editor") # Start menu shortcut
 set(CPACK_STRIP_FILES ON)
+# Values reach CPackConfig.cmake escaped as written (the NSIS commands below hold backslashes and quotes).
+set(CPACK_VERBATIM_VARIABLES ON)
 
 if(WIN32)
     find_program(ENGINE_MAKENSIS makensis)
@@ -27,7 +29,7 @@ if(WIN32)
     set(CPACK_NSIS_PACKAGE_NAME "Ungine Engine")
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/resources/ungine.ico")
     set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/resources/ungine.ico")
-    set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\UngineEditor.exe")
+    set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\UngineEditor.exe")
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_NSIS_MODIFY_PATH OFF)
     # Double-click on a .ungineproj opens the editor (per machine; the installer runs elevated).
