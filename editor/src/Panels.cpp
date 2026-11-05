@@ -1727,7 +1727,14 @@ const ScriptGraph* Editor::GraphFor(const std::string& file)
     auto it = m_GraphCache.find(file);
     if (it == m_GraphCache.end() || it->second.first != mtime) {
         try {
-            m_GraphCache[file] = {mtime, LoadScriptGraph(PathFromUtf8(file))};
+            ScriptGraph graph = LoadScriptGraph(PathFromUtf8(file));
+            // Parent classes (open graphs stand in for their files): inherited variables count too.
+            (void)ResolveScriptParent(graph, PathFromUtf8(file), [&](const std::filesystem::path& f) -> std::optional<ScriptGraph> {
+                if (const ScriptGraph* open = m_Graphs->Find(f))
+                    return *open;
+                return std::nullopt;
+            });
+            m_GraphCache[file] = {mtime, std::move(graph)};
         } catch (const std::exception&) {
             m_GraphCache.erase(file);
             return nullptr;
@@ -1742,8 +1749,22 @@ void Editor::DrawScriptVariables(ScriptComponent& script)
     const ScriptGraph* graph = GraphFor(script.graph);
     if (!graph)
         return;
+    // Own variables, then inherited ones with the nearest class default.
+    std::vector<ScriptVariable> variables = graph->variables;
+    for (const ScriptGraph* base = graph->inherited.get(); base; base = base->inherited.get())
+        for (const ScriptVariable& v : base->variables) {
+            if (std::ranges::any_of(variables, [&](const ScriptVariable& x) { return x.name == v.name; }))
+                continue;
+            ScriptVariable inherited = v;
+            for (const ScriptGraph* cls = graph; cls != base; cls = cls->inherited.get())
+                if (const auto d = cls->defaults.find(v.name); d != cls->defaults.end()) {
+                    inherited.value = Convert(d->second, v.type);
+                    break;
+                }
+            variables.push_back(std::move(inherited));
+        }
     bool any = false;
-    for (const ScriptVariable& v : graph->variables)
+    for (const ScriptVariable& v : variables)
         any |= v.exposed;
     if (!any) {
         ImGui::TextDisabled("No instance editable variables (tick the box next to a variable in the Blueprint)");
@@ -1752,7 +1773,7 @@ void Editor::DrawScriptVariables(ScriptComponent& script)
     if (!BeginProperties("scriptvars"))
         return;
     std::optional<std::string> reset;
-    for (const ScriptVariable& v : graph->variables) {
+    for (const ScriptVariable& v : variables) {
         if (!v.exposed)
             continue;
         const auto overridden = script.variables.find(v.name);

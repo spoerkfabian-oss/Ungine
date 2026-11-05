@@ -20,7 +20,7 @@ struct Expander {
     ScriptOrigin OriginOf(const ScriptNode& n) const
     {
         const auto it = origins.find(n.id);
-        return it != origins.end() ? it->second : ScriptOrigin{{}, n.id, n.function, 0};
+        return it != origins.end() ? it->second : ScriptOrigin{{}, n.id, n.function, 0, {}, {}};
     }
 
     std::uint32_t Add(ScriptNode node, ScriptOrigin origin)
@@ -68,7 +68,7 @@ struct Expander {
                 c.param = qualified;
             else
                 Qualify(c, lib, l->graph);
-            ids[n.id] = Add(std::move(c), {lib, n.id, f->name, 0});
+            ids[n.id] = Add(std::move(c), {lib, n.id, f->name, 0, {}, {}});
         }
         for (const ScriptLink& link : l->graph.links)
             if (ids.contains(link.fromNode) && ids.contains(link.toNode))
@@ -139,8 +139,14 @@ struct Expander {
             if (std::ranges::any_of(body, [&](const ScriptNode& n) { return n.id == l.fromNode; }))
                 bodyLinks.push_back(l);
         const ScriptOrigin useOrigin = OriginOf(use);
-        // The Macro node the debugger highlights: the outermost one in the graph itself.
-        const std::uint32_t top = origins.contains(use.id) ? useOrigin.use : use.id;
+        // The Macro node the debugger highlights: the outermost one in the graph itself (or in the
+        // parent class the use comes from; none for library copies).
+        std::uint32_t top = use.id;
+        std::string   topFile;
+        if (origins.contains(use.id)) {
+            top     = useOrigin.use != 0 ? useOrigin.use : useOrigin.library.empty() ? useOrigin.node : 0;
+            topFile = useOrigin.use != 0 ? useOrigin.useFile : useOrigin.file;
+        }
 
         std::uint32_t inputs = 0, outputs = 0;
         std::unordered_map<std::uint32_t, std::uint32_t> ids;
@@ -156,7 +162,11 @@ struct Expander {
             ScriptNode c = n;
             c.function   = use.function;
             Qualify(c, lib, *source);
-            ids[n.id] = Add(std::move(c), {lib, n.id, local, top}); // definitions are never copies
+            // Definitions are never copies; inherited ones keep their class file.
+            ScriptOrigin o = lib.empty() ? OriginOf(n) : ScriptOrigin{lib, n.id, local, 0, {}, {}};
+            o.use          = top;
+            o.useFile      = topFile;
+            ids[n.id]      = Add(std::move(c), std::move(o));
         }
 
         // The Macro node's own links.

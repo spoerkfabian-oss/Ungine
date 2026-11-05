@@ -18,8 +18,9 @@ namespace Engine {
 // --- Types -------------------------------------------------------------------------------------
 //
 // A pin / variable type: a kind (Bool .. Entity, or a user Enum / Struct named by an interned id),
-// optionally inside a container. Arrays hold one element type (no arrays of arrays / maps), maps
-// a scalar key (bool, int, string, entity or enum) and a non-container value. User types are
+// optionally inside a container. Arrays hold one element type, maps a scalar key (bool, int, float,
+// vec3, string, entity or enum) and a value; elements and values may be containers themselves
+// (arrays of arrays, maps of arrays, ...: PinType::inner names the nested type). User types are
 // defined in ScriptRegistry (.uenum / .ustruct files).
 
 enum class PinKind : std::uint8_t { Exec, Bool, Int, Float, Vec3, String, Entity, Enum, Struct };
@@ -35,12 +36,13 @@ struct PinType {
     PinKind       keyKind   = PinKind::Int; // maps
     std::uint16_t name      = 0;            // Enum / Struct (of the value)
     std::uint16_t keyName   = 0;            // maps with enum keys
+    std::uint16_t inner     = 0;            // containers of containers: the element / value type (InternPinType)
 
     static const PinType Exec, Bool, Int, Float, Vec3, String, Entity;
     static const PinType BoolArray, IntArray, FloatArray, Vec3Array, StringArray, EntityArray;
     [[nodiscard]] static PinType Enum(std::string_view enumName);
     [[nodiscard]] static PinType Struct(std::string_view structName);
-    [[nodiscard]] static PinType Map(PinType key, PinType value); // key / value: no containers
+    [[nodiscard]] static PinType Map(PinType key, PinType value); // key: IsKeyType; value: any (not exec)
 
     constexpr bool operator==(const PinType&) const = default;
 };
@@ -58,33 +60,43 @@ inline constexpr PinType PinType::Vec3Array{PinKind::Vec3, PinContainer::Array};
 inline constexpr PinType PinType::StringArray{PinKind::String, PinContainer::Array};
 inline constexpr PinType PinType::EntityArray{PinKind::Entity, PinContainer::Array};
 
+// Nested container types are interned (id 0 = none): PinType stays a small value.
+[[nodiscard]] std::uint16_t InternPinType(PinType type);
+[[nodiscard]] PinType       InternedPinType(std::uint16_t id);
+
 [[nodiscard]] constexpr bool IsArray(PinType t) { return t.container == PinContainer::Array; }
 [[nodiscard]] constexpr bool IsMap(PinType t) { return t.container == PinContainer::Map; }
 [[nodiscard]] constexpr bool IsContainer(PinType t) { return t.container != PinContainer::None; }
 // The value type of an array / map (the type itself otherwise).
-[[nodiscard]] constexpr PinType ElementType(PinType t)
+[[nodiscard]] inline PinType ElementType(PinType t)
 {
-    return {t.kind, PinContainer::None, PinKind::Int, t.name, 0};
+    return t.inner != 0 ? InternedPinType(t.inner) : PinType{t.kind, PinContainer::None, PinKind::Int, t.name, 0, 0};
 }
-[[nodiscard]] constexpr PinType KeyType(PinType t) { return {t.keyKind, PinContainer::None, PinKind::Int, t.keyName, 0}; }
-[[nodiscard]] constexpr PinType ArrayOf(PinType t)
+[[nodiscard]] constexpr PinType KeyType(PinType t) { return {t.keyKind, PinContainer::None, PinKind::Int, t.keyName, 0, 0}; }
+// An array of `t` (containers nest: an array of int arrays, ...).
+[[nodiscard]] inline PinType ArrayOf(PinType t)
 {
-    return t.kind == PinKind::Exec || IsContainer(t) ? t : PinType{t.kind, PinContainer::Array, PinKind::Int, t.name, 0};
+    if (t.kind == PinKind::Exec)
+        return t;
+    return {t.kind, PinContainer::Array, PinKind::Int, t.name, 0, IsContainer(t) ? InternPinType(t) : std::uint16_t{0}};
 }
 [[nodiscard]] constexpr bool IsUserType(PinType t) { return t.kind == PinKind::Enum || t.kind == PinKind::Struct; }
 // Allowed as map keys.
 [[nodiscard]] constexpr bool IsKeyType(PinType t)
 {
-    return !IsContainer(t) && (t.kind == PinKind::Bool || t.kind == PinKind::Int || t.kind == PinKind::String ||
-                               t.kind == PinKind::Entity || t.kind == PinKind::Enum);
+    return !IsContainer(t) && (t.kind == PinKind::Bool || t.kind == PinKind::Int || t.kind == PinKind::Float ||
+                               t.kind == PinKind::Vec3 || t.kind == PinKind::String || t.kind == PinKind::Entity ||
+                               t.kind == PinKind::Enum);
 }
 [[nodiscard]] inline const std::string& UserTypeName(PinType t) { return TypeNameOf(t.name); }
 
 // Stored form: "bool".."entity", "enum:Color", "struct:Item"; arrays "intArray" (built-in kinds)
-// or "struct:Item[]"; maps "map:<key>:<value>" (e.g. "map:string:struct:Item").
+// or "struct:Item[]"; maps "map:<key>:<value>" (e.g. "map:string:struct:Item"). Nested: arrays of
+// arrays "<array>[]" ("intArray[]"), arrays of maps "array:<map>", map values of any type
+// ("map:string:intArray", "map:int:map:string:float").
 [[nodiscard]] std::string            ToString(PinType type);
 [[nodiscard]] std::optional<PinType> PinTypeFromString(std::string_view name);
-// For the UI: "int", "Item", "Item[]", "Map<string, int>".
+// For the UI: "int", "Item", "Item[]", "int[][]", "Map<string, int>", "Map<string, int[]>".
 [[nodiscard]] std::string DisplayName(PinType type);
 
 // --- Values ------------------------------------------------------------------------------------
@@ -112,7 +124,7 @@ struct ScriptStruct {
     std::vector<std::pair<std::string, ScriptValue>> fields;   // by name (definitions may change)
 };
 
-// Map keys order: by value (bool / int / string / entity).
+// Map keys order: by value (bool / int / float / vec3 (x, y, z) / string / entity).
 struct ScriptKeyLess {
     bool operator()(const ScriptValue& a, const ScriptValue& b) const;
 };

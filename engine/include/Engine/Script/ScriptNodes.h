@@ -136,6 +136,9 @@ public:
     virtual bool CallFunctionOn(Entity target, const std::string& function, std::vector<ScriptValue> args,
                                 std::vector<ScriptValue>& results) = 0;
     [[nodiscard]] virtual bool Implements(Entity target, const std::string& interfaceName) = 0;
+    // Is the target's script graph `graphPath` (relative to the working directory, like the
+    // Script component) or a child class of it?
+    [[nodiscard]] virtual bool IsA(Entity target, const std::string& graphPath) = 0;
     // Event dispatchers. CallDispatcher runs every custom event bound to this script's dispatcher;
     // Bind adds (removes) this script's custom event `event` to (from) the target script's
     // dispatcher; UnbindAll clears it. False: the target has no script with that dispatcher.
@@ -191,7 +194,8 @@ struct NodeDesc {
     std::string              paramDefault;
     std::vector<std::string> paramChoices; // ParamKind::Choice
     ParamInference           inference     = ParamInference::None;
-    bool                     latent        = false; // suspends (not allowed in functions)
+    bool                     latent        = false; // suspends (in functions the callers wait; not in pure functions)
+    bool                     repeats       = false; // fires an output many times (timelines): not in functions
     bool                     arrayVariable = false; // ParamKind::Variable: needs an array variable
     bool                     mapVariable   = false; // ParamKind::Variable: needs a map variable
     bool                     hidden        = false; // not offered in the node palette (function nodes)

@@ -119,6 +119,7 @@ struct CompiledNode {
     std::uint32_t id   = 0;
     std::string   function;
     std::uint32_t use = 0;
+    int           useFile = 0; // Program::files index of `use`
 };
 
 struct CompiledFunction {
@@ -128,6 +129,7 @@ struct CompiledFunction {
     std::vector<ScriptVariable>          locals;
     std::unordered_map<std::string, int> localIndex;
     std::size_t                          outputs = 0;
+    std::vector<int>                     nodes; // node indices of the function (saved around recursive calls)
 };
 
 struct Program {
@@ -142,7 +144,8 @@ struct Program {
     std::map<std::string, std::vector<int>> events; // node type -> event nodes (event graph only)
     // Graph files of the nodes (debugger keys): 0 = this graph, then the libraries copied in.
     std::vector<std::string> files;
-    std::vector<std::string> fileLibraries; // library name per file ("" for this graph)
+    std::vector<std::string> fileLibraries; // library name per file ("" for this graph and parent classes)
+    std::vector<std::string> classes;       // this graph's key, then its parent classes' (nearest first)
 };
 
 // Debugger key of a library: its file (ScriptSystem::Key), or a name for libraries made in code.
@@ -194,20 +197,25 @@ std::shared_ptr<Program> Compile(std::string key, ScriptGraph graph, std::vector
         c.desc  = FindScriptNodeType(n.type);
         c.pins  = NodePins(p->graph, n);
         c.scope = n.function.empty() ? -1 : functionIndex.at(n.function);
+        if (c.scope >= 0)
+            p->functions[static_cast<std::size_t>(c.scope)].nodes.push_back(static_cast<int>(p->nodes.size()));
         c.id       = n.id;
         c.function = n.function;
         if (const auto o = origins.find(n.id); o != origins.end()) {
             c.id       = o->second.node;
             c.function = o->second.function;
             c.use      = o->second.use;
-            if (!o->second.library.empty()) {
-                const auto f = std::ranges::find(p->fileLibraries, o->second.library);
-                c.file       = static_cast<int>(f - p->fileLibraries.begin());
-                if (f == p->fileLibraries.end()) {
-                    p->files.push_back(LibraryKey(o->second.library));
-                    p->fileLibraries.push_back(o->second.library);
-                }
-            }
+            const auto fileIndex = [&](const std::string& fileKey, const std::string& library) {
+                const std::string k = !library.empty() ? LibraryKey(library) : fileKey.empty() ? p->key : fileKey;
+                const auto        f = std::ranges::find(p->files, k);
+                if (f != p->files.end())
+                    return static_cast<int>(f - p->files.begin());
+                p->files.push_back(k);
+                p->fileLibraries.push_back(library);
+                return static_cast<int>(p->files.size()) - 1;
+            };
+            c.file    = fileIndex(o->second.file, o->second.library);
+            c.useFile = fileIndex(o->second.useFile, {});
         }
         c.source.resize(c.pins.size());
         c.target.resize(c.pins.size());
@@ -255,13 +263,14 @@ struct ScriptSystem::Impl {
         double       next     = 0.0;
         bool         loop     = false;
     };
+    struct Parked;
     struct Instance {
         Entity                                 entity = NullEntity;
         std::uint64_t                          serial = 0; // distinguishes re-created instances
         std::shared_ptr<const Program>         program;
         std::vector<ScriptValue>               variables;
         std::vector<std::vector<ScriptValue>>  locals;  // per function
-        std::vector<char>                      active;  // per function: on the call stack
+        std::vector<int>                       active;  // per function: how often it is on the call stack
         std::vector<std::vector<ScriptValue>>  outputs; // per node, per pin
         std::vector<ScriptContext::NodeState>  states;
         std::vector<std::uint64_t>             evalStamp; // per node: the execution its pure outputs were computed for
@@ -274,6 +283,8 @@ struct ScriptSystem::Impl {
         };
         std::unordered_map<std::string, std::vector<Binding>> bindings; // dispatcher -> bound custom events
         std::vector<int>                                      ticking;  // nodes run with kScriptTick per update
+        // Ticking nodes inside functions: the call stack waiting for their completion.
+        std::unordered_map<int, std::shared_ptr<Parked>> parkedTicks;
         // Instance-editable entity variables whose target was not in the scene (an unloaded
         // streamed level): variable index -> UUID, resolved when a level loads.
         std::vector<std::pair<std::size_t, std::uint64_t>> pendingRefs;
@@ -296,11 +307,28 @@ struct ScriptSystem::Impl {
         int          node = 0;
         std::int32_t data = 0;
     };
+    // The function's pin values and locals of the outer call, kept while it calls itself again
+    // (recursion: a function's nodes exist once).
+    struct SavedScope {
+        std::vector<std::vector<ScriptValue>> outputs; // per node of the function
+        std::vector<std::uint64_t>            stamps;
+        std::vector<ScriptValue>              locals;
+        std::vector<ScriptContext::NodeState> states; // latent nodes wait per call
+    };
     struct CallFrame {
-        int                       callNode = 0; // -1: called from another script (CallFunctionOn)
-        int                       function = 0;
-        std::vector<Continuation> stack;             // the caller's
-        std::vector<ScriptValue>* results = nullptr; // callNode -1: the function's outputs
+        int                         callNode = 0; // -1: called from another script (CallFunctionOn)
+        int                         function = 0;
+        std::vector<Continuation>   stack;             // the caller's
+        std::vector<ScriptValue>*   results = nullptr; // callNode -1: the function's outputs
+        std::shared_ptr<SavedScope> saved;             // a recursive call: the outer call's values
+    };
+    // A chain stopped at a latent node inside functions (Delay, AI Move To, tweens...): its call
+    // stack and the functions' values, so the caller continues when the node completes.
+    struct Parked {
+        std::uint64_t                                    id = 0; // the chain's id
+        std::vector<Continuation>                        stack;
+        std::vector<CallFrame>                           calls;
+        std::vector<std::pair<std::size_t, SavedScope>>  scopes; // per function on the stack: its current values
     };
     // A running chain: where it is and what comes after.
     struct ChainState {
@@ -313,16 +341,18 @@ struct ScriptSystem::Impl {
         bool                      skipBreak = false; // resuming at a breakpoint
         std::uint32_t             lastUse   = 0;     // Macro node (CompiledNode::use) of the last node run
         bool                      atUse     = false; // paused on entering a macro copy: report its Macro node
+        std::shared_ptr<Parked>   restore;           // resumed at a latent node in a function: its call stack
     };
     struct SuspendedChain { // paused by the debugger, or queued while it pauses
         std::uint64_t entity = 0, serial = 0;
         ChainState    state;
     };
     struct Waiting {
-        std::uint64_t entity = 0, serial = 0;
-        int           node   = 0;
-        std::int32_t  data   = 0;
-        double        wake   = 0.0;
+        std::uint64_t           entity = 0, serial = 0;
+        int                     node   = 0;
+        std::int32_t            data   = 0;
+        double                  wake   = 0.0;
+        std::shared_ptr<Parked> parked; // inside functions: the call stack that continues afterwards
     };
     struct QueuedCollision {
         CollisionEvent event;
@@ -463,6 +493,12 @@ struct ScriptSystem::Impl {
                 return false;
             return m_Impl.CallFunction(m_Scene, *other, it->second, args, results);
         }
+        bool IsA(Entity target, const std::string& graphPath) override
+        {
+            const Instance* other = m_Impl.Find(target);
+            return other && other->program &&
+                   std::ranges::find(other->program->classes, ScriptSystem::Key(graphPath)) != other->program->classes.end();
+        }
         bool Implements(Entity target, const std::string& interfaceName) override
         {
             const Instance* other = m_Impl.Find(target);
@@ -500,9 +536,18 @@ struct ScriptSystem::Impl {
             const auto same = [&](const Instance::Binding& b) {
                 return b.entity == EntityKey(m_Instance.entity) && b.serial == m_Instance.serial && b.event == event;
             };
-            if (!bind)
+            if (!bind) {
                 std::erase_if(list, same);
-            else if (std::ranges::none_of(list, same))
+                return true;
+            }
+            // The event must take the dispatcher's arguments (refused otherwise).
+            if (std::string problem = DispatcherSignatureMismatch(*other->program->graph.FindDispatcher(dispatcher),
+                                                                  m_Instance.program->graph.FindEvent(event));
+                !problem.empty()) {
+                Error(problem);
+                return true; // reported
+            }
+            if (std::ranges::none_of(list, same))
                 list.push_back({EntityKey(m_Instance.entity), m_Instance.serial, event});
             return true;
         }
@@ -825,24 +870,44 @@ struct ScriptSystem::Impl {
                 diagnostics.push_back({0, e.what(), true});
             }
         }
-        if (diagnostics.empty())
-            diagnostics = ValidateScriptGraph(graph);
+        if (diagnostics.empty()) {
+            // Parent classes: unsaved editor versions first.
+            const std::string problem = ResolveScriptParent(graph, graphPath, [&](const std::filesystem::path& f) {
+                const auto o = overrides.find(ScriptSystem::Key(f));
+                return o != overrides.end() ? std::optional<ScriptGraph>(o->second) : std::nullopt;
+            });
+            if (!problem.empty())
+                diagnostics.push_back({0, problem, true});
+            else
+                diagnostics = ValidateScriptGraph(graph);
+        }
         if (!breakpoints.contains(key))
             breakpoints[key] = BreakpointsOf(graph);
+        std::vector<std::string> classes{key};
+        for (const ScriptGraph* g = &graph; g->inherited; g = g->inherited.get()) { // breakpoints saved in parents
+            const std::string parentKey = ScriptSystem::Key(g->inheritedFile);
+            if (!breakpoints.contains(parentKey))
+                breakpoints[parentKey] = BreakpointsOf(*g->inherited);
+        }
         // Macros and library functions: copied in. Problems the copies cause (e.g. recursion through
         // a macro) are reported at their origin.
         std::unordered_map<std::uint32_t, ScriptOrigin> origins;
         if (std::ranges::none_of(diagnostics, &ScriptDiagnostic::error)) {
             ScriptGraph expanded = graph;
+            FlattenScriptInheritance(expanded, origins, [](const std::filesystem::path& f) { return ScriptSystem::Key(f); },
+                                     classes);
             if (std::string problem = ExpandScriptGraph(expanded, origins); !problem.empty()) {
                 diagnostics.push_back({0, std::move(problem), true});
             } else {
                 for (const ScriptDiagnostic& d : ValidateExpandedScriptGraph(expanded)) {
                     const auto       o = origins.find(d.node);
                     ScriptDiagnostic mapped =
-                        o == origins.end()             ? d
-                        : o->second.library.empty() ? ScriptDiagnostic{o->second.node, d.message, d.error}
-                                                     : ScriptDiagnostic{o->second.use, "Library '" + o->second.library + "': " + d.message, d.error};
+                        o == origins.end() ? d
+                        : !o->second.library.empty()
+                            ? ScriptDiagnostic{o->second.use, "Library '" + o->second.library + "': " + d.message, d.error}
+                        : !o->second.file.empty()
+                            ? ScriptDiagnostic{0, "Parent class '" + std::filesystem::path(o->second.file).filename().string() + "': " + d.message, d.error}
+                            : ScriptDiagnostic{o->second.node, d.message, d.error};
                     if (std::ranges::none_of(diagnostics, [&](const ScriptDiagnostic& x) {
                             return x.node == mapped.node && x.message == mapped.message;
                         }))
@@ -851,7 +916,8 @@ struct ScriptSystem::Impl {
                 graph = std::move(expanded);
             }
         }
-        auto program = Compile(key, std::move(graph), diagnostics, origins);
+        auto program     = Compile(key, std::move(graph), diagnostics, origins);
+        program->classes = std::move(classes);
         for (std::size_t i = 1; i < program->files.size(); ++i) // breakpoints saved in libraries
             if (const ScriptLibrary* lib = ScriptRegistry::FindLibrary(program->fileLibraries[i]);
                 lib && !breakpoints.contains(program->files[i]))
@@ -1083,7 +1149,7 @@ struct ScriptSystem::Impl {
         const CompiledNode& c = p.nodes[static_cast<std::size_t>(node)];
         debug[p.files[static_cast<std::size_t>(c.file)]].nodeTimes[c.id] = time;
         if (c.use) // a copy of a macro: its Macro node runs too
-            debug[p.key].nodeTimes[c.use] = time;
+            debug[p.files[static_cast<std::size_t>(c.useFile)]].nodeTimes[c.use] = time;
     }
 
     // Exec output (node, pin) -> next (node, input pin); records the link for the debugger.
@@ -1111,21 +1177,26 @@ struct ScriptSystem::Impl {
         const CompiledNode&     call = p.nodes[static_cast<std::size_t>(st.node)];
         const auto              f    = static_cast<std::size_t>(call.callFunction);
         const CompiledFunction& fn   = p.functions[f];
-        if (inst.active[f]) {
-            RuntimeError(inst, st.node, "Recursive call of '" + fn.name + "' (not supported)");
+        if (functionDepth >= kMaxCallDepth) {
+            RuntimeError(inst, st.node, "Calls nested too deep (recursion without an end?) in '" + fn.name + "'");
             return Enter::Failed;
         }
         Exec        own(*this, scene, inst);
         Exec&       ctx   = caller ? *caller : own;
         const int   saved = ctx.node;
         ctx.node          = st.node;
+        std::vector<ScriptValue> args;
         for (std::size_t i = 0; i < call.argPins.size(); ++i)
-            inst.outputs[static_cast<std::size_t>(fn.entry)][i + 1] = ctx.In(call.argPins[i]);
+            args.push_back(ctx.In(call.argPins[i]));
         ctx.node = saved;
+        std::shared_ptr<SavedScope> outer = SaveScope(inst, f);
+        for (std::size_t i = 0; i < args.size(); ++i)
+            inst.outputs[static_cast<std::size_t>(fn.entry)][i + 1] = std::move(args[i]);
         for (std::size_t i = 0; i < fn.locals.size(); ++i)
             inst.locals[f][i] = fn.locals[i].value;
-        inst.active[f] = 1;
-        st.calls.push_back({st.node, static_cast<int>(f), std::move(st.stack)});
+        ++inst.active[f];
+        ++functionDepth;
+        st.calls.push_back({st.node, static_cast<int>(f), std::move(st.stack), nullptr, std::move(outer)});
         st.stack.clear();
         MarkNode(inst, fn.entry);
         int next = 0, entry = 0;
@@ -1137,14 +1208,98 @@ struct ScriptSystem::Impl {
         return Enter::Entered;
     }
 
-    // Leaves the innermost function: the caller's loop stack comes back. Returns the call node.
+    // A function about to be entered while it runs already: its current values (of the outer call).
+    static std::shared_ptr<SavedScope> SaveScope(const Instance& inst, std::size_t f)
+    {
+        if (inst.active[f] == 0)
+            return nullptr;
+        auto                    saved = std::make_shared<SavedScope>();
+        const CompiledFunction& fn    = inst.program->functions[f];
+        for (int node : fn.nodes) {
+            saved->outputs.push_back(inst.outputs[static_cast<std::size_t>(node)]);
+            saved->stamps.push_back(inst.evalStamp[static_cast<std::size_t>(node)]);
+            saved->states.push_back(inst.states[static_cast<std::size_t>(node)]);
+        }
+        saved->locals = inst.locals[f];
+        return saved;
+    }
+
+    // Leaves the innermost function: the caller's loop stack comes back (and, after a recursive
+    // call, the outer call's values). Returns the call node.
     int PopFrame(Instance& inst, ChainState& st)
     {
         CallFrame frame = std::move(st.calls.back());
         st.calls.pop_back();
-        st.stack = std::move(frame.stack);
-        inst.active[static_cast<std::size_t>(frame.function)] = 0;
+        st.stack      = std::move(frame.stack);
+        const auto f  = static_cast<std::size_t>(frame.function);
+        inst.active[f] = std::max(inst.active[f] - 1, 0);
+        functionDepth      = functionDepth > 0 ? functionDepth - 1 : 0;
+        if (frame.saved) {
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (std::size_t i = 0; i < fn.nodes.size(); ++i) {
+                inst.outputs[static_cast<std::size_t>(fn.nodes[i])]   = std::move(frame.saved->outputs[i]);
+                inst.evalStamp[static_cast<std::size_t>(fn.nodes[i])] = frame.saved->stamps[i];
+                inst.states[static_cast<std::size_t>(fn.nodes[i])]    = std::move(frame.saved->states[i]);
+            }
+            inst.locals[f] = std::move(frame.saved->locals);
+        }
         return frame.callNode;
+    }
+
+    // A latent node inside functions stops the chain: the call stack waits with it (the functions
+    // are no longer running meanwhile, other calls may use them).
+    std::shared_ptr<Parked> Park(Instance& inst, ChainState& st)
+    {
+        auto parked = std::make_shared<Parked>();
+        parked->id  = st.id;
+        for (const CallFrame& frame : st.calls) {
+            const auto f = static_cast<std::size_t>(frame.function);
+            if (std::ranges::any_of(parked->scopes, [&](const auto& s) { return s.first == f; }))
+                continue;
+            SavedScope              scope;
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (int node : fn.nodes) {
+                scope.outputs.push_back(inst.outputs[static_cast<std::size_t>(node)]);
+                scope.stamps.push_back(inst.evalStamp[static_cast<std::size_t>(node)]);
+                scope.states.push_back(inst.states[static_cast<std::size_t>(node)]);
+                // Latent nodes wait per call: the next call starts them afresh.
+                if (const NodeDesc* d = inst.program->nodes[static_cast<std::size_t>(node)].desc; d && d->latent)
+                    inst.states[static_cast<std::size_t>(node)] = {};
+            }
+            scope.locals = inst.locals[f];
+            parked->scopes.emplace_back(f, std::move(scope));
+        }
+        for (const CallFrame& frame : st.calls) {
+            const auto f   = static_cast<std::size_t>(frame.function);
+            inst.active[f] = std::max(inst.active[f] - 1, 0);
+            functionDepth  = functionDepth > 0 ? functionDepth - 1 : 0;
+        }
+        parked->stack = std::move(st.stack);
+        parked->calls = std::move(st.calls);
+        st.stack.clear();
+        st.calls.clear();
+        return parked;
+    }
+
+    // The latent node completes: its call stack and the functions' values come back.
+    void Restore(Instance& inst, ChainState& st, Parked parked)
+    {
+        for (auto& [f, scope] : parked.scopes) {
+            const CompiledFunction& fn = inst.program->functions[f];
+            for (std::size_t i = 0; i < fn.nodes.size() && i < scope.outputs.size(); ++i) {
+                inst.outputs[static_cast<std::size_t>(fn.nodes[i])]   = std::move(scope.outputs[i]);
+                inst.evalStamp[static_cast<std::size_t>(fn.nodes[i])] = scope.stamps[i];
+                inst.states[static_cast<std::size_t>(fn.nodes[i])]    = std::move(scope.states[i]);
+            }
+            inst.locals[f] = std::move(scope.locals);
+        }
+        for (const CallFrame& frame : parked.calls) {
+            ++inst.active[static_cast<std::size_t>(frame.function)];
+            ++functionDepth;
+        }
+        st.id    = parked.id;
+        st.stack = std::move(parked.stack);
+        st.calls = std::move(parked.calls);
     }
 
     bool ShouldBreak(Instance& inst, ChainState& st)
@@ -1167,7 +1322,7 @@ struct ScriptSystem::Impl {
         // Entering a copy of a macro whose Macro node has a breakpoint, else the node's own.
         Breakpoint* use = nullptr;
         if (c.use && c.use != st.lastUse)
-            if (const auto own = breakpoints.find(inst.program->key); own != breakpoints.end())
+            if (const auto own = breakpoints.find(inst.program->files[static_cast<std::size_t>(c.useFile)]); own != breakpoints.end())
                 if (const auto b = own->second.find(c.use); b != own->second.end())
                     use = &b->second;
         Breakpoint* node = nullptr;
@@ -1214,6 +1369,11 @@ struct ScriptSystem::Impl {
         const std::size_t   base  = nested ? st.calls.size() - 1 : 0;
         const Program&      p     = *inst.program;
         std::uint32_t       steps = 0;
+        bool resumed = false; // the first node is a latent node completing inside functions
+        if (st.restore && !nested) {
+            Restore(inst, st, std::move(*std::exchange(st.restore, nullptr)));
+            resumed = !st.calls.empty();
+        }
         for (;;) {
             if (++steps > maxSteps) {
                 RuntimeError(inst, st.node, "Too many steps in one event (infinite loop?) - chain aborted");
@@ -1250,7 +1410,24 @@ struct ScriptSystem::Impl {
                 if (ctx.suspended && constructing)
                     RuntimeError(inst, st.node, "Latent nodes do not run in the construction script");
                 else if (ctx.suspended)
-                    waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds});
+                    waiting.push_back({key, serial, st.node, ctx.suspendData, time + ctx.suspendSeconds, nullptr});
+                // Inside functions (called from a chain): the callers wait for the latent node.
+                if (!nested && !st.calls.empty() && out == kScriptStop && ctx.pushed.empty() && !constructing) {
+                    if (ctx.suspended) {
+                        waiting.back().parked = Park(inst, st);
+                        return true;
+                    }
+                    if (std::ranges::find(inst.ticking, st.node) != inst.ticking.end()) {
+                        inst.parkedTicks[st.node] = Park(inst, st);
+                        return true;
+                    }
+                    if (std::exchange(resumed, false)) { // did not complete (a newer trigger won): the callers stop
+                        while (!st.calls.empty())
+                            PopFrame(inst, st);
+                        return true;
+                    }
+                }
+                resumed = false;
                 if (out == kScriptReturn) {
                     out = kScriptStop;
                     if (!st.calls.empty()) { // hand the outputs to the caller, back after the call
@@ -1258,14 +1435,21 @@ struct ScriptSystem::Impl {
                         if (frame.callNode < 0) {
                             for (std::size_t i = 0; i < frame.results->size(); ++i)
                                 (*frame.results)[i] = ctx.In(static_cast<int>(i) + 1);
+                            st.stack.clear();
+                            from = PopFrame(inst, st);
                         } else {
-                            const CompiledNode& callNode = p.nodes[static_cast<std::size_t>(frame.callNode)];
+                            // Read before leaving: a recursive call's frame restores the outer
+                            // call's values, the call node (part of them) gets the results after.
+                            const CompiledNode&      callNode = p.nodes[static_cast<std::size_t>(frame.callNode)];
+                            std::vector<ScriptValue> results;
                             for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
-                                inst.outputs[static_cast<std::size_t>(frame.callNode)]
-                                            [static_cast<std::size_t>(callNode.resultPins[i])] = ctx.In(static_cast<int>(i) + 1);
+                                results.push_back(ctx.In(static_cast<int>(i) + 1));
+                            st.stack.clear();
+                            from = PopFrame(inst, st);
+                            for (std::size_t i = 0; i < callNode.resultPins.size(); ++i)
+                                inst.outputs[static_cast<std::size_t>(from)][static_cast<std::size_t>(callNode.resultPins[i])] =
+                                    std::move(results[i]);
                         }
-                        st.stack.clear();
-                        from = PopFrame(inst, st);
                         if (nested && st.calls.size() == base)
                             return true;
                         out = 1; // "Then" of the call
@@ -1321,10 +1505,11 @@ struct ScriptSystem::Impl {
         const auto              f  = static_cast<std::size_t>(function);
         const CompiledFunction& fn = p.functions[f];
         const ScriptFunction&   sf = p.graph.functions[f];
-        if (inst.active[f]) {
-            PrintMessage("Recursive call of '" + fn.name + "' (not supported)", 3.0f, true);
+        if (functionDepth >= kMaxCallDepth) {
+            PrintMessage("Calls nested too deep (recursion without an end?) in '" + fn.name + "'", 3.0f, true);
             return false;
         }
+        std::shared_ptr<SavedScope> outer = SaveScope(inst, f);
         const auto fit = [](const ScriptValue& v, PinType t) {
             return ValueFits(v, t) ? v : CanConvert(TypeOf(v), t) ? Convert(v, t) : DefaultValue(t);
         };
@@ -1336,9 +1521,10 @@ struct ScriptSystem::Impl {
             results.push_back(DefaultValue(out.type));
         for (std::size_t i = 0; i < fn.locals.size(); ++i)
             inst.locals[f][i] = fn.locals[i].value;
-        inst.active[f] = 1;
+        ++inst.active[f];
+        ++functionDepth;
         ChainState st;
-        st.calls.push_back({-1, function, {}, &results});
+        st.calls.push_back({-1, function, {}, &results, std::move(outer)});
         MarkNode(inst, fn.entry);
         int next = 0, entry = 0;
         if (!Follow(inst, fn.entry, 0, next, entry)) {
@@ -1352,11 +1538,18 @@ struct ScriptSystem::Impl {
     }
 
     // A new chain: queued while the debugger pauses.
-    void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data)
+    void RunChain(Scene& scene, Instance& inst, int node, int entry, std::int32_t data,
+                  std::shared_ptr<Parked> parked = nullptr)
     {
         if (!scene.GetRegistry().Valid(inst.entity)) // destroyed this frame (its instance goes at the end of Update)
             return;
         ChainState st;
+        if (!parked && entry == kScriptTick) // a tween inside a function: continues with its call stack
+            if (const auto it = inst.parkedTicks.find(node); it != inst.parkedTicks.end()) {
+                parked = std::move(it->second);
+                inst.parkedTicks.erase(it);
+            }
+        st.restore = std::move(parked);
         st.id        = ++nextChain;
         st.lastUse   = entry < 0 ? inst.program->nodes[static_cast<std::size_t>(node)].use : 0; // resumed inside a macro copy
         st.node      = node;
@@ -1376,8 +1569,10 @@ struct ScriptSystem::Impl {
         const auto resume = [&](SuspendedChain chain, bool skip) {
             const auto it = instances.find(chain.entity);
             if (it == instances.end() || it->second->serial != chain.serial || !it->second->program ||
-                !scene.GetRegistry().Valid(it->second->entity))
+                !scene.GetRegistry().Valid(it->second->entity)) {
+                functionDepth -= std::min(functionDepth, chain.state.calls.size()); // its frames are gone
                 return;
+            }
             const std::uint64_t chainId = chain.state.id;
             chain.state.skipBreak = skip;
             const bool finished = RunState(scene, *it->second, chain.state, false);
@@ -1501,6 +1696,7 @@ struct ScriptSystem::Impl {
         levelEvents.clear();
         paused.reset();
         queued.clear();
+        functionDepth = 0;
         stepMode = StepMode::None;
         if (assets)
             for (ModelHandle h : spawned)
@@ -1532,6 +1728,8 @@ struct ScriptSystem::Impl {
     double         time        = 0.0;
     float          frameDt     = 0.0f;
     std::uint32_t  maxSteps    = 100000;
+    std::size_t    functionDepth = 0; // function calls on all chains (recursion limit)
+    static constexpr std::size_t kMaxCallDepth = 256;
     int            callDepth   = 0;
     std::uint32_t  evalCounter = 0; // Exec stamps (pure evaluation cache)
     std::uint64_t  nextSerial  = 0;
@@ -1645,7 +1843,7 @@ void ScriptSystem::Update(Scene& scene, float dt, bool acceptInput)
     for (const Impl::Waiting& t : due) {
         const auto it = w.instances.find(t.entity);
         if (it != w.instances.end() && it->second->serial == t.serial && it->second->program)
-            w.RunChain(scene, *it->second, t.node, kScriptResume, t.data);
+            w.RunChain(scene, *it->second, t.node, kScriptResume, t.data, t.parked);
     }
 
     // Instances may be added / removed by scripts meanwhile: iterate over a copy of the keys.
@@ -1889,6 +2087,7 @@ void ScriptSystem::End(Scene& scene)
         return;
     w.paused.reset(); // the debugger lets go: EndPlay runs to completion
     w.queued.clear();
+    w.functionDepth = 0; // frames of the dropped chains
     w.stepMode = Impl::StepMode::None;
     w.breakpoints.clear();
     std::vector<std::uint64_t> keys;
@@ -1902,6 +2101,7 @@ void ScriptSystem::End(Scene& scene)
             if (w.paused) { // a breakpoint inside EndPlay: ignored now
                 w.paused.reset();
                 w.queued.clear();
+                w.functionDepth = 0;
             }
         }
     w.Clear();
@@ -1919,7 +2119,7 @@ void ScriptSystem::Provide(const std::filesystem::path& file, std::optional<Scri
         m_Impl->overrides[key] = std::move(*graph);
     else
         m_Impl->overrides.erase(key);
-    m_Impl->programs.erase(key); // scripts created from now on use it
+    m_Impl->programs.clear(); // scripts created from now on use it (child classes too)
 }
 
 const ScriptDebugInfo* ScriptSystem::Debug(const std::filesystem::path& file) const
@@ -2066,7 +2266,7 @@ std::optional<ScriptDebugFrame> ScriptSystem::PausedAt() const
     ScriptDebugFrame result = frame(w.paused->state.node);
     if (w.paused->state.atUse) { // stopped on a Macro node: it is what the graph shows
         const CompiledNode& c = p.nodes[static_cast<std::size_t>(w.paused->state.node)];
-        result.file           = p.key;
+        result.file           = p.files[static_cast<std::size_t>(c.useFile)];
         result.node           = c.use;
         result.function       = c.node->function;
     }
@@ -2125,7 +2325,7 @@ std::vector<Entity> ScriptSystem::InstancesOf(const std::filesystem::path& file)
     const std::string   key = Key(file);
     std::vector<Entity> out;
     for (const auto& [k, inst] : m_Impl->instances)
-        if (inst->program && inst->program->key == key)
+        if (inst->program && std::ranges::find(inst->program->classes, key) != inst->program->classes.end())
             out.push_back(inst->entity);
     std::ranges::sort(out, {}, [](Entity e) { return static_cast<std::uint64_t>(e); });
     return out;
@@ -2135,7 +2335,8 @@ std::optional<ScriptWatch> ScriptSystem::Watch(const std::filesystem::path& file
 {
     const Impl& w  = *m_Impl;
     const auto  it = w.instances.find(EntityKey(entity));
-    if (it == w.instances.end() || !it->second->program || it->second->program->key != Key(file))
+    const std::string key = Key(file);
+    if (it == w.instances.end() || !it->second->program || std::ranges::find(it->second->program->classes, key) == it->second->program->classes.end())
         return std::nullopt;
     const Impl::Instance& inst = *it->second;
     const Program&        p    = *inst.program;
@@ -2154,7 +2355,7 @@ std::optional<ScriptWatch> ScriptSystem::Watch(const std::filesystem::path& file
     }
     for (std::size_t n = 0; n < p.nodes.size(); ++n) {
         const CompiledNode& c = p.nodes[n];
-        if (c.file != 0) // copied from a library
+        if (p.files[static_cast<std::size_t>(c.file)] != key) // copied from a library / another class
             continue;
         for (std::size_t pin = 0; pin < c.pins.size(); ++pin)
             if (c.pins[pin].output && c.pins[pin].type != PinType::Exec)

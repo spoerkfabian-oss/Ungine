@@ -194,13 +194,30 @@ std::optional<MaterialOverrides> RelocatedMaterials(const MaterialOverrides* ove
 
 void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                         const fs::path& from, const fs::path& to, bool directory, std::size_t& count,
-                        const fs::path& oldOwnerDirectory = {}, bool pathValues = false)
+                        const fs::path& oldOwnerDirectory = {}, bool pathValues = false, const fs::path& projectRoot = {})
 {
     if (value.is_object()) {
         for (auto it = value.begin(); it != value.end(); ++it) {
             // pathValues: every string of the object is a path (a collider's meshMaterials, a decal).
             // Material graphs: a texture node's param is its file; instances: the parent.
             const bool textureNode = it.key() == "param" && value.value("type", std::string{}) == "Texture.Sample";
+            // Blueprint class nodes (Is A / Cast To): the class graph, relative to the project root.
+            const bool classNode = it.key() == "param" && it.value().is_string() &&
+                                   (value.value("type", std::string{}) == "Class.IsA" ||
+                                    value.value("type", std::string{}) == "Class.CastTo");
+            if (classNode) {
+                std::error_code ec;
+                const fs::path  root      = projectRoot.empty() ? fs::current_path(ec) : projectRoot;
+                fs::path        reference = PathFromUtf8(it.value().get<std::string>());
+                if (reference.is_relative())
+                    reference = root / reference;
+                if (const auto relocated = RelocateReference(PathToUtf8(reference), from, to, directory)) {
+                    const fs::path rel = fs::path(*relocated).lexically_relative(root);
+                    it.value()         = PathToUtf8(rel.empty() ? fs::path(*relocated) : rel);
+                    ++count;
+                }
+                continue;
+            }
             if (it.value().is_string() && (pathValues || it.key() == "graph" || it.key() == "sound" || it.key() == "image" ||
                                           it.key() == "file" || it.key() == "uri" || it.key() == "level" ||
                                           it.key() == "material" || it.key() == "effect" || it.key() == "texture" ||
@@ -234,18 +251,19 @@ void RewriteStoredPaths(nlohmann::json& value, const fs::path& ownerDirectory,
                 }
             } else {
                 RewriteStoredPaths(it.value(), ownerDirectory, from, to, directory, count, oldOwnerDirectory,
-                                   it.key() == "meshMaterials" || it.key() == "decal" || it.key() == "materials"); // their strings are all paths
+                                   it.key() == "meshMaterials" || it.key() == "decal" || it.key() == "materials", // their strings are all paths
+                                   projectRoot);
             }
         }
     } else if (value.is_array()) {
         for (nlohmann::json& child : value) {
             if (pathValues && child.is_string()) { // a list of paths (material overrides)
                 nlohmann::json wrapper = {{"file", child}};
-                RewriteStoredPaths(wrapper, ownerDirectory, from, to, directory, count, oldOwnerDirectory);
+                RewriteStoredPaths(wrapper, ownerDirectory, from, to, directory, count, oldOwnerDirectory, false, projectRoot);
                 child = wrapper["file"];
                 continue;
             }
-            RewriteStoredPaths(child, ownerDirectory, from, to, directory, count, oldOwnerDirectory);
+            RewriteStoredPaths(child, ownerDirectory, from, to, directory, count, oldOwnerDirectory, false, projectRoot);
         }
     }
 }
@@ -288,7 +306,8 @@ bool RepairStoredReferences(const fs::path& contentRoot, const fs::path& from, c
         }
         std::size_t fileChanges = 0;
         const fs::path oldOwner = !directory && it->path() == to ? from.parent_path() : fs::path{};
-        RewriteStoredPaths(document, it->path().parent_path(), from, to, directory, fileChanges, oldOwner);
+        RewriteStoredPaths(document, it->path().parent_path(), from, to, directory, fileChanges, oldOwner, false,
+                           contentRoot.parent_path()); // class paths in blueprints are relative to the project
         if (fileChanges == 0)
             continue;
 
@@ -1461,6 +1480,8 @@ void Editor::DrawContentBrowser()
                     }
                     if (item.kind == ContentItem::Kind::Prefab && ImGui::MenuItem("Create variant"))
                         (void)CreatePrefabVariantOf(item.path);
+                    if (item.kind == ContentItem::Kind::Blueprint && ImGui::MenuItem("Create child blueprint"))
+                        (void)CreateChildBlueprint(item.path);
                     if (item.kind == ContentItem::Kind::ParticleEffect) {
                         if (ImGui::MenuItem("Place particle system"))
                             CreateParticleEntity(item.path, PlacementPoint(std::max(m_Ctx.camera.moveSpeed, 1.0f) * 2.0f));
@@ -2510,6 +2531,30 @@ fs::path Editor::CreatePrefabVariantOf(const fs::path& base)
     }
     m_Status = "Variant " + PathToUtf8(file.filename());
     RefreshContent();
+    return file;
+}
+
+fs::path Editor::CreateChildBlueprint(const fs::path& parent)
+{
+    const fs::path file = UniquePath(parent.parent_path(), PathToUtf8(parent.stem()) + "_Child", ".ugraph");
+    try {
+        const ScriptGraph base = LoadScriptGraph(parent);
+        if (base.library)
+            throw std::runtime_error("A library cannot be a parent class");
+        ScriptGraph child;
+        child.parent = ScriptParentPath(file, parent);
+        SaveScriptGraph(file, child);
+    } catch (const std::exception& e) {
+        m_Status = e.what();
+        ENGINE_ERROR("{}", m_Status);
+        return {};
+    }
+    m_Status = "Child blueprint " + PathToUtf8(file.filename());
+    RefreshContent();
+    if (m_Graphs->Open(file)) {
+        m_ShowBlueprint = true;
+        m_Graphs->Focus();
+    }
     return file;
 }
 

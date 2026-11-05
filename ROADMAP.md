@@ -85,3 +85,13 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 - Bestehende Projektvorgabe: pro Phase ein Git-Commit; Branch `codex/feature-roadmap-and-phases`; nicht auf andere Branches pushen.
 - Vor jeder Phase Abhängigkeiten und Akzeptanzkriterien festhalten. Keine stillen Datenformatbrüche; neue Szenen-/Asset-Felder rückwärtskompatibel einlesen.
 - Bei nicht verfügbarer GPU/Windows-Laufzeit die konkret nicht verifizierten Pfade im Abschluss notieren.
+
+### Phase 35 – Blueprints erweitert (D)
+- Vererbung wie UE (Elternklasse, Variablen-Defaults, Overrides mit Call Parent, geerbte Interfaces, Is A / Cast To), Rekursion, verschachtelte Container + weitere Map-Schlüssel.
+- Fortschritt (2026-11-03): umgesetzt und lokal verifiziert – siehe CLAUDE.md „Blueprints erweitert (Phase 35)“, Grenzen in Offene Punkte 13.
+
+### Phase 36 – Latent in Funktionen/Async + Knoten/Komfort (D)
+- Fortschritt (2026-11-04): umgesetzt und lokal verifiziert (gestapelt in PR #24) – Latent-Knoten in Funktionen, Dispatcher-Signaturen, Refactoring (Umbenennen in Kindklassen, Move to parent class, Klassenpfade), ~55 Hilfsknoten + Async Load Model.
+### Phase 37 – Installer per CI (D)
+- Windows-Setup (NSIS) + ZIP, Linux-TGZ als Release-Artefakte (Workflow `release.yml`: Tag `v*` → GitHub-Release, `main`/manuell → Artefakte), jedes Paket vor dem Upload per `tests/PackageSmoke.cmake` geprüft.
+- Fortschritt (2026-11-05): umgesetzt (gestapelt in PR #24); lokal Linux-Release-Build + TGZ + Paket-Smoke, Windows-Job erst in CI.

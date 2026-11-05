@@ -4,7 +4,14 @@
 set(CPACK_PACKAGE_NAME "Ungine")
 set(CPACK_PACKAGE_VENDOR "Ungine")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Ungine game engine: editor, visual scripting and player")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+# Release builds (CI) pass the tag's version, e.g. -DENGINE_PACKAGE_VERSION=0.37.0.
+set(ENGINE_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Version in the package names and the installer")
+set(CPACK_PACKAGE_VERSION "${ENGINE_PACKAGE_VERSION}")
+if(WIN32)
+    set(CPACK_SYSTEM_NAME "windows-x64")
+else()
+    set(CPACK_SYSTEM_NAME "linux-x64")
+endif()
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "Ungine")
 set(CPACK_PACKAGE_EXECUTABLES "UngineEditor" "Ungine Editor") # Start menu shortcut
 set(CPACK_STRIP_FILES ON)

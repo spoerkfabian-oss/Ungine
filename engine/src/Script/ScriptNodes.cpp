@@ -278,11 +278,12 @@ PinType VariableElement(const ScriptGraph& graph, const ScriptNode& node)
     return IsArray(t) ? ElementType(t) : PinType::Float;
 }
 
-// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3); float if it names none.
+// Element type named by a param ("int", "struct:Item", "vec3:3" -> Vec3, "intArray" -> int[]); float
+// if it names none.
 PinType ElementParam(const std::string& param)
 {
     const auto t = PinTypeFromString(SplitTypeAndCount(param, 0).first);
-    return t && t->kind != PinKind::Exec && !IsContainer(*t) ? *t : PinType::Float;
+    return t && t->kind != PinKind::Exec ? *t : PinType::Float;
 }
 
 // Any value type named by a param (scalars and containers).
@@ -1803,7 +1804,77 @@ std::vector<NodeDesc> BuildRegistry()
             return pins;
         };
         add(WithParam(std::move(pure), ParamKind::Function, "Function", ""));
+
+        // Inheritance: the parent class's version of the overridden function / event (compiled
+        // into calls of the renamed parent version; never executed themselves).
+        const auto parentFunctionPins = [](bool exec) {
+            return [exec](const ScriptGraph& g, const ScriptNode& n) {
+                std::vector<PinInfo> pins;
+                if (exec)
+                    pins = {ExecIn(), ExecOut()};
+                const ScriptFunction* f = g.inherited ? g.inherited->FindFunction(n.param) : nullptr;
+                if (f) {
+                    for (const ScriptParam& p : f->inputs)
+                        pins.push_back(In(p.name, p.type));
+                    for (const ScriptParam& p : f->outputs)
+                        pins.push_back(Out(p.name, p.type));
+                }
+                return pins;
+            };
+        };
+        NodeDesc parent = Flow("Function.CallParent", "Call Parent Function", {}, [](ScriptContext&, int) { return 1; },
+                               "Runs the parent class's version of this function");
+        parent.category    = "Functions";
+        parent.hidden      = true;
+        parent.resolvePins = parentFunctionPins(true);
+        add(WithParam(std::move(parent), ParamKind::Function, "Function", ""));
+        NodeDesc parentPure = Pure("Function.CallParentPure", "Call Parent Function", "Functions", {}, [](ScriptContext&) {},
+                                   "The parent class's version of this pure function");
+        parentPure.hidden      = true;
+        parentPure.resolvePins = parentFunctionPins(false);
+        add(WithParam(std::move(parentPure), ParamKind::Function, "Function", ""));
+
+        NodeDesc parentEvent = Flow("Flow.CallParentEvent", "Call Parent Event", {}, [](ScriptContext&, int) { return 1; },
+                                    "Runs the parent class's handlers of this event (its outputs as inputs)");
+        parentEvent.category    = "Functions";
+        parentEvent.hidden      = true;
+        parentEvent.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
+            std::vector<PinInfo> pins{ExecIn(), ExecOut()};
+            ScriptNode           event;
+            const std::size_t    colon = n.param.find(':');
+            event.type                 = n.param.substr(0, colon);
+            event.param                = colon == std::string::npos ? std::string() : n.param.substr(colon + 1);
+            const NodeDesc* desc       = FindScriptNodeType(event.type);
+            if (desc && desc->kind == NodeKind::Event && desc->resolvePins)
+                for (const PinInfo& p : desc->resolvePins(g, event))
+                    if (p.type != P::Exec)
+                        pins.push_back(In(p.name, p.type));
+            if (desc && desc->kind == NodeKind::Event && !desc->resolvePins)
+                for (const PinInfo& p : desc->pins)
+                    if (p.type != P::Exec)
+                        pins.push_back(In(p.name, p.type));
+            return pins;
+        };
+        add(WithParam(std::move(parentEvent), ParamKind::Text, "Event", ""));
     }
+
+    // Classes (Blueprint inheritance): the param is the class graph (.ugraph, like the Script
+    // component's path); a script is of a class when its graph is that one or inherits from it.
+    add(WithParam(Pure("Class.IsA", "Is A", "Classes", {In("Target", P::Entity), Out("Result", P::Bool)},
+                       [](ScriptContext& c) { c.Out(1, c.IsA(c.InEntity(0), c.Param())); },
+                       "Is the target's script of this Blueprint class (or a child class of it)?"),
+                  ParamKind::Text, "Class", ""));
+    add([](NodeDesc d) { d.category = "Classes"; return d; }(WithParam(Flow("Class.CastTo", "Cast To",
+                       {ExecIn(), In("Target", P::Entity), ExecOut("Success"), ExecOut("Failed"), Out("As", P::Entity)},
+                       [](ScriptContext& c, int) {
+                           const Entity target = c.InEntity(1);
+                           const bool   is     = c.IsA(target, c.Param());
+                           c.Out(4, is ? target : NullEntity);
+                           return is ? 2 : 3;
+                       },
+                       "Continues with Success (As = the target) when the target's script is of this Blueprint class "
+                       "or a child class, else with Failed"),
+                  ParamKind::Text, "Class", "")));
 
     // Arrays. Read nodes take the element type as param (adapts when an array is connected);
     // nodes that change an array work on an array variable.
@@ -2668,6 +2739,7 @@ std::vector<NodeDesc> BuildRegistry()
         d.category    = "Timeline";
         d.hidden      = true;
         d.latent      = true;
+        d.repeats     = true;
         d.resolvePins = [](const ScriptGraph& g, const ScriptNode& n) {
             std::vector<PinInfo> pins{ExecIn("Play"),         ExecIn("Play from Start"), ExecIn("Stop"),
                                       ExecIn("Reverse"),      ExecIn("Reverse from End"), ExecIn("Set New Time"),
@@ -2745,6 +2817,7 @@ std::vector<NodeDesc> BuildRegistry()
                           "Animates Value from From to To over Duration seconds: Update every frame, then Completed");
         f.category = "Tween";
         f.latent   = true;
+        f.repeats  = true;
         add(WithParam(WithDefaults(std::move(f), {{"To", 1.0f}, {"Duration", 1.0f}}), ParamKind::Choice, "Ease", "Linear", eases));
         add(WithParam(Pure("Math.Ease", "Ease", "Math|Float", {In("Alpha", P::Float), Out("Result", P::Float)},
                            [](ScriptContext& c) { c.Out(1, ScriptEase(c.Param(), c.InFloat(0))); },
@@ -3050,6 +3123,384 @@ std::vector<NodeDesc> BuildRegistry()
                           },
                           "The streamed level is in the scene"),
                      {{"Level", std::string("Content/Scenes/Sub.scene.json")}}));
+    // --- Utilities (Phase 36) ------------------------------------------------------------------
+    // Math: float.
+    const auto unary = [&](const char* type, const char* title, float (*fn)(float), const char* tooltip = "") {
+        add(Pure(type, title, "Math|Float", {In("Value", P::Float), Out("Result", P::Float)},
+                 [fn](ScriptContext& c) { c.Out(1, fn(c.InFloat(0))); }, tooltip));
+    };
+    unary("Math.Ceil", "Ceil", [](float x) { return std::ceil(x); });
+    unary("Math.Frac", "Frac", [](float x) { return x - std::floor(x); }, "The fractional part (x - floor(x))");
+    unary("Math.Sign", "Sign", [](float x) { return x > 0.0f ? 1.0f : x < 0.0f ? -1.0f : 0.0f; });
+    unary("Math.Tan", "Tan (radians)", [](float x) { return std::tan(x); });
+    unary("Math.Exp", "Exp", [](float x) { return std::exp(x); });
+    unary("Math.Log", "Log (natural)", [](float x) { return x > 0.0f ? std::log(x) : 0.0f; }, "0 for x <= 0");
+    unary("Math.DegToRad", "Degrees to Radians", [](float x) { return glm::radians(x); });
+    unary("Math.RadToDeg", "Radians to Degrees", [](float x) { return glm::degrees(x); });
+    add(Pure("Math.Atan2", "Atan2 (radians)", "Math|Float", {In("Y", P::Float), In("X", P::Float), Out("Result", P::Float)},
+             [](ScriptContext& c) { c.Out(2, std::atan2(c.InFloat(0), c.InFloat(1))); }));
+    add(WithDefaults(Pure("Math.MapRange", "Map Range", "Math|Float",
+                          {In("Value", P::Float), In("In Min", P::Float), In("In Max", P::Float), In("Out Min", P::Float),
+                           In("Out Max", P::Float), In("Clamped", P::Bool), Out("Result", P::Float)},
+                          [](ScriptContext& c) {
+                              const float span = c.InFloat(2) - c.InFloat(1);
+                              float       t    = span != 0.0f ? (c.InFloat(0) - c.InFloat(1)) / span : 0.0f;
+                              if (c.InBool(5))
+                                  t = std::clamp(t, 0.0f, 1.0f);
+                              c.Out(6, c.InFloat(3) + (c.InFloat(4) - c.InFloat(3)) * t);
+                          }, "Value from [In Min, In Max] to [Out Min, Out Max] (clamped to the output range if asked)"),
+                     {{"In Max", 1.0f}, {"Out Max", 1.0f}, {"Clamped", true}}));
+    add(WithDefaults(Pure("Math.Wrap", "Wrap", "Math|Float", {In("Value", P::Float), In("Min", P::Float), In("Max", P::Float), Out("Result", P::Float)},
+                          [](ScriptContext& c) {
+                              const float lo = c.InFloat(1), range = c.InFloat(2) - lo;
+                              c.Out(3, range > 0.0f ? lo + (c.InFloat(0) - lo - range * std::floor((c.InFloat(0) - lo) / range)) : lo);
+                          }, "Value wrapped into [Min, Max) (angles: 0, 360)"),
+                     {{"Max", 360.0f}}));
+    add(WithDefaults(Pure("Math.Snap", "Snap to Grid", "Math|Float", {In("Value", P::Float), In("Grid", P::Float), Out("Result", P::Float)},
+                          [](ScriptContext& c) {
+                              const float g = c.InFloat(1);
+                              c.Out(2, g > 0.0f ? std::round(c.InFloat(0) / g) * g : c.InFloat(0));
+                          }),
+                     {{"Grid", 1.0f}}));
+    add(WithDefaults(Pure("Math.InterpTo", "Interp To (float)", "Math|Float",
+                          {In("Current", P::Float), In("Target", P::Float), In("Delta Seconds", P::Float), In("Speed", P::Float),
+                           Out("Result", P::Float)},
+                          [](ScriptContext& c) {
+                              const float cur = c.InFloat(0), target = c.InFloat(1), speed = c.InFloat(3);
+                              c.Out(4, speed <= 0.0f ? target : cur + (target - cur) * std::clamp(c.InFloat(2) * speed, 0.0f, 1.0f));
+                          }, "Moves Current towards Target, faster when far away (Speed 0: jumps)"),
+                     {{"Speed", 5.0f}}));
+    add(WithDefaults(Pure("Math.NearlyEqual", "Nearly Equal (float)", "Logic",
+                          {In("A", P::Float), In("B", P::Float), In("Tolerance", P::Float), Out("Result", P::Bool)},
+                          [](ScriptContext& c) { c.Out(3, std::abs(c.InFloat(0) - c.InFloat(1)) <= std::abs(c.InFloat(2))); }),
+                     {{"Tolerance", 1e-4f}}));
+    add(WithDefaults(Pure("Math.InRange", "In Range (float)", "Logic",
+                          {In("Value", P::Float), In("Min", P::Float), In("Max", P::Float), Out("Result", P::Bool)},
+                          [](ScriptContext& c) { c.Out(3, c.InFloat(0) >= c.InFloat(1) && c.InFloat(0) <= c.InFloat(2)); },
+                          "Min <= Value <= Max"),
+                     {{"Max", 1.0f}}));
+    // Math: int.
+    add(Pure("Math.MinInt", "Min (int)", "Math|Int", {In("A", P::Int), In("B", P::Int), Out("Result", P::Int)},
+             [](ScriptContext& c) { c.Out(2, std::min(c.InInt(0), c.InInt(1))); }));
+    add(Pure("Math.MaxInt", "Max (int)", "Math|Int", {In("A", P::Int), In("B", P::Int), Out("Result", P::Int)},
+             [](ScriptContext& c) { c.Out(2, std::max(c.InInt(0), c.InInt(1))); }));
+    add(Pure("Math.AbsInt", "Abs (int)", "Math|Int", {In("Value", P::Int), Out("Result", P::Int)}, [](ScriptContext& c) {
+        const std::int32_t v = c.InInt(0);
+        c.Out(1, v == std::numeric_limits<std::int32_t>::min() ? std::numeric_limits<std::int32_t>::max() : std::abs(v));
+    }));
+    add(Pure("Math.ClampInt", "Clamp (int)", "Math|Int", {In("Value", P::Int), In("Min", P::Int), In("Max", P::Int), Out("Result", P::Int)},
+             [](ScriptContext& c) { c.Out(3, std::clamp(c.InInt(0), c.InInt(1), std::max(c.InInt(1), c.InInt(2)))); }));
+    // Comparisons.
+    add(Pure("Compare.NotEqualInt", "!= (int)", "Logic", {In("A", P::Int), In("B", P::Int), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InInt(0) != c.InInt(1)); }));
+    add(Pure("Compare.LessEqualInt", "<= (int)", "Logic", {In("A", P::Int), In("B", P::Int), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InInt(0) <= c.InInt(1)); }));
+    add(Pure("Compare.GreaterEqualInt", ">= (int)", "Logic", {In("A", P::Int), In("B", P::Int), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InInt(0) >= c.InInt(1)); }));
+    add(Pure("Compare.NotEqualFloat", "!= (float)", "Logic", {In("A", P::Float), In("B", P::Float), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, std::abs(c.InFloat(0) - c.InFloat(1)) > 1e-4f); }));
+    add(Pure("Compare.EqualBool", "== (bool)", "Logic", {In("A", P::Bool), In("B", P::Bool), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InBool(0) == c.InBool(1)); }));
+    const auto lower = [](std::string text) {
+        std::ranges::transform(text, text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return text;
+    };
+    add(Pure("Compare.EqualString", "== (string)", "Logic",
+             {In("A", P::String), In("B", P::String), In("Ignore Case", P::Bool), Out("Result", P::Bool)},
+             [lower](ScriptContext& c) {
+                 c.Out(3, c.InBool(2) ? lower(c.InString(0)) == lower(c.InString(1)) : c.InString(0) == c.InString(1));
+             }));
+
+    // Vectors.
+    add(Pure("Vector.Negate", "Negate (vector)", "Math|Vector", {In("Vector", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) { c.Out(1, -c.InVec3(0)); }));
+    add(Pure("Vector.Multiply", "* (vector, per component)", "Math|Vector", {In("A", P::Vec3), In("B", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) { c.Out(2, c.InVec3(0) * c.InVec3(1)); }));
+    add(Pure("Vector.Divide", "/ (vector, per component)", "Math|Vector", {In("A", P::Vec3), In("B", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) {
+                 const glm::vec3 a = c.InVec3(0), b = c.InVec3(1);
+                 c.Out(2, glm::vec3(b.x != 0.0f ? a.x / b.x : 0.0f, b.y != 0.0f ? a.y / b.y : 0.0f, b.z != 0.0f ? a.z / b.z : 0.0f));
+             }, "0 where B is 0"));
+    add(Pure("Vector.LengthSquared", "Vector Length Squared", "Math|Vector", {In("Vector", P::Vec3), Out("Result", P::Float)},
+             [](ScriptContext& c) { c.Out(1, glm::dot(c.InVec3(0), c.InVec3(0))); }));
+    add(Pure("Vector.Reflect", "Reflect", "Math|Vector", {In("Direction", P::Vec3), In("Normal", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) {
+                 const glm::vec3 n = c.InVec3(1);
+                 const float     l = glm::length(n);
+                 c.Out(2, l > 1e-8f ? glm::reflect(c.InVec3(0), n / l) : c.InVec3(0));
+             }, "Direction mirrored at the surface with this normal"));
+    add(Pure("Vector.Project", "Project onto", "Math|Vector", {In("Vector", P::Vec3), In("Target", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) {
+                 const glm::vec3 t = c.InVec3(1);
+                 const float     d = glm::dot(t, t);
+                 c.Out(2, d > 1e-12f ? t * (glm::dot(c.InVec3(0), t) / d) : glm::vec3(0.0f));
+             }));
+    add(Pure("Vector.Angle", "Angle Between (degrees)", "Math|Vector", {In("A", P::Vec3), In("B", P::Vec3), Out("Degrees", P::Float)},
+             [](ScriptContext& c) {
+                 const float la = glm::length(c.InVec3(0)), lb = glm::length(c.InVec3(1));
+                 const float cosine = la > 1e-8f && lb > 1e-8f ? glm::dot(c.InVec3(0), c.InVec3(1)) / (la * lb) : 1.0f;
+                 c.Out(2, glm::degrees(std::acos(std::clamp(cosine, -1.0f, 1.0f))));
+             }));
+    add(Pure("Vector.Rotate", "Rotate Vector", "Math|Vector", {In("Vector", P::Vec3), In("Rotation", P::Vec3), Out("Result", P::Vec3)},
+             [](ScriptContext& c) { c.Out(2, FromEulerDegrees(c.InVec3(1)) * c.InVec3(0)); }, "Rotation in Euler degrees"));
+    add(Pure("Vector.Direction", "Direction (From -> To)", "Math|Vector", {In("From", P::Vec3), In("To", P::Vec3), Out("Direction", P::Vec3)},
+             [](ScriptContext& c) {
+                 const glm::vec3 d = c.InVec3(1) - c.InVec3(0);
+                 const float     l = glm::length(d);
+                 c.Out(2, l > 1e-8f ? d / l : glm::vec3(0.0f));
+             }, "Unit vector from From to To (0 when they coincide)"));
+    add(WithDefaults(Pure("Vector.InterpTo", "Interp To (vector)", "Math|Vector",
+                          {In("Current", P::Vec3), In("Target", P::Vec3), In("Delta Seconds", P::Float), In("Speed", P::Float),
+                           Out("Result", P::Vec3)},
+                          [](ScriptContext& c) {
+                              const float speed = c.InFloat(3);
+                              c.Out(4, speed <= 0.0f ? c.InVec3(1)
+                                                     : glm::mix(c.InVec3(0), c.InVec3(1), std::clamp(c.InFloat(2) * speed, 0.0f, 1.0f)));
+                          }),
+                     {{"Speed", 5.0f}}));
+    add(Pure("Vector.RandomUnit", "Random Unit Vector", "Math|Vector", {Out("Result", P::Vec3)}, [](ScriptContext& c) {
+        std::normal_distribution<float> n;
+        glm::vec3                       v(n(Rng()), n(Rng()), n(Rng()));
+        const float                     l = glm::length(v);
+        c.Out(0, l > 1e-6f ? v / l : glm::vec3(0.0f, 1.0f, 0.0f));
+    }));
+    add(WithDefaults(Pure("Vector.IsNearlyZero", "Is Nearly Zero (vector)", "Math|Vector",
+                          {In("Vector", P::Vec3), In("Tolerance", P::Float), Out("Result", P::Bool)},
+                          [](ScriptContext& c) { c.Out(2, glm::length(c.InVec3(0)) <= std::abs(c.InFloat(1))); }),
+                     {{"Tolerance", 1e-4f}}));
+
+    // Strings.
+    add(Pure("String.Length", "Length (string)", "String", {In("Text", P::String), Out("Length", P::Int)},
+             [](ScriptContext& c) { c.Out(1, static_cast<std::int32_t>(c.InString(0).size())); }, "In bytes (UTF-8)"));
+    add(Pure("String.Contains", "Contains (string)", "String",
+             {In("Text", P::String), In("Part", P::String), In("Ignore Case", P::Bool), Out("Result", P::Bool)},
+             [lower](ScriptContext& c) {
+                 const std::string t = c.InBool(2) ? lower(c.InString(0)) : c.InString(0);
+                 const std::string p = c.InBool(2) ? lower(c.InString(1)) : c.InString(1);
+                 c.Out(3, t.find(p) != std::string::npos);
+             }));
+    add(Pure("String.StartsWith", "Starts With", "String", {In("Text", P::String), In("Prefix", P::String), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InString(0).starts_with(c.InString(1))); }));
+    add(Pure("String.EndsWith", "Ends With", "String", {In("Text", P::String), In("Suffix", P::String), Out("Result", P::Bool)},
+             [](ScriptContext& c) { c.Out(2, c.InString(0).ends_with(c.InString(1))); }));
+    add(Pure("String.Replace", "Replace", "String", {In("Text", P::String), In("From", P::String), In("To", P::String), Out("Result", P::String)},
+             [](ScriptContext& c) {
+                 std::string       text = c.InString(0);
+                 const std::string from = c.InString(1), to = c.InString(2);
+                 if (!from.empty())
+                     for (std::size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+                         text.replace(at, from.size(), to);
+                 c.Out(3, std::move(text));
+             }, "Every occurrence"));
+    add(Pure("String.ToUpper", "To Upper", "String", {In("Text", P::String), Out("Result", P::String)}, [](ScriptContext& c) {
+        std::string t = c.InString(0);
+        std::ranges::transform(t, t.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+        c.Out(1, std::move(t));
+    }, "ASCII letters"));
+    add(Pure("String.ToLower", "To Lower", "String", {In("Text", P::String), Out("Result", P::String)},
+             [lower](ScriptContext& c) { c.Out(1, lower(c.InString(0))); }, "ASCII letters"));
+    add(Pure("String.Trim", "Trim", "String", {In("Text", P::String), Out("Result", P::String)}, [](ScriptContext& c) {
+        std::string       t     = c.InString(0);
+        const std::size_t first = t.find_first_not_of(" \t\r\n");
+        t = first == std::string::npos ? std::string() : t.substr(first, t.find_last_not_of(" \t\r\n") - first + 1);
+        c.Out(1, std::move(t));
+    }));
+    add(WithDefaults(Pure("String.Substring", "Substring", "String",
+                          {In("Text", P::String), In("Start", P::Int), In("Length", P::Int), Out("Result", P::String)},
+                          [](ScriptContext& c) {
+                              const std::string t     = c.InString(0);
+                              const std::size_t start = static_cast<std::size_t>(std::max(c.InInt(1), 0));
+                              const std::int32_t len  = c.InInt(2);
+                              c.Out(3, start >= t.size() ? std::string()
+                                                         : t.substr(start, len < 0 ? std::string::npos : static_cast<std::size_t>(len)));
+                          }, "Length < 0: to the end"),
+                     {{"Length", std::int32_t{-1}}}));
+    add(WithDefaults(Pure("String.Split", "Split", "String", {In("Text", P::String), In("Separator", P::String), Out("Parts", P::StringArray)},
+                          [](ScriptContext& c) {
+                              const std::string        t = c.InString(0), sep = c.InString(1);
+                              std::vector<ScriptValue> parts;
+                              if (sep.empty()) {
+                                  parts.push_back(t);
+                              } else {
+                                  std::size_t start = 0;
+                                  for (std::size_t at = t.find(sep); at != std::string::npos; at = t.find(sep, start)) {
+                                      parts.push_back(t.substr(start, at - start));
+                                      start = at + sep.size();
+                                  }
+                                  parts.push_back(t.substr(start));
+                              }
+                              c.Out(2, MakeArray(P::String, std::move(parts)));
+                          }),
+                     {{"Separator", std::string(",")}}));
+    add(WithDefaults(Pure("String.Join", "Join", "String", {In("Parts", P::StringArray), In("Separator", P::String), Out("Result", P::String)},
+                          [](ScriptContext& c) {
+                              const ScriptValue parts = c.In(0);
+                              std::string       out;
+                              for (const ScriptValue& p : ArrayItems(parts).items) {
+                                  if (&p != ArrayItems(parts).items.data())
+                                      out += c.InString(1);
+                                  out += ToDisplayString(p);
+                              }
+                              c.Out(2, std::move(out));
+                          }),
+                     {{"Separator", std::string(", ")}}));
+    add(Pure("String.ToInt", "String to Int", "String", {In("Text", P::String), Out("Value", P::Int), Out("Success", P::Bool)},
+             [](ScriptContext& c) {
+                 const std::string t     = c.InString(0);
+                 std::int32_t      value = 0;
+                 const auto [end, ec]    = std::from_chars(t.data(), t.data() + t.size(), value);
+                 const bool ok           = ec == std::errc() && end == t.data() + t.size() && !t.empty();
+                 c.Out(1, ok ? value : 0);
+                 c.Out(2, ok);
+             }));
+    add(Pure("String.ToFloat", "String to Float", "String", {In("Text", P::String), Out("Value", P::Float), Out("Success", P::Bool)},
+             [](ScriptContext& c) {
+                 const std::string t = c.InString(0);
+                 char*             end = nullptr;
+                 const float       v   = t.empty() ? 0.0f : std::strtof(t.c_str(), &end);
+                 const bool        ok  = !t.empty() && end == t.c_str() + t.size() && std::isfinite(v);
+                 c.Out(1, ok ? v : 0.0f);
+                 c.Out(2, ok);
+             }));
+    add(WithDefaults(Pure("String.Format", "Format Text", "String",
+                          {In("Format", P::String), In("0", P::String), In("1", P::String), In("2", P::String), In("3", P::String),
+                           Out("Result", P::String)},
+                          [](ScriptContext& c) {
+                              std::string text = c.InString(0);
+                              for (int i = 0; i < 4; ++i) {
+                                  const std::string key = "{" + std::to_string(i) + "}", value = c.InString(i + 1);
+                                  for (std::size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + value.size()))
+                                      text.replace(at, key.size(), value);
+                              }
+                              c.Out(5, std::move(text));
+                          }, "Replaces {0} ... {3} with the inputs (any type converts to text)"),
+                     {{"Format", std::string("{0}: {1}")}}));
+
+    // Arrays (copies; the element type adapts when an array is connected).
+    arrayRead("Array.Reverse", "Reverse", [](PinType e) { return std::vector<PinInfo>{In("Array", ArrayOf(e)), Out("Result", ArrayOf(e))}; },
+              [](ScriptContext& c, PinType e) {
+                  std::vector<ScriptValue> items = ArrayItems(c.In(0)).items;
+                  std::ranges::reverse(items);
+                  c.Out(1, MakeArray(e, std::move(items)));
+              });
+    arrayRead("Array.Slice", "Slice",
+              [](PinType e) {
+                  return std::vector<PinInfo>{In("Array", ArrayOf(e)), In("Start", P::Int), In("Count", P::Int), Out("Result", ArrayOf(e))};
+              },
+              [](ScriptContext& c, PinType e) {
+                  const ScriptValue  value = c.In(0);
+                  const auto&        items = ArrayItems(value).items;
+                  const std::size_t  start = std::min(static_cast<std::size_t>(std::max(c.InInt(1), 0)), items.size());
+                  const std::int32_t count = c.InInt(2);
+                  const std::size_t  end   = count < 0 ? items.size() : std::min(items.size(), start + static_cast<std::size_t>(count));
+                  c.Out(3, MakeArray(e, std::vector<ScriptValue>(items.begin() + static_cast<std::ptrdiff_t>(start),
+                                                                 items.begin() + static_cast<std::ptrdiff_t>(end))));
+              }, "Count items from Start (Count < 0: to the end)");
+    arrayRead("Array.Append", "Append (arrays)",
+              [](PinType e) { return std::vector<PinInfo>{In("A", ArrayOf(e)), In("B", ArrayOf(e)), Out("Result", ArrayOf(e))}; },
+              [](ScriptContext& c, PinType e) {
+                  std::vector<ScriptValue> items = ArrayItems(c.In(0)).items;
+                  const ScriptValue        b     = c.In(1);
+                  items.insert(items.end(), ArrayItems(b).items.begin(), ArrayItems(b).items.end());
+                  c.Out(2, MakeArray(e, std::move(items)));
+              });
+    arrayRead("Array.Shuffle", "Shuffle", [](PinType e) { return std::vector<PinInfo>{In("Array", ArrayOf(e)), Out("Result", ArrayOf(e))}; },
+              [](ScriptContext& c, PinType e) {
+                  std::vector<ScriptValue> items = ArrayItems(c.In(0)).items;
+                  std::ranges::shuffle(items, Rng());
+                  c.Out(1, MakeArray(e, std::move(items)));
+              });
+    arrayRead("Array.RandomItem", "Random Item",
+              [](PinType e) {
+                  return std::vector<PinInfo>{In("Array", ArrayOf(e)), Out("Item", e), Out("Index", P::Int), Out("Valid", P::Bool)};
+              },
+              [](ScriptContext& c, PinType e) {
+                  const ScriptValue value = c.In(0);
+                  const auto&       items = ArrayItems(value).items;
+                  if (items.empty()) {
+                      c.Out(1, DefaultValue(e));
+                      c.Out(2, std::int32_t{-1});
+                      c.Out(3, false);
+                      return;
+                  }
+                  const std::size_t i = std::uniform_int_distribution<std::size_t>(0, items.size() - 1)(Rng());
+                  c.Out(1, items[i]);
+                  c.Out(2, static_cast<std::int32_t>(i));
+                  c.Out(3, true);
+              });
+    arrayRead("Array.Sort", "Sort", [](PinType e) { return std::vector<PinInfo>{In("Array", ArrayOf(e)), In("Descending", P::Bool), Out("Result", ArrayOf(e))}; },
+              [](ScriptContext& c, PinType e) {
+                  std::vector<ScriptValue> items = ArrayItems(c.In(0)).items;
+                  if (!IsContainer(e) && (e.kind == PinKind::Int || e.kind == PinKind::Float || e.kind == PinKind::String ||
+                                          e.kind == PinKind::Bool || e.kind == PinKind::Enum))
+                      std::ranges::stable_sort(items, ScriptKeyLess{});
+                  else
+                      c.Error("Sort supports numbers, strings, bools and enums");
+                  if (c.InBool(1))
+                      std::ranges::reverse(items);
+                  c.Out(2, MakeArray(e, std::move(items)));
+              }, "A sorted copy (numbers, strings, bools, enums)");
+    const auto floatStat = [&](const char* type, const char* title, int which) {
+        add(Pure(type, title, "Array", {In("Array", P::FloatArray), Out("Value", P::Float), Out("Index", P::Int)},
+                 [which](ScriptContext& c) {
+                     const ScriptValue value = c.In(0);
+                     const auto&       items = ArrayItems(value).items;
+                     float             best  = 0.0f;
+                     std::int32_t      index = -1;
+                     for (std::size_t i = 0; i < items.size(); ++i) {
+                         const float v = std::get<float>(Convert(items[i], P::Float));
+                         if (which == 0)
+                             best += v;
+                         else if (index < 0 || (which == 1 ? v < best : v > best)) {
+                             best  = v;
+                             index = static_cast<std::int32_t>(i);
+                         }
+                     }
+                     c.Out(1, best);
+                     c.Out(2, which == 0 ? static_cast<std::int32_t>(items.size()) - 1 : index);
+                 }, which == 0 ? "Sum of the items (Index: last index)" : "Index -1 for an empty array"));
+    };
+    floatStat("Array.SumFloat", "Sum (float array)", 0);
+    floatStat("Array.MinFloat", "Min (float array)", 1);
+    floatStat("Array.MaxFloat", "Max (float array)", 2);
+
+    // Assets: loading in the background (the model is kept until play ends).
+    {
+        NodeDesc d = Flow("Asset.LoadModelAsync", "Async Load Model",
+                          {ExecIn(), In("File", P::String), ExecOut("Completed"), ExecOut("Failed")},
+                          [](ScriptContext& c, int entry) {
+                              AssetManager* assets = c.Assets();
+                              if (!assets) {
+                                  c.Error("No asset manager here");
+                                  return 3;
+                              }
+                              ScriptContext::NodeState& s = c.State();
+                              if (entry != kScriptResume) {
+                                  const std::string file = c.InString(1);
+                                  if (file.empty()) {
+                                      c.Error("No model file");
+                                      return 3;
+                                  }
+                                  const ModelHandle h = assets->LoadModel(PathFromUtf8(file));
+                                  c.KeepModel(h.index, h.generation);
+                                  s.counter = static_cast<std::int32_t>(h.index);
+                                  s.value   = static_cast<std::int32_t>(h.generation);
+                              }
+                              const ModelHandle h{static_cast<std::uint32_t>(s.counter),
+                                                  static_cast<std::uint32_t>(std::get<std::int32_t>(Convert(s.value, P::Int)))};
+                              switch (assets->State(h)) {
+                              case AssetState::Ready: return 2;
+                              case AssetState::Failed: return 3;
+                              default: c.Suspend(0.0f, 0); return kScriptStop;
+                              }
+                          },
+                          "Loads a model file (relative to the project) in the background and continues when it is ready "
+                          "(models spawned from it - prefabs, levels - then appear at once); kept until play ends");
+        d.category = "Assets";
+        d.latent   = true;
+        add(std::move(d));
+    }
+
     return r;
 }
 

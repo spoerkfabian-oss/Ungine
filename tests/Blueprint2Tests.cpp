@@ -48,7 +48,8 @@ TEST_CASE(Blueprint2_TypesValuesAndRegistry)
         const auto t = PinTypeFromString(name);
         CHECK(t && ToString(*t) == name);
     }
-    CHECK(!PinTypeFromString("map:float:int") && !PinTypeFromString("struct:") && !PinTypeFromString("nonsense"));
+    CHECK(!PinTypeFromString("map:struct:Item:int") && !PinTypeFromString("map:intArray:int") && !PinTypeFromString("struct:") &&
+          !PinTypeFromString("nonsense") && !PinTypeFromString("array:exec") && !PinTypeFromString("map:int:exec"));
     CHECK(DisplayName(*PinTypeFromString("map:string:struct:Item")) == "Map<string, Item>" &&
           DisplayName(PinType::Struct("Item")) == "Item" && DisplayName(ArrayOf(PinType::Enum("Color"))) == "Color[]");
     CHECK(CanConvert(PinType::Enum("Color"), PinType::Int) && CanConvert(PinType::Int, PinType::Enum("Color")) &&
@@ -452,6 +453,8 @@ TEST_CASE(Blueprint2_MacrosAndLibraries)
         CHECK(bad.g.AddFunction("F"));
         const std::uint32_t use = bad.Node("Macro.Use", "Wait", "F");
         bad.Link(bad.Find("Function.Entry", "F"), "Then", use, "In");
+        CHECK(!HasError(bad.g, "contains latent nodes")); // impure functions wait (Phase 36)
+        bad.g.SetFunctionPure("F", true);
         CHECK(HasError(bad.g, "contains latent nodes"));
         CHECK(!HasError(g.g, "contains latent nodes"));
     }
@@ -664,10 +667,12 @@ TEST_CASE(Blueprint2_TimelinesAndTweens)
     g.Link(tween2, "Completed", done, "In");
     CHECK(g.Valid());
     {
-        Graph bad = g; // timelines / tweens are latent: not in functions
+        Graph bad = g; // tweens with one completion may wait in functions, repeating outputs may not
         CHECK(bad.g.AddFunction("F"));
         bad.Node("Tween.MoveTo", "Linear", "F");
-        CHECK(HasError(bad.g, "latent"));
+        CHECK(!HasError(bad.g, "not allowed inside a function"));
+        bad.Node("Tween.Float", "Linear", "F");
+        CHECK(HasError(bad.g, "many times"));
         bad.g.timelines[0].tracks[0].name = "Update";
         CHECK(HasError(bad.g, "track names"));
     }
@@ -1107,7 +1112,8 @@ TEST_CASE(Blueprint2_CollapseToFunctionAndMacro)
 
     Graph f = g;
     CHECK(!f.g.Collapse({begin}, "Bad", false, {}).empty());            // events stay
-    CHECK(!f.g.Collapse({delay}, "Bad", false, {}).empty());            // latent: macro only
+    Graph waits = g; // latent nodes collapse into (impure) functions too
+    CHECK(waits.g.Collapse({delay}, "Wait", false, {}).empty() && waits.Valid());
     CHECK(!f.g.Collapse({mul}, "bad.name", false, {}).empty());
     CHECK(f.g.Collapse({mul, setx}, "Double", false, {100.0f, 0.0f}).empty());
     const ScriptFunction* fn = f.g.FindFunction("Double");

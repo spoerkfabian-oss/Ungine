@@ -249,6 +249,9 @@ public:
 
     // A new variant of the prefab `base` next to it ("<name>_Variant.uprefab"); empty on failure.
     std::filesystem::path CreatePrefabVariantOf(const std::filesystem::path& base);
+    // A new blueprint inheriting from `parent` next to it ("<name>_Child.ugraph", no own event
+    // nodes: the parent's run), opened in the Blueprint window; empty on failure.
+    std::filesystem::path CreateChildBlueprint(const std::filesystem::path& parent);
 
 private:
     enum class GizmoOperation { Translate, Rotate, Scale };

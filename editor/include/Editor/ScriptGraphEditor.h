@@ -67,6 +67,17 @@ public:
     [[nodiscard]] bool CanRedo() const;
     [[nodiscard]] const std::vector<ScriptDiagnostic>& Diagnostics(); // active graph, current
 
+    // Inheritance of the active graph: parent class file (empty: none; undoable), the problem
+    // loading the parent chain (empty: fine). Open graphs stand in for their files.
+    bool SetParentClass(const std::filesystem::path& parent);
+    [[nodiscard]] std::string ParentError();
+    // Refactoring with inheritance: renames a variable / function of the active graph in every graph
+    // inheriting from it (open graphs as undo steps, project files below the search root rewritten;
+    // returns how many changed), moves an own variable / function into the parent class (the open
+    // parent as an undo step, else its file; returns the problem, empty on success).
+    std::size_t RenameInChildClasses(bool function, const std::string& from, const std::string& to);
+    std::string MoveToParentClass(bool function, const std::string& name);
+
     // Selection of the active graph (node ids).
     [[nodiscard]] const std::vector<std::uint32_t>& SelectedNodes() const;
     void Select(std::vector<std::uint32_t> nodes);
@@ -135,6 +146,9 @@ private:
     void DrawFunctions(Document& doc);
     void DrawMacro(Document& doc, ScriptMacro& macro);
     void DrawMembers(Document& doc); // events, dispatchers, interfaces, timelines
+    void DrawClass(Document& doc);   // parent class, inherited variables / functions
+    void ResolveParent(Document& doc);
+    void RefreshInheritance(); // open graphs whose parents may have changed
     void DrawTimeline(Document& doc);
     void DrawSearch();
     void DrawWatch(Document& doc, const ScriptSystem* debug);
@@ -151,7 +165,7 @@ private:
     std::size_t                            m_Active = 0;
     std::unique_ptr<DragState>             m_Drag;
     std::unique_ptr<FileDialog>            m_Dialog;
-    enum class DialogPurpose { None, Open, New, SaveAs } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, Open, New, SaveAs, Parent } m_DialogPurpose = DialogPurpose::None;
     std::string   m_LastError;
     bool          m_Focused        = false;
     bool          m_FocusRequested = false;

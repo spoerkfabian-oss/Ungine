@@ -7,7 +7,9 @@
 #include <deque>
 #include <format>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 
 namespace Engine {
@@ -96,22 +98,61 @@ const std::string& TypeNameOf(std::uint16_t id)
     return id < t.names.size() ? t.names[id] : t.names.front(); // deque: references stay valid
 }
 
-PinType PinType::Enum(std::string_view enumName) { return {PinKind::Enum, PinContainer::None, PinKind::Int, InternTypeName(enumName), 0}; }
+PinType PinType::Enum(std::string_view enumName) { return {PinKind::Enum, PinContainer::None, PinKind::Int, InternTypeName(enumName), 0, 0}; }
 PinType PinType::Struct(std::string_view structName)
 {
-    return {PinKind::Struct, PinContainer::None, PinKind::Int, InternTypeName(structName), 0};
+    return {PinKind::Struct, PinContainer::None, PinKind::Int, InternTypeName(structName), 0, 0};
 }
 PinType PinType::Map(PinType key, PinType value)
 {
-    return {value.kind, PinContainer::Map, key.kind, value.name, key.kind == PinKind::Enum ? key.name : std::uint16_t{0}};
+    return {value.kind, PinContainer::Map, key.kind, value.name, key.kind == PinKind::Enum ? key.name : std::uint16_t{0},
+            IsContainer(value) ? InternPinType(value) : std::uint16_t{0}};
+}
+
+namespace {
+struct TypeTable {
+    std::mutex                                                           mutex;
+    std::deque<PinType>                                                  types{PinType{}}; // id 0: none
+    std::map<std::tuple<int, int, int, int, int, int>, std::uint16_t> ids;
+};
+TypeTable& Types()
+{
+    static TypeTable table;
+    return table;
+}
+} // namespace
+
+std::uint16_t InternPinType(PinType type)
+{
+    TypeTable&       t = Types();
+    std::scoped_lock lock(t.mutex);
+    const auto key = std::tuple(static_cast<int>(type.kind), static_cast<int>(type.container), static_cast<int>(type.keyKind),
+                                static_cast<int>(type.name), static_cast<int>(type.keyName), static_cast<int>(type.inner));
+    if (const auto it = t.ids.find(key); it != t.ids.end())
+        return it->second;
+    const auto id = static_cast<std::uint16_t>(t.types.size());
+    t.types.push_back(type);
+    t.ids.emplace(key, id);
+    return id;
+}
+
+PinType InternedPinType(std::uint16_t id)
+{
+    TypeTable&       t = Types();
+    std::scoped_lock lock(t.mutex);
+    return id < t.types.size() ? t.types[id] : PinType{};
 }
 
 std::string ToString(PinType type)
 {
     switch (type.container) {
     case PinContainer::Array:
+        if (type.inner != 0) {
+            const PinType element = ElementType(type);
+            return IsMap(element) ? "array:" + ToString(element) : ToString(element) + "[]";
+        }
         return IsUserType(type) ? BaseName(type.kind, type.name) + "[]" : BaseName(type.kind, 0) + "Array";
-    case PinContainer::Map: return "map:" + BaseName(type.keyKind, type.keyName) + ":" + BaseName(type.kind, type.name);
+    case PinContainer::Map: return "map:" + BaseName(type.keyKind, type.keyName) + ":" + ToString(ElementType(type));
     case PinContainer::None: break;
     }
     return BaseName(type.kind, type.name);
@@ -121,19 +162,27 @@ std::optional<PinType> PinTypeFromString(std::string_view name)
 {
     if (name == "exec")
         return PinType::Exec;
+    const auto valueType = [](std::string_view text) -> std::optional<PinType> {
+        const auto t = PinTypeFromString(text);
+        return t && t->kind != PinKind::Exec ? t : std::nullopt;
+    };
+    if (name.starts_with("array:")) { // an array of maps (or anything else)
+        const auto element = valueType(name.substr(6));
+        return element ? std::optional(ArrayOf(*element)) : std::nullopt;
+    }
     if (name.starts_with("map:")) {
         std::string_view rest;
         const auto       key = ParseBase(name.substr(4), &rest);
         if (!key || !rest.starts_with(':'))
             return std::nullopt;
-        const auto value = ParseBase(rest.substr(1));
+        const auto value = valueType(rest.substr(1));
         if (!value || !IsKeyType(*key))
             return std::nullopt;
         return PinType::Map(*key, *value);
     }
     if (name.ends_with("[]")) {
-        const auto base = ParseBase(name.substr(0, name.size() - 2));
-        return base ? std::optional(ArrayOf(*base)) : std::nullopt;
+        const auto element = valueType(name.substr(0, name.size() - 2));
+        return element ? std::optional(ArrayOf(*element)) : std::nullopt;
     }
     if (name.ends_with("Array") && !name.starts_with("enum:") && !name.starts_with("struct:")) {
         const auto base = ParseBase(name.substr(0, name.size() - 5));
@@ -148,8 +197,8 @@ std::string DisplayName(PinType type)
         return kind == PinKind::Enum || kind == PinKind::Struct ? TypeNameOf(name) : std::string(kKindNames[static_cast<std::size_t>(kind)]);
     };
     switch (type.container) {
-    case PinContainer::Array: return base(type.kind, type.name) + "[]";
-    case PinContainer::Map: return "Map<" + base(type.keyKind, type.keyName) + ", " + base(type.kind, type.name) + ">";
+    case PinContainer::Array: return DisplayName(ElementType(type)) + "[]";
+    case PinContainer::Map: return "Map<" + base(type.keyKind, type.keyName) + ", " + DisplayName(ElementType(type)) + ">";
     case PinContainer::None: break;
     }
     return base(type.kind, type.name);
@@ -205,11 +254,15 @@ bool ScriptKeyLess::operator()(const ScriptValue& a, const ScriptValue& b) const
         return *x < std::get<std::int32_t>(b);
     if (const auto* x = std::get_if<float>(&a))
         return *x < std::get<float>(b);
+    if (const auto* x = std::get_if<glm::vec3>(&a)) {
+        const glm::vec3& y = std::get<glm::vec3>(b);
+        return x->x != y.x ? x->x < y.x : x->y != y.y ? x->y < y.y : x->z < y.z;
+    }
     if (const auto* x = std::get_if<std::string>(&a))
         return *x < std::get<std::string>(b);
     if (const auto* x = std::get_if<Entity>(&a))
         return static_cast<std::uint64_t>(*x) < static_cast<std::uint64_t>(std::get<Entity>(b));
-    return false; // vectors / containers are no keys
+    return false; // containers / structs are no keys
 }
 
 PinType TypeOf(const ScriptValue& value)
@@ -391,7 +444,7 @@ T& Writable(ScriptValue& value, Make make)
 ScriptArrayPtr MakeArray(PinType element, std::vector<ScriptValue> items)
 {
     auto a     = std::make_shared<ScriptArray>();
-    a->element = ElementType(element);
+    a->element = element;
     a->items   = std::move(items);
     return a;
 }
@@ -449,8 +502,8 @@ void SetStructField(ScriptValue& value, std::string_view structName, std::string
 ScriptMapPtr MakeMap(PinType key, PinType value)
 {
     auto m   = std::make_shared<ScriptMap>();
-    m->key   = ElementType(key);
-    m->value = ElementType(value);
+    m->key   = key;
+    m->value = value;
     return m;
 }
 
