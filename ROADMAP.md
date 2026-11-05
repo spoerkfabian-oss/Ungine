@@ -92,4 +92,6 @@ Ziel: die im Projektgedächtnis dokumentierten Engine-Lücken als überprüfbare
 
 ### Phase 36 – Latent in Funktionen/Async + Knoten/Komfort (D)
 - Fortschritt (2026-11-04): umgesetzt und lokal verifiziert (gestapelt in PR #24) – Latent-Knoten in Funktionen, Dispatcher-Signaturen, Refactoring (Umbenennen in Kindklassen, Move to parent class, Klassenpfade), ~55 Hilfsknoten + Async Load Model.
-### Phase 37 – Installer per CI (D, geplant): Windows-Setup (NSIS) + ZIP, Linux-TGZ als Release-Artefakte.
+### Phase 37 – Installer per CI (D)
+- Windows-Setup (NSIS) + ZIP, Linux-TGZ als Release-Artefakte (Workflow `release.yml`: Tag `v*` → GitHub-Release, `main`/manuell → Artefakte), jedes Paket vor dem Upload per `tests/PackageSmoke.cmake` geprüft.
+- Fortschritt (2026-11-05): umgesetzt (gestapelt in PR #24); lokal Linux-Release-Build + TGZ + Paket-Smoke, Windows-Job erst in CI.

@@ -15,17 +15,32 @@ nötig sind nur das Vulkan SDK (für `glslc`) und ein Vulkan-1.3-Treiber.
 
 ## Installer (Doppelklick-Editor)
 
+**Fertige Pakete:** Jeder Tag `v<Version>` (z. B. `v0.37.0`) baut per GitHub Actions (*Release*-Workflow)
+geprüfte Pakete und hängt sie an ein GitHub-Release; Pushes auf `main` und manuelle Läufe
+(*Actions → Release → Run workflow*) legen sie 14 Tage als Workflow-Artefakte ab:
+
+- `Ungine-<Version>-windows-x64.exe` – Setup (NSIS): Startmenü- und Desktop-Verknüpfung
+  **Ungine Editor**, `.ungineproj`-Dateien öffnen sich per Doppelklick im Editor, Deinstallation über
+  „Apps & Features“.
+- `Ungine-<Version>-windows-x64.zip` – portabel, ohne Installation (`bin/UngineEditor.exe`).
+- `Ungine-<Version>-linux-x64.tar.gz` – entpacken, `bin/UngineEditor` starten;
+  `bin/install-desktop-integration.sh` registriert Menüeintrag, Icon und den Dateityp.
+- `SHA256SUMS.txt` – Prüfsummen.
+
+Voraussetzung zum Ausführen: ein Vulkan-1.3-Treiber (aktueller GPU-Treiber). Vor dem Veröffentlichen
+wird jedes Paket getestet (Release-CPU-Tests, Projekt aus der Basic-Vorlage mit dem gepackten
+`UngineCook` kochen; unter Linux zusätzlich das gekochte Spiel starten).
+
+**Selbst bauen:**
+
 ```
 cd build
 cpack -C Release
 ```
 
-Ergebnis: `Ungine-<Version>-win64.exe` (NSIS, falls installiert) und ein ZIP. Der Installer legt
-Startmenü- und Desktop-Verknüpfung **Ungine Editor** an und verknüpft `.ungineproj`-Dateien mit
-dem Editor – ein Doppelklick auf ein Projekt öffnet es.
-
-Linux: `cpack` erzeugt ein `.tar.gz`; nach dem Entpacken registriert
-`bin/install-desktop-integration.sh` Menüeintrag, Icon und den Dateityp.
+Ergebnis: `Ungine-<Version>-windows-x64.exe` (NSIS, falls installiert) und ein ZIP bzw. unter Linux
+das `.tar.gz`. Die Version kommt aus `CMakeLists.txt` (überschreibbar mit
+`-DENGINE_PACKAGE_VERSION=…`).
 
 ## Arbeiten mit dem Editor
 

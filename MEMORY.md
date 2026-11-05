@@ -2,7 +2,7 @@
 
 Persistent handover memory for continued development of Ungine.
 
-- Last updated: 2026-11-04 (Phases 35 + 36 blueprints on `branch`, both in PR #24; next: 37 CI installers after merge)
+- Last updated: 2026-11-05 (Phases 35 + 36 blueprints + 37 CI installers on `branch`, all stacked in PR #24)
 - Repository: spoerkfabian-oss/Ungine
 - Default branch: main
 - Current working branch: branch
@@ -1056,6 +1056,7 @@ Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
 - One PR per phase as before.
 - Phase 36 decisions (user, 2026-11-04): stacked on `branch` (same PR #24, user merges later). Scope: latent nodes in functions (caller waits; interface calls run the rest async), dispatcher signature checks, refactoring tools (Is-A/Cast-To paths on move, rename across child graphs, move variable/function to parent class), more nodes (math/vector/string/array utilities, async asset load).
 - Phase 36 progress (2026-11-04): done and verified locally – latent nodes in impure functions (parked call stacks per Waiting/tick, per-call latent state), dispatcher signature checks, RenameInChildClasses / MoveToParentClass / class-path repair, ~55 utility nodes + Async Load Model. Limits in CLAUDE.md, Offene Punkte 13.
+- Phase 37 progress (2026-11-05): stacked in PR #24 (user said "Weiter" after 36). `.github/workflows/release.yml`: tag `v<version>` → GitHub release with packages + SHA256SUMS; push to main / manual dispatch → artifacts (14 days). Linux TGZ (tested incl. running the cooked game on lavapipe), Windows NSIS setup + ZIP (cook-only smoke, no Vulkan on runners). `tests/PackageSmoke.cmake` checks a package before upload. Version 0.37.0 in CMakeLists.txt, `ENGINE_PACKAGE_VERSION`, package names `Ungine-<v>-{windows,linux}-x64`. Verified locally: Linux Release build, EngineTests, cpack TGZ, PackageSmoke with player (and fails on a broken package). Not verified: the Windows job and the release job (only run on main/tags/dispatch, not on PRs) – after merge, run "Actions → Release → Run workflow" or push tag v0.37.0.
 - Phase 35 progress (2026-11-03): done and verified locally – nested container types (`PinType::inner`, interned), float/vec3 map keys, recursion (saved frames, depth 256), inheritance (`parent`/`defaults`, `ResolveScriptParent`, flatten before expansion with "Super<n>:" renames, Call Parent nodes, Class.IsA/CastTo, `Program::classes`), editor Class section + "Create child blueprint". Limits in CLAUDE.md, Offene Punkte 13.
 
 ### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)

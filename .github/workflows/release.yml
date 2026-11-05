@@ -1,0 +1,232 @@
+# Installable builds of the whole engine (editor, player, cook tool, templates, samples):
+#   Windows: Ungine-<version>-windows-x64.exe (NSIS setup: Start menu + desktop shortcut,
+#            .ungineproj file association) and a portable .zip
+#   Linux:   Ungine-<version>-linux-x64.tar.gz (bin/install-desktop-integration.sh adds the menu
+#            entry and the file type)
+# Every package is tested before it is published: CPU tests of the Release build, then the package
+# itself is unpacked, a project is made from its Basic template and cooked with its UngineCook (Linux
+# also runs the packaged game on lavapipe). Pushing a tag v<version> publishes a GitHub release with
+# the packages; pushes to main and manual runs keep them as workflow artifacts (14 days).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version (empty = the version in CMakeLists.txt)
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            version="$INPUT_VERSION"
+          else
+            version=$(sed -n 's/^project(Engine VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+            version="$version-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Invalid version '$version'"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version"
+
+  linux:
+    name: Linux package
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build glslc \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev \
+            mesa-vulkan-drivers xvfb
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: .deps
+          key: deps-linux-release-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGLFW_BUILD_WAYLAND=OFF -DENGINE_GPU_TESTS=OFF
+          -DENGINE_PACKAGE_VERSION=${{ needs.version.outputs.version }}
+          -DFETCHCONTENT_BASE_DIR="$GITHUB_WORKSPACE/.deps"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: CPU tests (Release)
+        run: ctest --test-dir build -R "^EngineTests$" --output-on-failure
+
+      - name: Package
+        run: cd build && cpack -G TGZ -C Release
+
+      - name: Test the package (cook + play on lavapipe)
+        run: |
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf build/Ungine-*-linux-x64.tar.gz -C "$RUNNER_TEMP/unpacked"
+          root=$(find "$RUNNER_TEMP/unpacked" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          xvfb-run -a -s "-screen 0 1280x1024x24" cmake -DINSTALL="$root" -DWORK="$RUNNER_TEMP/smoke" -DRUN_PLAYER=ON \
+            -P tests/PackageSmoke.cmake
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ungine-linux-x64
+          path: build/Ungine-*-linux-x64.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Trim dependency cache
+        run: rm -rf .deps/*-build
+
+  windows:
+    name: Windows package
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      # glslc only (volk loads Vulkan at run time); same lookup as in ci.yml.
+      - name: Resolve Vulkan SDK version
+        id: vulkan
+        shell: pwsh
+        run: |
+          $version = (Invoke-RestMethod -Uri https://vulkan.lunarg.com/sdk/latest/windows.txt).Trim()
+          if (-not $version) { throw 'Could not resolve the latest Vulkan SDK version' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Cache Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v5
+        with:
+          path: C:\VulkanSDK
+          key: vulkan-sdk-${{ steps.vulkan.outputs.version }}
+
+      - name: Install Vulkan SDK (glslc)
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $v = '${{ steps.vulkan.outputs.version }}'
+          $urls = @("https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe",
+                    "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe")
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try { Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe; $downloaded = $true; break }
+            catch { Write-Host "Not available: $url" }
+          }
+          if (-not $downloaded) { throw "Vulkan SDK $v installer not found" }
+          $p = Start-Process -FilePath .\vulkan-sdk.exe -Wait -PassThru -NoNewWindow -ArgumentList `
+            '--root', 'C:\VulkanSDK', '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer failed ($($p.ExitCode))" }
+          Remove-Item vulkan-sdk.exe
+
+      - name: Tools environment (Vulkan SDK, NSIS)
+        shell: pwsh
+        run: |
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) {
+            choco install nsis -y --no-progress
+          }
+          'C:\Program Files (x86)\NSIS' | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: .deps
+          key: deps-windows-release-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $deps = ($env:GITHUB_WORKSPACE -replace '\\', '/') + '/.deps'
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DENGINE_GPU_TESTS=OFF `
+            "-DENGINE_PACKAGE_VERSION=${{ needs.version.outputs.version }}" "-DFETCHCONTENT_BASE_DIR=$deps"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: CPU tests (Release)
+        run: ctest --test-dir build -C Release -R "^EngineTests$" --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Set-Location build
+          cpack -G "NSIS;ZIP" -C Release
+          if (-not (Get-ChildItem Ungine-*-windows-x64.exe)) { throw 'No NSIS installer was made' }
+
+      # No Vulkan driver on the runners: the packaged game is cooked, not started.
+      - name: Test the package (unzip + cook)
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem build\Ungine-*-windows-x64.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath "$env:RUNNER_TEMP\unpacked"
+          $root = (Get-ChildItem "$env:RUNNER_TEMP\unpacked" -Directory | Select-Object -First 1).FullName
+          cmake "-DINSTALL=$root" "-DWORK=$env:RUNNER_TEMP\smoke" -P tests/PackageSmoke.cmake
+          if ($LASTEXITCODE -ne 0) { throw 'Package smoke test failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ungine-windows-x64
+          path: |
+            build/Ungine-*-windows-x64.exe
+            build/Ungine-*-windows-x64.zip
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Trim dependency cache
+        shell: pwsh
+        run: Remove-Item -Recurse -Force .deps\*-build -ErrorAction SilentlyContinue
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Checksums
+        run: cd packages && sha256sum Ungine-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Ungine ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          files: packages/*
