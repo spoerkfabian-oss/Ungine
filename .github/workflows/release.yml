@@ -6,13 +6,23 @@
 # Every package is tested before it is published: CPU tests of the Release build, then the package
 # itself is unpacked, a project is made from its Basic template and cooked with its UngineCook (Linux
 # also runs the packaged game on lavapipe). Pushing a tag v<version> publishes a GitHub release with
-# the packages; pushes to main and manual runs keep them as workflow artifacts (14 days).
+# the packages; pushes to main, manual runs and PRs that touch the packaging keep them as workflow
+# artifacts (14 days).
 name: Release
 
 on:
   push:
     tags: ['v*']
     branches: [main]
+  # Packaging changes are tested before they reach main (no release is published from a PR).
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - cmake/Package.cmake
+      - tests/PackageSmoke.cmake
+      - tests/MakeProject.cmake
+      - apps/CMakeLists.txt
+      - resources/**
   workflow_dispatch:
     inputs:
       version:
@@ -185,7 +195,10 @@ jobs:
         run: |
           Set-Location build
           cpack -G "NSIS;ZIP" -C Release
-          if (-not (Get-ChildItem Ungine-*-windows-x64.exe)) { throw 'No NSIS installer was made' }
+          if ($LASTEXITCODE -ne 0 -or -not (Get-ChildItem Ungine-*-windows-x64.exe -ErrorAction SilentlyContinue)) {
+            Get-Content _CPack_Packages/windows-x64/NSIS/NSISOutput.log -Tail 40 -ErrorAction SilentlyContinue
+            throw 'No NSIS installer was made'
+          }
 
       # No Vulkan driver on the runners: the packaged game is cooked, not started.
       - name: Test the package (unzip + cook)
