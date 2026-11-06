@@ -1,4 +1,4 @@
-# tools/
+# Folder `tools/`
 
 Developer-only utilities. Nothing here is built by default (`EXCLUDE_FROM_ALL` in
 `tools/CMakeLists.txt`) or installed.

@@ -25,6 +25,17 @@ project state and lessons learned are in [MEMORY.md](../MEMORY.md); planned work
 | [limitations.md](limitations.md) | Known limitations per system (not regressions) |
 | [history.md](history.md) | Phase history |
 
+Pages for the non-code folders of the repository:
+
+| Page | Folder |
+|---|---|
+| [folders/assets.md](folders/assets.md) | `assets/` — sample models, scripts, sounds and their licenses |
+| [folders/resources.md](folders/resources.md) | `resources/` — icons and desktop integration |
+| [folders/templates.md](folders/templates.md) | `templates/` — project templates and `template.json` |
+| [folders/tools.md](folders/tools.md) | `tools/` — developer tools (MakeSounds) |
+| [folders/cmake.md](folders/cmake.md) | `cmake/` — dependency, shader and packaging modules |
+| [folders/tests.md](folders/tests.md) | `tests/` — test executables, smoke tests, CMake test scripts |
+
 Conventions used in these documents:
 
 - Paths are relative to the repository root unless stated otherwise.

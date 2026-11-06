@@ -25,7 +25,7 @@ project state materially changes.
   PR #24 (phases 35–37, 2026-11-05, merge fc5e213).
 - **Open: PR #25** on `branch` — Windows NSIS installer fix (`CPACK_VERBATIM_VARIABLES ON`, NSIS log on
   failure, release workflow also on PRs touching packaging files) plus this documentation overhaul
-  (English, `docs/` reference, folder READMEs). CI incl. the release workflow was green for the fix.
+  (English, `docs/` reference incl. `docs/folders/` pages for the non-code folders). CI incl. the release workflow was green for the fix.
 - After the merge: push tag `v0.37.0` to publish the first GitHub release with all packages.
 - Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
 
@@ -134,7 +134,7 @@ and targeted tests. Still open:
   functions + dispatcher checks + refactoring + utility nodes; CI-built installers (NSIS setup + ZIP,
   Linux TGZ). 36 and 37 stacked on PR #24 at the owner's request.
 - 2026-11-06: documentation in English; `CLAUDE.md` becomes an index with rules, technical reference
-  split into `docs/`; READMEs in the non-code folders; stacked on PR #25.
+  split into `docs/`; pages for the non-code folders in `docs/folders/` (owner: all docs in one place); stacked on PR #25.
 
 ## 7. Merge log
 

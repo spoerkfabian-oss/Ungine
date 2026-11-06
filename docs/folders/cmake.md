@@ -1,4 +1,4 @@
-# cmake/
+# Folder `cmake/`
 
 CMake modules included by the top-level `CMakeLists.txt`.
 
@@ -9,7 +9,7 @@ and added as `SYSTEM` so their warnings do not affect engine targets): Vulkan he
 vk-bootstrap, VMA, GLFW, GLM, cgltf, stb, nlohmann/json, Jolt Physics, meshoptimizer, bc7enc_rdo,
 miniaudio (+ stb_vorbis, verblib), recastnavigation, glslang, Dear ImGui (docking) and ImGuizmo. Some
 are built as small static libraries with `-O2` even in Debug (meshoptimizer, bc7enc, miniaudio,
-recastnav, glslang). See [docs/architecture.md](../docs/architecture.md#technology-stack) for the
+recastnav, glslang). See [architecture.md](../architecture.md#technology-stack) for the
 versions and roles.
 
 - Change a version only together with a full build and test run on all CI platforms.
@@ -36,4 +36,4 @@ CPack configuration for installers (`cpack -C Release` in the build folder):
 - The install layout itself (`bin/`, `bin/shaders`, `bin/templates`, `bin/samples`,
   `bin/resources`) is defined in `apps/CMakeLists.txt`.
 - The release workflow (`.github/workflows/release.yml`) builds and tests these packages; see
-  [docs/build-and-test.md](../docs/build-and-test.md#continuous-integration).
+  [build-and-test.md](../build-and-test.md#continuous-integration).

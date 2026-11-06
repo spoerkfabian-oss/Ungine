@@ -12,7 +12,7 @@ rules and the map of the documentation; read it first.
 | [docs/](docs/README.md) | Technical reference per system (architecture, rendering, assets, scene, physics, audio, scripting, particles, navigation, animation, terrain, materials, editor, build and test, verification, limitations, history) |
 | [README.md](README.md) | User guide: installing, building, working with the editor |
 | [ROADMAP.md](ROADMAP.md) | Completed and planned phases |
-| Folder READMEs | `assets/`, `resources/`, `templates/`, `tools/`, `cmake/`, `tests/` |
+| [docs/folders/](docs/folders/) | One page per non-code folder: `assets/`, `resources/`, `templates/`, `tools/`, `cmake/`, `tests/` |
 
 Keep MEMORY.md and the affected `docs/` pages current with every phase or significant change.
 

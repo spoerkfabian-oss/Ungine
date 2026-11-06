@@ -39,7 +39,7 @@ included as `SYSTEM`. CMake ≥ 3.25.
 
 ```
 CMakeLists.txt            top-level build (version, options, subdirectories)
-cmake/                    Dependencies.cmake, Shaders.cmake, Package.cmake (see cmake/README.md)
+cmake/                    Dependencies.cmake, Shaders.cmake, Package.cmake (see docs/folders/cmake.md)
 engine/include/Engine/    public engine headers
   Core/        Application, Window, Input, InputMap, Log, ThreadPool, MoveOnlyFunction, FlatMap,
                Platform, Project, FileSystem (pak/VFS), GameOptions
@@ -73,11 +73,11 @@ apps/editor/              UngineEditor (project browser + editor)
 apps/player/              UnginePlayer (runs a project or a packaged game; OptionsMenu.h)
 apps/cook/                UngineCook (command-line packaging)
 apps/sandbox/             Sandbox (developer demo)
-templates/                project templates (see templates/README.md)
-assets/                   sample models, scripts and sounds (see assets/README.md)
-resources/                icons and desktop integration (see resources/README.md)
-tests/                    CPU and GPU test suites, CMake test scripts (see tests/README.md)
-tools/                    developer tools, not built by default (see tools/README.md)
+templates/                project templates (see docs/folders/templates.md)
+assets/                   sample models, scripts and sounds (see docs/folders/assets.md)
+resources/                icons and desktop integration (see docs/folders/resources.md)
+tests/                    CPU and GPU test suites, CMake test scripts (see docs/folders/tests.md)
+tools/                    developer tools, not built by default (see docs/folders/tools.md)
 docs/                     this documentation
 .github/workflows/        ci.yml (build + tests), release.yml (installers)
 ```

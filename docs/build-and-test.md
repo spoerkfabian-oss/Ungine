@@ -42,7 +42,7 @@ For sanitizer builds use separate FetchContent binary folders
 TGZ. Names: `Ungine-<version>-windows-x64.{exe,zip}`, `Ungine-<version>-linux-x64.tar.gz`. Everything
 is installed below `bin/`: the executables, `shaders/` (SPIR-V + `source/`), `templates/`, `samples/`
 (models, scripts, sounds), `resources/` and on Linux `install-desktop-integration.sh`. Details in
-[cmake/README.md](../cmake/README.md).
+[folders/cmake.md](folders/cmake.md).
 
 ## Sandbox
 
@@ -80,7 +80,7 @@ cd build && xvfb-run -a ctest -E "^Engine(Gpu)?Tests$" -j3   # smokes need a dis
 
 Test helpers: `UNGINE_TEST_SCREENSHOT=<png>` saves a screenshot from GPU tests that support it;
 editor tests use `.layoutFile = {}` so `editor.ini` does not interfere; under Xvfb the cursor lags one
-frame (hold end positions for two frames). See [tests/README.md](../tests/README.md).
+frame (hold end positions for two frames). See [folders/tests.md](folders/tests.md).
 
 ## Continuous integration
 

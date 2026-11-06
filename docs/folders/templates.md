@@ -1,9 +1,9 @@
-# templates/
+# Folder `templates/`
 
 Project templates offered by the editor's project browser. Each subfolder with a `template.json`
 is one template; `Project::Create` copies **everything in the folder except `template.json`** into the
-new project, so keep other files (including documentation) out of the template folders — this README
-lives one level up for that reason.
+new project, so keep other files (including documentation) out of the template folders — this page
+lives in `docs/` for that reason.
 
 ## template.json
 

@@ -1,7 +1,7 @@
-# tests/
+# Folder `tests/`
 
 Test executables and CMake test scripts. How to build and run them is described in
-[docs/build-and-test.md](../docs/build-and-test.md#tests).
+[build-and-test.md](../build-and-test.md#tests).
 
 ## Executables
 

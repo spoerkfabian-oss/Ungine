@@ -1,4 +1,4 @@
-# resources/
+# Folder `resources/`
 
 Application icons and operating-system integration files. Installed to `bin/resources/` (the Linux
 script to `bin/`).
