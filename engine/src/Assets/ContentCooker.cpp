@@ -13,6 +13,7 @@
 #include "../Scene/SceneJson.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -930,7 +931,12 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 continue;
             }
             const std::string path = entryPath(file);
-            writer.Add(path, *bytes);
+            // Sounds stay as they are: miniaudio streams them straight from the pak (and their
+            // formats are compressed already).
+            std::string extension = PathToUtf8(file.extension());
+            std::ranges::transform(extension, extension.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            const bool sound = extension == ".wav" || extension == ".ogg" || extension == ".mp3" || extension == ".flac";
+            writer.Add(path, *bytes, sound ? PakCompression::None : PakCompression::Auto);
             report.entries.push_back({path, bytes->size(), "raw"});
             ++report.rawFiles;
             report.rawBytes += bytes->size();

@@ -98,6 +98,32 @@ add_library(bc7enc STATIC "${bc7enc_SOURCE_DIR}/bc7enc.cpp" "${bc7enc_SOURCE_DIR
 target_include_directories(bc7enc SYSTEM PUBLIC "${bc7enc_SOURCE_DIR}")
 set_target_properties(bc7enc PROPERTIES FOLDER "ThirdParty")
 
+# --- zstd (pak entry compression; BSD): the library sources only, without assembly ---
+FetchContent_Declare(zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _none) # its CMake project lives in build/cmake and builds the programs too
+FetchContent_MakeAvailable(zstd)
+file(GLOB ZSTD_SOURCES "${zstd_SOURCE_DIR}/lib/common/*.c" "${zstd_SOURCE_DIR}/lib/compress/*.c"
+                       "${zstd_SOURCE_DIR}/lib/decompress/*.c")
+add_library(zstd STATIC ${ZSTD_SOURCES})
+target_include_directories(zstd SYSTEM PUBLIC "${zstd_SOURCE_DIR}/lib")
+target_compile_definitions(zstd PRIVATE ZSTD_DISABLE_ASM)
+set_target_properties(zstd PROPERTIES FOLDER "ThirdParty" POSITION_INDEPENDENT_CODE ON)
+
+# --- Monocypher (pak signatures: Ed25519 + BLAKE2b; CC0 / BSD-2) ---
+FetchContent_Declare(monocypher
+    GIT_REPOSITORY https://github.com/LoupVaillant/Monocypher.git
+    GIT_TAG        4.0.2
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  _none)
+FetchContent_MakeAvailable(monocypher)
+add_library(monocypher STATIC "${monocypher_SOURCE_DIR}/src/monocypher.c"
+                              "${monocypher_SOURCE_DIR}/src/optional/monocypher-ed25519.c")
+target_include_directories(monocypher SYSTEM PUBLIC "${monocypher_SOURCE_DIR}/src" "${monocypher_SOURCE_DIR}/src/optional")
+set_target_properties(monocypher PROPERTIES FOLDER "ThirdParty")
+
 # --- miniaudio (devices, mixing, 3D spatialization, decoders; public domain / MIT-0) ---
 # Built as our own static library together with stb_vorbis (OGG) and the reverb node
 # (verblib, MIT-0), both shipped in miniaudio's extras. See engine/src/ThirdParty/miniaudio_impl.c.

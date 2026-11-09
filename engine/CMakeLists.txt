@@ -86,7 +86,7 @@ target_include_directories(Engine PUBLIC include PRIVATE src)
 target_link_libraries(Engine
     PUBLIC  Vulkan::Headers volk vk-bootstrap::vk-bootstrap
             GPUOpen::VulkanMemoryAllocator glfw glm::glm
-    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio recastnav
+    PRIVATE cgltf stb nlohmann_json::nlohmann_json Jolt meshoptimizer bc7enc miniaudio recastnav zstd monocypher
             glslang glslang-default-resource-limits
             $<$<PLATFORM_ID:Windows>:shell32>)
 

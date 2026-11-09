@@ -285,6 +285,145 @@ TEST_CASE(Pak_RejectsEscapingEntryPaths)
     fs::remove_all(dir, ec);
 }
 
+// Version 2: zstd where it pays off (never for PakCompression::None), digests checked before
+// decompressing, an implausible size refused on open, deleted entries hiding older mounts, and
+// version 1 paks still readable.
+TEST_CASE(Pak_CompressionDeletedEntriesAndVersion1)
+{
+    const fs::path dir = TempDir("pak_v2");
+    std::mt19937             random(7);
+    std::string              repetitive(20000, ' '); // four letters: compresses well, below the ratio limit
+    for (char& ch : repetitive)
+        ch = "acgt"[random() % 4];
+    std::vector<std::byte> noise(4096);
+    for (std::byte& b : noise)
+        b = static_cast<std::byte>(random());
+    {
+        PakWriter writer(dir / "Base.upak");
+        writer.Add("Content/big.txt", Bytes(repetitive));
+        writer.Add("Content/noise.bin", noise);
+        writer.Add("Content/raw.txt", Bytes(repetitive), PakCompression::None);
+        writer.Add("Content/zeros.bin", std::vector<std::byte>(1 << 20)); // beyond 1:1024: stored raw
+        writer.Add("Content/old.txt", Bytes("old"));
+        writer.Add(":cooked/models/Content/old.glb", Bytes("cooked old"));
+        writer.Finish();
+    }
+    {
+        const auto pak = PakFile::Open(dir / "Base.upak");
+        const PakEntryInfo* big = pak->Find("Content/big.txt");
+        CHECK(big && big->Compressed() && big->storedSize * 2 < big->size && big->size == repetitive.size());
+        CHECK(!pak->Find("Content/zeros.bin")->Compressed());
+        CHECK(big && pak->Read(*big) == Bytes(repetitive));
+        CHECK(!pak->Find("Content/noise.bin")->Compressed() && !pak->Find("Content/raw.txt")->Compressed());
+        CHECK(pak->Read(*pak->Find("Content/noise.bin")) == noise);
+        CHECK(pak->Version() == kPakVersion && !pak->Signed());
+    }
+
+    // A flipped byte inside the compressed entry: the digest catches it before zstd sees it.
+    std::vector<std::byte> bytes = ReadAll(dir / "Base.upak");
+    {
+        const auto pak = PakFile::Open(dir / "Base.upak");
+        std::vector<std::byte> broken = bytes;
+        broken[static_cast<std::size_t>(pak->Find("Content/big.txt")->offset) + 5] ^= std::byte{0x40};
+        WriteBytes(dir / "Broken.upak", broken);
+        const auto brokenPak = PakFile::Open(dir / "Broken.upak");
+        bool       caught    = false;
+        try {
+            (void)brokenPak->Read(*brokenPak->Find("Content/big.txt"));
+        } catch (const std::runtime_error& e) {
+            caught = std::string(e.what()).find("corrupt") != std::string::npos;
+        }
+        CHECK(caught);
+    }
+    // An index claiming a huge decompressed size is refused on open (no allocation of that size).
+    {
+        std::uint64_t indexOffset = 0, indexSize = 0;
+        std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+        std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+        const std::string all(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        const std::size_t at = all.find("Content/big.txt", static_cast<std::size_t>(indexOffset));
+        CHECK(at != std::string::npos);
+        std::vector<std::byte> bomb = bytes;
+        const std::uint64_t    huge = std::uint64_t{1} << 40;
+        std::memcpy(bomb.data() + at + 15 + 16, &huge, sizeof(huge)); // path, offset, storedSize, then size
+        const std::uint64_t hash = Fnv1a64(std::span<const std::byte>(bomb.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+        std::memcpy(bomb.data() + 32, &hash, sizeof(hash));
+        WriteBytes(dir / "Bomb.upak", bomb);
+        bool refused = false;
+        try {
+            (void)PakFile::Open(dir / "Bomb.upak");
+        } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("implausible size") != std::string::npos;
+        }
+        CHECK(refused);
+    }
+
+    // A patch: a changed file, a new one and two deletions hide the base's entries.
+    {
+        PakWriter writer(dir / "Patch.upak");
+        writer.Add("Content/big.txt", Bytes("patched"));
+        writer.Add("Content/new.txt", Bytes("new"));
+        writer.AddDeleted("Content/old.txt");
+        writer.AddDeleted(":cooked/models/Content/old.glb");
+        writer.Finish();
+    }
+    const fs::path root = dir / "Game";
+    fs::create_directories(root / "Content");
+    WriteBytes(root / "Content" / "old.txt", Bytes("loose")); // a deleted entry hides the disk file too
+    Vfs::Mount(PakFile::Open(dir / "Base.upak"), root);
+    Vfs::Mount(PakFile::Open(dir / "Patch.upak"), root);
+    CHECK(Vfs::Read(root / "Content" / "big.txt") == Bytes("patched"));
+    CHECK(Vfs::Read(root / "Content" / "new.txt") == Bytes("new"));
+    CHECK(Vfs::Read(root / "Content" / "raw.txt") == Bytes(repetitive));
+    CHECK(!Vfs::Read(root / "Content" / "old.txt") && !Vfs::Exists(root / "Content" / "old.txt") &&
+          !Vfs::Locate(root / "Content" / "old.txt"));
+    CHECK(!Vfs::ReadCookedFor(root / "Content" / "old.glb", "models"));
+    std::vector<std::string> listed;
+    for (const fs::path& file : Vfs::ListFiles(root / "Content", true))
+        listed.push_back(PathToUtf8(file.filename()));
+    CHECK((listed == std::vector<std::string>{"big.txt", "new.txt", "noise.bin", "raw.txt", "zeros.bin"}));
+    const std::optional<Vfs::Location> located = Vfs::Locate(root / "Content" / "raw.txt");
+    CHECK(located && located->packed && !located->compressed && located->size == repetitive.size());
+    Vfs::UnmountAll();
+
+    // Version 1 (uncompressed, FNV-1a per entry): written by hand like an older engine did.
+    {
+        const std::vector<std::byte> content = Bytes("version one");
+        std::vector<std::byte>       pak(40);
+        while (pak.size() % 16)
+            pak.push_back(std::byte{0});
+        const std::uint64_t offset = pak.size();
+        pak.insert(pak.end(), content.begin(), content.end());
+        std::vector<std::byte> index;
+        const auto put = [&](const auto& value) {
+            const auto* p = reinterpret_cast<const std::byte*>(&value);
+            index.insert(index.end(), p, p + sizeof(value));
+        };
+        const std::string path = "Content/v1.txt";
+        put(static_cast<std::uint32_t>(path.size()));
+        for (const char ch : path)
+            index.push_back(static_cast<std::byte>(ch));
+        put(offset);
+        put(static_cast<std::uint64_t>(content.size()));
+        put(Fnv1a64(content));
+        const std::uint64_t indexOffset = pak.size(), indexSize = index.size(), indexHash = Fnv1a64(index);
+        pak.insert(pak.end(), index.begin(), index.end());
+        const std::uint32_t version = 1, count = 1, flags = 0;
+        std::memcpy(pak.data(), "UPAK", 4);
+        std::memcpy(pak.data() + 4, &version, 4);
+        std::memcpy(pak.data() + 8, &count, 4);
+        std::memcpy(pak.data() + 12, &flags, 4);
+        std::memcpy(pak.data() + 16, &indexOffset, 8);
+        std::memcpy(pak.data() + 24, &indexSize, 8);
+        std::memcpy(pak.data() + 32, &indexHash, 8);
+        WriteBytes(dir / "V1.upak", pak);
+        const auto v1 = PakFile::Open(dir / "V1.upak");
+        CHECK(v1->Version() == 1 && v1->Find("Content/v1.txt") && v1->Read(*v1->Find("Content/v1.txt")) == content);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ModelDataRoundTrip)
 {
     // Embedded textures (GLB), a skin with animations (the Basic template's banner) and an
