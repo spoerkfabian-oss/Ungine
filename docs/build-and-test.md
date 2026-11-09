@@ -64,7 +64,7 @@ is installed below `bin/`: the executables, `shaders/` (SPIR-V + `source/`), `te
 
 | Suite | Contents |
 |---|---|
-| `EngineTests` (CPU) | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests` (randomized lifecycle audits), `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests` |
+| `EngineTests` (CPU) | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests` (randomized lifecycle audits), `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests`, `MalformedInputTests` (crafted files, allocation limits via `AllocationProbe`) |
 | `EngineGpuTests` | Real Vulkan device + window: rendering, culling, shadows, assets, editor workflows, UI automation |
 | Smokes (CTest) | `SandboxSmoke`, `SandboxEditorSmoke`, `SandboxLightsSmoke`, `SandboxInstancesSmoke`, `SandboxPhysicsSmoke`, `SandboxPhysicsEditorSmoke`, `SandboxCpuCullingSmoke`, `SandboxHotReloadSmoke`, `UngineEditorSmoke`, `UnginePlayerSmoke`, `UnginePlayerBasicSmoke`, `UnginePlayerLevelSwitchSmoke`, `UnginePackagedPlayerSmoke` with setup fixtures from `tests/MakeProject.cmake` |
 

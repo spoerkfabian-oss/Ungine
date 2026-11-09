@@ -22,7 +22,7 @@ These are known, accepted limitations — not regressions. Unverified platforms 
   Color and Linear is two assets. Placeholders are boxes without physics. Reloading a model recreates
   its mesh colliders (contacts break briefly).
 - Textures: BC7/BC5/RGBA8 (+ BC1/3/4 from KTX2); no Basis supercompression, ASTC, BC6H/HDR or mip
-  streaming. Storage images are fixed to `rgba16f` in GLSL.
+  streaming; KTX2 input at most 65536 texels per side. Storage images are fixed to `rgba16f` in GLSL.
 - Shader hot reload blocks the main thread and needs glslc + the build tree; ImGui pipelines are
   excluded. The validation warning "OutputNotConsumed" (mesh.vert locations 5/6 in the prepass) is
   harmless.

@@ -86,14 +86,17 @@ textures → `BuildModelMaterials` (materials and `GpuSubmesh` records; CPU copy
 - Pak format v1 (`.upak`, uncompressed): 40-byte header (`UPAK`, version, count, flags, index
   offset/size/hash), data aligned to 16 bytes, index at the end; FNV-1a 64 per entry (checked on every
   read) and for the index (checked on open). Entries are paths relative to the project root
-  (`Content/...`, case-insensitive on Windows); cooked data lives under `:cooked/…`
+  (`Content/...`, case-insensitive on Windows); entries with `..`, `.`, empty components, `\` or `:`
+  are refused by `PakWriter::Add` and by `PakFile::Open`, and `ListFiles` only returns files inside
+  the mount root; cooked data lives under `:cooked/…`
   (`ReadCooked`, `ReadCookedFor(file, category)`). `PakWriter` deletes the file unless `Finish`
   succeeds.
 
 ## Cooker
 
 `CookProjectContent(project, pak, CookOptions)` (`Assets/ContentCooker.h`) packs everything below
-`Content/` (except dot files and `.tmp`), sorted, reproducibly:
+`Content/` (except dot files and `.tmp`; symlinks whose target lies outside `Content/` are skipped
+with a warning), sorted, reproducibly:
 
 - glTF/GLB → `LoadGltf` + `OptimizeMeshes` (LODs) → `SerializeModelData` (`UMDL` v1 + hash of the
   mesh settings) as `:cooked/models/<path>`; the raw `.gltf/.glb/.bin` files are left out.

@@ -32,7 +32,9 @@ Colliders without trigger on static bodies or without a RigidBody (character and
 excluded): boxes as 12 triangles, spheres/capsules as UV spheres (scaled by the largest axis like the
 physics), mesh colliders from the model's collision data (waits for the model; failed = no geometry),
 and terrains (triangles clipped per tile straight from the height field, holes left out). Each source
-has a signature (world matrix + collider + mesh key) + world triangles + AABB, keyed by UUID.
+has a signature (world matrix + collider + mesh key) + world triangles + AABB, keyed by UUID. The
+mesh key includes a content hash of the model's collision positions and indices (cached per model
+revision, stable across sessions so bake files still match), so reloads that move vertices rebuild.
 
 ## Tiles and rebuilds
 

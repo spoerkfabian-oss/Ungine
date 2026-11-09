@@ -4,7 +4,7 @@ Leading handover file: current state, decisions, lessons and priorities. Technic
 [docs/](docs/README.md); working rules in [CLAUDE.md](CLAUDE.md). Update this file whenever the
 project state materially changes.
 
-- Last updated: 2026-11-06
+- Last updated: 2026-11-09
 - Repository: spoerkfabian-oss/Ungine, default branch `main`, working branch `branch`
 - Version: 0.37.0 (`CMakeLists.txt`)
 
@@ -21,12 +21,13 @@ project state materially changes.
 
 ## 2. Current state
 
-- Phases 1–37 are implemented and merged (see [docs/history.md](docs/history.md)); the last merge was
-  PR #24 (phases 35–37, 2026-11-05, merge fc5e213).
-- **Open: PR #25** on `branch` — Windows NSIS installer fix (`CPACK_VERBATIM_VARIABLES ON`, NSIS log on
-  failure, release workflow also on PRs touching packaging files) plus this documentation overhaul
-  (English, `docs/` reference incl. `docs/folders/` pages for the non-code folders). CI incl. the release workflow was green for the fix.
-- After the merge: push tag `v0.37.0` to publish the first GitHub release with all packages.
+- Phases 1–37 are implemented and merged (see [docs/history.md](docs/history.md)); PR #25 (NSIS fix +
+  English documentation overhaul) merged as c917f0a.
+- **Open: hardening PR** on `branch` (external audit of fc5e213, BUG-002…008): pak/VFS entry paths,
+  cook symlinks outside `Content/`, terrain JSON size, KTX2 range/block overflow, cooked-model counts,
+  navmesh mesh signatures with a geometry hash, indices past the vertices. New `tests/MalformedInputTests.cpp`
+  + `tests/AllocationProbe.*`.
+- Tag `v0.37.0` (first GitHub release) still to push — owner decides when.
 - Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
 
 ## 3. Git and delivery rules
@@ -76,6 +77,12 @@ Engine
 - Detour `findRandomPointAroundCircle` can return points outside the radius (retry).
 - Paths stored in assets must stay relative across folders (`../`), otherwise packaged games break.
 - Prefab fuzzing can grow exponentially; caps exist (≤ 300 entities, Apply only ≤ 24).
+- Untrusted binary readers: check `offset > size || len > size - offset` (never `offset + len`), do
+  block math in 64 bits, and check element counts against the smallest serialized record. Cooked
+  models bypass `cgltf_validate`, so they validate index values themselves.
+- Navmesh source signatures are stored in `.unav` bake files: only use values that are stable across
+  sessions (content hashes, not asset revisions).
+- Prove "no huge allocation" with `AllocationProbe` (tests) instead of relying on a crash.
 
 Editor and tests
 - Always pair `PropertyRow` with `PopID` (ImGui ID stack assert). ImGui 1.92.9 swapped `AddRect`
@@ -135,6 +142,7 @@ and targeted tests. Still open:
   Linux TGZ). 36 and 37 stacked on PR #24 at the owner's request.
 - 2026-11-06: documentation in English; `CLAUDE.md` becomes an index with rules, technical reference
   split into `docs/`; pages for the non-code folders in `docs/folders/` (owner: all docs in one place); stacked on PR #25.
+- 2026-11-09: external audit — verify every finding, fix the real ones, one hardening PR.
 
 ## 7. Merge log
 
@@ -153,4 +161,5 @@ and targeted tests. Still open:
 | #22 | Phase 33 materials | 2026-11-02 |
 | #23 | Phase 34 nested prefabs, settings undo | 2026-11-03 |
 | #24 | Phases 35–37 Blueprints, installers | fc5e213, 2026-11-05 |
-| #25 | NSIS fix + documentation overhaul | open |
+| #25 | NSIS fix + documentation overhaul | c917f0a, 2026-11-09 |
+| — | Hardening after the external audit (BUG-002…008) | open |
