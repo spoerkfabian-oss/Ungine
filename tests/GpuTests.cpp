@@ -1176,7 +1176,8 @@ std::string Base64(const std::vector<std::uint8_t>& bytes)
 }
 
 // Square of half-size `s` in the XY plane facing +Z; base color from `image` (none if empty).
-std::string QuadGltf(float s, const std::string& image)
+// `otherDiagonal`: split along the other diagonal (same vertices, bounds and index count).
+std::string QuadGltf(float s, const std::string& image, bool otherDiagonal = false)
 {
     std::vector<std::uint8_t> buffer;
     const auto put = [&](const void* data, std::size_t bytes) {
@@ -1186,7 +1187,8 @@ std::string QuadGltf(float s, const std::string& image)
     const float         positions[] = {-s, -s, 0.0f, s, -s, 0.0f, s, s, 0.0f, -s, s, 0.0f};
     const float         normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
     const float         uvs[]       = {0, 1, 1, 1, 1, 0, 0, 0};
-    const std::uint16_t indices[]   = {0, 1, 2, 0, 2, 3};
+    const std::uint16_t indices[6]  = {0, 1, otherDiagonal ? std::uint16_t{3} : std::uint16_t{2},
+                                       otherDiagonal ? std::uint16_t{1} : std::uint16_t{0}, 2, 3};
     put(positions, sizeof(positions));
     put(normals, sizeof(normals));
     put(uvs, sizeof(uvs));
@@ -1812,6 +1814,13 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         // Packaging without a player fails the same way; the report window shows why.
         CHECK(!editor.PackageProject(root / "Package") && editor.PackageReport() && !editor.PackageReport()->Ok());
         runFrames(3); // content browser, project menus, package report
+        // In the background (Build menu): the progress window until the worker ends, then the report.
+        CHECK(editor.StartPackaging(root / "Package2") && !editor.StartPackaging(root / "Package3"));
+        CHECK(F().Pump([&] {
+            runFrames(1);
+            return !editor.PackagingBusy();
+        }));
+        CHECK(editor.PackageReport() && !editor.PackageReport()->Ok() && editor.Status().starts_with("Packaging failed"));
         editor.NewScene();
     }
     for (ModelHandle h : modelRefs)
@@ -2727,6 +2736,90 @@ TEST_CASE(Editor_RuntimeUiInPlayMode)
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Editor_ContentDeleteGoesToTrashAndUndoes)
+{
+    // Content browser delete: the scene and its baked navmesh move to Saved/Trash, the start scene
+    // and the open scene's file are forgotten; Undo / Redo move them back and forth; a name that is
+    // taken again blocks the restore; old trash folders are purged when an editor opens the project.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      root = fs::temp_directory_path() / std::format("ungine_trash_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(root, ec);
+    const auto templates = ProjectTemplates();
+    const auto blank     = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Blank"; });
+    CHECK(blank != templates.end());
+    if (blank == templates.end())
+        return;
+    std::optional<Project> project = Project::Create(root / "Game", "TrashGame", *blank);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    const fs::path trash   = project->SavedDirectory() / "Trash";
+    fs::create_directories(trash / "20000101-000000-1", ec); // stale: purged on open
+    WriteFile(trash / "20000101-000000-1" / "old.txt", std::string_view("old"));
+    fs::last_write_time(trash / "20000101-000000-1", fs::file_time_type::clock::now() - std::chrono::hours(24 * 30), ec);
+    fs::create_directories(content / "Stuff", ec);
+    WriteFile(content / "Stuff" / "notes.txt", std::string_view("notes"));
+    const auto trashEntries = [&] {
+        std::size_t count = 0;
+        for (const fs::directory_entry& entry : fs::recursive_directory_iterator(trash, ec))
+            count += entry.is_regular_file() ? 1 : 0;
+        return count;
+    };
+
+    Scene                    scene;
+    SceneRenderer            sceneRenderer(*F().renderer, *F().context, *F().assets);
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .project       = &*project,
+                       .layoutFile    = {}});
+        CHECK(!fs::exists(trash / "20000101-000000-1"));
+        const fs::path level = content / "Scenes" / "Level.scene.json";
+        fs::create_directories(level.parent_path(), ec);
+        CHECK(editor.SaveScene(level));
+        WriteFile(NavMeshFileFor(level), std::string_view("baked"));
+        project->settings.startScene = "Content/Scenes/Level.scene.json";
+        CHECK(project->Save());
+
+        CHECK(!editor.DeleteContent(root / "elsewhere.txt"));
+        CHECK(!editor.DeleteContent(content));
+        CHECK(editor.DeleteContent(level));
+        CHECK(!fs::exists(level) && !fs::exists(NavMeshFileFor(level)) && trashEntries() == 2);
+        CHECK(project->settings.startScene.empty() && editor.ScenePath().empty());
+        CHECK(editor.UndoLabel() == "Delete Level.scene.json");
+        CHECK(editor.Undo());
+        CHECK(fs::exists(level) && fs::exists(NavMeshFileFor(level)) && trashEntries() == 0);
+        CHECK(project->settings.startScene == "Content/Scenes/Level.scene.json" && editor.ScenePath() == level);
+        CHECK(Project::Load(project->File()).value().settings.startScene == "Content/Scenes/Level.scene.json");
+        CHECK(editor.Redo());
+        CHECK(!fs::exists(level) && trashEntries() == 2 && project->settings.startScene.empty());
+        CHECK(editor.Undo());
+        CHECK(fs::exists(level));
+
+        // A folder; its name is taken again before the undo, so the restore refuses to overwrite.
+        CHECK(editor.DeleteContent(content / "Stuff"));
+        CHECK(!fs::exists(content / "Stuff") && trashEntries() == 1);
+        fs::create_directories(content / "Stuff", ec);
+        CHECK(editor.Undo());
+        CHECK(editor.Status().starts_with("Cannot restore") && trashEntries() == 1);
+        CHECK(fs::is_empty(content / "Stuff"));
+        fs::remove(content / "Stuff", ec);
+        CHECK(editor.Redo() && editor.Undo()); // the command stays usable once the name is free
+        CHECK(fs::exists(content / "Stuff" / "notes.txt"));
+    }
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+    fs::remove_all(root, ec);
 }
 
 TEST_CASE(Editor_ContentImportAndReferenceRepair)
@@ -3768,6 +3861,7 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     CHECK(graph.has_value());
     if (!graph)
         return;
+    graph->ik.push_back(AnimIk{.name = "Hand", .kind = AnimIkKind::TwoBone, .endBone = "b_RightHand_08"}); // the IK gizmo's goal
     const fs::path file = dir / "Fox.uanim";
     CHECK(SaveAnimGraph(file, *graph)); // previewModel stays the template's Fox (relative path)
 
@@ -3849,6 +3943,43 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     runFrames(20);
     CHECK(poseDifference(rest, pose()) < 1e-6f && !animation.HasInstance(root)); // edit mode: no animation
 
+    // Bone overlay: every joint of the selected instance; a click on one selects its node entity.
+    const auto boneNamed = [&](std::string_view name) {
+        Entity found = NullEntity;
+        r.ViewOf<Name>().Each([&](Entity e, Name& n) { found = n.value == name ? e : found; });
+        return found;
+    };
+    const Entity head = boneNamed("b_Head_05");
+    editor.Select(boneNamed("b_LeftFoot02_018")); // the gizmo sits at the foot, away from the head
+    editor.SetShowBones(true);
+    int windowWidth = 0, windowHeight = 0;
+    glfwGetWindowSize(F().window->Native(), &windowWidth, &windowHeight);
+    glfwSetWindowSize(F().window->Native(), 1600, 900); // a viewport large enough to aim at one joint
+    runFrames(10);
+    CHECK(editor.DrawnBones() == foxModel->skins.at(0).joints.size());
+    {
+        const glm::vec4  rect = editor.ViewportRect();
+        const CameraData view = camera.GetData(rect.z / std::max(rect.w, 1.0f));
+        const glm::vec4  clip = view.projection * view.view * glm::vec4(glm::vec3(r.Get<WorldTransform>(head).matrix[3]), 1.0f);
+        const glm::vec2  ndc  = glm::vec2(clip) / clip.w;
+        const glm::vec2  at{rect.x + (ndc.x * 0.5f + 0.5f) * rect.z, rect.y + (0.5f - ndc.y * 0.5f) * rect.w};
+        for (const bool down : {true, false}) {
+            for (int i = 0; i < 2; ++i) { // under Xvfb the warped pointer reaches ImGui a frame later
+                editor.SimulateMouse(at);
+                runFrames(1);
+            }
+            editor.SimulateMouse(at, 0, down);
+            runFrames(2);
+        }
+        CHECK(editor.Selected() == head);
+    }
+    editor.SetShowBones(false);
+    if (!screenshot)
+        glfwSetWindowSize(F().window->Native(), windowWidth, windowHeight);
+    runFrames(3);
+    CHECK(editor.DrawnBones() == 0);
+    editor.Select(root);
+
     // The window + preview (the template's Fox).
     editor.OpenAsset(file);
     AnimGraphEditor& ag = editor.AnimGraphs();
@@ -3899,8 +4030,24 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     runFrames(15);
     CHECK(animation.CurrentState(root) == "Look");
     CHECK(animation.Stats().instances == 1);
+
+    // IK gizmo: starts at the goal's end bone, drags its target (the hand follows), Stop forgets it.
+    editor.Select(root);
+    editor.SetGizmoTarget(Editor::GizmoTarget::IkGoal, "Hand");
+    Entity hand = NullEntity;
+    r.ViewOf<Name>().Each([&](Entity e, Name& n) { hand = n.value == "b_RightHand_08" ? e : hand; });
+    const std::optional<glm::vec3> handStart = editor.GizmoTargetPosition();
+    CHECK(hand != NullEntity && handStart && glm::distance(*handStart, glm::vec3(r.Get<WorldTransform>(hand).matrix[3])) < 1e-4f);
+    const glm::vec3 ikTarget = handStart.value_or(glm::vec3(0.0f)) + glm::vec3(0.0f, 0.15f, 0.1f);
+    CHECK(editor.MoveGizmoTarget(ikTarget));
+    runFrames(10); // the target gizmo draws; the hand reaches
+    CHECK(editor.GizmoTargetPosition() == std::optional<glm::vec3>(ikTarget));
+    const float reached = glm::distance(glm::vec3(r.Get<WorldTransform>(hand).matrix[3]), ikTarget);
+    ENGINE_INFO("IK gizmo: hand {:.4f} from the target (started {:.4f})", reached, glm::distance(*handStart, ikTarget));
+    CHECK(reached < 0.5f * glm::distance(*handStart, ikTarget));
     const std::uint64_t uuid = r.Get<Uuid>(root).value;
     editor.Stop();
+    CHECK(editor.CurrentGizmoTarget() == Editor::GizmoTarget::Transform && !editor.GizmoTargetPosition());
     runFrames(3);
     const Entity restored = scene.FindByUuid(uuid);
     CHECK(restored != NullEntity && !animation.HasInstance(restored));
@@ -3992,6 +4139,20 @@ TEST_CASE(Editor_NavigationBakeOverlayAndPlay)
     const Entity agent = scene.CreateEntity("Agent");
     scene.EditTransform(agent).position = {-5.0f, 0.0f, 0.0f};
     scene.GetRegistry().Emplace<NavAgent>(agent, NavAgent{.maxSpeed = 6.0f});
+
+    // Link gizmo: moves the end point (entity space), one undo step.
+    const std::uint64_t linkUuid = scene.GetRegistry().Get<Uuid>(link).value;
+    const auto          linkEnd  = [&] { return scene.GetRegistry().Get<NavLink>(scene.FindByUuid(linkUuid)).end; };
+    editor.Select(link);
+    editor.SetGizmoTarget(Editor::GizmoTarget::LinkEnd);
+    CHECK(editor.GizmoTargetPosition() == std::optional<glm::vec3>(glm::vec3(-1.0f, 0.0f, 8.5f)));
+    runFrames(2); // the target gizmo draws
+    CHECK(editor.MoveGizmoTarget({-1.0f, 0.0f, 9.0f}) && linkEnd() == glm::vec3(-1.0f, 0.0f, 9.0f));
+    CHECK(editor.UndoLabel() == "Move link end");
+    CHECK(editor.Undo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 8.5f));
+    CHECK(editor.Redo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 9.0f));
+    CHECK(editor.Undo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 8.5f));
+    editor.SetGizmoTarget(Editor::GizmoTarget::Transform);
     editor.Select(agent);
     for (int i = 0; i < 300 && (navigation.Stats().sources < 2 || navigation.IsBuilding()); ++i)
         runFrames(1); // the plane loads, then its tiles build in the background
@@ -5598,4 +5759,61 @@ TEST_CASE(Editor_BlueprintInheritance)
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Navigation_MeshColliderReloadRebuildsTiles)
+{
+    // A reload that changes a mesh collider's triangles but keeps its index count and bounds (the
+    // same quad split along the other diagonal) rebuilds the navmesh; nothing else does.
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_nav_reload_{}", std::random_device{}());
+    fs::create_directories(dir);
+    WriteFile(dir / "floor.gltf", QuadGltf(5.0f, ""));
+    AssetManagerDesc desc;
+    desc.textures.cacheDirectory = dir / "cache";
+    {
+        AssetManager      assets(*F().renderer, *F().jobs, F().events, desc);
+        const auto        pump  = [&](const std::function<bool()>& done) {
+            return F().Pump([&] {
+                assets.Update();
+                return done();
+            });
+        };
+        const ModelHandle model = assets.LoadModel(dir / "floor.gltf");
+        CHECK(pump([&] { return assets.State(model) == AssetState::Ready; }));
+
+        Scene        scene;
+        const Entity floor = scene.CreateEntity("Floor");
+        scene.EditTransform(floor).rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f));
+        scene.GetRegistry().Emplace<MeshRenderer>(floor, MeshRenderer{.model = model, .meshIndex = 0});
+        scene.GetRegistry().Emplace<RigidBody>(floor, RigidBody{.type = BodyType::Static});
+        scene.GetRegistry().Emplace<Collider>(floor, Collider{.shape = ColliderShape::Mesh});
+        const Entity bounds = scene.CreateEntity("Bounds");
+        scene.GetRegistry().Emplace<NavMeshBounds>(bounds, NavMeshBounds{.halfExtents = {6.0f, 2.0f, 6.0f}});
+        scene.UpdateTransforms();
+
+        NavigationWorld navigation(F().jobs.get(), &assets, nullptr);
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().sources == 1 && navigation.Stats().tiles > 0);
+        const std::uint64_t built = navigation.Stats().tilesBuilt;
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt == built); // unchanged sources: nothing rebuilt
+
+        const std::uint32_t revision = assets.Revision(model);
+        WriteFile(dir / "floor.gltf", QuadGltf(5.0f, "", true));
+        CHECK(assets.Reload(model));
+        CHECK(pump([&] { return assets.Revision(model) != revision && assets.State(model) == AssetState::Ready; }));
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt > built && navigation.Stats().tiles > 0);
+        const std::uint64_t rebuilt = navigation.Stats().tilesBuilt;
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt == rebuilt);
+        navigation.Reset();
+        assets.Release(model);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

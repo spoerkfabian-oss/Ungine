@@ -85,8 +85,10 @@ Editor::Editor(const EditorContext& context)
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
     ReloadScriptRegistry();
-    if (m_Ctx.project)
+    if (m_Ctx.project) {
         m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
+        PurgeTrash();
+    }
     if (m_Ctx.streaming) {
         m_Ctx.streaming->volumesEnabled = false; // edit mode: previews only
         if (m_Ctx.scripts) {
@@ -151,6 +153,10 @@ Editor::~Editor()
     if (m_ImportWorker.joinable()) {
         m_ImportWorker.request_stop();
         m_ImportWorker.join();
+    }
+    if (m_PackageWorker.joinable()) {
+        CancelPackaging();
+        m_PackageWorker.join();
     }
     Stop(); // leaving the editor while playing returns to the edit scene
     if (m_Ctx.streaming) { // previews belong to the editor
@@ -232,6 +238,7 @@ void Editor::Update(float dt)
         DrawProjectSettings();
     if (m_ShowPackageReport)
         DrawPackageReport();
+    DrawPackagingProgress();
     if (m_ShowTypes)
         DrawBlueprintTypes();
     if (m_ShowPhysicsMaterial)
@@ -260,6 +267,7 @@ void Editor::Update(float dt)
     TrackSettings();
     UpdatePendingInstances();
     UpdateContentImport(); // also with the content browser closed
+    UpdatePackaging();
     // Prefab files changed on disk (another editor, version control): instances follow.
     if (m_PlayState == PlayState::Edit && ImGui::GetTime() - m_PrefabPollTime > 1.0) {
         m_PrefabPollTime = ImGui::GetTime();
@@ -478,10 +486,16 @@ void Editor::DrawMenuBar()
     if (m_Ctx.project && ImGui::BeginMenu("Build")) {
         if (ImGui::MenuItem("Build & Run", "Ctrl+B"))
             BuildAndRun();
-        if (ImGui::MenuItem("Package project...")) {
+        if (ImGui::MenuItem("Package project...", nullptr, false, !m_PackageWorker.joinable())) {
             m_DialogPurpose = DialogPurpose::Package;
             m_FileDialog->Open("Package into folder", FileDialog::Mode::Folder, m_Ctx.project->Root().parent_path(), {});
         }
+        if (ImGui::MenuItem("Package patch...", nullptr, false, !m_PackageWorker.joinable())) {
+            m_DialogPurpose = DialogPurpose::PackagePatch;
+            m_FileDialog->Open("Packaged game to patch", FileDialog::Mode::Folder, m_PackageOutput.empty() ? m_Ctx.project->Root().parent_path() : m_PackageOutput, {});
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Patch_<n>.upak with only what changed since the game in the chosen folder was packaged");
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
@@ -714,6 +728,9 @@ void Editor::DrawViewport()
         iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowParticles)
         iconHit = DrawParticleOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
+    m_DrawnBones = 0;
+    if (m_ShowBones)
+        iconHit = DrawBoneOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics) {
@@ -833,6 +850,16 @@ void Editor::DrawViewport()
         m_ShowBvh = !m_ShowBvh;
     if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
         m_ShowColliders = !m_ShowColliders;
+    if (m_Ctx.scene.GetRegistry().Valid(Selected()) && m_Ctx.scene.GetRegistry().Has<NavLink>(Selected())) {
+        if (toolButton("Link start", m_GizmoTarget == GizmoTarget::LinkStart))
+            SetGizmoTarget(m_GizmoTarget == GizmoTarget::LinkStart ? GizmoTarget::Transform : GizmoTarget::LinkStart);
+        if (toolButton("Link end", m_GizmoTarget == GizmoTarget::LinkEnd))
+            SetGizmoTarget(m_GizmoTarget == GizmoTarget::LinkEnd ? GizmoTarget::Transform : GizmoTarget::LinkEnd);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The gizmo moves the selected Nav Link's start / end point");
+    }
+    if (m_GizmoTarget == GizmoTarget::IkGoal && toolButton(("IK: " + m_IkGizmoGoal).c_str(), true))
+        SetGizmoTarget(GizmoTarget::Transform);
     if (m_Ctx.scene.GetRegistry().Valid(Selected()) && m_Ctx.scene.GetRegistry().Has<Joint>(Selected())) {
         if (toolButton("Anchor", m_EditJointAnchor))
             m_EditJointAnchor = !m_EditJointAnchor;
@@ -841,6 +868,10 @@ void Editor::DrawViewport()
     }
     if (toolButton("Audio", m_ShowAudio))
         m_ShowAudio = !m_ShowAudio;
+    if (toolButton("Bones", m_ShowBones))
+        m_ShowBones = !m_ShowBones;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Skeletons of the selected model instances (click a joint to select it)");
     if (toolButton("FX", m_ShowParticles))
         m_ShowParticles = !m_ShowParticles;
     if (ImGui::IsItemHovered())
@@ -864,6 +895,107 @@ void Editor::DrawViewport()
     ImGui::End();
 }
 
+void Editor::SetGizmoTarget(GizmoTarget target, std::string_view ikGoal)
+{
+    if (m_GizmoEdit) { // a drag in progress ends here, as one undo step
+        PushStateChange("Move", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    m_GizmoTarget = target;
+    m_IkGizmoGoal = target == GizmoTarget::IkGoal ? std::string(ikGoal) : std::string{};
+    m_IkGizmoTarget.reset();
+    m_IkGizmoEntity = NullEntity;
+}
+
+std::optional<glm::vec3> Editor::GizmoTargetPosition() const
+{
+    const Registry& registry = m_Ctx.scene.GetRegistry();
+    const Entity    primary  = Selected();
+    if (primary == NullEntity || !registry.Valid(primary))
+        return std::nullopt;
+    const glm::mat4& world = registry.Get<WorldTransform>(primary).matrix;
+    switch (m_GizmoTarget) {
+    case GizmoTarget::Transform:
+        return std::nullopt;
+    case GizmoTarget::LinkStart:
+    case GizmoTarget::LinkEnd: {
+        const NavLink* link = registry.TryGet<NavLink>(primary);
+        if (!link)
+            return std::nullopt;
+        return glm::vec3(world * glm::vec4(m_GizmoTarget == GizmoTarget::LinkStart ? link->start : link->end, 1.0f));
+    }
+    case GizmoTarget::IkGoal: {
+        if (m_PlayState == PlayState::Edit || !m_Ctx.animation || !registry.Has<AnimationController>(primary))
+            return std::nullopt;
+        if (m_IkGizmoTarget && m_IkGizmoEntity == primary)
+            return m_IkGizmoTarget;
+        // Not dragged yet: start at the goal's end bone (a node entity below the controller).
+        std::string bone;
+        if (const auto graph = m_Ctx.animation->Graph(registry.Get<AnimationController>(primary).graph))
+            for (const AnimIk& goal : graph->ik)
+                if (goal.name == m_IkGizmoGoal)
+                    bone = !goal.endBone.empty() ? goal.endBone : goal.bones.empty() ? std::string{} : goal.bones.back();
+        std::vector<Entity> stack{primary};
+        while (!bone.empty() && !stack.empty()) {
+            const Entity e = stack.back();
+            stack.pop_back();
+            if (const Name* name = registry.TryGet<Name>(e); name && name->value == bone)
+                return glm::vec3(registry.Get<WorldTransform>(e).matrix[3]);
+            if (const Hierarchy* h = registry.TryGet<Hierarchy>(e))
+                stack.insert(stack.end(), h->children.begin(), h->children.end());
+        }
+        return glm::vec3(world[3]);
+    }
+    }
+    return std::nullopt;
+}
+
+bool Editor::MoveGizmoTarget(const glm::vec3& world)
+{
+    if (!GizmoTargetPosition())
+        return false;
+    Registry&    registry = m_Ctx.scene.GetRegistry();
+    const Entity primary  = Selected();
+    if (m_GizmoTarget == GizmoTarget::IkGoal) {
+        if (!m_Ctx.animation->SetIkTarget(primary, m_IkGizmoGoal, world))
+            return false;
+        m_IkGizmoTarget = world;
+        m_IkGizmoEntity = primary;
+        return true;
+    }
+    const bool dragging = m_GizmoEdit.has_value();
+    if (!dragging)
+        m_GizmoEdit.emplace(std::vector<StateEdit>{{UuidOf(primary), SnapshotEntityState(m_Ctx.scene, primary)}});
+    NavLink&        link  = registry.Get<NavLink>(primary);
+    const glm::vec3 local = glm::vec3(glm::inverse(registry.Get<WorldTransform>(primary).matrix) * glm::vec4(world, 1.0f));
+    (m_GizmoTarget == GizmoTarget::LinkStart ? link.start : link.end) = local;
+    if (!dragging) {
+        PushStateChange(m_GizmoTarget == GizmoTarget::LinkStart ? "Move link start" : "Move link end", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    return true;
+}
+
+bool Editor::DrawTargetGizmo(const glm::mat4& view, const glm::mat4& projection)
+{
+    const std::optional<glm::vec3> position = GizmoTargetPosition();
+    if (!position)
+        return false;
+    glm::mat4  frame = glm::translate(glm::mat4(1.0f), *position);
+    const bool moved = ImGuizmo::Manipulate(glm::value_ptr(view), glm::value_ptr(projection), ImGuizmo::TRANSLATE,
+                                            ImGuizmo::WORLD, glm::value_ptr(frame));
+    const bool link  = m_GizmoTarget != GizmoTarget::IkGoal;
+    if (link && ImGuizmo::IsUsing() && !m_GizmoEdit)
+        m_GizmoEdit.emplace(std::vector<StateEdit>{{UuidOf(Selected()), SnapshotEntityState(m_Ctx.scene, Selected())}});
+    if (moved)
+        MoveGizmoTarget(glm::vec3(frame[3]));
+    if (link && !ImGuizmo::IsUsing() && m_GizmoEdit) {
+        PushStateChange(m_GizmoTarget == GizmoTarget::LinkStart ? "Move link start" : "Move link end", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    return true;
+}
+
 void Editor::DrawGizmo(float x, float y, float width, float height)
 {
     Registry&    registry = m_Ctx.scene.GetRegistry();
@@ -879,6 +1011,9 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
 
     // The engine projection is reverse-Z with an infinite far plane; ImGuizmo handles both.
     const CameraData camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+
+    if (m_GizmoTarget != GizmoTarget::Transform && DrawTargetGizmo(camera.view, camera.projection))
+        return;
 
     // Joint anchor: the frame (entity world x anchor) moves; the entity stays.
     if (Joint* joint = registry.TryGet<Joint>(primary); joint && m_EditJointAnchor && m_GizmoOperation != GizmoOperation::Scale) {
@@ -1126,6 +1261,72 @@ bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool 
                 projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, radius, color);
             }
     });
+    if (clicked && hit != NullEntity)
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
+    list->PopClipRect();
+    return clicked && hit != NullEntity;
+}
+
+bool Editor::DrawBoneOverlay(float x, float y, float width, float height, bool clicked)
+{
+    Registry& registry = m_Ctx.scene.GetRegistry();
+    // Instances with a selected root or a selected node.
+    std::vector<Entity> roots;
+    for (const Entity e : m_Selection) {
+        if (!registry.Valid(e))
+            continue;
+        const ModelNodeRef* ref  = registry.TryGet<ModelNodeRef>(e);
+        const Entity        root = registry.Has<ModelInstance>(e) ? e : ref ? ref->instanceRoot : NullEntity;
+        if (root != NullEntity && registry.Valid(root) && std::ranges::find(roots, root) == roots.end())
+            roots.push_back(root);
+    }
+    if (roots.empty())
+        return false;
+
+    const CameraData        camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    constexpr float kJoint      = 3.5f;
+    const ImVec2    mouse       = ImGui::GetIO().MousePos;
+    Entity          hit         = NullEntity;
+    float           hitDistance = kJoint + 4.0f;
+    for (const Entity root : roots) {
+        const Model* model = m_Ctx.assets.Get(registry.Get<ModelInstance>(root).model);
+        if (!model)
+            continue;
+        std::vector<bool> joint(model->nodes.size(), false);
+        for (const Skin& skin : model->skins)
+            for (const SkinJoint& j : skin.joints)
+                if (j.node >= 0 && static_cast<std::size_t>(j.node) < joint.size())
+                    joint[static_cast<std::size_t>(j.node)] = true;
+        registry.ViewOf<ModelNodeRef, WorldTransform>().Each([&](Entity e, ModelNodeRef& ref, WorldTransform& world) {
+            if (ref.instanceRoot != root || ref.node >= joint.size() || !joint[ref.node])
+                return;
+            const glm::vec3 position = glm::vec3(world.matrix[3]);
+            const bool      selected = IsSelected(e);
+            const ImU32     color    = selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(120, 220, 255, 230);
+            // The bone: from the parent joint to this one.
+            if (const Hierarchy* h = registry.TryGet<Hierarchy>(e); h && registry.Valid(h->parent))
+                if (const ModelNodeRef* parent = registry.TryGet<ModelNodeRef>(h->parent);
+                    parent && parent->instanceRoot == root && parent->node < joint.size() && joint[parent->node])
+                    projector.Line(list, glm::vec3(registry.Get<WorldTransform>(h->parent).matrix[3]), position, color);
+            ImVec2 p;
+            if (!projector.Project(position, p))
+                return;
+            ++m_DrawnBones;
+            list->AddCircleFilled(p, kJoint, color);
+            list->AddCircle(p, kJoint + 1.0f, IM_COL32(0, 0, 0, 200));
+            if (selected)
+                if (const Name* name = registry.TryGet<Name>(e))
+                    list->AddText(ImVec2(p.x + kJoint + 4.0f, p.y - kJoint - 6.0f), IM_COL32(230, 230, 230, 230), name->value.c_str());
+            const float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+            if (d < hitDistance) {
+                hitDistance = d;
+                hit         = e;
+            }
+        });
+    }
     if (clicked && hit != NullEntity)
         SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
     list->PopClipRect();

@@ -135,6 +135,23 @@ public:
     // project into the rectangle (viewport pixels). additive: added to the selection.
     void SelectInRect(glm::vec2 min, glm::vec2 max, bool additive);
 
+    // What the viewport gizmo moves besides the selection's transform (toolbar / inspector): a Nav
+    // Link's start or end point (undoable, one step per drag) or, while playing, the target of an IK
+    // goal of the selected Animation Controller (runtime only, like AnimationSystem::SetIkTarget;
+    // Stop forgets it). Falls back to the transform while the selection has nothing to move.
+    enum class GizmoTarget : std::uint8_t { Transform, LinkStart, LinkEnd, IkGoal };
+    void SetGizmoTarget(GizmoTarget target, std::string_view ikGoal = {});
+    [[nodiscard]] GizmoTarget CurrentGizmoTarget() const { return m_GizmoTarget; }
+    // World position the target gizmo sits at; nullopt when it does not apply to the selection.
+    [[nodiscard]] std::optional<glm::vec3> GizmoTargetPosition() const;
+    // The same as a gizmo drag to `world` (tests, scripted tools). False: nothing to move.
+    bool MoveGizmoTarget(const glm::vec3& world);
+
+    // Bone overlay (toolbar "Bones"): the skeletons of selected model instances; a click on a joint
+    // selects its node entity. DrawnBones: joints drawn in the last frame.
+    void SetShowBones(bool show) { m_ShowBones = show; }
+    [[nodiscard]] std::size_t DrawnBones() const { return m_DrawnBones; }
+
     // Edit operations (menu / hotkeys), all undoable.
     void DuplicateSelection(); // Ctrl+D
     void DeleteSelection();    // Del
@@ -184,7 +201,14 @@ public:
     // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
     [[nodiscard]] std::filesystem::path ContentRoot() const;
     bool BuildAndRun();
-    bool PackageProject(const std::filesystem::path& outputDirectory);
+    bool PackageProject(const std::filesystem::path& outputDirectory); // blocking (StartPackaging + wait)
+    // Background packaging (Build > Package project): a progress window shows the step and offers
+    // Cancel; the report window opens when it ends. False if one is running or there is no project.
+    // patch: Patch_<n>.upak against the game already packaged into outputDirectory (PackagePatch).
+    bool StartPackaging(const std::filesystem::path& outputDirectory, bool patch = false);
+    [[nodiscard]] bool  PackagingBusy() const { return m_PackageWorker.joinable(); } // until its result is shown
+    [[nodiscard]] float PackagingProgress() const { return m_PackageProgress.load(std::memory_order_relaxed); }
+    void                CancelPackaging() { m_PackageCancel.store(true, std::memory_order_relaxed); }
     // Cook report of the last packaging (null before), shown in the "Package report" window.
     [[nodiscard]] const CookReport* PackageReport() const { return m_PackageReport.get(); }
     // Navigation: rebuilds every tile now and saves the baked file next to the scene (if saved).
@@ -226,6 +250,11 @@ public:
     {
         return RelocateContentAsset(source, target);
     }
+    // Delete a file or folder below ContentRoot() (a scene takes its baked navmesh along). With a
+    // project it moves to Saved/Trash (kept for kTrashDays) and Undo restores it, the start scene
+    // included; without a project it is deleted for good. False: nothing changed (see Status()).
+    bool DeleteContent(const std::filesystem::path& target);
+    static constexpr int kTrashDays = 7;
     [[nodiscard]] const std::string& Status() const { return m_Status; } // last file operation
     // Part of a streamed sub-level (preview or play): shown read-only, never saved.
     [[nodiscard]] bool IsStreamed(Entity entity) const;
@@ -323,7 +352,10 @@ private:
     void ReleaseContentPreview();
     void ImportContentFile(const std::filesystem::path& source);
     void UpdateContentImport();
+    void UpdatePackaging();         // collects a finished background packaging
+    void DrawPackagingProgress();
     bool RelocateContentAsset(const std::filesystem::path& source, const std::filesystem::path& target);
+    void PurgeTrash(); // Saved/Trash entries older than kTrashDays
     void DrawProjectSettings();
     void DrawPackageReport();
     void DrawBlueprintTypes();
@@ -348,7 +380,7 @@ private:
     // Compared every frame after the panels; a change becomes one step once no widget is active.
     struct ViewState {
         bool          lights = true, bvh = false, colliders = true, audio = true, particles = true;
-        bool          volumes = true, navMesh = true, gameCamera = false;
+        bool          volumes = true, navMesh = true, gameCamera = false, bones = false;
         int           bvhDepth  = 8;
         std::uint32_t debugView = 0;
         bool          operator==(const ViewState&) const = default;
@@ -389,6 +421,7 @@ private:
     Entity CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position); // + undo
     // Particle system icons (click selects), bounds of the selected one's particles.
     bool DrawParticleOverlay(float x, float y, float width, float height, bool clicked);
+    bool DrawBoneOverlay(float x, float y, float width, float height, bool clicked);
     void   DestroyByUuids(std::span<const std::uint64_t> uuids);
     [[nodiscard]] std::uint64_t UuidOf(Entity entity) const;
 
@@ -455,6 +488,8 @@ private:
     bool                m_ShowColliders   = true;
     bool                m_EditJointAnchor = false; // the gizmo moves the selected joint's anchor
     bool                m_ShowAudio       = true; // audio source icons / ranges, reverb zones
+    bool                m_ShowBones       = false; // skeletons of selected model instances
+    std::size_t         m_DrawnBones      = 0;
     bool                m_ShowParticles   = true; // particle system icons / bounds
     bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
@@ -469,6 +504,11 @@ private:
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
     std::optional<std::vector<StateEdit>> m_GizmoEdit;
+    GizmoTarget              m_GizmoTarget = GizmoTarget::Transform;
+    std::string              m_IkGizmoGoal;                // GizmoTarget::IkGoal
+    Entity                   m_IkGizmoEntity = NullEntity; // the controller m_IkGizmoTarget was set on
+    std::optional<glm::vec3> m_IkGizmoTarget;              // world, last value given to SetIkTarget
+    bool DrawTargetGizmo(const glm::mat4& view, const glm::mat4& projection); // false: not applicable
     std::optional<std::vector<StateEdit>> m_InspectorEdit; // primary first, then the multi-edited others
     std::string                           m_InspectorFrameState; // primary entity at the start of the inspector
 
@@ -522,6 +562,7 @@ private:
     bool                     m_NavOtherLevel = false; // Open Level while playing replaced the navmesh
     struct TypeEdit;                    // the enum / struct / interface edited there
     std::shared_ptr<TypeEdit> m_TypeEdit;
+    std::uint32_t m_TrashCounter = 0; // makes trash folders of one second unique
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
     bool m_AskQuit = false, m_QuitConfirmed = false;
 
@@ -566,10 +607,20 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph, ImportHeightmap, ExportHeightmap, TerrainAsset, AssignTerrain } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, PackagePatch, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph, ImportHeightmap, ExportHeightmap, TerrainAsset, AssignTerrain } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
+    // Background packaging: the worker owns m_PackagingReport / m_PackageError until m_PackageDone.
+    std::jthread                 m_PackageWorker;
+    std::unique_ptr<CookReport>  m_PackagingReport;
+    std::string                  m_PackageError;
+    bool                         m_PackageOk = false;
+    bool                         m_PackageIsPatch = false;
+    std::atomic<bool>            m_PackageDone{false}, m_PackageCancel{false};
+    std::atomic<float>           m_PackageProgress{0.0f};
+    std::mutex                   m_PackageStepMutex;
+    std::string                  m_PackageStep; // guarded by m_PackageStepMutex
     std::filesystem::path        m_PackageOutput;
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_MaterialTarget = NullEntity; // collider the physics material dialog fills

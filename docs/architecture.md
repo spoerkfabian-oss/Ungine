@@ -31,6 +31,8 @@ included as `SYSTEM`. CMake ≥ 3.25.
 | miniaudio 0.11.22 (+ stb_vorbis, verblib) | Audio | own static lib `miniaudio` from `engine/src/ThirdParty/miniaudio_impl.c`, `MA_NO_RESOURCE_MANAGER`, `-O2` |
 | recastnavigation v1.6.0 | Navmeshes and crowds | static lib `recastnav` (Recast, Detour, DetourCrowd, DetourTileCache), `-O2` |
 | glslang vulkan-sdk-1.4.357.0 | Runtime GLSL → SPIR-V for materials | `ENABLE_OPT=OFF`, no HLSL/binaries, `-O2` |
+| zstd v1.5.6 | Pak entry compression | static lib `zstd` from the library sources, `ZSTD_DISABLE_ASM`, engine-private |
+| Monocypher 4.0.2 | Pak signatures (Ed25519) and digests (BLAKE2b) | static lib `monocypher` (+ optional ed25519), engine-private |
 | Dear ImGui (docking) 1.92.9, ImGuizmo | Editor UI | only in `editor/` |
 
 `glslc` from the Vulkan SDK compiles the engine shaders at build time (`cmake/Shaders.cmake`).

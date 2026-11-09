@@ -22,11 +22,14 @@
 #include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -229,6 +232,362 @@ TEST_CASE(Pak_WriteReadMountAndCorruption)
     fs::remove_all(dir, ec);
 }
 
+// Entry paths must stay below their mount root: a crafted pak with "..", absolute or drive paths is
+// refused when opened (otherwise ListFiles/Read would reach files outside the game folder), and the
+// writer never produces such entries.
+TEST_CASE(Pak_RejectsEscapingEntryPaths)
+{
+    const fs::path dir = TempDir("pak_escape");
+    {
+        PakWriter writer(dir / "Good.upak");
+        for (const char* bad : {"../outside.txt", "Content/../../x", "/abs/x", "C:/x", "Content\\x", "Content//x",
+                                "Content/./x", "Content/", "", ":cooked/../x"}) {
+            bool refused = false;
+            try {
+                writer.Add(bad, Bytes("x"));
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            CHECK(refused);
+        }
+        writer.Add("Content/aa/bb/outside.txt", Bytes("inside"));
+        writer.Finish();
+    }
+    // Same length, so only the index bytes change; the index hash is recomputed like a crafted pak would.
+    std::vector<std::byte> bytes   = ReadAll(dir / "Good.upak");
+    const std::string      inside  = "Content/aa/bb/outside.txt";
+    const std::string      escaped = "Content/../../outside.txt";
+    std::uint64_t          indexOffset = 0, indexSize = 0;
+    std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+    std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+    const std::string all(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const std::size_t at = all.find(inside, static_cast<std::size_t>(indexOffset));
+    CHECK(at != std::string::npos);
+    std::memcpy(bytes.data() + at, escaped.data(), escaped.size());
+    const std::uint64_t hash =
+        Fnv1a64(std::span<const std::byte>(bytes.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+    std::memcpy(bytes.data() + 32, &hash, sizeof(hash));
+    WriteBytes(dir / "Evil.upak", bytes);
+    WriteBytes(dir / "Game" / "outside.txt", Bytes("secret")); // where the escaped entry points to
+
+    bool refused = false;
+    try {
+        const auto evil = PakFile::Open(dir / "Evil.upak");
+        Vfs::Mount(evil, dir / "Game" / "Root"); // only reached without the check
+        for (const fs::path& file : Vfs::ListFiles(dir / "Game" / "Root" / "Content", true))
+            CHECK(Vfs::Read(file) != Bytes("secret"));
+        Vfs::UnmountAll();
+    } catch (const std::runtime_error& e) {
+        refused = std::string(e.what()).find("invalid entry path") != std::string::npos;
+    }
+    CHECK(refused);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// Version 2: zstd where it pays off (never for PakCompression::None), digests checked before
+// decompressing, an implausible size refused on open, deleted entries hiding older mounts, and
+// version 1 paks still readable.
+TEST_CASE(Pak_CompressionDeletedEntriesAndVersion1)
+{
+    const fs::path dir = TempDir("pak_v2");
+    std::mt19937             random(7);
+    std::string              repetitive(20000, ' '); // four letters: compresses well, below the ratio limit
+    for (char& ch : repetitive)
+        ch = "acgt"[random() % 4];
+    std::vector<std::byte> noise(4096);
+    for (std::byte& b : noise)
+        b = static_cast<std::byte>(random());
+    {
+        PakWriter writer(dir / "Base.upak");
+        writer.Add("Content/big.txt", Bytes(repetitive));
+        writer.Add("Content/noise.bin", noise);
+        writer.Add("Content/raw.txt", Bytes(repetitive), PakCompression::None);
+        writer.Add("Content/zeros.bin", std::vector<std::byte>(1 << 20)); // beyond 1:1024: stored raw
+        writer.Add("Content/old.txt", Bytes("old"));
+        writer.Add(":cooked/models/Content/old.glb", Bytes("cooked old"));
+        writer.Finish();
+    }
+    {
+        const auto pak = PakFile::Open(dir / "Base.upak");
+        const PakEntryInfo* big = pak->Find("Content/big.txt");
+        CHECK(big && big->Compressed() && big->storedSize * 2 < big->size && big->size == repetitive.size());
+        CHECK(!pak->Find("Content/zeros.bin")->Compressed());
+        CHECK(big && pak->Read(*big) == Bytes(repetitive));
+        CHECK(!pak->Find("Content/noise.bin")->Compressed() && !pak->Find("Content/raw.txt")->Compressed());
+        CHECK(pak->Read(*pak->Find("Content/noise.bin")) == noise);
+        CHECK(pak->Version() == kPakVersion && !pak->Signed());
+    }
+
+    // A flipped byte inside the compressed entry: the digest catches it before zstd sees it.
+    std::vector<std::byte> bytes = ReadAll(dir / "Base.upak");
+    {
+        const auto pak = PakFile::Open(dir / "Base.upak");
+        std::vector<std::byte> broken = bytes;
+        broken[static_cast<std::size_t>(pak->Find("Content/big.txt")->offset) + 5] ^= std::byte{0x40};
+        WriteBytes(dir / "Broken.upak", broken);
+        const auto brokenPak = PakFile::Open(dir / "Broken.upak");
+        bool       caught    = false;
+        try {
+            (void)brokenPak->Read(*brokenPak->Find("Content/big.txt"));
+        } catch (const std::runtime_error& e) {
+            caught = std::string(e.what()).find("corrupt") != std::string::npos;
+        }
+        CHECK(caught);
+    }
+    // An index claiming a huge decompressed size is refused on open (no allocation of that size).
+    {
+        std::uint64_t indexOffset = 0, indexSize = 0;
+        std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+        std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+        const std::string all(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        const std::size_t at = all.find("Content/big.txt", static_cast<std::size_t>(indexOffset));
+        CHECK(at != std::string::npos);
+        std::vector<std::byte> bomb = bytes;
+        const std::uint64_t    huge = std::uint64_t{1} << 40;
+        std::memcpy(bomb.data() + at + 15 + 16, &huge, sizeof(huge)); // path, offset, storedSize, then size
+        const std::uint64_t hash = Fnv1a64(std::span<const std::byte>(bomb.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+        std::memcpy(bomb.data() + 32, &hash, sizeof(hash));
+        WriteBytes(dir / "Bomb.upak", bomb);
+        bool refused = false;
+        try {
+            (void)PakFile::Open(dir / "Bomb.upak");
+        } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("implausible size") != std::string::npos;
+        }
+        CHECK(refused);
+    }
+
+    // A patch: a changed file, a new one and two deletions hide the base's entries.
+    {
+        PakWriter writer(dir / "Patch.upak");
+        writer.Add("Content/big.txt", Bytes("patched"));
+        writer.Add("Content/new.txt", Bytes("new"));
+        writer.AddDeleted("Content/old.txt");
+        writer.AddDeleted(":cooked/models/Content/old.glb");
+        writer.Finish();
+    }
+    const fs::path root = dir / "Game";
+    fs::create_directories(root / "Content");
+    WriteBytes(root / "Content" / "old.txt", Bytes("loose")); // a deleted entry hides the disk file too
+    Vfs::Mount(PakFile::Open(dir / "Base.upak"), root);
+    Vfs::Mount(PakFile::Open(dir / "Patch.upak"), root);
+    CHECK(Vfs::Read(root / "Content" / "big.txt") == Bytes("patched"));
+    CHECK(Vfs::Read(root / "Content" / "new.txt") == Bytes("new"));
+    CHECK(Vfs::Read(root / "Content" / "raw.txt") == Bytes(repetitive));
+    CHECK(!Vfs::Read(root / "Content" / "old.txt") && !Vfs::Exists(root / "Content" / "old.txt") &&
+          !Vfs::Locate(root / "Content" / "old.txt"));
+    CHECK(!Vfs::ReadCookedFor(root / "Content" / "old.glb", "models"));
+    std::vector<std::string> listed;
+    for (const fs::path& file : Vfs::ListFiles(root / "Content", true))
+        listed.push_back(PathToUtf8(file.filename()));
+    CHECK((listed == std::vector<std::string>{"big.txt", "new.txt", "noise.bin", "raw.txt", "zeros.bin"}));
+    const std::optional<Vfs::Location> located = Vfs::Locate(root / "Content" / "raw.txt");
+    CHECK(located && located->packed && !located->compressed && located->size == repetitive.size());
+    Vfs::UnmountAll();
+
+    // Version 1 (uncompressed, FNV-1a per entry): written by hand like an older engine did.
+    {
+        const std::vector<std::byte> content = Bytes("version one");
+        std::vector<std::byte>       pak(40);
+        while (pak.size() % 16)
+            pak.push_back(std::byte{0});
+        const std::uint64_t offset = pak.size();
+        pak.insert(pak.end(), content.begin(), content.end());
+        std::vector<std::byte> index;
+        const auto put = [&](const auto& value) {
+            const auto* p = reinterpret_cast<const std::byte*>(&value);
+            index.insert(index.end(), p, p + sizeof(value));
+        };
+        const std::string path = "Content/v1.txt";
+        put(static_cast<std::uint32_t>(path.size()));
+        for (const char ch : path)
+            index.push_back(static_cast<std::byte>(ch));
+        put(offset);
+        put(static_cast<std::uint64_t>(content.size()));
+        put(Fnv1a64(content));
+        const std::uint64_t indexOffset = pak.size(), indexSize = index.size(), indexHash = Fnv1a64(index);
+        pak.insert(pak.end(), index.begin(), index.end());
+        const std::uint32_t version = 1, count = 1, flags = 0;
+        std::memcpy(pak.data(), "UPAK", 4);
+        std::memcpy(pak.data() + 4, &version, 4);
+        std::memcpy(pak.data() + 8, &count, 4);
+        std::memcpy(pak.data() + 12, &flags, 4);
+        std::memcpy(pak.data() + 16, &indexOffset, 8);
+        std::memcpy(pak.data() + 24, &indexSize, 8);
+        std::memcpy(pak.data() + 32, &indexHash, 8);
+        WriteBytes(dir / "V1.upak", pak);
+        const auto v1 = PakFile::Open(dir / "V1.upak");
+        CHECK(v1->Version() == 1 && v1->Find("Content/v1.txt") && v1->Read(*v1->Find("Content/v1.txt")) == content);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// Signed paks: the right key opens them, another key / no signature / a changed index is refused;
+// a project with a pakPublicKey packages with the key from the key store (or --key file) and only
+// mounts paks signed by it.
+TEST_CASE(Pak_SigningAndSignedProjects)
+{
+    const fs::path   dir   = TempDir("pak_signing");
+    const PakKeyPair key   = GeneratePakKey();
+    const PakKeyPair other = GeneratePakKey();
+    CHECK(key.publicKey != other.publicKey && PakKeyFromSeed(key.seed).publicKey == key.publicKey);
+    CHECK(ParsePakKeyHex(HexString(key.publicKey)) == std::optional<PakPublicKey>(key.publicKey));
+    CHECK(!ParsePakKeyHex("abc") && !ParsePakKeyHex(std::string(64, 'x')));
+    {
+        PakWriter writer(dir / "Signed.upak");
+        writer.Add("Content/a.txt", Bytes("signed content"));
+        writer.Finish(&key);
+        PakWriter unsigned_(dir / "Unsigned.upak");
+        unsigned_.Add("Content/a.txt", Bytes("signed content"));
+        unsigned_.Finish();
+    }
+    const auto refused = [](const fs::path& file, const PakPublicKey* required, std::string_view why) {
+        try {
+            (void)PakFile::Open(file, required);
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what()).find(why) != std::string::npos;
+        }
+        return false;
+    };
+    const auto pak = PakFile::Open(dir / "Signed.upak", &key.publicKey);
+    CHECK(pak->Signed() && pak->SignedBy() == std::optional<PakPublicKey>(key.publicKey));
+    CHECK(pak->Read(*pak->Find("Content/a.txt")) == Bytes("signed content"));
+    CHECK(PakFile::Open(dir / "Signed.upak")->Signed()); // no key required: still checked, accepted
+    CHECK(refused(dir / "Signed.upak", &other.publicKey, "signed by another key"));
+    CHECK(refused(dir / "Unsigned.upak", &key.publicKey, "not signed"));
+    // A changed index (with a fixed FNV index hash, as an attacker would) breaks the signature.
+    {
+        std::vector<std::byte> bytes = ReadAll(dir / "Signed.upak");
+        std::uint64_t          indexOffset = 0, indexSize = 0;
+        std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+        std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+        bytes[static_cast<std::size_t>(indexOffset + 4)] = static_cast<std::byte>('X'); // "Content/a.txt" -> "Xontent/a.txt"
+        const std::uint64_t hash = Fnv1a64(std::span<const std::byte>(bytes.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+        std::memcpy(bytes.data() + 32, &hash, sizeof(hash));
+        WriteBytes(dir / "Forged.upak", bytes);
+        CHECK(refused(dir / "Forged.upak", nullptr, "signature is invalid"));
+    }
+
+    // A signed project: packaging needs the private key; the packaged game mounts only its paks.
+    std::string            error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir / "Project", "SignedGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path fakePlayer = dir / "UnginePlayer.bin";
+    std::ofstream(fakePlayer) << "player";
+    project->settings.pakPublicKey = HexString(key.publicKey);
+    CHECK(project->Save());
+    CHECK(Project::Load(project->File())->settings.pakPublicKey == HexString(key.publicKey));
+    const fs::path keyFile = dir / "build.key";
+    std::ofstream(keyFile) << HexString(key.seed) << "\n";
+    PackageOptions withKey;
+    withKey.keyFile = dir / "missing.key";
+    CHECK(!PackageProject(*project, fakePlayer, dir / "NoKey", &error, nullptr, &withKey));
+    CHECK(error.find("not on this machine") != std::string::npos && !fs::exists(dir / "NoKey"));
+    withKey.keyFile = keyFile;
+    CHECK(PackageProject(*project, fakePlayer, dir / "Game", &error, nullptr, &withKey));
+    CHECK(PakFile::Open(dir / "Game" / "Content.upak", &key.publicKey)->Signed());
+    std::optional<Project> game = Project::Load(dir / "Game" / project->File().filename());
+    CHECK(game.has_value() && MountPackagedContent(*game, &error) && Vfs::Mounted());
+    Vfs::UnmountAll();
+    game->settings.pakPublicKey = HexString(other.publicKey); // a game expecting another key
+    CHECK(!MountPackagedContent(*game, &error) && error.find("signed by another key") != std::string::npos && !Vfs::Mounted());
+    std::ofstream(keyFile) << HexString(other.seed) << "\n";
+    CHECK(!LoadPakSigningKey(project->settings, keyFile, &error) && error.find("another key") != std::string::npos);
+
+    // The key store: CreatePakSigningKey writes the seed below the user config directory.
+    Project fresh = *project;
+    fresh.settings.pakPublicKey.clear();
+    CHECK(CreatePakSigningKey(fresh, &error));
+    const std::optional<PakPublicKey> created = ParsePakKeyHex(fresh.settings.pakPublicKey);
+    CHECK(created && fs::exists(PakKeyFile(*created)));
+    CHECK(LoadPakSigningKey(fresh.settings).has_value());
+    std::error_code ec;
+    if (created)
+        fs::remove(PakKeyFile(*created), ec);
+    fs::remove_all(dir, ec);
+}
+
+// Patches: only what changed since the packaged build (changed, new and deleted files), nothing when
+// nothing changed, numbered in mount order, signed like the base (a foreign patch keeps the whole
+// game from mounting), and dropped by the next full packaging.
+TEST_CASE(Pak_PatchesAgainstThePackagedGame)
+{
+    const fs::path         dir = TempDir("pak_patch");
+    std::string            error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir / "Project", "PatchGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const PakKeyPair key     = GeneratePakKey();
+    const fs::path   keyFile = dir / "build.key";
+    std::ofstream(keyFile) << HexString(key.seed) << "\n";
+    project->settings.pakPublicKey = HexString(key.publicKey);
+    CHECK(project->Save());
+    PackageOptions options;
+    options.keyFile = keyFile;
+    const fs::path data = project->ContentDirectory() / "Data";
+    WriteBytes(data / "keep.txt", Bytes("keep"));
+    WriteBytes(data / "change.txt", Bytes("version 1"));
+    WriteBytes(data / "remove.txt", Bytes("remove me"));
+    const fs::path fakePlayer = dir / "UnginePlayer.bin";
+    std::ofstream(fakePlayer) << "player";
+    const fs::path game = dir / "Game";
+    CHECK(PackageProject(*project, fakePlayer, game, &error, nullptr, &options));
+
+    fs::path patch;
+    CookReport report;
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch.empty()); // nothing changed
+    CHECK(PakPatches(game).empty());
+
+    WriteBytes(data / "change.txt", Bytes("version 2"));
+    WriteBytes(data / "new.txt", Bytes("new"));
+    fs::remove(data / "remove.txt");
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch == game / "Patch_1.upak");
+    std::vector<std::string> kinds;
+    for (const CookReport::Entry& e : report.entries)
+        kinds.push_back(e.path + ":" + e.kind);
+    CHECK((kinds == std::vector<std::string>{"Content/Data/change.txt:changed", "Content/Data/new.txt:changed",
+                                             "Content/Data/remove.txt:deleted"}));
+    CHECK(PakFile::Open(patch, &key.publicKey)->Entries().size() == 3);
+
+    WriteBytes(data / "change.txt", Bytes("version 3"));
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch == game / "Patch_2.upak");
+    CHECK(report.entries.size() == 1 && PakPatches(game) == (std::vector<fs::path>{game / "Patch_1.upak", game / "Patch_2.upak"}));
+
+    std::optional<Project> shipped = Project::Load(game / project->File().filename());
+    CHECK(shipped && MountPackagedContent(*shipped, &error));
+    const fs::path content = shipped->Root() / "Content" / "Data";
+    CHECK(Vfs::Read(content / "change.txt") == Bytes("version 3"));
+    CHECK(Vfs::Read(content / "keep.txt") == Bytes("keep") && Vfs::Read(content / "new.txt") == Bytes("new"));
+    CHECK(!Vfs::Exists(content / "remove.txt"));
+    Vfs::UnmountAll();
+
+    // A patch that is not signed by the project's key: the game refuses to start, nothing is mounted.
+    {
+        PakWriter rogue(game / "Patch_3.upak");
+        rogue.Add("Content/Data/keep.txt", Bytes("rogue"));
+        rogue.Finish();
+    }
+    CHECK(!MountPackagedContent(*shipped, &error) && error.find("not signed") != std::string::npos && !Vfs::Mounted());
+    fs::remove(game / "Patch_3.upak");
+
+    // A full packaging starts over: the old patches would override the new pak.
+    CHECK(PackageProject(*project, fakePlayer, game, &error, nullptr, &options));
+    CHECK(PakPatches(game).empty());
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ModelDataRoundTrip)
 {
     // Embedded textures (GLB), a skin with animations (the Basic template's banner) and an
@@ -367,7 +726,74 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
     CHECK(PackageProject(*project, fakePlayer, dir / "Package", &error, &packaged) && packaged.Ok());
     CHECK(fs::exists(dir / "Package" / "Content.upak") && fs::exists(dir / "Package" / "BuildReport.txt") &&
           !fs::exists(dir / "Package" / "Content"));
+
+    // Progress from 0 to 1 (texture jobs report out of order); cancelling stops without a pak.
+    std::mutex         stepsMutex;
+    std::vector<float> steps;
+    PackageOptions     reporting;
+    reporting.progress = [&](float value, const std::string&) {
+        std::scoped_lock lock(stepsMutex);
+        steps.push_back(value);
+    };
+    CHECK(PackageProject(*project, fakePlayer, dir / "Package2", &error, nullptr, &reporting));
+    CHECK(steps.size() > 4 && steps.front() == 0.0f && steps.back() == 1.0f &&
+          std::ranges::all_of(steps, [](float v) { return v >= 0.0f && v <= 1.0f; }));
+    for (const int pollsBeforeCancel : {0, 3}) { // before anything is copied / inside the cook
+        std::atomic<int> polls{0};
+        PackageOptions   cancelling;
+        cancelling.cancelled = [&] { return ++polls > pollsBeforeCancel; };
+        const fs::path   cancelledOut = dir / std::format("Cancelled{}", pollsBeforeCancel);
+        CookReport       partial;
+        error.clear();
+        CHECK(!PackageProject(*project, fakePlayer, cancelledOut, &error, &partial, &cancelling));
+        CHECK(error == "packaging was cancelled" && !fs::exists(cancelledOut / "Content.upak"));
+        CHECK((pollsBeforeCancel == 0) == partial.errors.empty()); // the cook ran and reported the cancel
+    }
+    CookOptions stopAtOnce;
+    stopAtOnce.cancelled = [] { return true; };
+    const CookReport stopped = CookProjectContent(*project, dir / "Stopped.upak", stopAtOnce);
+    CHECK(stopped.errors == std::vector<std::string>{std::string(kCookCancelled)} && !fs::exists(dir / "Stopped.upak"));
     std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// A file symlink inside Content/ that points elsewhere on the machine must not be packaged (it would
+// leak that file into the game); links that stay inside Content/ are fine.
+TEST_CASE(Cook_SymlinksOutsideContentAreNotPackaged)
+{
+    const fs::path dir = TempDir("cook_symlink");
+    std::string    error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir, "LinkGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    WriteBytes(dir / "private.txt", Bytes("secret"));
+    WriteBytes(content / "Notes" / "real.txt", Bytes("inside"));
+    std::error_code ec;
+    fs::create_symlink(dir / "private.txt", content / "Notes" / "leak.txt", ec);
+    if (!ec)
+        fs::create_symlink(content / "Notes" / "real.txt", content / "Notes" / "alias.txt", ec);
+    if (ec) { // e.g. Windows without the symlink privilege
+        std::printf("  (skipped: cannot create symlinks: %s)\n", ec.message().c_str());
+        fs::remove_all(dir, ec);
+        return;
+    }
+    CookOptions options;
+    options.threads = 2;
+    const CookReport report = CookProjectContent(*project, dir / "Out" / "Content.upak", options);
+    CHECK(report.Ok());
+    const auto pak = PakFile::Open(dir / "Out" / "Content.upak");
+    CHECK(!pak->Find("Content/Notes/leak.txt"));
+    CHECK(pak->Find("Content/Notes/real.txt") && pak->Find("Content/Notes/alias.txt"));
+    CHECK(std::ranges::any_of(report.warnings, [](const std::string& w) {
+        return w.find("Notes/leak.txt") != std::string::npos && w.find("outside Content") != std::string::npos;
+    }));
+    for (const PakEntryInfo& e : pak->Entries())
+        CHECK(pak->Read(e) != Bytes("secret"));
     fs::remove_all(dir, ec);
 }
 

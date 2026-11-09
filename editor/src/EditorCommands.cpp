@@ -60,6 +60,7 @@ Editor::ViewState Editor::CaptureView() const
     v.particles  = m_ShowParticles;
     v.volumes    = m_ShowVolumes;
     v.navMesh    = m_ShowNavMesh;
+    v.bones      = m_ShowBones;
     v.gameCamera = m_GameCamera;
     v.bvhDepth   = m_BvhDepth;
     v.debugView  = static_cast<std::uint32_t>(m_Ctx.sceneRenderer.post.debugView);
@@ -75,6 +76,7 @@ void Editor::ApplyView(const ViewState& v)
     m_ShowParticles  = v.particles;
     m_ShowVolumes    = v.volumes;
     m_ShowNavMesh    = v.navMesh;
+    m_ShowBones      = v.bones;
     m_GameCamera     = v.gameCamera;
     m_BvhDepth       = v.bvhDepth;
     m_Ctx.sceneRenderer.post.debugView = static_cast<DebugView>(v.debugView);
@@ -672,7 +674,11 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::Package:
             if (m_Ctx.project)
-                PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
+                StartPackaging(*path / PathFromUtf8(m_Ctx.project->settings.name));
+            break;
+        case DialogPurpose::PackagePatch:
+            if (m_Ctx.project)
+                StartPackaging(*path, true);
             break;
         case DialogPurpose::CreatePrefab: {
             std::filesystem::path file = *path;
@@ -1050,6 +1056,8 @@ void Editor::Stop()
 {
     if (m_PlayState == PlayState::Edit)
         return;
+    if (m_GizmoTarget == GizmoTarget::IkGoal) // IK targets were runtime state of the play session
+        SetGizmoTarget(GizmoTarget::Transform);
     std::vector<std::uint64_t> selected;
     for (Entity e : m_Selection)
         if (m_Ctx.scene.GetRegistry().Valid(e))

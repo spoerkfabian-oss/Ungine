@@ -8,6 +8,7 @@
 #include "Engine/Particles/ParticleEffect.h"
 #include "Editor/ScriptGraphEditor.h"
 #include "Editor/FileDialog.h"
+#include "Editor/History.h"
 #include "Editor/ImGuiLayer.h"
 
 #include "Engine/Assets/AssetManager.h"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <format>
 #include <fstream>
@@ -416,6 +418,37 @@ std::optional<fs::path> RelocateReference(const std::string& reference, const fs
     return (to / relative).lexically_normal();
 }
 
+// `file` is `folder` or lies below it (lexically).
+bool InsideOrSame(const fs::path& file, const fs::path& folder)
+{
+    const fs::path relative = file.lexically_normal().lexically_relative(folder.lexically_normal());
+    return !relative.empty() && !relative.is_absolute() && *relative.begin() != "..";
+}
+
+struct TrashMove {
+    fs::path from, to; // content file, its place in Saved/Trash
+};
+
+// Rename, or copy + remove when source and target are on different volumes.
+bool MovePath(const fs::path& from, const fs::path& to, std::error_code& ec)
+{
+    fs::create_directories(to.parent_path(), ec);
+    if (ec)
+        return false;
+    fs::rename(from, to, ec);
+    if (!ec)
+        return true;
+    ec.clear();
+    fs::copy(from, to, fs::copy_options::recursive, ec);
+    if (ec) {
+        std::error_code ignored;
+        fs::remove_all(to, ignored);
+        return false;
+    }
+    fs::remove_all(from, ec);
+    return !ec;
+}
+
 } // namespace
 
 fs::path Editor::ContentRoot() const
@@ -493,22 +526,107 @@ bool Editor::BuildAndRun()
 
 bool Editor::PackageProject(const fs::path& outputDirectory)
 {
+    if (!StartPackaging(outputDirectory))
+        return false;
+    while (!m_PackageDone.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    UpdatePackaging();
+    return m_PackageOk;
+}
+
+bool Editor::StartPackaging(const fs::path& outputDirectory, bool patch)
+{
     if (!m_Ctx.project)
         return false;
-    SaveAll();
-    std::string error;
-    m_PackageReport     = std::make_unique<CookReport>();
-    m_PackageOutput     = outputDirectory;
-    m_ShowPackageReport = true;
-    if (!Engine::PackageProject(*m_Ctx.project, SiblingExecutable("UnginePlayer"), outputDirectory, &error, m_PackageReport.get())) {
-        ENGINE_ERROR("Package: {}", error);
-        if (std::ranges::find(m_PackageReport->errors, error) == m_PackageReport->errors.end())
-            m_PackageReport->errors.push_back(error);
-        m_Status = "Packaging failed (see Package report)";
+    if (m_PackageWorker.joinable()) {
+        m_Status = "Packaging is already running";
         return false;
     }
-    m_Status = "Packaged into " + PathToUtf8(outputDirectory);
+    SaveAll(); // the worker reads the files, not the editor's state
+    m_PackageOutput = outputDirectory;
+    m_PackageIsPatch = patch;
+    m_PackagingReport = std::make_unique<CookReport>();
+    m_PackageError.clear();
+    m_PackageOk = false;
+    m_PackageDone.store(false, std::memory_order_relaxed);
+    m_PackageCancel.store(false, std::memory_order_relaxed);
+    m_PackageProgress.store(0.0f, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock(m_PackageStepMutex);
+        m_PackageStep = "Starting";
+    }
+    m_Status = "Packaging " + m_Ctx.project->settings.name + "...";
+    m_PackageWorker = std::jthread([this, project = *m_Ctx.project, player = SiblingExecutable("UnginePlayer"),
+                                    outputDirectory, patch, report = m_PackagingReport.get()] {
+        PackageOptions callbacks;
+        callbacks.progress = [this](float value, const std::string& step) {
+            m_PackageProgress.store(value, std::memory_order_relaxed);
+            std::scoped_lock lock(m_PackageStepMutex);
+            m_PackageStep = step;
+        };
+        callbacks.cancelled = [this] { return m_PackageCancel.load(std::memory_order_relaxed); };
+        std::string error;
+        bool        ok = false;
+        try {
+            if (patch) {
+                std::filesystem::path file;
+                ok = Engine::PackagePatch(project, outputDirectory, &error, report, &callbacks, &file);
+                if (ok && file.empty())
+                    report->warnings.insert(report->warnings.begin(), "No changes since the last build: no patch was written");
+            } else
+                ok = Engine::PackageProject(project, player, outputDirectory, &error, report, &callbacks);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        m_PackageOk    = ok;
+        m_PackageError = std::move(error);
+        m_PackageDone.store(true, std::memory_order_release);
+    });
     return true;
+}
+
+void Editor::UpdatePackaging()
+{
+    if (!m_PackageWorker.joinable() || !m_PackageDone.load(std::memory_order_acquire))
+        return;
+    m_PackageWorker.join();
+    m_PackageReport     = std::move(m_PackagingReport);
+    m_ShowPackageReport = true;
+    if (!m_PackageOk) {
+        ENGINE_ERROR("Package: {}", m_PackageError);
+        if (std::ranges::find(m_PackageReport->errors, m_PackageError) == m_PackageReport->errors.end())
+            m_PackageReport->errors.push_back(m_PackageError);
+        m_Status = m_PackageCancel.load(std::memory_order_relaxed) ? "Packaging cancelled" : "Packaging failed (see Package report)";
+        return;
+    }
+    m_Status = (m_PackageIsPatch ? "Patched " : "Packaged into ") + PathToUtf8(m_PackageOutput);
+}
+
+void Editor::DrawPackagingProgress()
+{
+    if (!m_PackageWorker.joinable())
+        return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::Begin("Packaging", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+        std::string step;
+        {
+            std::scoped_lock lock(m_PackageStepMutex);
+            step = m_PackageStep;
+        }
+        ImGui::Text("Packaging %s into %s", m_Ctx.project ? m_Ctx.project->settings.name.c_str() : "",
+                    PathToUtf8(m_PackageOutput).c_str());
+        ImGui::ProgressBar(PackagingProgress(), ImVec2(-1.0f, 0.0f));
+        ImGui::TextUnformatted(step.c_str());
+        const bool cancelling = m_PackageCancel.load(std::memory_order_relaxed);
+        ImGui::BeginDisabled(cancelling);
+        if (ImGui::Button(cancelling ? "Cancelling..." : "Cancel"))
+            CancelPackaging();
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
 }
 
 void Editor::DrawPackageReport()
@@ -1196,6 +1314,115 @@ bool Editor::RelocateContentAsset(const fs::path& source, const fs::path& target
     return true;
 }
 
+bool Editor::DeleteContent(const fs::path& target)
+{
+    if (m_PlayState != PlayState::Edit) {
+        m_Status = "Stop playing to delete content";
+        return false;
+    }
+    std::error_code ec;
+    const fs::path  root = ContentRoot().lexically_normal();
+    if (!fs::exists(target, ec) || ec || !InsideOrSame(target, root) || target.lexically_normal() == root) {
+        m_Status = "Cannot delete '" + PathToUtf8(target.filename()) + "': not content below the content root";
+        return false;
+    }
+    const std::string name = PathToUtf8(target.filename());
+
+    // What goes (a scene takes its baked navmesh along) and, with a project, where it goes.
+    std::vector<TrashMove> moves{{target.lexically_normal(), {}}};
+    if (EndsWith(Lower(name), ".json"))
+        if (const fs::path nav = NavMeshFileFor(target); fs::exists(nav, ec))
+            moves.push_back({nav.lexically_normal(), {}});
+    if (m_Ctx.project) {
+        const auto     now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+        const fs::path bin = m_Ctx.project->SavedDirectory() / "Trash" / std::format("{:%Y%m%d-%H%M%S}-{}", now, ++m_TrashCounter);
+        for (TrashMove& m : moves)
+            m.to = bin / m.from.lexically_relative(root);
+    }
+    std::string failure;
+    for (std::size_t i = 0; i < moves.size(); ++i) {
+        const bool ok = m_Ctx.project ? MovePath(moves[i].from, moves[i].to, ec) : (fs::remove_all(moves[i].from, ec), !ec);
+        if (!ok) {
+            failure = "Delete failed: " + ec.message();
+            if (i == 0) {
+                m_Status = failure;
+                return false;
+            }
+            moves.resize(i); // the navmesh stays; the scene is gone
+            break;
+        }
+    }
+
+    // The start scene and the open scene's file no longer exist.
+    const std::string oldStart     = m_Ctx.project ? m_Ctx.project->settings.startScene : std::string{};
+    const bool        clearedStart = m_Ctx.project && !oldStart.empty() && InsideOrSame(m_Ctx.project->StartScene(), target);
+    const fs::path    oldScene     = m_ScenePath;
+    const bool        clearedScene = !oldScene.empty() && InsideOrSame(oldScene, target);
+    const auto        forget       = [this, clearedStart, clearedScene] {
+        if (clearedStart) {
+            m_Ctx.project->settings.startScene.clear();
+            m_ProjectDirty = !m_Ctx.project->Save();
+        }
+        if (clearedScene)
+            m_ScenePath.clear();
+    };
+    forget();
+    m_Status = !failure.empty() ? failure : m_Ctx.project ? "Deleted " + name + " (Ctrl+Z restores it)" : "Deleted " + name;
+    RefreshContent();
+    if (!m_Ctx.project)
+        return true;
+
+    EditCommand command;
+    command.label       = "Delete " + name;
+    command.sceneChange = false;
+    command.undo        = [this, moves, name, oldStart, clearedStart, oldScene, clearedScene] {
+                     std::error_code e;
+                     for (auto it = moves.rbegin(); it != moves.rend(); ++it)
+                         if (fs::exists(it->from, e) || !MovePath(it->to, it->from, e)) {
+                             m_Status = "Cannot restore " + PathToUtf8(it->from.filename()) +
+                                        (e ? ": " + e.message() : std::string(": a file with that name exists"));
+                             RefreshContent();
+                             return;
+                         }
+                     if (clearedStart) {
+                         m_Ctx.project->settings.startScene = oldStart;
+                         m_ProjectDirty                     = !m_Ctx.project->Save();
+                     }
+                     if (clearedScene && m_ScenePath.empty())
+                         m_ScenePath = oldScene;
+                     m_Status = "Restored " + name;
+                     RefreshContent();
+                 };
+    command.redo = [this, moves, name, forget] {
+                     std::error_code e;
+                     for (const TrashMove& m : moves)
+                         if (fs::exists(m.to, e) || !MovePath(m.from, m.to, e)) {
+                             m_Status = "Cannot delete " + PathToUtf8(m.from.filename()) + " again" +
+                                        (e ? ": " + e.message() : std::string());
+                             RefreshContent();
+                             return;
+                         }
+                     forget();
+                     m_Status = "Deleted " + name + " (Ctrl+Z restores it)";
+                     RefreshContent();
+                 };
+    PushCommand(std::move(command));
+    return true;
+}
+
+void Editor::PurgeTrash()
+{
+    if (!m_Ctx.project)
+        return;
+    std::error_code ec;
+    const auto      cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * kTrashDays);
+    for (fs::directory_iterator it(m_Ctx.project->SavedDirectory() / "Trash", ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code e;
+        if (const auto time = it->last_write_time(e); !e && time < cutoff)
+            fs::remove_all(it->path(), e);
+    }
+}
+
 void Editor::DrawContentBrowser()
 {
     if (!ImGui::Begin("Content", &m_ShowContent)) {
@@ -1807,30 +2034,14 @@ void Editor::DrawContentBrowser()
     if (!m_DeleteTarget.empty())
         ImGui::OpenPopup("Delete?");
     if (ImGui::BeginPopupModal("Delete?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Delete '%s'? This cannot be undone.", PathToUtf8(m_DeleteTarget.filename()).c_str());
+        if (m_Ctx.project)
+            ImGui::Text("Delete '%s'? It moves to Saved/Trash for %d days; Ctrl+Z restores it.",
+                        PathToUtf8(m_DeleteTarget.filename()).c_str(), kTrashDays);
+        else
+            ImGui::Text("Delete '%s'? This cannot be undone.", PathToUtf8(m_DeleteTarget.filename()).c_str());
         if (ImGui::Button("Delete")) {
-            const fs::path deleted = m_DeleteTarget;
-            fs::remove_all(m_DeleteTarget, ec);
-            if (!ec && EndsWith(Lower(PathToUtf8(deleted.filename())), ".json")) { // a scene's baked navmesh
-                std::error_code navError;
-                fs::remove(NavMeshFileFor(deleted), navError);
-            }
-            m_Status = ec ? "Delete failed: " + ec.message() : "Deleted " + PathToUtf8(m_DeleteTarget.filename());
-            if (!ec && m_Ctx.project) {
-                const fs::path start = m_Ctx.project->StartScene();
-                const fs::path startRelative = start.lexically_normal().lexically_relative(deleted.lexically_normal());
-                if (!startRelative.empty() && !startRelative.is_absolute() && startRelative.begin() != startRelative.end() && *startRelative.begin() != "..") {
-                    m_Ctx.project->settings.startScene.clear();
-                    m_ProjectDirty = !m_Ctx.project->Save();
-                }
-            }
-            if (!ec && !m_ScenePath.empty()) {
-                const fs::path sceneRelative = m_ScenePath.lexically_normal().lexically_relative(deleted.lexically_normal());
-                if (sceneRelative.empty() || (!sceneRelative.is_absolute() && sceneRelative.begin() != sceneRelative.end() && *sceneRelative.begin() != ".."))
-                    m_ScenePath.clear();
-            }
+            DeleteContent(m_DeleteTarget);
             m_DeleteTarget.clear();
-            RefreshContent();
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -2112,6 +2323,35 @@ void Editor::DrawProjectSettings()
             if (ImGui::Button("Apply (rebuilds the navmesh)"))
                 m_Ctx.navigation->SetSettings(next);
             ImGui::EndDisabled();
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::CollapsingHeader("Pak signing")) {
+        ImGui::PushID("signing");
+        if (const std::optional<PakPublicKey> key = ParsePakKeyHex(s.pakPublicKey)) {
+            std::error_code ec;
+            const fs::path  file    = PakKeyFile(*key);
+            const bool      present = fs::is_regular_file(file, ec);
+            ImGui::TextWrapped("Packaged paks are signed; the player refuses others. Public key: %s", s.pakPublicKey.c_str());
+            if (present)
+                ImGui::TextDisabled("Private key: %s (keep a backup; copy it to build machines)", PathToUtf8(file).c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "The private key is not on this machine (%s): packaging fails",
+                                   PathToUtf8(file).c_str());
+            if (ImGui::Button("Stop signing")) {
+                s.pakPublicKey.clear();
+                m_ProjectDirty = true;
+            }
+        } else {
+            ImGui::TextWrapped("Paks are not signed: players accept any Content.upak next to the game.");
+            if (ImGui::Button("Create signing key")) {
+                std::string error;
+                if (CreatePakSigningKey(project, &error)) {
+                    m_ProjectDirty = true;
+                    m_Status       = "Created a pak signing key (save the project)";
+                } else
+                    m_Status = "Signing key: " + error;
+            }
         }
         ImGui::PopID();
     }

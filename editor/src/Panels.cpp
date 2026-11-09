@@ -1378,6 +1378,25 @@ void Editor::DrawInspector()
                         m_Ctx.animation->SetFloat(e, parameter.name, v);
                     ImGui::PopID();
                 }
+                // IK goals: the viewport gizmo drags a goal's target (runtime only).
+                if (const auto graph = m_Ctx.animation->Graph(controller->graph); graph && !graph->ik.empty()) {
+                    ImGui::TextDisabled("IK targets (gizmo):");
+                    for (const AnimIk& goal : graph->ik) {
+                        ImGui::PushID(goal.name.c_str());
+                        const bool active = m_GizmoTarget == GizmoTarget::IkGoal && m_IkGizmoGoal == goal.name;
+                        if (ImGui::SmallButton(active ? "Done" : "Drag"))
+                            SetGizmoTarget(active ? GizmoTarget::Transform : GizmoTarget::IkGoal, goal.name);
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Release")) {
+                            m_Ctx.animation->ClearIkTarget(e, goal.name);
+                            if (active)
+                                SetGizmoTarget(GizmoTarget::Transform);
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(goal.name.c_str());
+                        ImGui::PopID();
+                    }
+                }
             } else
                 ImGui::TextDisabled("Not running (model loading, graph missing or broken)");
         }

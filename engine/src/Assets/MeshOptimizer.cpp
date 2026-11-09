@@ -63,10 +63,10 @@ MeshOptimizeStats OptimizeMeshes(ModelData& data, const MeshOptimizeSettings& se
             std::uint32_t highest = 0;
             for (std::uint32_t i = 0; i < sm.indexCount; ++i)
                 highest = std::max(highest, data.indices[sm.firstIndex + i]);
-            const std::uint32_t count = sm.indexCount > 0 ? highest + 1 : 0;
-            if (static_cast<std::uint64_t>(sm.vertexOffset) + count > data.vertices.size())
+            const std::uint64_t count = sm.indexCount > 0 ? std::uint64_t{highest} + 1 : 0;
+            if (sm.vertexOffset < 0 || static_cast<std::uint64_t>(sm.vertexOffset) + count > data.vertices.size())
                 throw std::runtime_error("OptimizeMeshes: vertex range out of bounds");
-            counts.push_back(count);
+            counts.push_back(static_cast<std::uint32_t>(count));
         }
     const std::vector<bool> exclusive = ExclusiveVertexRanges(data, counts);
 

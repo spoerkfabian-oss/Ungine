@@ -7,12 +7,15 @@ Test executables and CMake test scripts. How to build and run them is described 
 
 | Target | Sources | Needs |
 |---|---|---|
-| `EngineTests` | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests`, `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests` | CPU only (audio uses the offline mixer or miniaudio's null device) |
+| `EngineTests` | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests`, `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests`, `MalformedInputTests` | CPU only (audio uses the offline mixer or miniaudio's null device) |
 | `EngineGpuTests` | `GpuTests.cpp` | A Vulkan device and a window (lavapipe + Xvfb in CI) |
 
 Both take an optional filter argument: only cases whose name contains it run
 (`EngineTests Blueprint`). Helpers: `Test.h` (`TEST_CASE`, checks, `RunAll`),
-`BlueprintTestUtil.h` (graph building helpers). Tests read sample content via `ENGINE_ASSET_DIR`
+`BlueprintTestUtil.h` (graph building helpers), `AllocationProbe.h` (replaces the global `operator new`
+in `EngineTests`; `Begin(limit)` makes larger single allocations on the calling thread throw
+`std::bad_alloc` and records the largest request, so tests can prove a loader never asks for huge
+buffers). Tests read sample content via `ENGINE_ASSET_DIR`
 (`assets/`) and write only below the system temp directory.
 
 GPU test conventions: editor tests pass `.layoutFile = {}` so a local `editor.ini` cannot change the
@@ -29,7 +32,9 @@ two frames.
   - `SmokeBasicProjectSetup` (Basic template) → `UnginePlayerBasicSmoke`
   - `SmokeLevelSwitchProjectSetup` (Basic + level switch + textured model) →
     `UnginePlayerLevelSwitchSmoke`, then `SmokePackageSetup` (`UngineCook`) →
-    `UnginePackagedPlayerSmoke` (plays from `Content.upak`; fails on "not cooked into the pak")
+    `UnginePackagedPlayerSmoke` (plays from `Content.upak`; fails on "not cooked into the pak"),
+    then `SmokePatchSetup` (`PatchSmoke.cmake`: a content change + `UngineCook --patch`) →
+    `UnginePatchedPlayerSmoke` (the packaged player mounts `Patch_1.upak`)
 
 Smokes need a display: run CTest under `xvfb-run -a` on headless Linux.
 

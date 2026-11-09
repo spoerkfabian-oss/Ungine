@@ -32,7 +32,7 @@ For sanitizer builds use separate FetchContent binary folders
 |---|---|
 | `UngineEditor [project.ungineproj] [--frames N]` | Editor; without a project the project browser opens |
 | `UnginePlayer [project.ungineproj] [--frames N]` | Runs a project; without an argument the project next to the executable (packaged game, mounts `Content.upak`) |
-| `UngineCook <project> <out> [--pak-only]` | Cooks and packages a game; exit 0 ok, 1 arguments/project, 2 cooking |
+| `UngineCook <project> <out> [--pak-only \| --patch] [--key <file>]` | Cooks and packages a game (or a patch against the game in `<out>`); exit 0 ok, 1 arguments/project, 2 cooking |
 | `Sandbox …` | Developer demo (below) |
 | `MakeSounds <dir>` | Regenerates the sample WAVs (`tools/`, not built by default) |
 
@@ -64,9 +64,9 @@ is installed below `bin/`: the executables, `shaders/` (SPIR-V + `source/`), `te
 
 | Suite | Contents |
 |---|---|
-| `EngineTests` (CPU) | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests` (randomized lifecycle audits), `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests` |
+| `EngineTests` (CPU) | `CoreTests`, `ScriptTests`, `BlueprintTests` (incl. prefabs), `Blueprint2Tests`, `Blueprint3Tests`, `ProjectTests`, `AudioTests`, `AudioMixTests`, `LifecycleTests` (randomized lifecycle audits), `StreamingTests`, `CookTests`, `PhysicsToolsTests`, `ParticleTests`, `NavigationTests`, `AnimationTests`, `RenderingTests`, `TerrainTests`, `MaterialTests`, `MalformedInputTests` (crafted files, allocation limits via `AllocationProbe`) |
 | `EngineGpuTests` | Real Vulkan device + window: rendering, culling, shadows, assets, editor workflows, UI automation |
-| Smokes (CTest) | `SandboxSmoke`, `SandboxEditorSmoke`, `SandboxLightsSmoke`, `SandboxInstancesSmoke`, `SandboxPhysicsSmoke`, `SandboxPhysicsEditorSmoke`, `SandboxCpuCullingSmoke`, `SandboxHotReloadSmoke`, `UngineEditorSmoke`, `UnginePlayerSmoke`, `UnginePlayerBasicSmoke`, `UnginePlayerLevelSwitchSmoke`, `UnginePackagedPlayerSmoke` with setup fixtures from `tests/MakeProject.cmake` |
+| Smokes (CTest) | `SandboxSmoke`, `SandboxEditorSmoke`, `SandboxLightsSmoke`, `SandboxInstancesSmoke`, `SandboxPhysicsSmoke`, `SandboxPhysicsEditorSmoke`, `SandboxCpuCullingSmoke`, `SandboxHotReloadSmoke`, `UngineEditorSmoke`, `UnginePlayerSmoke`, `UnginePlayerBasicSmoke`, `UnginePlayerLevelSwitchSmoke`, `UnginePackagedPlayerSmoke`, `UnginePatchedPlayerSmoke` with setup fixtures from `tests/MakeProject.cmake` and `tests/PatchSmoke.cmake` |
 
 Running them (Linux, headless):
 

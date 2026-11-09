@@ -8,6 +8,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <unordered_map>
 #include <chrono>
 #include <format>
 #include <fstream>
@@ -109,6 +111,11 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
         s.startScene                   = root->value("startScene", std::string());
         s.loadingScreen                = root->value("loadingScreen", std::string());
         s.saveVersion                  = std::max(root->value("saveVersion", 1u), 1u);
+        s.pakPublicKey                 = root->value("pakPublicKey", std::string());
+        if (!s.pakPublicKey.empty() && !ParsePakKeyHex(s.pakPublicKey)) {
+            SetError(error, "pakPublicKey is not a 64-digit hex key");
+            return std::nullopt;
+        }
         if (const auto w = root->find("window"); w != root->end()) {
             s.windowWidth  = std::clamp(w->value("width", s.windowWidth), 320u, 16384u);
             s.windowHeight = std::clamp(w->value("height", s.windowHeight), 200u, 16384u);
@@ -205,6 +212,7 @@ bool Project::Save(std::string* error) const
                     {"startScene", settings.startScene},
                     {"loadingScreen", settings.loadingScreen},
                     {"saveVersion", settings.saveVersion},
+                    {"pakPublicKey", settings.pakPublicKey},
                     {"window",
                      {{"width", settings.windowWidth},
                       {"height", settings.windowHeight},
@@ -356,8 +364,26 @@ void RemoveRecentProject(const fs::path& file, const fs::path& list)
 // --- Packaging ----------------------------------------------------------------------------------
 
 bool PackageProject(const Project& project, const fs::path& playerExecutable, const fs::path& outputDirectory,
-                    std::string* error, CookReport* reportOut)
+                    std::string* error, CookReport* reportOut, const PackageOptions* packaging)
 {
+    const auto step = [&](float value, const std::string& what) {
+        if (packaging && packaging->progress)
+            packaging->progress(value, what);
+    };
+    const auto cancelled = [&] { return packaging && packaging->cancelled && packaging->cancelled(); };
+    const auto cancel    = [&] {
+        SetError(error, "packaging was cancelled");
+        return false;
+    };
+    std::optional<PakKeyPair> signingKey;
+    if (!project.settings.pakPublicKey.empty()) { // before anything is written
+        std::string keyError;
+        signingKey = LoadPakSigningKey(project.settings, packaging ? packaging->keyFile : fs::path(), &keyError);
+        if (!signingKey) {
+            SetError(error, keyError);
+            return false;
+        }
+    }
     std::error_code ec;
     if (!fs::exists(playerExecutable, ec)) {
         SetError(error, "player executable not found: '" + PathToUtf8(playerExecutable) + "'");
@@ -385,11 +411,17 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
         SetError(error, what + ": " + ec.message());
         return false;
     };
+    step(0.0f, "Copying the player");
+    if (cancelled())
+        return cancel();
     // The game: player renamed after the project, finds the project file next to it.
     const fs::path game = outputDirectory / (PathFromUtf8(project.settings.name).string() + playerExecutable.extension().string());
     fs::copy_file(playerExecutable, game, fs::copy_options::overwrite_existing, ec);
     if (ec)
         return fail("copying the player");
+    step(0.01f, "Copying the shaders");
+    if (cancelled())
+        return cancel();
     for (const fs::directory_entry& e : fs::directory_iterator(ShaderDirectory(), ec))
         if (e.path().extension() == ".spv")
             fs::copy_file(e.path(), outputDirectory / "shaders" / e.path().filename(), fs::copy_options::overwrite_existing, ec);
@@ -404,11 +436,19 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     if (ec)
         return fail("copying the project file");
     fs::remove_all(outputDirectory / "Content", ec); // loose content of older packages
+    for (const fs::path& patch : PakPatches(outputDirectory)) // they would override the new pak
+        fs::remove(patch, ec);
     ec.clear();
 
     // The content: cooked into one pak (+ a build report next to it).
+    if (cancelled())
+        return cancel();
     CookOptions options;
     options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
+    options.progress = [&](float value, const std::string& what) { step(0.04f + 0.95f * value, what); };
+    if (packaging)
+        options.cancelled = packaging->cancelled;
+    options.signingKey = signingKey;
     const CookReport report = CookProjectContent(project, outputDirectory / "Content.upak", options);
     {
         std::ofstream text(outputDirectory / "BuildReport.txt", std::ios::binary | std::ios::trunc);
@@ -416,6 +456,8 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     }
     if (reportOut)
         *reportOut = report;
+    if (std::ranges::find(report.errors, std::string(kCookCancelled)) != report.errors.end())
+        return cancel();
     if (!report.Ok()) {
         SetError(error, std::format("cooking failed with {} error(s), first: {} (see BuildReport.txt)", report.errors.size(),
                                     report.errors.front()));
@@ -429,6 +471,264 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     ENGINE_INFO("Packaged '{}' into '{}': {} raw files, {} cooked models, {} cooked textures, {:.1f} MB pak",
                 project.settings.name, PathToUtf8(outputDirectory), report.rawFiles, report.cookedModels,
                 report.cookedTextures, report.pakBytes / 1048576.0);
+    step(1.0f, "Done");
+    return true;
+}
+
+// --- Patches -----------------------------------------------------------------------------------------
+
+namespace {
+
+// n of "Patch_<n>.upak", nullopt for other names.
+std::optional<std::uint32_t> PatchNumber(const fs::path& file)
+{
+    const std::string name = PathToUtf8(file.filename());
+    if (!name.starts_with("Patch_") || !name.ends_with(".upak") || name.size() <= 11 || name.size() > 16)
+        return std::nullopt;
+    std::uint32_t n = 0;
+    for (const char ch : std::string_view(name).substr(6, name.size() - 11)) {
+        if (ch < '0' || ch > '9')
+            return std::nullopt;
+        n = n * 10 + static_cast<std::uint32_t>(ch - '0');
+    }
+    return n;
+}
+
+} // namespace
+
+std::vector<fs::path> PakPatches(const fs::path& directory)
+{
+    std::vector<std::pair<std::uint32_t, fs::path>> found;
+    std::error_code                                 ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec))
+        if (const auto n = PatchNumber(it->path()); n && it->is_regular_file(ec))
+            found.emplace_back(*n, it->path());
+    std::ranges::sort(found);
+    std::vector<fs::path> files;
+    for (auto& [n, file] : found)
+        files.push_back(std::move(file));
+    return files;
+}
+
+bool PackagePatch(const Project& project, const fs::path& outputDirectory, std::string* error, CookReport* reportOut,
+                  const PackageOptions* packaging, fs::path* patchFile)
+{
+    if (patchFile)
+        patchFile->clear();
+    const auto step = [&](float value, const std::string& what) {
+        if (packaging && packaging->progress)
+            packaging->progress(value, what);
+    };
+    std::error_code ec;
+    const fs::path  base = outputDirectory / "Content.upak";
+    if (!fs::is_regular_file(base, ec)) {
+        SetError(error, "'" + PathToUtf8(outputDirectory) + "' holds no packaged game (Content.upak); package it first");
+        return false;
+    }
+    std::optional<PakKeyPair> signingKey;
+    if (!project.settings.pakPublicKey.empty()) {
+        std::string keyError;
+        signingKey = LoadPakSigningKey(project.settings, packaging ? packaging->keyFile : fs::path(), &keyError);
+        if (!signingKey) {
+            SetError(error, keyError);
+            return false;
+        }
+    }
+
+    // What the game has now: the newest entry per path over the base and its patches.
+    struct Shipped {
+        std::uint64_t hash = 0, size = 0;
+        bool          deleted = false;
+        std::string   path;
+    };
+    std::unordered_map<std::string, Shipped> shipped; // by lookup key (lowercase on Windows)
+    const auto key = [](std::string_view path) {
+#ifdef _WIN32
+        std::string lower(path);
+        std::ranges::transform(lower, lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return lower;
+#else
+        return std::string(path);
+#endif
+    };
+    std::vector<fs::path> layers{base};
+    const std::vector<fs::path> patches = PakPatches(outputDirectory);
+    layers.insert(layers.end(), patches.begin(), patches.end());
+    std::uint32_t next = 1;
+    try {
+        for (const fs::path& layer : layers) {
+            if (const auto n = PatchNumber(layer))
+                next = std::max(next, *n + 1);
+            const auto pak = PakFile::Open(layer, signingKey ? &signingKey->publicKey : nullptr);
+            for (const PakEntryInfo& e : pak->Entries())
+                shipped[key(e.path)] = {e.hash, e.size, e.Deleted(), e.path};
+        }
+    } catch (const std::exception& e) {
+        SetError(error, e.what());
+        return false;
+    }
+
+    // The current content, cooked into a temporary pak.
+    step(0.0f, "Cooking");
+    const fs::path temporary = outputDirectory / "Patch.tmp.upak";
+    CookOptions    options;
+    options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
+    options.progress = [&](float value, const std::string& what) { step(0.9f * value, what); };
+    if (packaging)
+        options.cancelled = packaging->cancelled;
+    CookReport report = CookProjectContent(project, temporary, options);
+    const auto cleanup = [&] {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+    };
+    if (std::ranges::find(report.errors, std::string(kCookCancelled)) != report.errors.end()) {
+        cleanup();
+        SetError(error, "packaging was cancelled");
+        return false;
+    }
+    if (!report.Ok()) {
+        cleanup();
+        if (reportOut)
+            *reportOut = report;
+        SetError(error, std::format("cooking failed with {} error(s), first: {}", report.errors.size(), report.errors.front()));
+        return false;
+    }
+
+    step(0.92f, "Comparing with the shipped content");
+    const fs::path file = outputDirectory / std::format("Patch_{}.upak", next);
+    CookReport     patchReport;
+    patchReport.warnings = report.warnings;
+    try {
+        const auto current = PakFile::Open(temporary);
+        PakWriter  writer(file);
+        for (const PakEntryInfo& e : current->Entries()) {
+            const auto it = shipped.find(key(e.path));
+            if (it != shipped.end() && !it->second.deleted && it->second.hash == e.hash && it->second.size == e.size) {
+                it->second.deleted = true; // seen: not removed below
+                continue;
+            }
+            if (it != shipped.end())
+                it->second.deleted = true;
+            const std::vector<std::byte> bytes = current->Read(e);
+            writer.Add(e.path, bytes, e.Compressed() ? PakCompression::Auto : PakCompression::None);
+            patchReport.entries.push_back({e.path, e.size, e.path.starts_with(kCookedPrefix) ? "cooked" : "changed"});
+        }
+        for (const auto& [lookup, s] : shipped)
+            if (!s.deleted) { // shipped before, gone now
+                writer.AddDeleted(s.path);
+                patchReport.entries.push_back({s.path, 0, "deleted"});
+            }
+        if (patchReport.entries.empty()) { // nothing changed: the writer removes its file
+            cleanup();
+            if (reportOut)
+                *reportOut = patchReport;
+            step(1.0f, "No changes");
+            return true;
+        }
+        writer.Finish(signingKey ? &*signingKey : nullptr);
+        patchReport.pakBytes = writer.BytesWritten();
+    } catch (const std::exception& e) {
+        cleanup();
+        SetError(error, e.what());
+        return false;
+    }
+    cleanup();
+    fs::copy_file(project.File(), outputDirectory / project.File().filename(), fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        SetError(error, "copying the project file: " + ec.message());
+        return false;
+    }
+    std::ranges::sort(patchReport.entries, {}, &CookReport::Entry::path);
+    patchReport.seconds = report.seconds;
+    {
+        std::ofstream text(outputDirectory / std::format("BuildReport_Patch_{}.txt", next), std::ios::binary | std::ios::trunc);
+        text << patchReport.Text();
+    }
+    if (reportOut)
+        *reportOut = patchReport;
+    if (patchFile)
+        *patchFile = file;
+    ENGINE_INFO("Patched '{}': {} with {} entries, {:.2f} MB", project.settings.name, PathToUtf8(file.filename()),
+                patchReport.entries.size(), patchReport.pakBytes / 1048576.0);
+    step(1.0f, "Done");
+    return true;
+}
+
+// --- Pak signing / packaged content ------------------------------------------------------------------
+
+fs::path PakKeyFile(const PakPublicKey& publicKey)
+{
+    return UserConfigDirectory() / "keys" / (HexString(publicKey) + ".key");
+}
+
+bool CreatePakSigningKey(Project& project, std::string* error)
+{
+    PakKeyPair      key  = GeneratePakKey();
+    const fs::path  file = PakKeyFile(key.publicKey);
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << HexString(key.seed) << "\n";
+        if (!out) {
+            SetError(error, "cannot write the signing key '" + PathToUtf8(file) + "'");
+            return false;
+        }
+    }
+    fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, ec); // private (POSIX)
+    key.seed.fill(0);
+    project.settings.pakPublicKey = HexString(key.publicKey);
+    return true;
+}
+
+std::optional<PakKeyPair> LoadPakSigningKey(const ProjectSettings& settings, const fs::path& keyFile, std::string* error)
+{
+    const std::optional<PakPublicKey> publicKey = ParsePakKeyHex(settings.pakPublicKey);
+    if (!publicKey) {
+        SetError(error, "the project has no pak signing key");
+        return std::nullopt;
+    }
+    const fs::path file = keyFile.empty() ? PakKeyFile(*publicKey) : keyFile;
+    std::ifstream  in(file, std::ios::binary);
+    std::string    text;
+    if (!in || !std::getline(in, text)) {
+        SetError(error, "the private pak signing key is not on this machine (expected '" + PathToUtf8(file) + "')");
+        return std::nullopt;
+    }
+    const std::optional<PakPublicKey> seed = ParsePakKeyHex(text);
+    std::fill(text.begin(), text.end(), '\0');
+    if (!seed) {
+        SetError(error, "'" + PathToUtf8(file) + "' is not a pak signing key");
+        return std::nullopt;
+    }
+    PakKeyPair key = PakKeyFromSeed(*seed);
+    if (key.publicKey != *publicKey) {
+        SetError(error, "'" + PathToUtf8(file) + "' holds another key than the project's pakPublicKey");
+        return std::nullopt;
+    }
+    return key;
+}
+
+bool MountPackagedContent(const Project& project, std::string* error)
+{
+    std::error_code ec;
+    const fs::path  base = project.Root() / "Content.upak";
+    if (!fs::is_regular_file(base, ec))
+        return true; // development: the loose Content/
+    const std::optional<PakPublicKey> required = ParsePakKeyHex(project.settings.pakPublicKey);
+    std::vector<fs::path>             layers{base};
+    const std::vector<fs::path>       patches = PakPatches(project.Root());
+    layers.insert(layers.end(), patches.begin(), patches.end());
+    std::vector<std::shared_ptr<const PakFile>> paks;
+    try { // all or nothing: a refused patch must not leave a half-patched game mounted
+        for (const fs::path& layer : layers)
+            paks.push_back(PakFile::Open(layer, required ? &*required : nullptr));
+    } catch (const std::exception& e) {
+        SetError(error, e.what());
+        return false;
+    }
+    for (std::shared_ptr<const PakFile>& pak : paks)
+        Vfs::Mount(std::move(pak), project.Root());
     return true;
 }
 

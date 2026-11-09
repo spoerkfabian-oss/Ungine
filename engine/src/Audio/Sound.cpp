@@ -7,6 +7,7 @@
 #include <miniaudio.h>
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -41,10 +42,12 @@ struct Decoder {
 // miniaudio file access through Vfs: a pak entry's byte range or a disk file. The path handed to
 // ma_decoder_init_vfs is UTF-8 (also on Windows).
 struct VfsHandle {
-    std::ifstream file;
-    std::uint64_t offset   = 0;
-    std::uint64_t size     = 0;
-    std::uint64_t position = 0;
+    std::ifstream          file;
+    std::vector<std::byte> memory; // compressed pak entries are decompressed here
+    bool                   inMemory = false;
+    std::uint64_t          offset   = 0;
+    std::uint64_t          size     = 0;
+    std::uint64_t          position = 0;
 };
 
 ma_result VfsOpen(ma_vfs*, const char* path, ma_uint32 openMode, ma_vfs_file* out)
@@ -56,6 +59,16 @@ ma_result VfsOpen(ma_vfs*, const char* path, ma_uint32 openMode, ma_vfs_file* ou
         if (!location)
             return MA_DOES_NOT_EXIST;
         auto handle = std::make_unique<VfsHandle>();
+        if (location->compressed) {
+            std::optional<std::vector<std::byte>> bytes = Vfs::Read(PathFromUtf8(path));
+            if (!bytes)
+                return MA_DOES_NOT_EXIST;
+            handle->memory   = std::move(*bytes);
+            handle->inMemory = true;
+            handle->size     = handle->memory.size();
+            *out             = handle.release();
+            return MA_SUCCESS;
+        }
         handle->file.open(location->file, std::ios::binary);
         if (!handle->file)
             return MA_ACCESS_DENIED;
@@ -82,7 +95,11 @@ ma_result VfsRead(ma_vfs*, ma_vfs_file file, void* dst, size_t bytes, size_t* re
     const std::uint64_t left = h.position < h.size ? h.size - h.position : 0;
     const std::size_t   want = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, left));
     std::size_t         got  = 0;
-    if (want > 0) {
+    if (want > 0 && h.inMemory) {
+        std::memcpy(dst, h.memory.data() + h.position, want);
+        got = want;
+        h.position += got;
+    } else if (want > 0) {
         h.file.clear();
         h.file.seekg(static_cast<std::streamoff>(h.offset + h.position));
         h.file.read(static_cast<char*>(dst), static_cast<std::streamsize>(want));

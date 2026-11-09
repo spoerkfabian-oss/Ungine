@@ -38,6 +38,9 @@ Blueprints (see [docs/history.md](docs/history.md)). The roadmap phases since th
 | 35 | Blueprints: inheritance like UE (parent classes, defaults, overrides with Call Parent, Is A / Cast To), recursion, nested containers | Merged (PR #24) |
 | 36 | Blueprints: latent nodes in functions, dispatcher signature checks, refactoring (rename in child classes, move to parent, class paths on move), ~55 utility nodes, async model loading | Merged (PR #24) |
 | 37 | Installers per CI: release workflow building and testing the Windows setup + ZIP and the Linux TGZ, GitHub releases on tags | Merged (PR #24); NSIS fix in PR #25 |
+| H2 | Hardening after an external audit (paks, cooks, malformed inputs, navmesh signatures) | PR #26 |
+| 38 | Tools: undoable content delete (project trash), nav-link and IK-target gizmos, bone overlay, background packaging with progress and cancel | PR #26 (stacked) |
+| 39 | Paks: zstd per entry, Ed25519 signatures with a key per project, delta patch paks | PR #26 (stacked) |
 
 ## Candidates for future phases
 
@@ -49,6 +52,6 @@ Not scheduled; to be discussed with the owner:
   area lights, temporal AO, TAA upscaling.
 - Content: material functions and static switches, custom materials on terrain/foliage/particles,
   GPU particles, mesh LODs for skinned meshes, morph targets, retargeting.
-- Tools: undoable delete in the content browser, IK and nav-link gizmos, bone overlay, a progress UI for
-  packaging, compressed/signed paks and patching.
+- Tools: undo for asset-window deletes, a bone overlay in the animation graph preview; paks: key
+  rotation, DLC paks, an update client.
 - Known limitations per system are listed in [docs/limitations.md](docs/limitations.md).

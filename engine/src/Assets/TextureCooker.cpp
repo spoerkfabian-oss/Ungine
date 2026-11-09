@@ -353,7 +353,7 @@ std::uint64_t LevelBytes(VkFormat format, std::uint32_t width, std::uint32_t hei
     const FormatInfo& info = RequireInfo(format);
     if (!info.compressed)
         return std::uint64_t{width} * height * info.blockBytes;
-    return std::uint64_t{(width + 3) / 4} * ((height + 3) / 4) * info.blockBytes;
+    return ((std::uint64_t{width} + 3) / 4) * ((std::uint64_t{height} + 3) / 4) * info.blockBytes;
 }
 
 std::string TextureCookKey(std::span<const std::byte> source, TextureKind kind, const TextureCookSettings& settings)
@@ -509,6 +509,7 @@ std::vector<std::byte> WriteKtx2(const TextureImage& image)
 
 TextureImage ReadKtx2(std::span<const std::byte> bytes)
 {
+    constexpr std::uint32_t kMaxKtx2Extent = 65536; // keeps the level size math far from overflow
     if (!IsKtx2(bytes))
         throw std::runtime_error("not a KTX2 file");
     const auto format      = static_cast<VkFormat>(Get<std::uint32_t>(bytes, 12));
@@ -529,6 +530,8 @@ TextureImage ReadKtx2(std::span<const std::byte> bytes)
         throw std::runtime_error("KTX2: only single 2D images are supported");
     if (levelCount > 16)
         throw std::runtime_error("KTX2: too many levels");
+    if (width > kMaxKtx2Extent || height > kMaxKtx2Extent)
+        throw std::runtime_error(std::format("KTX2: {}x{} exceeds the supported size", width, height));
 
     TextureImage image;
     image.format = format;
@@ -538,7 +541,7 @@ TextureImage ReadKtx2(std::span<const std::byte> bytes)
         const auto offset = Get<std::uint64_t>(bytes, 80 + std::size_t{i} * 24);
         const auto size   = Get<std::uint64_t>(bytes, 80 + std::size_t{i} * 24 + 8);
         const std::uint32_t w = std::max(width >> i, 1u), h = std::max(height >> i, 1u);
-        if (size != LevelBytes(format, w, h) || offset + size > bytes.size())
+        if (size != LevelBytes(format, w, h) || offset > bytes.size() || size > bytes.size() - offset)
             throw std::runtime_error(std::format("KTX2: level {} has an unexpected size", i));
         TextureImage::Level level{.offset = Align(image.data.size(), 16), .size = size, .width = w, .height = h};
         image.data.resize(level.offset + size);

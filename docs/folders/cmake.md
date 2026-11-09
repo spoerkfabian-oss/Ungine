@@ -7,7 +7,8 @@ CMake modules included by the top-level `CMakeLists.txt`.
 Fetches and configures every third-party library with `FetchContent` (all pinned to a tag or commit
 and added as `SYSTEM` so their warnings do not affect engine targets): Vulkan headers, volk,
 vk-bootstrap, VMA, GLFW, GLM, cgltf, stb, nlohmann/json, Jolt Physics, meshoptimizer, bc7enc_rdo,
-miniaudio (+ stb_vorbis, verblib), recastnavigation, glslang, Dear ImGui (docking) and ImGuizmo. Some
+miniaudio (+ stb_vorbis, verblib), recastnavigation, glslang, zstd, Monocypher, Dear ImGui (docking)
+and ImGuizmo. Some
 are built as small static libraries with `-O2` even in Debug (meshoptimizer, bc7enc, miniaudio,
 recastnav, glslang). See [architecture.md](../architecture.md#technology-stack) for the
 versions and roles.

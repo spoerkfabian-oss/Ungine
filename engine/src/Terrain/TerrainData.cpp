@@ -435,6 +435,11 @@ std::optional<TerrainData> LoadTerrain(const fs::path& file, std::string* error)
         SetError(error, "'" + PathToUtf8(file) + "' was written by a newer version");
         return std::nullopt;
     }
+    // Check the size against the file before allocating: a crafted header must not request ~4 GB.
+    if (jsonSize > remain) {
+        SetError(error, "'" + PathToUtf8(file) + "' is truncated");
+        return std::nullopt;
+    }
     std::string text(jsonSize, '\0');
     if (!take(text.data(), jsonSize)) {
         SetError(error, "'" + PathToUtf8(file) + "' is truncated");

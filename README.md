@@ -63,6 +63,10 @@ options: [docs/build-and-test.md](docs/build-and-test.md).
    **Build → Package project…** creates a standalone game folder (`<Name>.exe`, shaders, project,
    `Content.upak` = cooked content, `BuildReport.txt`); the *Package report* window lists warnings
    (missing references) and errors. Without the editor: `UngineCook <project> <target>`.
+   **Build → Package patch…** writes `Patch_<n>.upak` with only what changed since that folder was
+   packaged (`UngineCook <project> <target> --patch`). *Project settings → Pak signing* creates a
+   signing key: the paks are then signed and the game refuses others (the private key stays in your
+   user folder; copy it to build machines or pass it with `--key`).
 6. The player renders through the primary **Camera** component of the start scene (*File → Project
    settings…*). In the editor, *Game cam* shows that view.
 

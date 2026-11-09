@@ -13,6 +13,7 @@
 #include "../Scene/SceneJson.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -182,6 +183,38 @@ void WriteLight(Writer& w, const Light& l)
     w.Bool(l.castShadows);
 }
 
+// Smallest serialized size of each record: element counts are checked against the remaining bytes
+// with these, so a crafted count cannot make resize() allocate far more than the file holds.
+constexpr std::size_t kCountBytes        = sizeof(std::uint64_t); // String / Array length prefix
+constexpr std::size_t kMinTextureBytes   = kCountBytes + 1 + kCountBytes + kCountBytes + 8;
+constexpr std::size_t kMinMaterialBytes  = kCountBytes + sizeof(glm::vec4) + sizeof(glm::vec3) + 5 * 4 + 3 + 5 * 4;
+constexpr std::size_t kMinMeshBytes      = 2 * kCountBytes;
+constexpr std::size_t kMinNodeBytes      = kCountBytes + 2 * sizeof(glm::vec3) + sizeof(glm::quat) + 3 * 4 + 1;
+constexpr std::size_t kMinSkinBytes      = kCountBytes + 4 + kCountBytes;
+constexpr std::size_t kMinAnimationBytes = kCountBytes + 4 + kCountBytes;
+constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes;
+
+// Cooked models skip the glTF loader's checks: every index range must lie in the index buffer and
+// every index must address a vertex, or the GPU and the collision code read past the vertices.
+void ValidateGeometry(const ModelData& d)
+{
+    const auto checkRange = [&](std::uint32_t first, std::uint32_t count, std::int32_t vertexOffset) {
+        if (std::uint64_t{first} + count > d.indices.size())
+            throw std::runtime_error("cooked model: index range out of bounds");
+        for (std::uint32_t i = 0; i < count; ++i)
+            if (vertexOffset < 0 || std::uint64_t(vertexOffset) + d.indices[first + i] >= d.vertices.size())
+                throw std::runtime_error("cooked model: index out of the vertex range");
+    };
+    for (const Mesh& mesh : d.meshes)
+        for (const Submesh& sm : mesh.submeshes) {
+            if (sm.lodCount > kMaxLods)
+                throw std::runtime_error("cooked model: too many LODs");
+            checkRange(sm.firstIndex, sm.indexCount, sm.vertexOffset);
+            for (std::uint32_t l = 1; l < sm.lodCount; ++l)
+                checkRange(sm.lods[l].firstIndex, sm.lods[l].indexCount, sm.vertexOffset);
+        }
+}
+
 Light ReadLight(Reader& r)
 {
     Light l;
@@ -311,7 +344,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
     d.name     = r.String();
     d.vertices = r.Array<Vertex>();
     d.indices  = r.Array<std::uint32_t>();
-    d.textures.resize(r.Count(1));
+    d.textures.resize(r.Count(kMinTextureBytes));
     for (TextureData& t : d.textures) {
         t.name                   = r.String();
         t.kind                   = static_cast<TextureKind>(r.U8());
@@ -321,7 +354,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
         t.encoded = r.Array<std::byte>();
         t.hash    = r.U64();
     }
-    d.materials.resize(r.Count(1));
+    d.materials.resize(r.Count(kMinMaterialBytes));
     for (MaterialData& m : d.materials) {
         m.name              = r.String();
         m.baseColorFactor   = r.Pod<glm::vec4>();
@@ -338,12 +371,12 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
                                 &m.occlusionTexture})
             *t = r.I32();
     }
-    d.meshes.resize(r.Count(1));
+    d.meshes.resize(r.Count(kMinMeshBytes));
     for (Mesh& m : d.meshes) {
         m.name      = r.String();
         m.submeshes = r.Array<Submesh>();
     }
-    d.nodes.resize(r.Count(1));
+    d.nodes.resize(r.Count(kMinNodeBytes));
     for (ModelNode& n : d.nodes) {
         n.name   = r.String();
         n.local  = r.Transform();
@@ -354,17 +387,17 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
             n.light = ReadLight(r);
     }
     d.skinInfluences = r.Array<VertexSkinInfluence>();
-    d.skins.resize(r.Count(1));
+    d.skins.resize(r.Count(kMinSkinBytes));
     for (Skin& s : d.skins) {
         s.name         = r.String();
         s.skeletonRoot = r.I32();
         s.joints       = r.Array<SkinJoint>();
     }
-    d.animations.resize(r.Count(1));
+    d.animations.resize(r.Count(kMinAnimationBytes));
     for (AnimationClip& a : d.animations) {
         a.name     = r.String();
         a.duration = r.F32();
-        a.tracks.resize(r.Count(1));
+        a.tracks.resize(r.Count(kMinTrackBytes));
         for (AnimationTrack& t : a.tracks) {
             t.node          = r.U32();
             t.path          = static_cast<AnimationPath>(r.U8());
@@ -377,11 +410,12 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
     }
     d.boundsMin = r.Pod<glm::vec3>();
     d.boundsMax = r.Pod<glm::vec3>();
-    d.dependencies.resize(r.Count(1));
+    d.dependencies.resize(r.Count(kCountBytes));
     for (fs::path& p : d.dependencies)
         p = LoadPath(r.String(), modelDir);
     if (!r.AtEnd())
         throw std::runtime_error("cooked model: trailing data");
+    ValidateGeometry(d);
     d.optimized = true;
     return d;
 }
@@ -462,6 +496,12 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         if (options.progress)
             options.progress(value, step);
     };
+    const auto cancelled = [&] { return options.cancelled && options.cancelled(); };
+    const auto stopped   = [&] {
+        report.errors.push_back(std::string(kCookCancelled));
+        report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return report;
+    };
     const fs::path root    = fs::absolute(project.Root()).lexically_normal();
     const fs::path content = fs::absolute(project.ContentDirectory()).lexically_normal();
     const auto     entryPath = [&](const fs::path& file) { return GenericUtf8(file.lexically_relative(root)); };
@@ -470,10 +510,14 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         return !relative.empty() && !GenericUtf8(relative).starts_with("..");
     };
 
-    // Every regular file below Content/ (sorted: the pak does not depend on directory order).
+    // Every regular file below Content/ (sorted: the pak does not depend on directory order). Symlinks
+    // are followed only when their target stays inside Content/: a link to a file elsewhere on the
+    // machine must not end up in a distributed game.
     std::vector<fs::path> files;
     {
         std::error_code ec;
+        const fs::path  realContent = fs::weakly_canonical(content, ec);
+        ec.clear();
         for (fs::recursive_directory_iterator it(content, fs::directory_options::skip_permission_denied, ec), end;
              !ec && it != end; it.increment(ec)) {
             std::error_code e;
@@ -482,6 +526,13 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             const std::string name = PathToUtf8(it->path().filename());
             if (name.starts_with(".") || name.ends_with(".tmp"))
                 continue;
+            const fs::path target   = fs::weakly_canonical(it->path(), e);
+            const fs::path relative = e ? fs::path() : target.lexically_relative(realContent);
+            if (relative.empty() || *relative.begin() == "..") {
+                report.warnings.push_back("'" + entryPath(it->path().lexically_normal()) +
+                                          "' links to a file outside Content/ and was not packaged");
+                continue;
+            }
             files.push_back(it->path().lexically_normal());
         }
         if (ec)
@@ -516,6 +567,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         ++done;
         if (!IsModelFile(file))
             continue;
+        if (cancelled())
+            return stopped();
         progress(0.4f * static_cast<float>(done) / static_cast<float>(files.size()), "Cooking " + PathToUtf8(file.filename()));
         try {
             ModelData data = LoadGltf(file);
@@ -825,7 +878,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         const std::uint32_t threads = std::max(1u, options.threads ? options.threads : std::thread::hardware_concurrency());
         std::mutex progressMutex;
         const auto work = [&] {
-            for (std::size_t i = next++; i < jobs.size(); i = next++) {
+            for (std::size_t i = next++; i < jobs.size() && !cancelled(); i = next++) {
                 const TextureJob& job = jobs[i]->second;
                 try {
                     const CookResult r = CookTexture(*job.source, job.kind, options.textures);
@@ -843,6 +896,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             pool.emplace_back(work);
         work();
         pool.clear();
+        if (cancelled())
+            return stopped();
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             if (!failures[i].empty()) {
                 report.errors.push_back(failures[i]);
@@ -858,6 +913,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
     try {
         PakWriter writer(pakFile);
         for (const fs::path& file : files) {
+            if (cancelled()) // the writer deletes the unfinished pak
+                throw std::runtime_error(std::string(kCookCancelled));
             if (replaced.contains(file)) {
                 ++report.replacedFiles;
                 continue;
@@ -874,7 +931,12 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
                 continue;
             }
             const std::string path = entryPath(file);
-            writer.Add(path, *bytes);
+            // Sounds stay as they are: miniaudio streams them straight from the pak (and their
+            // formats are compressed already).
+            std::string extension = PathToUtf8(file.extension());
+            std::ranges::transform(extension, extension.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            const bool sound = extension == ".wav" || extension == ".ogg" || extension == ".mp3" || extension == ".flac";
+            writer.Add(path, *bytes, sound ? PakCompression::None : PakCompression::Auto);
             report.entries.push_back({path, bytes->size(), "raw"});
             ++report.rawFiles;
             report.rawBytes += bytes->size();
@@ -884,7 +946,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             report.entries.push_back({path, bytes.size(), path.starts_with(std::string(kCookedPrefix) + "models/") ? "model" : "texture"});
             report.cookedBytes += bytes.size();
         }
-        writer.Finish();
+        writer.Finish(options.signingKey ? &*options.signingKey : nullptr);
         report.pakBytes = writer.BytesWritten();
     } catch (const std::exception& e) {
         report.errors.push_back(e.what());
