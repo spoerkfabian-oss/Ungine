@@ -1176,7 +1176,8 @@ std::string Base64(const std::vector<std::uint8_t>& bytes)
 }
 
 // Square of half-size `s` in the XY plane facing +Z; base color from `image` (none if empty).
-std::string QuadGltf(float s, const std::string& image)
+// `otherDiagonal`: split along the other diagonal (same vertices, bounds and index count).
+std::string QuadGltf(float s, const std::string& image, bool otherDiagonal = false)
 {
     std::vector<std::uint8_t> buffer;
     const auto put = [&](const void* data, std::size_t bytes) {
@@ -1186,7 +1187,8 @@ std::string QuadGltf(float s, const std::string& image)
     const float         positions[] = {-s, -s, 0.0f, s, -s, 0.0f, s, s, 0.0f, -s, s, 0.0f};
     const float         normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
     const float         uvs[]       = {0, 1, 1, 1, 1, 0, 0, 0};
-    const std::uint16_t indices[]   = {0, 1, 2, 0, 2, 3};
+    const std::uint16_t indices[6]  = {0, 1, otherDiagonal ? std::uint16_t{3} : std::uint16_t{2},
+                                       otherDiagonal ? std::uint16_t{1} : std::uint16_t{0}, 2, 3};
     put(positions, sizeof(positions));
     put(normals, sizeof(normals));
     put(uvs, sizeof(uvs));
@@ -5598,4 +5600,61 @@ TEST_CASE(Editor_BlueprintInheritance)
     std::error_code ec;
     fs::remove_all(dir, ec);
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+}
+
+TEST_CASE(Navigation_MeshColliderReloadRebuildsTiles)
+{
+    // A reload that changes a mesh collider's triangles but keeps its index count and bounds (the
+    // same quad split along the other diagonal) rebuilds the navmesh; nothing else does.
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_nav_reload_{}", std::random_device{}());
+    fs::create_directories(dir);
+    WriteFile(dir / "floor.gltf", QuadGltf(5.0f, ""));
+    AssetManagerDesc desc;
+    desc.textures.cacheDirectory = dir / "cache";
+    {
+        AssetManager      assets(*F().renderer, *F().jobs, F().events, desc);
+        const auto        pump  = [&](const std::function<bool()>& done) {
+            return F().Pump([&] {
+                assets.Update();
+                return done();
+            });
+        };
+        const ModelHandle model = assets.LoadModel(dir / "floor.gltf");
+        CHECK(pump([&] { return assets.State(model) == AssetState::Ready; }));
+
+        Scene        scene;
+        const Entity floor = scene.CreateEntity("Floor");
+        scene.EditTransform(floor).rotation = glm::angleAxis(-glm::half_pi<float>(), glm::vec3(1.0f, 0.0f, 0.0f));
+        scene.GetRegistry().Emplace<MeshRenderer>(floor, MeshRenderer{.model = model, .meshIndex = 0});
+        scene.GetRegistry().Emplace<RigidBody>(floor, RigidBody{.type = BodyType::Static});
+        scene.GetRegistry().Emplace<Collider>(floor, Collider{.shape = ColliderShape::Mesh});
+        const Entity bounds = scene.CreateEntity("Bounds");
+        scene.GetRegistry().Emplace<NavMeshBounds>(bounds, NavMeshBounds{.halfExtents = {6.0f, 2.0f, 6.0f}});
+        scene.UpdateTransforms();
+
+        NavigationWorld navigation(F().jobs.get(), &assets, nullptr);
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().sources == 1 && navigation.Stats().tiles > 0);
+        const std::uint64_t built = navigation.Stats().tilesBuilt;
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt == built); // unchanged sources: nothing rebuilt
+
+        const std::uint32_t revision = assets.Revision(model);
+        WriteFile(dir / "floor.gltf", QuadGltf(5.0f, "", true));
+        CHECK(assets.Reload(model));
+        CHECK(pump([&] { return assets.Revision(model) != revision && assets.State(model) == AssetState::Ready; }));
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt > built && navigation.Stats().tiles > 0);
+        const std::uint64_t rebuilt = navigation.Stats().tilesBuilt;
+        navigation.Update(scene, 1.0f / 60.0f);
+        navigation.Flush(scene);
+        CHECK(navigation.Stats().tilesBuilt == rebuilt);
+        navigation.Reset();
+        assets.Release(model);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

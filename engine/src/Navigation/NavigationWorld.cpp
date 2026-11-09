@@ -591,6 +591,11 @@ struct NavigationWorld::Impl {
     std::shared_ptr<JobResults>           results = std::make_shared<JobResults>();
 
     std::unordered_map<std::uint64_t, SourceRecord>   sources;
+    struct GeometryHashEntry {
+        std::uint32_t revision = 0;
+        std::uint64_t hash     = 0;
+    };
+    mutable std::unordered_map<ModelHandle, GeometryHashEntry> geometryHashes; // see GeometryHash
     std::unordered_map<std::uint64_t, AreaRecord>     areas;
     std::unordered_map<std::uint64_t, LinkRecord>     links;
     std::unordered_map<std::uint64_t, BoundsRecord>   bounds;
@@ -831,10 +836,28 @@ struct NavigationWorld::Impl {
         const ModelSource source = assets->Source(mr->model);
         h.Add(std::string_view(source.primitive ? PrimitiveKey(*source.primitive) : PathToUtf8(source.file)));
         h.Add(mr->meshIndex).Add(assets->State(mr->model));
-        if (const Model* model = assets->Get(mr->model); model && mr->meshIndex < model->meshes.size())
+        if (const Model* model = assets->Get(mr->model); model && mr->meshIndex < model->meshes.size()) {
+            h.Add(GeometryHash(mr->model, *model));
             for (const Submesh& sm : model->meshes[mr->meshIndex].submeshes)
-                h.Add(sm.indexCount).Add(sm.boundsMin).Add(sm.boundsMax);
+                h.Add(sm.firstIndex).Add(sm.indexCount).Add(sm.vertexOffset);
+        }
         return h.Value();
+    }
+
+    // Content hash of a model's collision geometry, recomputed only when its revision changes. It
+    // stays stable across sessions (signatures are stored in bake files) and catches reloads that
+    // move vertices without changing index counts or bounds.
+    std::uint64_t GeometryHash(ModelHandle handle, const Model& model) const
+    {
+        const std::uint32_t revision = assets->Revision(handle);
+        if (const auto it = geometryHashes.find(handle); it != geometryHashes.end() && it->second.revision == revision)
+            return it->second.hash;
+        if (geometryHashes.size() > 1024) // released handles are never looked up again
+            geometryHashes.clear();
+        const std::uint64_t hash = Fnv1a64(std::as_bytes(std::span(model.collisionIndices)),
+                                           Fnv1a64(std::as_bytes(std::span(model.collisionPositions))));
+        geometryHashes[handle] = {.revision = revision, .hash = hash};
+        return hash;
     }
 
     void MarkDirty(const Box& region)
