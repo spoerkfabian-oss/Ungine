@@ -117,6 +117,9 @@ with a warning), sorted, reproducibly:
   old `Content/`, cooks `Content.upak` (cache `Saved/Cache/Textures`) and writes `BuildReport.txt`.
   It fails on cook errors or when the start scene / loading screen is not in the pak, and refuses
   the project folder itself as target.
+- `PackageProject(..., callbacks)`: optional progress (0..1 + step) and cancel poll, both on the
+  packaging thread; `CookOptions::cancelled` is polled between model files, texture jobs and pak
+  entries, a cancelled cook reports `kCookCancelled` and deletes its unfinished pak.
 - **UngineCook** (`apps/cook`, console): `UngineCook <project> <out> [--pak-only]`; exit 0 success,
   1 arguments/project, 2 cooking.
 - The player mounts `<root>/Content.upak` at startup. The editor shows the **Package report**

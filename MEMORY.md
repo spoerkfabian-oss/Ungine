@@ -23,10 +23,12 @@ project state materially changes.
 
 - Phases 1–37 are implemented and merged (see [docs/history.md](docs/history.md)); PR #25 (NSIS fix +
   English documentation overhaul) merged as c917f0a.
-- **Open: hardening PR** on `branch` (external audit of fc5e213, BUG-002…008): pak/VFS entry paths,
-  cook symlinks outside `Content/`, terrain JSON size, KTX2 range/block overflow, cooked-model counts,
-  navmesh mesh signatures with a geometry hash, indices past the vertices. New `tests/MalformedInputTests.cpp`
-  + `tests/AllocationProbe.*`.
+- **Open: PR #26** on `branch`: (1) hardening after the external audit of fc5e213 (BUG-002…008):
+  pak/VFS entry paths, cook symlinks outside `Content/`, terrain JSON size, KTX2 range/block overflow,
+  cooked-model counts, navmesh mesh signatures with a geometry hash, indices past the vertices; new
+  `tests/MalformedInputTests.cpp` + `tests/AllocationProbe.*`. (2) Phase 38 Tools stacked on it at the
+  owner's request: undoable content delete (`Saved/Trash`), nav-link / IK-target gizmos, bone overlay,
+  background packaging with progress + cancel.
 - Tag `v0.37.0` (first GitHub release) still to push — owner decides when.
 - Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
 
@@ -85,6 +87,10 @@ Engine
 - Prove "no huge allocation" with `AllocationProbe` (tests) instead of relying on a crash.
 
 Editor and tests
+- GCC 13 crashed (ICE) on a designated-initializer `EditCommand` with lambdas while `History.h` was
+  not included (incomplete type): include the header and build the command field by field.
+- GPU tests that click on something small in the viewport need a large window (the default
+  viewport is ~190x130 px); restore the old size afterwards, the window is shared by all tests.
 - Always pair `PropertyRow` with `PopID` (ImGui ID stack assert). ImGui 1.92.9 swapped `AddRect`
   thickness/flags. Re-fetch component pointers after operations that may reallocate pools
   (e.g. `AssignMaterial`).
@@ -143,6 +149,8 @@ and targeted tests. Still open:
 - 2026-11-06: documentation in English; `CLAUDE.md` becomes an index with rules, technical reference
   split into `docs/`; pages for the non-code folders in `docs/folders/` (owner: all docs in one place); stacked on PR #25.
 - 2026-11-09: external audit — verify every finding, fix the real ones, one hardening PR.
+- 2026-11-09: phase 38 = Tools (content delete undo, nav-link/IK gizmos, bone overlay, packaging
+  progress), stacked on PR #26.
 
 ## 7. Merge log
 
@@ -162,4 +170,4 @@ and targeted tests. Still open:
 | #23 | Phase 34 nested prefabs, settings undo | 2026-11-03 |
 | #24 | Phases 35–37 Blueprints, installers | fc5e213, 2026-11-05 |
 | #25 | NSIS fix + documentation overhaul | c917f0a, 2026-11-09 |
-| — | Hardening after the external audit (BUG-002…008) | open |
+| #26 | Hardening after the external audit (BUG-002…008) + phase 38 tools | open |

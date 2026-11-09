@@ -44,6 +44,7 @@ Each phase was delivered as one or more commits and, from Phase 24 on, as one pu
 | 36 | Blueprints: latent nodes in functions, dispatcher signatures, refactoring tools, ~55 utility nodes (PR #24) |
 | 37 | Installers per CI: release workflow with tested Windows setup/ZIP and Linux TGZ (PR #24, fix in PR #25) |
 | H2 | Hardening after an external audit: pak/VFS paths, cook symlinks, malformed terrain/KTX2/cooked models, navmesh reload signatures |
+| 38 | Tools: undoable content delete via `Saved/Trash`, nav-link and IK-target gizmos, bone overlay, background packaging with progress and cancel |
 
 Details of each phase's verification are in [verification.md](verification.md); decisions and lessons
 are in [MEMORY.md](../MEMORY.md).

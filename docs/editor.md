@@ -40,8 +40,13 @@ The engine core does not depend on ImGui; everything editor-related lives in the
   physics, scripts, audio, particles, navigation, animation, streaming, project, layout file,
   model references): dock space with a default layout (DockBuilder).
 - **Viewport:** scene rendered into a texture sized to the panel, only when visible; toolbar with
-  gizmo modes (W/E/R, local/world), overlays (Lights, BVH with depth, Colliders, Audio, FX, Volumes,
-  Nav), Anchor (joint frame), Game cam (view through the primary camera, gizmo off), debug views.
+  gizmo modes (W/E/R, local/world), overlays (Lights, BVH with depth, Colliders, Audio, Bones, FX,
+  Volumes, Nav), Anchor (joint frame), Link start / Link end (the gizmo moves a selected Nav Link's
+  point, one undo step per drag), Game cam (view through the primary camera, gizmo off), debug views.
+  **Bones** draws the skin joints of the selected model instances (or of the instance a selected node
+  belongs to); a click on a joint selects its node entity. While playing, the Animation Controller
+  inspector lists the graph's IK goals: **Drag** puts the gizmo on the goal's end bone and moves its
+  target (`AnimationSystem::SetIkTarget`, runtime only, no undo), **Release** clears it; Stop forgets it.
   ImGuizmo results become local TRS relative to the parent's world matrix. Picking by GPU ID buffer
   (two frames late), Ctrl/Shift-click toggles, box selection by dragging (bounds centers), F frames the
   selection's world bounds, Delete deletes. Hotkeys only when the viewport is hovered/focused.
@@ -64,7 +69,10 @@ The engine core does not depend on ImGui; everything editor-related lives in the
   (models, prefabs, sounds/cues, effects, terrains, materials onto meshes) or onto the selection
   (Blueprints); "+ New" (folder, Blueprint, scene, library, enum, struct, interface, physics material,
   sound cue, particle effect, animation graph, terrain, material, material instance); import, move,
-  rename (with reference repair), delete (confirmation; not undoable); set as start scene; assign to
+  rename (with reference repair), delete (confirmation; with a project the file or folder, a scene
+  with its baked navmesh, moves to `Saved/Trash/<time>-<n>/` and Ctrl+Z restores it and the start
+  scene; restores never overwrite a name taken again; trash folders older than 7 days are purged when
+  the editor opens the project; without a project the delete is permanent); set as start scene; assign to
   selection; create child blueprint/variant/instance.
 - Other windows: Blueprint, Blueprint types, Find in Blueprints, Particle Effect, Animation Graph,
   Material, Sound Cue, Physics material, Terrain, Navigation, Levels, Project Settings (incl. input,
@@ -113,8 +121,11 @@ and terrains. `EditorContext::modelRefs` owns all models the editor acquired (re
 
 - **Build & Run** (Ctrl+B): Save all, set a start scene if none, launch `UnginePlayer <project>`
   (it must sit next to the editor).
-- **Package project…**: folder dialog → `PackageProject` → **Package report** window (result, counts,
-  errors, warnings, pak entries, Show folder).
+- **Package project…**: folder dialog → packaging on a worker thread (`StartPackaging`): a
+  **Packaging** window shows the progress bar, the current step and **Cancel** (no pak is left
+  behind; copied player/shaders stay) → **Package report** window (result, counts, errors, warnings,
+  pak entries, Show folder). The editor saves everything first; edits made while packaging are not
+  part of the build. `Editor::PackageProject` blocks until done (tools, tests).
 
 ## UnginePlayer (`apps/player`)
 
