@@ -3,6 +3,7 @@
 #include "AllocationProbe.h"
 #include "Test.h"
 
+#include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/TextureCooker.h"
 #include "Engine/Terrain/TerrainData.h"
 
@@ -122,4 +123,39 @@ TEST_CASE(Malformed_Ktx2LevelRange)
     Patch(wide, 88, std::uint64_t{0});           // level size that matches the wrapped math
     CHECK(RejectsKtx2(wide));
     CHECK(LevelBytes(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 0xFFFFFFFEu, 4) == std::uint64_t{0x40000000} * 8);
+}
+
+// Record counts in a cooked model are checked against the smallest serialized record, so a count
+// of "one per remaining byte" no longer turns 64 KB of file into megabytes of empty records.
+TEST_CASE(Malformed_CookedModelCounts)
+{
+    const fs::path             file = fs::temp_directory_path() / "Model.glb";
+    const MeshOptimizeSettings settings;
+    std::vector<std::byte>     bytes = SerializeModelData(ModelData{}, file, settings);
+    CHECK(DeserializeModelData(bytes, file, settings).optimized);
+
+    // An empty model ends with: textures, materials, meshes, nodes, skin influences, skins and
+    // animations counts (7 x 8 B), bounds (24 B) and the dependency count (8 B).
+    const std::size_t texturesAt = bytes.size() - 88;
+    bytes.resize(bytes.size() + 65536, std::byte{0});
+    Patch(bytes, texturesAt, std::uint64_t{bytes.size() - texturesAt - 8});
+
+    for (const std::size_t countAt : {texturesAt, texturesAt + 8, texturesAt + 16, texturesAt + 24}) {
+        std::vector<std::byte> crafted = bytes;
+        if (countAt != texturesAt) {
+            Patch(crafted, texturesAt, std::uint64_t{0});
+            Patch(crafted, countAt, std::uint64_t{crafted.size() - countAt - 8});
+        }
+        bool rejected = false;
+        AllocationProbe::Begin(kSmallLimit);
+        try {
+            (void)DeserializeModelData(crafted, file, settings);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        } catch (const std::bad_alloc&) {
+        }
+        AllocationProbe::End();
+        CHECK(!AllocationProbe::Exceeded());
+        CHECK(rejected);
+    }
 }

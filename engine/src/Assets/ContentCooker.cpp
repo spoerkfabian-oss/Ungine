@@ -182,6 +182,17 @@ void WriteLight(Writer& w, const Light& l)
     w.Bool(l.castShadows);
 }
 
+// Smallest serialized size of each record: element counts are checked against the remaining bytes
+// with these, so a crafted count cannot make resize() allocate far more than the file holds.
+constexpr std::size_t kCountBytes        = sizeof(std::uint64_t); // String / Array length prefix
+constexpr std::size_t kMinTextureBytes   = kCountBytes + 1 + kCountBytes + kCountBytes + 8;
+constexpr std::size_t kMinMaterialBytes  = kCountBytes + sizeof(glm::vec4) + sizeof(glm::vec3) + 5 * 4 + 3 + 5 * 4;
+constexpr std::size_t kMinMeshBytes      = 2 * kCountBytes;
+constexpr std::size_t kMinNodeBytes      = kCountBytes + 2 * sizeof(glm::vec3) + sizeof(glm::quat) + 3 * 4 + 1;
+constexpr std::size_t kMinSkinBytes      = kCountBytes + 4 + kCountBytes;
+constexpr std::size_t kMinAnimationBytes = kCountBytes + 4 + kCountBytes;
+constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes;
+
 Light ReadLight(Reader& r)
 {
     Light l;
@@ -311,7 +322,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
     d.name     = r.String();
     d.vertices = r.Array<Vertex>();
     d.indices  = r.Array<std::uint32_t>();
-    d.textures.resize(r.Count(1));
+    d.textures.resize(r.Count(kMinTextureBytes));
     for (TextureData& t : d.textures) {
         t.name                   = r.String();
         t.kind                   = static_cast<TextureKind>(r.U8());
@@ -321,7 +332,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
         t.encoded = r.Array<std::byte>();
         t.hash    = r.U64();
     }
-    d.materials.resize(r.Count(1));
+    d.materials.resize(r.Count(kMinMaterialBytes));
     for (MaterialData& m : d.materials) {
         m.name              = r.String();
         m.baseColorFactor   = r.Pod<glm::vec4>();
@@ -338,12 +349,12 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
                                 &m.occlusionTexture})
             *t = r.I32();
     }
-    d.meshes.resize(r.Count(1));
+    d.meshes.resize(r.Count(kMinMeshBytes));
     for (Mesh& m : d.meshes) {
         m.name      = r.String();
         m.submeshes = r.Array<Submesh>();
     }
-    d.nodes.resize(r.Count(1));
+    d.nodes.resize(r.Count(kMinNodeBytes));
     for (ModelNode& n : d.nodes) {
         n.name   = r.String();
         n.local  = r.Transform();
@@ -354,17 +365,17 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
             n.light = ReadLight(r);
     }
     d.skinInfluences = r.Array<VertexSkinInfluence>();
-    d.skins.resize(r.Count(1));
+    d.skins.resize(r.Count(kMinSkinBytes));
     for (Skin& s : d.skins) {
         s.name         = r.String();
         s.skeletonRoot = r.I32();
         s.joints       = r.Array<SkinJoint>();
     }
-    d.animations.resize(r.Count(1));
+    d.animations.resize(r.Count(kMinAnimationBytes));
     for (AnimationClip& a : d.animations) {
         a.name     = r.String();
         a.duration = r.F32();
-        a.tracks.resize(r.Count(1));
+        a.tracks.resize(r.Count(kMinTrackBytes));
         for (AnimationTrack& t : a.tracks) {
             t.node          = r.U32();
             t.path          = static_cast<AnimationPath>(r.U8());
@@ -377,7 +388,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
     }
     d.boundsMin = r.Pod<glm::vec3>();
     d.boundsMax = r.Pod<glm::vec3>();
-    d.dependencies.resize(r.Count(1));
+    d.dependencies.resize(r.Count(kCountBytes));
     for (fs::path& p : d.dependencies)
         p = LoadPath(r.String(), modelDir);
     if (!r.AtEnd())
