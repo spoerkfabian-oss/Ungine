@@ -135,6 +135,18 @@ public:
     // project into the rectangle (viewport pixels). additive: added to the selection.
     void SelectInRect(glm::vec2 min, glm::vec2 max, bool additive);
 
+    // What the viewport gizmo moves besides the selection's transform (toolbar / inspector): a Nav
+    // Link's start or end point (undoable, one step per drag) or, while playing, the target of an IK
+    // goal of the selected Animation Controller (runtime only, like AnimationSystem::SetIkTarget;
+    // Stop forgets it). Falls back to the transform while the selection has nothing to move.
+    enum class GizmoTarget : std::uint8_t { Transform, LinkStart, LinkEnd, IkGoal };
+    void SetGizmoTarget(GizmoTarget target, std::string_view ikGoal = {});
+    [[nodiscard]] GizmoTarget CurrentGizmoTarget() const { return m_GizmoTarget; }
+    // World position the target gizmo sits at; nullopt when it does not apply to the selection.
+    [[nodiscard]] std::optional<glm::vec3> GizmoTargetPosition() const;
+    // The same as a gizmo drag to `world` (tests, scripted tools). False: nothing to move.
+    bool MoveGizmoTarget(const glm::vec3& world);
+
     // Edit operations (menu / hotkeys), all undoable.
     void DuplicateSelection(); // Ctrl+D
     void DeleteSelection();    // Del
@@ -475,6 +487,11 @@ private:
 
     // Edits in progress: gizmo drag, inspector widget (one undo step each when they end).
     std::optional<std::vector<StateEdit>> m_GizmoEdit;
+    GizmoTarget              m_GizmoTarget = GizmoTarget::Transform;
+    std::string              m_IkGizmoGoal;                // GizmoTarget::IkGoal
+    Entity                   m_IkGizmoEntity = NullEntity; // the controller m_IkGizmoTarget was set on
+    std::optional<glm::vec3> m_IkGizmoTarget;              // world, last value given to SetIkTarget
+    bool DrawTargetGizmo(const glm::mat4& view, const glm::mat4& projection); // false: not applicable
     std::optional<std::vector<StateEdit>> m_InspectorEdit; // primary first, then the multi-edited others
     std::string                           m_InspectorFrameState; // primary entity at the start of the inspector
 

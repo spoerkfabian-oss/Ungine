@@ -835,6 +835,16 @@ void Editor::DrawViewport()
         m_ShowBvh = !m_ShowBvh;
     if (m_Ctx.physics && toolButton("Colliders", m_ShowColliders))
         m_ShowColliders = !m_ShowColliders;
+    if (m_Ctx.scene.GetRegistry().Valid(Selected()) && m_Ctx.scene.GetRegistry().Has<NavLink>(Selected())) {
+        if (toolButton("Link start", m_GizmoTarget == GizmoTarget::LinkStart))
+            SetGizmoTarget(m_GizmoTarget == GizmoTarget::LinkStart ? GizmoTarget::Transform : GizmoTarget::LinkStart);
+        if (toolButton("Link end", m_GizmoTarget == GizmoTarget::LinkEnd))
+            SetGizmoTarget(m_GizmoTarget == GizmoTarget::LinkEnd ? GizmoTarget::Transform : GizmoTarget::LinkEnd);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The gizmo moves the selected Nav Link's start / end point");
+    }
+    if (m_GizmoTarget == GizmoTarget::IkGoal && toolButton(("IK: " + m_IkGizmoGoal).c_str(), true))
+        SetGizmoTarget(GizmoTarget::Transform);
     if (m_Ctx.scene.GetRegistry().Valid(Selected()) && m_Ctx.scene.GetRegistry().Has<Joint>(Selected())) {
         if (toolButton("Anchor", m_EditJointAnchor))
             m_EditJointAnchor = !m_EditJointAnchor;
@@ -866,6 +876,107 @@ void Editor::DrawViewport()
     ImGui::End();
 }
 
+void Editor::SetGizmoTarget(GizmoTarget target, std::string_view ikGoal)
+{
+    if (m_GizmoEdit) { // a drag in progress ends here, as one undo step
+        PushStateChange("Move", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    m_GizmoTarget = target;
+    m_IkGizmoGoal = target == GizmoTarget::IkGoal ? std::string(ikGoal) : std::string{};
+    m_IkGizmoTarget.reset();
+    m_IkGizmoEntity = NullEntity;
+}
+
+std::optional<glm::vec3> Editor::GizmoTargetPosition() const
+{
+    const Registry& registry = m_Ctx.scene.GetRegistry();
+    const Entity    primary  = Selected();
+    if (primary == NullEntity || !registry.Valid(primary))
+        return std::nullopt;
+    const glm::mat4& world = registry.Get<WorldTransform>(primary).matrix;
+    switch (m_GizmoTarget) {
+    case GizmoTarget::Transform:
+        return std::nullopt;
+    case GizmoTarget::LinkStart:
+    case GizmoTarget::LinkEnd: {
+        const NavLink* link = registry.TryGet<NavLink>(primary);
+        if (!link)
+            return std::nullopt;
+        return glm::vec3(world * glm::vec4(m_GizmoTarget == GizmoTarget::LinkStart ? link->start : link->end, 1.0f));
+    }
+    case GizmoTarget::IkGoal: {
+        if (m_PlayState == PlayState::Edit || !m_Ctx.animation || !registry.Has<AnimationController>(primary))
+            return std::nullopt;
+        if (m_IkGizmoTarget && m_IkGizmoEntity == primary)
+            return m_IkGizmoTarget;
+        // Not dragged yet: start at the goal's end bone (a node entity below the controller).
+        std::string bone;
+        if (const auto graph = m_Ctx.animation->Graph(registry.Get<AnimationController>(primary).graph))
+            for (const AnimIk& goal : graph->ik)
+                if (goal.name == m_IkGizmoGoal)
+                    bone = !goal.endBone.empty() ? goal.endBone : goal.bones.empty() ? std::string{} : goal.bones.back();
+        std::vector<Entity> stack{primary};
+        while (!bone.empty() && !stack.empty()) {
+            const Entity e = stack.back();
+            stack.pop_back();
+            if (const Name* name = registry.TryGet<Name>(e); name && name->value == bone)
+                return glm::vec3(registry.Get<WorldTransform>(e).matrix[3]);
+            if (const Hierarchy* h = registry.TryGet<Hierarchy>(e))
+                stack.insert(stack.end(), h->children.begin(), h->children.end());
+        }
+        return glm::vec3(world[3]);
+    }
+    }
+    return std::nullopt;
+}
+
+bool Editor::MoveGizmoTarget(const glm::vec3& world)
+{
+    if (!GizmoTargetPosition())
+        return false;
+    Registry&    registry = m_Ctx.scene.GetRegistry();
+    const Entity primary  = Selected();
+    if (m_GizmoTarget == GizmoTarget::IkGoal) {
+        if (!m_Ctx.animation->SetIkTarget(primary, m_IkGizmoGoal, world))
+            return false;
+        m_IkGizmoTarget = world;
+        m_IkGizmoEntity = primary;
+        return true;
+    }
+    const bool dragging = m_GizmoEdit.has_value();
+    if (!dragging)
+        m_GizmoEdit.emplace(std::vector<StateEdit>{{UuidOf(primary), SnapshotEntityState(m_Ctx.scene, primary)}});
+    NavLink&        link  = registry.Get<NavLink>(primary);
+    const glm::vec3 local = glm::vec3(glm::inverse(registry.Get<WorldTransform>(primary).matrix) * glm::vec4(world, 1.0f));
+    (m_GizmoTarget == GizmoTarget::LinkStart ? link.start : link.end) = local;
+    if (!dragging) {
+        PushStateChange(m_GizmoTarget == GizmoTarget::LinkStart ? "Move link start" : "Move link end", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    return true;
+}
+
+bool Editor::DrawTargetGizmo(const glm::mat4& view, const glm::mat4& projection)
+{
+    const std::optional<glm::vec3> position = GizmoTargetPosition();
+    if (!position)
+        return false;
+    glm::mat4  frame = glm::translate(glm::mat4(1.0f), *position);
+    const bool moved = ImGuizmo::Manipulate(glm::value_ptr(view), glm::value_ptr(projection), ImGuizmo::TRANSLATE,
+                                            ImGuizmo::WORLD, glm::value_ptr(frame));
+    const bool link  = m_GizmoTarget != GizmoTarget::IkGoal;
+    if (link && ImGuizmo::IsUsing() && !m_GizmoEdit)
+        m_GizmoEdit.emplace(std::vector<StateEdit>{{UuidOf(Selected()), SnapshotEntityState(m_Ctx.scene, Selected())}});
+    if (moved)
+        MoveGizmoTarget(glm::vec3(frame[3]));
+    if (link && !ImGuizmo::IsUsing() && m_GizmoEdit) {
+        PushStateChange(m_GizmoTarget == GizmoTarget::LinkStart ? "Move link start" : "Move link end", std::move(*m_GizmoEdit));
+        m_GizmoEdit.reset();
+    }
+    return true;
+}
+
 void Editor::DrawGizmo(float x, float y, float width, float height)
 {
     Registry&    registry = m_Ctx.scene.GetRegistry();
@@ -881,6 +992,9 @@ void Editor::DrawGizmo(float x, float y, float width, float height)
 
     // The engine projection is reverse-Z with an infinite far plane; ImGuizmo handles both.
     const CameraData camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+
+    if (m_GizmoTarget != GizmoTarget::Transform && DrawTargetGizmo(camera.view, camera.projection))
+        return;
 
     // Joint anchor: the frame (entity world x anchor) moves; the entity stays.
     if (Joint* joint = registry.TryGet<Joint>(primary); joint && m_EditJointAnchor && m_GizmoOperation != GizmoOperation::Scale) {

@@ -1050,6 +1050,8 @@ void Editor::Stop()
 {
     if (m_PlayState == PlayState::Edit)
         return;
+    if (m_GizmoTarget == GizmoTarget::IkGoal) // IK targets were runtime state of the play session
+        SetGizmoTarget(GizmoTarget::Transform);
     std::vector<std::uint64_t> selected;
     for (Entity e : m_Selection)
         if (m_Ctx.scene.GetRegistry().Valid(e))

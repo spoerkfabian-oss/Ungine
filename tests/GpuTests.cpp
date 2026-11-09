@@ -3854,6 +3854,7 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     CHECK(graph.has_value());
     if (!graph)
         return;
+    graph->ik.push_back(AnimIk{.name = "Hand", .kind = AnimIkKind::TwoBone, .endBone = "b_RightHand_08"}); // the IK gizmo's goal
     const fs::path file = dir / "Fox.uanim";
     CHECK(SaveAnimGraph(file, *graph)); // previewModel stays the template's Fox (relative path)
 
@@ -3985,8 +3986,24 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     runFrames(15);
     CHECK(animation.CurrentState(root) == "Look");
     CHECK(animation.Stats().instances == 1);
+
+    // IK gizmo: starts at the goal's end bone, drags its target (the hand follows), Stop forgets it.
+    editor.Select(root);
+    editor.SetGizmoTarget(Editor::GizmoTarget::IkGoal, "Hand");
+    Entity hand = NullEntity;
+    r.ViewOf<Name>().Each([&](Entity e, Name& n) { hand = n.value == "b_RightHand_08" ? e : hand; });
+    const std::optional<glm::vec3> handStart = editor.GizmoTargetPosition();
+    CHECK(hand != NullEntity && handStart && glm::distance(*handStart, glm::vec3(r.Get<WorldTransform>(hand).matrix[3])) < 1e-4f);
+    const glm::vec3 ikTarget = handStart.value_or(glm::vec3(0.0f)) + glm::vec3(0.0f, 0.15f, 0.1f);
+    CHECK(editor.MoveGizmoTarget(ikTarget));
+    runFrames(10); // the target gizmo draws; the hand reaches
+    CHECK(editor.GizmoTargetPosition() == std::optional<glm::vec3>(ikTarget));
+    const float reached = glm::distance(glm::vec3(r.Get<WorldTransform>(hand).matrix[3]), ikTarget);
+    ENGINE_INFO("IK gizmo: hand {:.4f} from the target (started {:.4f})", reached, glm::distance(*handStart, ikTarget));
+    CHECK(reached < 0.5f * glm::distance(*handStart, ikTarget));
     const std::uint64_t uuid = r.Get<Uuid>(root).value;
     editor.Stop();
+    CHECK(editor.CurrentGizmoTarget() == Editor::GizmoTarget::Transform && !editor.GizmoTargetPosition());
     runFrames(3);
     const Entity restored = scene.FindByUuid(uuid);
     CHECK(restored != NullEntity && !animation.HasInstance(restored));
@@ -4078,6 +4095,20 @@ TEST_CASE(Editor_NavigationBakeOverlayAndPlay)
     const Entity agent = scene.CreateEntity("Agent");
     scene.EditTransform(agent).position = {-5.0f, 0.0f, 0.0f};
     scene.GetRegistry().Emplace<NavAgent>(agent, NavAgent{.maxSpeed = 6.0f});
+
+    // Link gizmo: moves the end point (entity space), one undo step.
+    const std::uint64_t linkUuid = scene.GetRegistry().Get<Uuid>(link).value;
+    const auto          linkEnd  = [&] { return scene.GetRegistry().Get<NavLink>(scene.FindByUuid(linkUuid)).end; };
+    editor.Select(link);
+    editor.SetGizmoTarget(Editor::GizmoTarget::LinkEnd);
+    CHECK(editor.GizmoTargetPosition() == std::optional<glm::vec3>(glm::vec3(-1.0f, 0.0f, 8.5f)));
+    runFrames(2); // the target gizmo draws
+    CHECK(editor.MoveGizmoTarget({-1.0f, 0.0f, 9.0f}) && linkEnd() == glm::vec3(-1.0f, 0.0f, 9.0f));
+    CHECK(editor.UndoLabel() == "Move link end");
+    CHECK(editor.Undo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 8.5f));
+    CHECK(editor.Redo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 9.0f));
+    CHECK(editor.Undo() && linkEnd() == glm::vec3(-1.0f, 0.0f, 8.5f));
+    editor.SetGizmoTarget(Editor::GizmoTarget::Transform);
     editor.Select(agent);
     for (int i = 0; i < 300 && (navigation.Stats().sources < 2 || navigation.IsBuilding()); ++i)
         runFrames(1); // the plane loads, then its tiles build in the background
