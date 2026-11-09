@@ -229,6 +229,59 @@ TEST_CASE(Pak_WriteReadMountAndCorruption)
     fs::remove_all(dir, ec);
 }
 
+// Entry paths must stay below their mount root: a crafted pak with "..", absolute or drive paths is
+// refused when opened (otherwise ListFiles/Read would reach files outside the game folder), and the
+// writer never produces such entries.
+TEST_CASE(Pak_RejectsEscapingEntryPaths)
+{
+    const fs::path dir = TempDir("pak_escape");
+    {
+        PakWriter writer(dir / "Good.upak");
+        for (const char* bad : {"../outside.txt", "Content/../../x", "/abs/x", "C:/x", "Content\\x", "Content//x",
+                                "Content/./x", "Content/", "", ":cooked/../x"}) {
+            bool refused = false;
+            try {
+                writer.Add(bad, Bytes("x"));
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            CHECK(refused);
+        }
+        writer.Add("Content/aa/bb/outside.txt", Bytes("inside"));
+        writer.Finish();
+    }
+    // Same length, so only the index bytes change; the index hash is recomputed like a crafted pak would.
+    std::vector<std::byte> bytes   = ReadAll(dir / "Good.upak");
+    const std::string      inside  = "Content/aa/bb/outside.txt";
+    const std::string      escaped = "Content/../../outside.txt";
+    std::uint64_t          indexOffset = 0, indexSize = 0;
+    std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+    std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+    const std::string all(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const std::size_t at = all.find(inside, static_cast<std::size_t>(indexOffset));
+    CHECK(at != std::string::npos);
+    std::memcpy(bytes.data() + at, escaped.data(), escaped.size());
+    const std::uint64_t hash =
+        Fnv1a64(std::span<const std::byte>(bytes.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+    std::memcpy(bytes.data() + 32, &hash, sizeof(hash));
+    WriteBytes(dir / "Evil.upak", bytes);
+    WriteBytes(dir / "Game" / "outside.txt", Bytes("secret")); // where the escaped entry points to
+
+    bool refused = false;
+    try {
+        const auto evil = PakFile::Open(dir / "Evil.upak");
+        Vfs::Mount(evil, dir / "Game" / "Root"); // only reached without the check
+        for (const fs::path& file : Vfs::ListFiles(dir / "Game" / "Root" / "Content", true))
+            CHECK(Vfs::Read(file) != Bytes("secret"));
+        Vfs::UnmountAll();
+    } catch (const std::runtime_error& e) {
+        refused = std::string(e.what()).find("invalid entry path") != std::string::npos;
+    }
+    CHECK(refused);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ModelDataRoundTrip)
 {
     // Embedded textures (GLB), a skin with animations (the Basic template's banner) and an

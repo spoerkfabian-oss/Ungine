@@ -51,6 +51,26 @@ std::string LookupKey(std::string_view path)
     return key;
 }
 
+// Entry paths are relative, '/'-separated and never leave their root: no absolute paths, drive
+// letters, backslashes, NULs, empty, "." or ".." components (a crafted pak must not reach files
+// outside the mount point). Cooked entries are checked after their ":cooked/" prefix.
+bool ValidEntryPath(std::string_view path)
+{
+    if (path.starts_with(kCookedPrefix))
+        path.remove_prefix(kCookedPrefix.size());
+    if (path.empty() || path.find_first_of(std::string_view("\\:\0", 3)) != std::string_view::npos)
+        return false;
+    for (std::size_t start = 0;;) {
+        const std::size_t      end       = path.find('/', start);
+        const std::string_view component = path.substr(start, end == std::string_view::npos ? path.npos : end - start);
+        if (component.empty() || component == "." || component == "..")
+            return false;
+        if (end == std::string_view::npos)
+            return true;
+        start = end + 1;
+    }
+}
+
 std::string GenericUtf8(const fs::path& path)
 {
     const std::u8string s = path.generic_u8string();
@@ -105,8 +125,8 @@ void PakWriter::Add(std::string_view path, std::span<const std::byte> bytes)
 {
     if (m_Finished)
         throw std::logic_error("PakWriter: already finished");
-    if (path.empty())
-        throw std::invalid_argument("PakWriter: empty entry path");
+    if (!ValidEntryPath(path))
+        throw std::invalid_argument(std::format("PakWriter: invalid entry path '{}'", path));
     const std::string key = LookupKey(path);
     for (const PakEntryInfo& e : m_Entries)
         if (LookupKey(e.path) == key)
@@ -191,6 +211,8 @@ std::shared_ptr<const PakFile> PakFile::Open(const fs::path& file)
         e.offset = Take<std::uint64_t>(index, at);
         e.size   = Take<std::uint64_t>(index, at);
         e.hash   = Take<std::uint64_t>(index, at);
+        if (!ValidEntryPath(e.path))
+            throw std::runtime_error(std::format("'{}': invalid entry path '{}'", name, e.path));
         if (e.offset < sizeof(Header) || e.offset > header.indexOffset || e.size > header.indexOffset - e.offset)
             throw std::runtime_error(std::format("'{}': entry '{}' out of range", name, e.path));
         if (!pak->m_Index.emplace(LookupKey(e.path), pak->m_Entries.size()).second)
@@ -392,7 +414,9 @@ std::vector<fs::path> ListFiles(const fs::path& directory, bool recursive)
                 continue;
             if (!recursive && e.path.find('/', prefix.size()) != std::string::npos)
                 continue;
-            files.push_back((mount.root / PathFromUtf8(e.path)).lexically_normal());
+            const fs::path file = (mount.root / PathFromUtf8(e.path)).lexically_normal();
+            if (Relative(file, mount.root)) // entry paths are validated on open; never list outside the root
+                files.push_back(file);
         }
     }
     std::ranges::sort(files);
