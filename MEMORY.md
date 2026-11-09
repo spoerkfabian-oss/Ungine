@@ -1,1097 +1,156 @@
-# Ungine — Project Memory
-
-Persistent handover memory for continued development of Ungine.
-
-- Last updated: 2026-11-05 (Phases 35 + 36 blueprints + 37 CI installers on `branch`, all stacked in PR #24)
-- Repository: spoerkfabian-oss/Ungine
-- Default branch: main
-- Current working branch: branch
-- Project type: C++20 / Vulkan 1.3 3D game engine
-- Editor: UngineEditor
-- Player: UnginePlayer
-- Developer application: Sandbox
-
-## 0. Collaboration preferences
-
-- Answer in German, short and to the point; work token-efficiently.
-- Before starting a task, ask about real ambiguities (short multiple-choice questions with a recommended option).
-- Use and update memory often: MEMORY.md is the leading handover file (current state, rules, priorities); CLAUDE.md is the detailed technical reference (architecture, data layouts, verification history). Keep both current.
-- Review your own work before delivering: end with a self-review split into "bereits behoben" (already fixed) and "noch offen" (still open).
-
-## 1. Project purpose
-
-Ungine is a custom 3D game engine with an integrated editor and standalone player. Its intended workflow is broadly comparable to Unreal/Unity:
-
-- Entity Component System
-- scene and hierarchy editing
-- Blueprint-style visual scripting
-- prefabs
-- physically based rendering
-- GPU-driven rendering
-- clustered Forward+
-- Jolt Physics
-- 3D audio using miniaudio
-- asynchronous asset loading
-- project templates
-- packaging and standalone game execution
-
-Primary development target is Windows with Visual Studio 2022/MSVC and Vulkan 1.3. The GTX 1070 Ti is the reference development GPU. Mesh shaders are intentionally not required.
-
-The development style is concrete repository work: inspect the actual implementation, identify real defects, fix them, add regression tests where appropriate, commit the result, and verify the build/CI. Avoid speculative changes merely to produce commits.
-
-## 2. Branch and Git rules
-
-Repository:
-spoerkfabian-oss/Ungine
-
-Branch policy:
-- main is the default integration branch.
-- branch is the current user-requested working branch.
-- New work should be committed to branch unless the user explicitly changes the target.
-- claude/friendly-mccarthy-33nhl0 is an old feature branch that was merged and deleted. Do not recreate or use it.
-- Confirmed by the user on 2026-10-05: work on `branch`. Before new work, bring `branch` up to date with main (fast-forward or merge main into it).
-
-Normal workflow:
-1. Inspect current branch and relevant files.
-2. Reproduce or reason about the concrete problem.
-3. Make the smallest justified fix.
-4. Add or update regression coverage when useful.
-5. Commit with a clear message.
-6. Check the resulting commit and CI.
-7. Never claim CI is green without actually verifying it.
-
-The user prefers real GitHub commits rather than ZIP archives.
-
-## 3. Repository structure
-
-Current intended structure:
-
-Ungine/
-- apps/
-  - editor/
-  - player/ (main.cpp, OptionsMenu.h)
-  - cook/ (UngineCook: command-line packaging)
-  - sandbox/
-- engine/
-  - include/Engine/
-  - src/
-  - shaders/
-- editor/
-  - include/Editor/
-  - src/
-- tests/
-- tools/
-  - CMakeLists.txt
-  - MakeSounds.cpp
-- assets/
-- templates/
-- resources/
-- cmake/
-- CMakeLists.txt
-- CLAUDE.md
-- README.md
-
-Architecture of the structure:
-- Public engine headers are under engine/include/Engine.
-- Engine-private implementation headers remain under engine/src.
-- Editor headers are organized under editor/include/Editor.
-- Applications live under apps.
-- The developer sandbox lives under apps/sandbox.
-- Tool-specific build configuration lives in tools/CMakeLists.txt.
-- Renderer implementation details such as GpuScene and GpuCulling remain private.
-
-Relevant organization commits:
-- 6189db649ec47b7e899c028565f19d2c022fc7d4 — organize editor public headers
-- b308b342d9451eaa9d285760a5cff344b082a52c — move developer sandbox into apps
-- a5b31d179c50b3a2d47e6f660e4f340da24b0c6f — document tools build layout
-
-## 4. Build and test
-
-Typical Windows build:
-
-cmake -B build -G "Visual Studio 17 2022"
-cmake --build build --config Release
-
-CMake FetchContent supplies the dependencies. Vulkan SDK is required for glslc and a Vulkan 1.3 driver is required for runtime rendering.
-
-Test targets:
-- EngineTests — CPU tests
-- EngineGpuTests — GPU/editor smoke tests
-- CTest integration
-- GPU tests can be enabled with ENGINE_GPU_TESTS=ON
-
-Warning policy:
-- GCC/Clang use strong warnings and Werror in CI.
-- MSVC uses W4 and WX.
-- Warning regressions are treated as build failures.
-
-Packaging:
-- a game: Build → Package project… in the editor (Package report window) or `UngineCook <project> <out> [--pak-only]` → player, shaders/, project file, Content.upak, BuildReport.txt
-- cpack -C Release
-- Windows can produce NSIS and ZIP packages.
-- Linux produces a tarball and desktop integration script.
-
-## 5. Technology stack
-
-Core:
-- C++20
-- CMake 3.25+
-- GLM
-- GLFW
-- nlohmann/json 3.11.3
-- volk
-- vk-bootstrap
-- Vulkan Memory Allocator
-- Jolt Physics 5.6.0
-- meshoptimizer 0.25
-- cgltf
-- stb_image
-
-Rendering:
-- Vulkan 1.3
-- dynamic rendering
-- synchronization2
-- descriptor indexing/bindless
-- buffer device address
-- timeline semaphores
-- GPU-driven scene data
-- Forward+
-- PBR
-- cascaded shadow maps
-- GTAO
-- bloom
-- automatic exposure
-- tone mapping
-- image based lighting
-
-Audio:
-- miniaudio 0.11.22
-- stb_vorbis
-- Freeverb
-
-Editor:
-- Dear ImGui docking
-- ImGuizmo
-
-## 6. Core architecture
-
-### Application lifetime
-
-The Application member/lifetime ordering is intentionally:
-
-EventBus -> Input -> Window -> VulkanContext -> Renderer -> ThreadPool -> AssetManager
-
-Destruction happens in reverse order.
-
-Main-loop concept:
-1. Input new frame
-2. Poll events
-3. Flush EventBus
-4. If minimized, wait for events while still processing required uploads/assets
-5. FixedUpdate at 60 Hz using an accumulator
-6. AssetManager update
-7. application update
-8. Renderer BeginFrame
-9. render
-10. Renderer EndFrame
-
-Frame time is clamped to approximately 0.25 seconds.
-
-### ECS
-
-The engine uses a registry/entity/component architecture.
-
-Important convention:
-- Structural ECS changes should not be performed during active view iteration unless the registry guarantees safety.
-- Transform writes are currently a convention rather than an enforced API rule.
-- Scene::GetRegistry remains mutable intentionally.
-
-This is a major future audit area because scripts, prefabs, physics and editor operations can all mutate entities.
-
-### EventBus
-
-Properties:
-- typed publish/subscribe
-- RAII Subscription
-- true means event consumed
-- re-entrancy safe
-- thread-safe enqueue
-- delivery during Flush
-- move-only handlers supported
-
-Lifetime rule:
-- Subscription must not outlive its EventBus.
-
-### ThreadPool
-
-Properties:
-- fixed worker count, normally hardware concurrency minus one
-- FIFO work queue
-- Submit returns futures
-- future exceptions propagate
-- fire-and-forget jobs log exceptions
-- destructor drains the queue and joins workers
-
-## 7. Vulkan context and synchronization
-
-The Vulkan context enables the intended Vulkan 1.3 feature set, including:
-- dynamic rendering
-- synchronization2
-- buffer device address
-- descriptor indexing/update-after-bind
-- timeline semaphores
-- host query reset
-- anisotropy
-- depth clamp
-- non-solid fill
-- multi-draw indirect
-
-Frames in flight:
-- 2
-
-Depth/coordinate conventions:
-- negative viewport Y flip
-- positive visual Y direction
-- glTF CCW winding
-- Reverse-Z
-- depth clear = 0
-- comparison = GREATER_OR_EQUAL
-- D32_SFLOAT depth
-- sRGB BGRA8 swapchain
-
-Resize:
-- swapchain maintenance extensions are used when available
-- present fences allow old swapchains to be retired without unconditional device idle
-- fallback uses device idle where required
-
-Lifetime rule:
-- GPU resources must not be released until the relevant fence/timeline guarantees that no in-flight command can reference them.
-
-## 8. UploadQueue
-
-UploadQueue supports asset work from arbitrary worker threads.
-
-Operations include:
-- CreateBuffer
-- CreateTexture2D
-- CreateTexture
-- WriteBuffer
-
-Design:
-- staging ring
-- default staging size around 64 MB
-- 16-byte alignment
-- wrapping ring
-- oversized or full-ring allocations use dedicated staging buffers
-- copy recording is synchronized
-- uploads are grouped into batches
-- batches are submitted to the transfer queue when possible
-- timeline semaphore values identify batches
-- graphics command buffers record the required acquire operations
-
-Hardening already completed:
-- failed batches cannot remain permanently pending
-- discarded batches preserve ring ordering
-- reused batch state is reset
-- resources remain alive until upload readiness is established
-
-Known limitations:
-- a full ring uses dedicated staging instead of waiting
-- budget is byte based
-- mip operations can consume graphics time
-- QFOT has not been exercised by the current software test environment because it exposes only one queue family
-
-## 9. AssetManager
-
-Asset handles use index + generation. Zero is null. Handles do not themselves keep assets alive.
-
-Model flow:
-1. normalize the path
-2. cache by normalized absolute path
-3. increment reference count
-4. load/parse on the thread pool
-5. build model and GPU resources
-6. upload asynchronously
-7. main-thread Update transitions the asset toward Ready
-8. publish load/failure events after processing
-
-Release behavior:
-- zero references normally release the asset
-- still-uploading assets use deferred/graveyard lifetime
-- assets with unfinished jobs use an orphan path
-- shutdown waits for jobs, flushes uploads and releases resources
-
-Known limitations:
-- hot reload uses mtime polling
-- embedded textures are coupled to their model
-- generated CreateModel assets are not reloadable
-- instance refresh uses node-name matching
-- texture cache uses LRU/mtime behavior
-- some glTF texture formats/extensions are unsupported
-- geometry-pool exhaustion is a load failure
-- placeholders are simple box geometry
-
-Open audit:
-- simultaneous reload and release
-- shutdown while worker results are still pending
-- stale generation handles
-- failed upload cleanup
-- bindless slot lifetime
-- renderer shutdown ordering
-
-## 10. Rendering
-
-The renderer is GPU-driven but still performs important CPU-side visibility work.
-
-Important GPU data layouts:
-- Vertex: 48 B
-- GpuMaterial: 80 B
-- GpuSubmesh: 96 B
-- GpuInstance: 128 B
-- GpuDraw: 16 B
-- GpuBatch: 32 B
-
-Bindless resources include:
-- texture2D array
-- sampler array
-- storage image array
-- cube textures
-- image arrays for compute
-
-Main rendering sequence:
-1. environment/IBL update when needed
-2. shadow rendering
-3. depth/normal prepass
-4. GTAO
-5. clustered light culling
-6. PBR forward pass
-7. sky
-8. bloom
-9. auto exposure
-10. tone mapping
-
-Implemented features:
-- glTF metallic/roughness PBR
-- IBL
-- cascaded shadow maps
-- point and spot lights
-- local shadow atlas
-- Forward+ clustered lighting
-- depth/normal prepass
-- GTAO and bilateral filtering
-- bloom
-- histogram exposure
-- multiple tone mapping modes
-- GPU profiler
-- RenderOutput
-- shader hot reload
-
-Known limitations:
-- no mesh shaders
-- no meshlets
-- no mip streaming
-- no PCSS
-- GTAO is screen space
-- cluster grid is fixed at 16 x 9 x 24
-- cluster lists are capped
-- no depth min/max optimization for clusters
-- CSM is recomputed every frame
-- local shadow caching has documented limits
-- actual GTX 1070 Ti runtime validation is still required
-
-## 11. Scene and transform systems
-
-Scene contains:
-- entities
-- transform hierarchy
-- cameras
-- mesh renderers
-- lights
-- physics
-- audio
-- scripts
-- prefab data
-
-Transform processing is hierarchy aware and propagates parent-before-child.
-
-Spatial index/BVH:
-- used for rendering visibility queries
-- renderer owns the spatial index consumption path
-- changes must be marked correctly
-
-Editor reparenting:
-- preserves world position/transform
-- hierarchy mutations are delayed where necessary to avoid invalidating UI iteration
-
-Known limitations:
-- transform write rules are conventions
-- transform/culling jobs are not broadly parallelized
-- spatial raycast uses AABBs
-- physics raycast uses Jolt shapes
-- RenderOutput and swapchain share visibility logic
-
-## 12. Physics
-
-Backend:
-- Jolt Physics 5.6.0
-
-Lifecycle:
-- ECS physics components synchronize to Jolt
-- bodies are created/removed according to current component state
-- simulation updates transforms
-- world poses are written back to local transforms
-- parent transforms are validated before inversion
-
-Completed hardening:
-- replaced invalid GLM isfinite usage with std::isfinite-based checks
-- reject zero/near-zero scales
-- reject NaN/Inf scales
-- reject invalid physics matrices
-- reject non-finite positions and rotations
-- reject nearly singular parent matrices before inversion
-- validate all relevant matrix components
-- validate physics layer indices before accessing the collision matrix
-- invalid bodies are removed and creation is retried after returning to a valid state
-
-Regression tests:
-- Physics_InvalidScaleDropsBody
-- Physics_LayerMatrixValidation
-
-Important historical failure:
-ValidPhysicsScale existed but was not used. With warning-as-error builds this produced an unused-function failure. It is now called from SyncBody.
-
-Phase 26 additions (details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)"):
-- physics material assets (`.uphysmat`), per collider and per glTF material of a mesh collider; surface in raycasts and contacts
-- contact data (point, normal, impulse estimate, relative velocity, surfaces), CollisionPersistEvent, Blueprint On Hit / On Collision Stay
-- Joint component (Fixed/Hinge/Slider/Ball/Distance/Cone/SwingTwist/6DOF): Jolt body1 = B (connected or world), body2 = A, so limits/motors are A relative to B
-- ragdolls from skeletons (Ragdoll.h), character rotation modes / moving platforms / crouch / slope sliding / push strength
-- Jolt objects (GroupFilter, materials) must be created after AcquireJolt and released before ReleaseJolt (allocator registration)
-
-Known limitations:
-- mesh colliders are for static/kinematic use
-- contact impulse is estimated, not Jolt's solver lambda; motors only on hinge/slider/swing-twist
-- CCD is more expensive
-- negative scale is not preserved through current decomposition
-- Scaled uses absolute scale
-- synchronization is O(number of bodies) per frame
-
-## 13. Blueprint and visual scripting
-
-Supported systems include:
-- execution graphs
-- variables
-- arrays
-- maps
-- structs
-- enums
-- interfaces
-- Blueprint libraries
-- functions
-- macros
-- custom events
-- event dispatchers
-- timelines
-- tweens
-- input actions
-- save games
-- level requests
-- construction scripts
-- debugger and breakpoints
-- pure nodes
-- prefab spawning
-
-Completed hardening/testing includes:
-- pure-node cycle detection using an active evaluation set
-- 64-bit evaluation stamps
-- recursion/depth defense
-- construction-script state invalidation
-- correct invalidation of closed graph programs
-- array/map copy-on-write tests
-- debugger stepping and call-stack tests
-- macro/library/interface/dispatcher tests
-- Blueprint type validation
-
-Intentional constraints:
-- no general recursion
-- no Blueprint inheritance
-- no nested container types such as arrays of arrays
-- restricted map key types
-- enum values are index based
-- macro expansion copies graph state
-- interface calls are synchronous
-- latent nodes are not supported in function/interface bodies
-- timelines have limited track types
-- save slots are not versioned/encrypted
-- level loading is synchronous
-- entity references saved by UUID can become null after a level restart because spawned entities get new UUIDs
-
-Construction Script:
-- runs in editor after changes
-- runs before BeginPlay
-- generated entities are temporary/non-persistent
-- owner reset uses entity state snapshots and user-edit preservation
-- documented edge cases remain
-
-Debugger:
-- breakpoints
-- conditional breakpoints
-- hit counts
-- continue
-- step over
-- step into
-- step out
-- call stack
-- watches and pin values
-
-NEXT BLUEPRINT AUDIT:
-- entity destruction during script execution
-- component mutation during active script views
-- latent-node synchronization and cancellation
-- VM call-stack/depth behavior
-- COW lifetime under mutation
-- construction-owned entity cleanup
-- level transition during execution
-- debugger state after recompilation
-- prefab spawn/teardown interaction
-
-## 14. Prefabs
-
-Prefabs are stored as .uprefab files.
-
-Supported:
-- create from hierarchy
-- place/instantiate
-- instance overrides
-- revert one/all overrides
-- Apply to prefab
-- Unlink
-- refresh after file changes
-- Spawn Prefab from Blueprint
-
-Intentional limitations:
-- no nested prefabs
-- no variants/inheritance
-- hierarchy is defined by the prefab
-- prefab root transform is outside the stored prefab definition
-- Apply writes the prefab immediately
-- undo restores scene state rather than a transactional file history
-- refresh uses polling
-- Spawn Prefab loads synchronously
-
-Lifecycle audit:
-- spawned entity destruction
-- stale references after prefab refresh
-- construction-owned entities
-- scene unload ordering
-- prefab rebuild while instances are selected or referenced
-
-## 15. Audio
-
-Audio uses miniaudio.
-
-Implemented:
-- WAV/OGG/MP3/FLAC
-- streaming
-- 2D and 3D playback
-- buses
-- master volume
-- panning
-- inverse-distance attenuation
-- pitch
-- Doppler
-- looping
-- fades
-- pause/resume
-- occlusion
-- reverb zones
-- listener
-- editor preview
-- Blueprint audio nodes
-
-Race hardening:
-- TSan found races around smoothed bus volume and listener world-up
-- the affected implementation was changed to avoid unsafe concurrent miniaudio parameter access
-- later CPU tests reported no engine race
-
-Testing:
-- null-device playback
-- offline mix
-- asset loading/cache/release
-- editor playback controls
-- preview
-- occlusion/reverb behavior
-
-Known limitations:
-- no HRTF/binaural
-- ray-based occlusion (several rays, material absorption) without diffraction/portals
-- one global Freeverb-style reverb path
-- sound cues (.ucue) without nesting/sequences; loop repeats the chosen variant
-- voice stealing by estimated loudness, no virtual voices; no HRTF (deliberately)
-- raw audio packaging
-
-## 16. Editor
-
-UngineEditor is the integrated development environment.
-
-Major systems:
-- project launcher
-- dockspace
-- viewport
-- hierarchy
-- inspector
-- content browser
-- renderer panels
-- Blueprint graph editor
-- prefab workflow
-- undo/redo
-- asset management
-- game camera
-- audio controls
-- Blueprint debugger
-
-The engine core deliberately does not depend on ImGui.
-
-Known editor limitations:
-- no ImGui multi-viewports
-- limited import/thumbnail workflow
-- deleting assets is not fully undoable
-- renaming does not repair every external reference
-- picking has frame delay
-- box selection uses bounds centers
-- multi-object inspector lacks a full mixed-value representation
-- some interaction paths require manual testing
-
-Editor-specific lifetime rule:
-- viewport textures must remain alive long enough for the ImGui backend and GPU to finish using them
-- editor resources must not be released using a renderer lifetime mechanism that is too early for the backend
-
-## 17. Test and CI history
-
-The project has extensive CPU and GPU/editor test coverage accumulated through phases 1–20.
-
-Phase 20 covered:
-- Blueprint types
-- structs/enums/maps
-- Switch/Select/MultiGate/Delay
-- macros and libraries
-- interfaces and dispatchers
-- timelines and tweens
-- input actions
-- Save Game
-- level requests
-- debugger conditions and stepping
-- Construction Script
-- graph collapse
-- editor Blueprint tooling
-
-Documented validation results from the recent audit:
-- CPU CTest suite passed
-- GPU/editor suite passed in the software test environment
-- synchronization validation reported 0 errors in those runs
-- GCC/Clang warning builds were clean
-- ASan/UBSan found no engine defects; the known llvmpipe JIT leak remained
-- TSan found no engine race in the documented CPU run; external runtime/library findings were distinguished from engine code
-
-These are historical results. Always verify the current branch and current CI before presenting them as current.
-
-CI incident (2026-10-03/05): PR #11 (Phases 21-23, codex/feature-roadmap-and-phases) was merged although its CI was red (runs #70/#71); main stayed red (run #72: Build failed on Linux GCC, Linux Clang and Windows MSVC). Repaired on `branch` in 32ea260 (see section 18).
-
-## 18. Recent concrete fixes
-
-### GLM finite check fix
-Commit:
-1473984cceb95ed5d5209c64688116cb940bcd20
-
-Problem:
-GLM does not provide the used glm::isfinite API.
-
-Fix:
-Use std::isfinite with explicit component checks.
-
-### Degenerate physics scale hardening
-Commit:
-611191d9a0a1b7ef2349587ee4aaa0c75dfd9e38
-
-Problem:
-Invalid scale values could reach Jolt body creation. ValidPhysicsScale was initially unused.
-
-Fix:
-- reject near-zero scales
-- reject NaN/Inf
-- remove invalid body
-- retry when valid
-- maintain complete finite matrix checks
-
-Tests:
-ad9fe60911c879c71dd1e6c2ed21ac5a51073178
-
-### MSVC warning fix
-Commit:
-a9791a82448b32719f8582de8ec48c4488092e2f
-
-Problem:
-A local variable named begin shadowed an outer name under MSVC W4/WX.
-
-Fix:
-Renamed it to spawnBegin.
-
-### GitHub Actions update
-Commit:
-8055fee31ef3a398582deb4300bc83aa9fbdce27
-
-Fix:
-- actions/checkout upgraded to v5
-- actions/cache upgraded to v5
-Purpose:
-Node 24-compatible GitHub Actions.
-
-### Phase 21-23 build repair
-Commits:
-32ea260 and 5e62aec (on `branch`)
-
-Problem:
-Phases 21-23 (animation, runtime UI, content import) were merged to main without ever being compiled; every CI job failed in the Build step.
-
-Fix:
-- Registry gained a read-only ConstView / `ViewOf() const` (GpuScene joint palettes and UiSystem iterate a const Scene)
-- skinned vertices are uploaded as `span<const Vertex>`
-- the uiWidget scene reader captures ModelRefs for its image path
-- explicit `glm::vec2` for the UI root rect
-- default member initializers on UiWidget, AnimationTrack and StoredReferenceFile (designated initializers vs. -Wmissing-field-initializers)
-- player designated initializers in declaration order
-- Editor links nlohmann_json, includes ImGuiLayer.h, uses the ImGui 1.92.8 AddPolyline argument order
-- tests: missing Input/Events includes, a macro comma
-- 5e62aec (MSVC only): ContentBrowser `RelocateReference` takes the reference as UTF-8 `std::string` (`fs::path` has no implicit conversion to `std::string` on Windows); two C4456 shadowing renames (ScriptGraphEditor `frameLabel`, Blueprint2Tests `begin`)
-- two wrong test expectations corrected: blending towards a half turn is ambiguous (angleAxis(pi) has w = -0, so shortest-path slerp goes the other way) -> quarter turn; the UI layout test expected the pivot offset unscaled in y (164 is correct)
-
-Verification (local, 2026-10-05):
-- GCC 13 and Clang with Werror: clean
-- EngineTests: all passed
-- EngineGpuTests 30/30 plus 13 CTest smokes (lavapipe, synchronization validation): passed, 0 validation errors; the Basic-template player smoke exercises the animated banner (GPU skinning)
-- CI run for 5e62aec (push to `branch`): Windows MSVC (VS 2022 Debug, /W4 /WX) build + EngineTests, Linux GCC and Linux Clang (Werror) build + EngineTests all green. The lavapipe GPU job runs only on PR/main/manual dispatch and was not part of this run.
-
-### Phase A hardening (GPU tests for phases 21-23 + lifecycle audits, 2026-10-05)
-Merged as PR #13.
-
-Defects found by the new tests and fixed:
-- Prefab instances (and anything rebuilt from JSON) never animated or skinned: `ModelNodeRef::instanceRoot` stayed null. New `FindModelInstanceRoot` (nearest ancestor with ModelInstance) is used by `UpdateAnimations`, `GpuScene::UpdateJointPalettes` and the serializer; `instanceRoot` is only a refreshed hint now.
-- `UpdateAnimations` wrote every animated node every frame even for stopped clips (dirty transforms, BVH updates, local shadow cache invalidation): unchanged poses are skipped.
-- Editor Play mode: runtime UI was drawn but not interactive and UI events never reached Blueprints. `UiSystem::Update` now takes a `UiInput` (player: `UiInputFromWindow`); the editor feeds viewport mouse/keys while playing, clicks on widgets skip picking, events are dispatched after `ScriptSystem::Update`.
-- Content browser move/rename changed MeshRenderer models without `Scene::MarkChanged` (renderer/BVH/GPU instances kept the old model); now marked. Moves are refused while playing (Stop would restore the old paths). Imports finish even with the content browser closed.
-- Blueprint VM fired Tick/timers/delays/custom events on entities destroyed earlier in the same update; instances of destroyed entities are now skipped and pruned at the end of `Update`; `End` resets the stats counts.
-- Prefab members dragged out of their instance kept a stale `PrefabLink`; after a revert (member recreated) and moving the detached entity back below the instance, one of them was skipped when saving (data loss). Rebuild drops links to the instance from non-members; scene files do not write `prefabLink` for non-members.
-- Geometry pool fragmentation: first fit cut the large holes with small allocations, so a big model's reload failed with two thirds of the pool free. `RangeAllocator` is best fit now.
-- Removed the outdated glTF warning "runtime animation is not implemented yet".
-
-New tests: GPU `Render_SkinnedAnimationInstancesAndPrefabs`, `Render_RuntimeUiOverlay`, `Editor_RuntimeUiInPlayMode`, `Editor_ContentImportAndReferenceRepair`, `Asset_LifecycleStress`; CPU `tests/LifecycleTests.cpp` (scene hierarchy fuzz, prefab instance fuzz, scripts destroying/spawning while running, detached prefab member survives save, destroyed entity gets no more events), RangeAllocator best-fit case. Each fix was checked by running its test without the fix (fails) and with it (passes).
-
-### Phase 24 level/area streaming (2026-10-06)
-PR #14 from `branch`. Technical details: CLAUDE.md "Level-Streaming (Phase 24)".
-
-- Scene loading split into `PrepareSceneFile` (any thread), `AcquireSceneModels` and `InstantiatePreparedScene` (main thread); `LoadSceneFile` uses all three.
-- `LevelStreamer`: additive sub-levels wanted by requests (`Load`/Blueprint Load Stream Level) or `LevelStreamingVolume`s (box + load/unload margins = hysteresis; sources: `StreamingSource` entities, else the camera); parsed on the pool, models loaded before the entities are created in one step; unload hook = `ScriptSystem::EndPlayFor`; `LevelStreamedEvent`; streamed roots carry `StreamedLevel` and are never saved.
-- `LevelLoader`: Open Level in the player runs in the background behind a loading screen (project `loadingScreen` UI scene with a progress bar tagged "LoadingProgress", else built-in text + bar). The editor's Play-mode Open Level stays synchronous.
-- Blueprints: Load/Unload Stream Level (latent), Is Level Loaded, Level Loaded/Unloaded events; entity references into unloaded levels are null and resolve by UUID when the level loads.
-- Editor: Levels window, read-only previews in edit mode (inspector note + Open level, no gizmo, excluded from duplicate/delete/reparent/multi-edit/assign), volumes stream around the editor camera while playing, volume overlay + inspector, content browser repairs `level` paths and the project loading screen, Project Settings field. Basic template streams `Annex.scene.json`.
-
-Defects found and fixed while doing it:
-- Swapchain acquire barrier covered only COLOR_ATTACHMENT_WRITE: a pass that loads the swapchain image first (text overlay alone over the loading screen) was a READ-after-layout-transition hazard (found by the new `UnginePlayerLevelSwitchSmoke`; red before, green after).
-- Open Level node default pointed to `Main.uscene` (wrong extension).
-- `Lifecycle_PrefabInstancesFuzz` (Phase A, on main) could grow exponentially: Apply adds an instance's extra children to the prefab, instantiate/duplicate copy whole subtrees; whether it explodes depends on prefab-file mtime timing, so it passed in the full suite but ran for minutes alone (and could hang CI). Capped at 300 entities (clear instead) and Apply only for instances of at most 24 entities; still catches the stale-link bug (checked by reverting that fix).
-- Activation failure of a streamed level now releases its models.
-- Prefab Apply could write the same prefab UUID twice (unreadable prefab file): an entity created into the prefab keeps its own UUID as prefab UUID; moved below another instance whose member has that UUID as source, the dedup fell back to the entity's own (already used) UUID. Now a fresh UUID is chosen. Found by the capped prefab fuzz in CI (Clang, timing-dependent); deterministic regression test `Lifecycle_ApplyWithForeignMemberKeepsPrefabUuidsUnique` (red before, green after).
-
-### Phase 25 cooked builds, savegame versions, options (2026-10-06)
-Technical details: CLAUDE.md "Gekochte Builds, Savegame-Versionen, Optionen (Phase 25)".
-
-- `Core/FileSystem.h`: pak format v1 (one uncompressed file, index at the end, FNV-1a 64 per entry + index), `PakWriter`/`PakFile`, `Vfs::Mount` (paths below the root come from the pak; ":cooked/" entries for cooked data). Every content reader goes through the VFS (assets, glTF, scenes, prefabs, blueprints, script registry, sounds incl. streaming via miniaudio `ma_vfs`).
-- `Assets/ContentCooker.h`: everything below Content/ into the pak; glTF/GLB cooked as binary `ModelData` after optimization/LODs (raw model files left out), textures as KTX2 BC7/BC5 under their cook key, the rest raw; missing references reported; reproducible. The runtime prefers cooked models/textures; encoding with a mounted pak logs "not cooked into the pak".
-- `PackageProject` now cooks `Content.upak` + `BuildReport.txt` (no Content/ folder); `UngineCook` CLI; editor Package report window; player mounts `<root>/Content.upak`.
-- Savegames: `ProjectSettings::saveVersion`; older slots fire `Event.MigrateSaveGame`, newer slots are refused (not read, not overwritten); nodes Slot Version / Game Version.
-- `Core/GameOptions.h`: per-user `Settings.json` (graphics, bus volumes, remapped bindings); player options menu (Graphics/Audio/Controls with key capture, conflict hint, paging, resets), `Renderer::SetVSync`, `Window::SetSize`; Blueprint Options/Remap nodes; editor Play applies only the remapped input.
-- Tests: CPU `tests/CookTests.cpp` (5 cases), GPU editor package-report check, smokes `SmokePackageSetup` + `UnginePackagedPlayerSmoke` (Basic level-switch project with a textured model, played from the pak).
-
-### Phase 26 physics and character tools (2026-10-07)
-Technical details: CLAUDE.md "Physik-/Character-Werkzeuge (Phase 26)".
-
-- New: `Physics/PhysicsMaterial.h`, `Physics/Ragdoll.h`; Components Collider (rotation, material, meshMaterials), CharacterController (rotation, turnSpeed, crouchHeight, mass, pushStrength, slideOnSteepSlopes, movingPlatforms), Joint/JointMotor, Ragdoll/RagdollBone; serialized (joint UUIDs remapped on duplicate/prefab/level instantiation; material paths relative in files).
-- Blueprint: On Collision Stay, On Hit, On Joint Broken, contact outputs on Begin/End, Raycast Surface, character crouch/yaw/state, joint enable/connect/motor/state, ragdoll create/simulate.
-- Editor: inspector sections, joint overlay + "Anchor" gizmo mode, PHYS content type + Physics material window.
-- Fixes during development: GroupFilter created before Jolt's allocator was registered (ctor crash); slider/6DOF limits inverted (body order).
-- Tests: CPU `tests/PhysicsToolsTests.cpp` (7 cases), GPU `Physics_TriangleMaterialsAndEditorTools`.
-- Verification: CTest 18/18 with sync validation, ASan/UBSan clean (known llvmpipe leak only). MSVC lesson: C4458 also fires for locals in a nested `Impl` that hide members of the enclosing class (e.g. `PhysicsWorld::settings`); Clang `-Wshadow-all` does not catch this - avoid local names equal to outer-class members.
-
-### Phase 27 audio expansion (2026-10-12)
-Technical details: CLAUDE.md "Audio-Ausbau (Phase 27)".
-
-- New `Audio/SoundCue.h` (.ucue), AudioEngine bus nodes (`BusNode`: volume x snapshot mix, RMS level, ducking envelopes, continuous processing), voice priority/stealing/limits (`Admit`), AudioSystem cues/snapshots/multi-ray occlusion, `PhysicsMaterialData::absorption`, `PhysicsHit::absorption`.
-- Editor: Sound Cue window, CUE content type, mixer sections (limits, snapshots, ducking), reference repair for `.ucue` and collider material paths.
-- Found by the new GPU UI test: a `PropertyRow` without `PopID` in the Audio Source inspector (ImGui ID-stack assert) - always pair PropertyRow with PopID.
-- Tests: CPU `tests/AudioMixTests.cpp` (6 cases), GPU `Editor_AudioCuesMixerUi`.
-
-### Phase 28 particle system (2026-10-14)
-Technical details: CLAUDE.md "Partikel (Phase 28)".
-
-- New `engine/include/Engine/Particles/` (`ParticleEffect.h` data model + `.uparticle` JSON, `ParticleFields.h` field reflection shared by serialization and the editor UI, `ParticleWorld.h` CPU simulation on the ThreadPool with the main thread working along), private `src/Renderer/ParticleRenderer`, shaders `particle*.{vert,frag}` + `include/particle.glsl`, component `ParticleSystem`, `SceneRenderer::particles`, `ScriptContext::Particles()` / `ScriptSystem::SetParticleWorld`, editor `ParticleEditor` window (own preview SceneRenderer), PFX content type, FX viewport icons.
-- Found while testing: the finished check treated every emitter with burst modules as never done (one-shots never removed); a failed restart kept its old render output; Reset kept old stats; saving an effect from the editor hot-reloaded it and restarted running instances even with identical content (now: version only bumps on changed content, and not while an editor version is provided).
-- Found by the new cook test: effect texture paths and (Phase 27!) sound-cue variant paths outside their own folder ("../Textures/x.png") were stored absolute - packaged games on another machine would not find them. Both now store relative paths across folders like scene files (absolute only without a relative path).
-- Tests: CPU `tests/ParticleTests.cpp` (6 cases) + `Cook_ParticleEffectReferences`, GPU `Render_ParticlesSpritesRibbonsMeshes`, `Editor_ParticleEditorAndPreview`.
-
-### Phase 29 navigation (2026-10-15)
-Technical details: CLAUDE.md "Navigation (Phase 29)".
-
-- New dependency recastnavigation v1.6.0 (static lib `recastnav` from Recast/Detour/DetourCrowd/DetourTileCache sources, engine-private, -O2). New `engine/include/Engine/Navigation/` (`NavTypes.h` settings/profiles/areas/path types, `NavigationWorld.h`), private `src/Navigation/NavJson` (project settings JSON), components NavMeshBounds/NavArea/NavLink/NavObstacle/NavAgent, `ScriptContext::Navigation()` / `ScriptSystem::SetNavigationWorld`, AI blueprint nodes, `EditorContext::navigation`, editor `Navigation.cpp` window + overlay + inspector, Project Settings "Navigation", Physics template Wander.ugraph + agent + box obstacles.
-- Design: one tile cache + navmesh + query + crowd per profile; tiles rasterized in ThreadPool jobs (generation per tile drops stale results); sources diffed every Update by signature (UUID-keyed); baked `.unav` stores tiles + source signatures so loading rebuilds only changed tiles; Flush() for saving.
-- Found while testing: Detour's findRandomPointAroundCircle returns points far outside the radius (random point on a big polygon) → retry until inside; character agents on off-mesh links never crossed (npos overwritten by the character every frame) → while OFFMESH the entity is placed directly (test with a real gap, red without the fix); tiles rebuilt while a baked mesh collider was still loading would keep the hole → `missed` flag rebuilds them; replaced cache tiles lose their obstacles (touched refs) → obstacles re-added after a tile rebuild.
-- Tests: CPU `tests/NavigationTests.cpp` (6 cases), GPU `Editor_NavigationBakeOverlayAndPlay`.
-
-## 19. Important CI lesson
-
-A previous failure showed that syntax-only checking was insufficient.
-
-Valid-looking code still failed the real build because an unused helper triggered Werror on GCC/Clang and WX-related failure on MSVC.
-
-Rule:
-- perform actual target compilation
-- use production warning flags
-- wait for CI before merging
-- do not assume syntax-only success means CI success
-- never merge a pull request whose CI is red or still running (PR #11 was merged red and broke main); require status checks via branch protection
-
-## 20. Known limitations that should not be mistaken for regressions
-
-Rendering:
-- no mesh shaders
-- no meshlets
-- no mip streaming
-- no PCSS
-- limited shadow cache
-- fixed cluster layout
-- deferred renderer is not the primary path
-
-glTF:
-- no morph targets
-- limited color/UV support
-- selected extensions unsupported
-
-Physics:
-- no joints
-- limited collider set
-- limited collision event data
-- negative scale cannot be faithfully preserved
-
-Blueprint:
-- no general recursion
-- no inheritance
-- restricted nested containers
-- Open Level in editor Play mode is synchronous (the player loads in the background with a loading screen)
-- level streaming: a level's entities are created in one frame (spike for big levels), box volumes only (no priorities/budgets), sub-level renderer/physics settings ignored, a sub-level's primary camera can take over, a file is loaded at most once, UUID collisions with the main scene get new UUIDs, only script entity variables/overrides resolve late, previews are read-only (edit the level by opening it), no automatic reload of a loaded level, Open Level drops running sub-levels
-- save slots: migration only through the Blueprint event (no schema), the save version is a manually raised project integer
-- documented construction-script semantics
-
-Editor:
-- player options: the menu shows/remaps only an action's first key (more via Blueprint), no resolution/monitor choice, no gamepad bindings, axis remap changes keys only (scale kept), graphics options cap the level settings and apply only in the player (editor Play applies only the input bindings)
-- some interaction testing is manual
-- Content import supports GLB, glTF with local URI dependencies, PNG/JPEG/KTX2 and WAV/OGG/MP3/FLAC; other formats and remote glTF dependencies are unsupported
-- asset previews are asynchronous and cached through AssetManager; model geometry is shown as a bounded wireframe, materials as base-color/metallic/roughness swatches, and streamed audio has no decoded waveform
-- move/rename repairs recognized references in saved scenes, legacy Scenes JSON, prefabs, Blueprints and glTF plus the active scene/project start scene; arbitrary user-defined path strings, unsaved open Blueprint documents and references in unrecognized formats are not repaired
-- deleting remains non-undoable and does not enumerate or repair dependent references
-
-Particles:
-- CPU simulation (no GPU compute); collision = one physics raycast per particle per frame (cost), no depth-buffer collision; unlit + emissive only (no lighting/shadows on sprites; mesh particles get a simple sun/sky factor), no shadows cast
-- particles are drawn after transparent meshes (no interleaved sorting with them); alpha sorting per emitter + between emitters by bounds center; mesh particles do not write depth (alpha pass)
-- no GPU-side flipbook blending between frames, no motion vectors, no light emission, no vector fields / skeletal mesh sampling
-- effects restart on file changes (no state carry-over); one-shots from scripts are not stopped by ScriptSystem::End (Play/Stop and level changes reset the world)
-- a SceneRenderer must not render twice per frame (per-frame particle buffers are overwritten)
-
-Navigation:
-- geometry only from colliders (static / without RigidBody), no render meshes; dynamic objects need NavObstacle; no detail meshes (heights from polygons); tiles stored uncompressed
-- off-mesh links only between neighboring tiles (< tile size 9.6 m by default), traversed linearly (characters teleported along); obstacles box-with-yaw / cylinder only
-- baked file only for the main scene; source signatures miss model file changes with identical index counts / bounds
-- sources diffed every Update (O(colliders) per frame)
-
-Audio:
-- no HRTF
-- simple occlusion
-- simple reverb
-
-Packaging:
-- the pak is uncompressed and unsigned (hashes only detect corruption); entries are read whole into memory (except streamed sounds)
-- source images (PNG/JPEG) also ship raw in the pak (the cook key is the hash of the source bytes); model textures outside Content/ are missing in the game (warning)
-- always everything below Content/ (no exclusion list); shaders ship as a folder
-- models are re-optimized on every cook (only textures are cached); editor packaging is synchronous
-- cooked models need identical MeshOptimizeSettings in cooker and player (otherwise the missing glTF is loaded → load error)
-- reference checks only for scenes/prefabs (not for paths in Blueprint pins); unreferenced images are cooked as color
-
-## 21. Open audit priorities
-
-Status 2026-10-05 (Phase A): priorities 1-3 were audited with randomized lifecycle tests (tests/LifecycleTests.cpp, GPU `Asset_LifecycleStress`) plus targeted GPU tests; the defects found are listed in section 18 ("Phase A hardening"). Not yet covered by tests: debugger state after recompilation, level transition in the middle of a chain (Open Level inside ForEach), shutdown with pending asset jobs under ASan for the new tests. Priorities 4-5 still need Windows / real hardware (user).
-
-Priority 1: ECS and Scene lifecycle
-- destruction during script execution
-- creation/destruction during view iteration
-- component add/remove during views
-- stale Entity references
-- scene unload
-- prefab instance teardown
-- Construction Script-owned entities
-- hierarchy deletion/reparenting
-- selection after entity destruction
-
-Priority 2: Blueprint runtime lifecycle
-- call stack and depth
-- pure COW arrays/maps
-- latent scheduling/cancellation
-- shutdown while callbacks exist
-- level transition during execution
-- spawned entity lifetime
-- construction cleanup
-- debugger state after recompilation
-
-Priority 3: Asset lifetime
-- reload + release races
-- shutdown with pending jobs
-- stale generation handles
-- upload failures
-- bindless lifetime
-- renderer destruction ordering
-
-Priority 4: Windows/MSVC runtime
-- full W4/WX build
-- process launch
-- command-line parsing
-- UTF-8/Unicode paths
-- NSIS installer
-- .ungineproj file association
-- icons/resources
-- Build & Run
-- packaged player
-
-Priority 5: Real hardware
-- GTX 1070 Ti
-- Vulkan validation
-- synchronization validation
-- dedicated transfer queue/QFOT
-- actual GPU performance
-
-## 22. Engineering rules for future work
-
-1. Fix concrete bugs, not hypothetical ones.
-2. Preserve existing architecture unless evidence requires a change.
-3. Treat warnings as errors.
-4. Treat lifetime and synchronization as first-class correctness concerns.
-5. For ECS work, explicitly consider iterator invalidation and generation safety.
-6. For Blueprint work, consider VM state, recompilation, latent execution and teardown.
-7. For Vulkan work, reason about barriers, queue ownership, timeline values and frame lifetime.
-8. For physics work, validate all external numeric input before Jolt receives it.
-9. For asynchronous assets, ensure worker jobs cannot access destroyed owners.
-10. Add regression coverage for concrete bugs.
-11. Verify CI rather than assuming it.
-12. Keep commits focused and descriptive.
-13. Continue from the existing audit state rather than repeatedly fixing already-resolved issues.
-14. If no concrete issue is found, do not manufacture a code change; document the audit result and move on.
-
-## 23. Immediate continuation point
-
-User-approved work plan (2026-10-05, after PR #12 merged the build repair; main green at 181cfc6):
-
-1. Phase A (hardening): A1 GPU tests for phases 21-23 (skinning image/bounds, runtime UI interaction, content import + reference maintenance); A2 lifecycle audits (ECS/Scene, Blueprint runtime, asset lifetime; section 21) with regression tests and fixes.
-2. Roadmap phases 24 (level/area streaming), 25 (cooked builds + savegame versioning + options/input remapping), 26 (joints, character rotation, per-triangle materials, contact point/impulse), 27 (sound cues, voice priority, snapshots/ducking, multi-ray occlusion).
-3. Phases 28+ ("C" features, all approved): GPU particles; navmesh via Recast/Detour (zlib, FetchContent, engine-private) + AI Blueprint nodes; animation state machine/blend trees/IK; rendering TAA/decals/SSR/volumetric fog/terrain; editor material assets + material editor, nested prefabs, undo for renderer settings.
-
-Delivery: one PR per phase from `branch`; drive it until CI incl. the GPU suite is green; the user merges; start the next phase only after the merge (restart `branch` from main).
-
-Status 2026-10-06: Phase A merged (PR #13); Phase 24 merged (PR #14, merge f9a1699); `branch` restarted from main for Phase 25. Phase 25 merged (PR #15, merge 4c58715); `branch` fast-forwarded to main. Phase 26 merged (PR #16, 2026-10-12); `branch` restarted from main. Phase 27 merged (PR #17, merge 8377582, 2026-10-14), `branch` restarted from main; decisions (user "Mach es" = recommendation): sound cues as `.ucue` assets accepted wherever a sound path is, priority 0-255 with stealing + per-cue and per-bus limits, snapshots + sidechain ducking, multiple occlusion rays with absorption from `.uphysmat`, no diffraction, no HRTF. Afterwards the C phases (28+), ask first. C decisions (user, 2026-10-14): one PR per topic in order 28 particles → 29 navmesh → 30 anim state machine/IK → 31 rendering (TAA/decals/SSR/fog) → 32 terrain → 33 material editor → 34 nested prefabs + settings undo. Phase 28 particles: modular (Niagara-like emitter stacks of modules), simulated on the CPU with ThreadPool jobs (user chose CPU over GPU uber-shader), all renderers: sprites (billboard modes, flipbook, soft edges, alpha/additive, sorted), mesh particles, ribbons/trails, sub-emitters on events + collision (CPU → physics raycasts, not depth buffer), unlit + emissive only, stack editor window with own preview + curves/gradients, ParticleSystem component + Blueprint nodes. Phase 28 implemented on `branch` (2026-10-14), merged via PR #18 (merge fde7c2f, 2026-10-15; MSVC fund: test compared paths as strings, Windows temp path RUNNER~1 vs canonical long form -> use fs::equivalent); `branch` restarted from main. Phase 29 navmesh decisions (user, 2026-10-15): Recast/Detour tiled navmesh with runtime rebake; movement via DetourCrowd (avoidance, path smoothing; drives the entity directly or through the CharacterController); multiple agent profiles in the project (radius/height/climb/slope), one navmesh per profile; areas + costs (area volumes, per-agent filters), off-mesh links (jumps/ladders, one-way possible), dynamic obstacles (TileCache), baked navmesh file as asset (cooked; at runtime only changed tiles rebuilt); full editor (bounds volume, bake button, overlay polys/tiles/areas/links, test path by click, inspectors, Blueprint nodes Move To/Find Path/Random Point/Raycast). Phase 26 (joints/constraints, character rotation, per-triangle materials, contact point/impulse) – decisions (user, 2026-10-06): joints as a component with Fixed/Hinge/Slider/Ball/Distance/Cone + generic 6DOF and ragdoll creation from skeletons (limits, motors, break force, editor gizmo, Blueprint nodes); per-triangle collision materials as physics material assets (`.uphysmat`: friction, restitution, surface tag) assigned per glTF material of a mesh collider, surface reported in raycasts and contacts; contact events with point, normal, impulse, relative velocity, surfaces + Hit event with threshold + per-frame Persist events; character: rotation modes (none/movement/camera yaw/script, turn speed), moving platforms (ground velocity), crouch with headroom check, steep-slope sliding and push strength. Phase 25 decisions (user): one uncompressed pak file (index + hash; textures pre-cooked KTX2, models as binary mesh with optimization/LODs done, scenes/blueprints/sounds raw); everything from Content/ goes into the build; savegames carry a project save version, older slots trigger a Blueprint 'Migrate Save Game' event, newer slots are refused; built-in options menu (graphics/audio/controls with key remapping, conflict hint, reset) persisted per user + Blueprint API. Phase 24 decisions (user): additive sub-levels via streaming volumes or Blueprint Load/Unload Stream Level; Open Level async with a loading screen customizable via a UI canvas; editor Levels panel with preview loading, sub-levels edited by opening their file; cross-level references by UUID, null while unloaded, plus Is Level Loaded and Level Loaded events.
-
-For every concrete issue:
-- patch branch
-- add regression coverage where appropriate
-- commit
-- verify CI
-- update MEMORY.md when the project state materially changes
-
-If an audit finds no concrete defect:
-- make no speculative change
-- record the inspected area
-- continue with the next audit priority
-
-## 24. Roadmap status at handoff
-
-- Phases 21 (skeletal animation), 22 (runtime UI and pause menu) and 23 (content import and previews) are on main via PR #11 (merge 43b639d, Phase 23 = 4c73c55).
-- They did not compile when merged; the repair is 32ea260 on `branch` (section 18). Local GCC/Clang builds, CPU tests and the lavapipe GPU suite pass; CI on `branch` (5e62aec) is green for MSVC, GCC and Clang. PR #12 merged it on 2026-10-05 (merge 181cfc6); main is green.
-- Phase A added GPU tests for skinning (model, duplicate, prefab instances), runtime UI drawing and editor Play-mode interaction, content import and reference repair; import previews (thumbnails, waveforms) still have no dedicated test.
-- Phase A merged as PR #13 (2026-10-06).
-- Phase 24 (level/area streaming) merged as PR #14.
-- Phase 25 (cooked builds, savegame versions, options/remapping) merged as PR #15 (merge 4c58715, 2026-10-06).
-- Phase 26 (physics materials, contact data, joints, ragdolls, character tools) merged as PR #16 (2026-10-12).
-- Phase 27 (sound cues, voice priority/limits, snapshots, ducking, multi-ray occlusion) merged (PR #17, 2026-10-14).
-- Phase 28 (particles: module stacks, CPU simulation, sprites/meshes/ribbons, sub-emitters, collision, particle editor) merged (PR #18, fde7c2f, 2026-10-15).
-- Phase 29 (navigation: Recast/Detour tiled navmeshes per profile, runtime rebuild, baked .unav, areas/links/obstacles, DetourCrowd agents, AI blueprint nodes, editor tools) merged (PR #19, fa23918, 2026-10-22).
-- Phase 30 merged (PR #20); Phase 31 + 32 merged (PR #21, 83cdfcb, 2026-10-27).
-- Phase 33 (material editor: node graphs, instances, runtime-compiled shaders, per-submesh overrides) merged (PR #22, 2026-11-02).
-
-### Phase 30 animation state machine / IK – decisions (user, 2026-10-22)
-- State machine as asset `.uanim` + node graph editor; states = clip or blend space; transitions with conditions over parameters (Float/Int/Bool/Trigger), blend times; layers with bone masks; driven by blueprint nodes.
-- Blending: 1D blend space (phase sync), 2D blend space (triangulated), layers + bone masks (incl. additive), anim notifies/events (sound/particles/blueprint).
-- IK: two-bone (pole vector), foot IK on ground (physics raycast, pelvis offset, foot to normal), look-at/aim (limits, weight), FABRIK chains.
-- Test/template model: Khronos glTF sample "Fox" (mesh CC0, rig/animation CC-BY 4.0; clips Survey/Walk/Run), license in LICENSE.md.
-
-### Phase 30 animation (2026-10-22)
-Technical details: CLAUDE.md "Animation-State-Machine + IK (Phase 30)".
-- New `engine/include/Engine/Animation/` (AnimGraph `.uanim`, AnimGraphPlayer, AnimIk, AnimationSystem), component AnimationController (on the ModelInstance root; UpdateAnimations skips it), `ScriptContext::Animation()` / `ScriptSystem::SetAnimationSystem`, Anim blueprint nodes + On Anim Notify, `EditorContext::animation`, editor `AnimGraphEditor` window (canvas, blend-space plot, live preview), content type ANIM, Fox in the Physics template (Wander.ugraph sets Speed).
-- Found while testing: foot-IK rays started inside the character's own capsule (actor now ignored; red without fix); LookAt missed when ancestors moved the tip; notifies fired once per update instead of per loop crossing; **Phase 21 bug: OptimizeMeshes reordered vertices (vertex fetch) without the skin influences → every skinned mesh with its own vertex range exploded (Fox; the banner GPU test did not catch it)** → influences remapped too, regression in MeshOptimizer_LodChainAndReordering (red without fix). Lesson: look at a screenshot of every new model.
-- Tests: CPU `tests/AnimationTests.cpp` (6), GPU `Editor_AnimationGraphWindowAndPlay`; Navigation_PhysicsTemplateWanderer now also checks the Speed parameter.
-- Open: edit mode does not animate, foot IK has no effect in the preview (no physics), linear crossfades, unwrapped exit time, no bone overlay / IK gizmo, root motion translation only.
-
-### Phase 31 rendering – decisions (user, 2026-10-25)
-- TAA with motion vectors: sub-pixel jitter, velocity buffer (incl. skinning, particles), reprojection with neighborhood clamp, sharpening, velocity debug view (no upscaling, no FXAA).
-- Clustered decals: projection boxes sorted into the light clusters, applied in the forward shader before lighting (albedo, normal, roughness/metallic, emissive, angle fade, sort order); Decal component + Blueprint spawn.
-- SSR: Hi-Z raymarching over the existing pyramid, roughness-dependent blur, temporal accumulation (TAA reprojection), IBL fallback at screen edges / misses.
-- Fog: analytic height/distance fog + froxel volumetric fog with sun and local light scattering incl. shadows (light shafts), local fog volumes (box) as a component, settings in scene/editor.
-
-### Phases 35–37 – decisions (user, 2026-11-03)
-- Phase 35: Blueprint inheritance like UE (graph with a parent graph: inherits variables with overridable defaults, functions, events, dispatchers, timelines; override functions/events, "Call Parent"; interfaces inherited; "Cast To" / "Is A" nodes) + recursion (functions, interface calls) + nested containers (array of arrays/maps, more map key types).
-- Phase 36: latent nodes in functions / async (Delay, Timeline, AI Move To etc. inside functions and interface calls) + more nodes/comfort (node libraries, refactoring tools, dispatcher signature checks).
-- Phase 37: Ungine as an installable executable like Unity/UE: CI builds Release installers (Windows Setup.exe via NSIS + portable ZIP, Linux TGZ) and attaches them to a GitHub release/artifact.
-- One PR per phase as before.
-- Phase 36 decisions (user, 2026-11-04): stacked on `branch` (same PR #24, user merges later). Scope: latent nodes in functions (caller waits; interface calls run the rest async), dispatcher signature checks, refactoring tools (Is-A/Cast-To paths on move, rename across child graphs, move variable/function to parent class), more nodes (math/vector/string/array utilities, async asset load).
-- Phase 36 progress (2026-11-04): done and verified locally – latent nodes in impure functions (parked call stacks per Waiting/tick, per-call latent state), dispatcher signature checks, RenameInChildClasses / MoveToParentClass / class-path repair, ~55 utility nodes + Async Load Model. Limits in CLAUDE.md, Offene Punkte 13.
-- Phase 37 progress (2026-11-05): stacked in PR #24 (user said "Weiter" after 36). `.github/workflows/release.yml`: tag `v<version>` → GitHub release with packages + SHA256SUMS; push to main / manual dispatch → artifacts (14 days). Linux TGZ (tested incl. running the cooked game on lavapipe), Windows NSIS setup + ZIP (cook-only smoke, no Vulkan on runners). `tests/PackageSmoke.cmake` checks a package before upload. Version 0.37.0 in CMakeLists.txt, `ENGINE_PACKAGE_VERSION`, package names `Ungine-<v>-{windows,linux}-x64`. Verified locally: Linux Release build, EngineTests, cpack TGZ, PackageSmoke with player (and fails on a broken package). Not verified: the Windows job and the release job (only run on main/tags/dispatch, not on PRs) – after merge, run "Actions → Release → Run workflow" or push tag v0.37.0.
-- Phase 35 progress (2026-11-03): done and verified locally – nested container types (`PinType::inner`, interned), float/vec3 map keys, recursion (saved frames, depth 256), inheritance (`parent`/`defaults`, `ResolveScriptParent`, flatten before expansion with "Super<n>:" renames, Call Parent nodes, Class.IsA/CastTo, `Program::classes`), editor Class section + "Create child blueprint". Limits in CLAUDE.md, Offene Punkte 13.
-
-### Phase 34 nested prefabs + settings undo – decisions (user, 2026-11-02)
-- Prefabs: nested (prefab instances inside prefabs, overrides per level, Apply chooses the target level) + variants (.uprefab with base prefab + overrides). Not: reparenting members / adding-removing components or children as overrides.
-- Settings undo in the scene history: renderer settings, project settings (audio mixer, input, navigation, save/loading screen), physics settings, and editor view (camera/toolbar overlay toggles).
-- Editor view camera: undo only for discrete jumps (Focus F, Game-cam on/off, camera fields in the renderer panel like FOV/speed); free flight is not undoable; toolbar toggles (overlays, debug view) always.
-- Asset windows (Blueprint, Material, Particle, Animation) keep their own undo (no global history).
-- Implementation notes (2026-11-03): prefab files v2 store nested instances like scene files and are *expanded on load* (scene format unchanged; one PrefabInstance per outermost instance). Cache entries carry transitive dependencies; InvalidatePrefab after every write. Self-nesting on write is flattened with a warning (the lifecycle fuzz depends on that). Inner-level Apply goes through a scratch instance + WriteAndLink and only transfers component values. Settings undo = per-frame baseline compare (TrackSettings) + EditCommand::sceneChange (History::Dirty counts scene changes only). Camera fields are tracked per widget (the fly camera updates in app code, so a per-frame diff cannot tell wheel speed changes apart).
-
-### Phase 33 material editor – decisions (user, 2026-10-27)
-- Node-graph materials (`.umat`): nodes (textures, math, parameters, Fresnel, Panner, …) → generated GLSL, own pipeline per material, live preview sphere.
-- Also: material instances (override parameters of a base material, settable per Blueprint at runtime), blend/shading models (Opaque/Masked/Translucent/Additive, Unlit, Two-Sided, Emissive), vertex animation (world position offset with velocity for TAA), per-submesh material overrides on MeshRenderer (drag & drop in the editor).
-- glTF materials stay the default; `.umat` only as override.
-
-### Phase 33 material editor (2026-10-27)
-Technical details: CLAUDE.md "Materialien (Phase 33)".
-- New deps/modules: glslang (FetchContent `vulkan-sdk-1.4.357.0`, engine-private) + `Renderer/ShaderCompiler.h` (runtime GLSL→SPIR-V, virtual includes, defines); `Engine/Material/` (MaterialGraph `.umat`/`.uminst`, node registry, codegen, MaterialAsset); `src/Material/MaterialBuild` (worker: instance chain, codegen, compile with memory + disk cache); `AssetManager::LoadMaterial/ProvideMaterial*/MaterialVersion`; component `MaterialOverrides`; editor `MaterialEditor` window; Blueprint nodes Set Material / Set Material Scalar|Vector Parameter / Clear Material Parameters; Basic template `Content/Materials/Pulse.umat` + `Pulse_Warm.uminst`.
-- Key design: generated code is injected into the **existing** engine shaders via `#ifdef CUSTOM_MATERIAL` (mesh.vert, depth_normal*.frag, mesh*.frag, shadow*.vert/frag) → lit materials use the same `ShadeSurface` as glTF (a lit graph with glTF values renders identical ±1). Parameter values never change the code (instances share shaders). GPU scene: material slots, batch key includes slot + material revision, **dynamic buckets** (camera 5 + 2·slot + mirrored, shadow 2 + slot, `kBucketNone`), bucket offsets = prefix sums uploaded for `gpu_cull.comp`, `GpuDraw::params` = per-draw parameter block (material block + entity overrides). Shader sources ship in `shaders/source` (build copy, install, packaging).
-- Gotchas: glslang with SPIR-V 1.6 turns `discard` into DemoteToHelperInvocation (feature not enabled) → target SPIR-V 1.5; ImGui 1.92.9 swapped `AddRect` thickness/flags (old order is deleted); editor UI tests need the GLFW window large enough for floating windows (320×240 default); ImGui windows opened at 1180×680 lie off-screen in tests. Segfault in the GPU suite (CI + local, "after Streaming_LevelLoaderSwitch") was really `Render_CustomMaterials`: `any_of(F().assets->Materials().begin(), F().assets->Materials().end())` = two different temporaries (UB) – stdout is buffered in a pipe, so the last printed `[ OK ]` lies about where a crash happened; find it with ASan (build-asan needs `-fno-sanitize=vptr`, glslang has no RTTI; FetchContent sources via `FETCHCONTENT_SOURCE_DIR_<NAME uppercased, hyphens kept>`). Editor `DrawMaterialSlots`: re-fetch the component pointer after `AssignMaterial`. MSVC C4456 (inner `slot` hid an outer local in GpuScene) → before pushing, scan changed .cpp files with GCC `-fsyntax-only -Wshadow` via build/compile_commands.json (ignore lambda-boundary hits; MSVC does not flag those). Test readback buffers can reuse memory of a freed index buffer → sync-val WAR only in the full suite (fix: execution barrier ALL_COMMANDS → COPY before the copy in `RenderImage`).
-- Tests: CPU `tests/MaterialTests.cpp` (4: files/instances, codegen/slots/variants, every node compiles in every template via glslang, overrides/scene files/undo/Blueprint nodes/template material), GPU `Render_CustomMaterials` (unlit/instance/entity override/WPO/masked/translucent, GPU == CPU path pixel-exact, picking through the material prepass, live Provide, removal, lit graph == glTF), `Editor_MaterialEditorAndAssignment` (assign + undo, window/preview, live edit, problems, palette by mouse, save, instance window, scene file paths).
-- Open: see CLAUDE.md open point 25 (runtime compile/first-use pipeline hitch, no material functions/static switches, entity params only scalar/vector, no custom materials on terrain/foliage/particles, translucent without shadows).
-
-### Phase 32 terrain – decisions (user, 2026-10-26)
-- Built on `branch` on top of Phase 31 (PR #21 still open; user: keep building on branch).
-- Heightmap terrain with CDLOD (quadtree, morphing, height from texture in the vertex shader), Jolt HeightField collider, navmesh source.
-- Splat layers (up to 8: albedo/normal/ORM) + editor painting and sculpting (raise/lower/smooth/flatten) with undo; foliage/grass (instanced, density maps painted, culling, wind); heightmap import/export (16-bit PNG/RAW); holes mask + triplanar on steep slopes.
-- Done (2026-10-26), in PR #21 together with Phase 31. Technical details: CLAUDE.md "Terrain (Phase 32)".
-- Key design: one shared `TerrainStore` copy per path (renderer/physics/nav/editor), edits report kinds + normalized rects (`MarkDirty`; kinds 0 = live values only); renderer uploads only changed rects; foliage scattered per 16 m chunk on the CPU but placed/culled by height/holes/slope in the shader; editor strokes = one undo step each (`CaptureTerrainRegion`), window field edits commit when no widget is active (baseline reset by the terrain undo lambdas, not by history revision).
-- Gotchas: Jolt height-field holes are per vertex (sample removed only if all 4 cells are holes); hole mask stores 1 (shader threshold > 0.001); staging memory reuse needs an execution barrier (sync-val WAR); foliage mesh frame must be a rotation (z → +facing), else lighting is mirrored; MSVC C4458 again (never name a local `settings` in PhysicsWorld.cpp – Clang/GCC do not warn).
-- Tests: CPU `tests/TerrainTests.cpp` (6), GPU `Render_TerrainCdlodLayersAndEdits`, `Render_TerrainFoliage`, `Editor_TerrainToolsAndUndo`.
-- Open: see CLAUDE.md open point 24 (single grid, fixed resolution, CPU scatter, no wind zones, binary file paths not repaired on move).
-
-### Phase 31 rendering (2026-10-26)
-Technical details: CLAUDE.md "TAA, Decals, SSR, Nebel (Phase 31)".
-- TAA (Halton jitter, velocity target R16G16 from the prepass incl. skinning/particles/transparents, `taa.comp` resolve, unsharp mask in tonemap), Decal component + clustered decals (light_cull fills decal lists, applied before lighting), Hi-Z SSR (closest-depth pyramid, half res, temporal, roughness blur, IBL fallback), height fog + froxel volumetric fog (`fog_inject.comp` / `fog_integrate.comp`, bindless binding 5/6 = texture3D/image3D), FogVolume component, settings `taa/ssr/decals/fog` in scene files, editor sections/inspectors/overlay, Blueprint *Spawn Decal at Location*, cooker cooks decal textures with their kinds.
-- Gotchas found: llvmpipe speculatively loads from a null buffer reference even when the loop runs 0 times → never pass address 0 for lists read in loops (fog volumes get a dummy element); TAA jitter breaks pixel-exact frame comparisons (5 tests set `taa.enabled = false`); fog history must reset on settings change (else ~10 frames lag); shadow maps are now also read from compute (barrier stages extended).
-- Tests: CPU `tests/RenderingTests.cpp` (2), GPU `Render_TemporalAntiAliasing`, `Render_ClusteredDecals`, `Render_ScreenSpaceReflections`, `Render_HeightAndVolumetricFog`, `Editor_DecalsAndFogUi`.
-- Open: no TAA/SSR/fog player options, SSR only from on-screen data, decals only on opaque, fog volumes only boxes, orthographic cameras unsupported by fog reprojection.
+# Ungine — project memory
+
+Leading handover file: current state, decisions, lessons and priorities. Technical details live in
+[docs/](docs/README.md); working rules in [CLAUDE.md](CLAUDE.md). Update this file whenever the
+project state materially changes.
+
+- Last updated: 2026-11-06
+- Repository: spoerkfabian-oss/Ungine, default branch `main`, working branch `branch`
+- Version: 0.37.0 (`CMakeLists.txt`)
+
+## 1. Collaboration preferences
+
+- Answer in German, short and to the point; work token-efficiently. Repository docs are in English
+  (decided 2026-11-06).
+- Before a task, ask about real ambiguities (short multiple-choice questions with a recommended
+  option).
+- Use and update this memory often.
+- Review your own work and end with a self-review: "bereits behoben" (already fixed) / "noch offen"
+  (still open).
+- Deliver real Git commits (no ZIP archives).
+
+## 2. Current state
+
+- Phases 1–37 are implemented and merged (see [docs/history.md](docs/history.md)); the last merge was
+  PR #24 (phases 35–37, 2026-11-05, merge fc5e213).
+- **Open: PR #25** on `branch` — Windows NSIS installer fix (`CPACK_VERBATIM_VARIABLES ON`, NSIS log on
+  failure, release workflow also on PRs touching packaging files) plus this documentation overhaul
+  (English, `docs/` reference incl. `docs/folders/` pages for the non-code folders). CI incl. the release workflow was green for the fix.
+- After the merge: push tag `v0.37.0` to publish the first GitHub release with all packages.
+- Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
+
+## 3. Git and delivery rules
+
+- Work on `branch`; bring it up to date with `main` before new work (fast-forward or merge); never push
+  to other branches. `claude/friendly-mccarthy-33nhl0` is an old merged branch — do not reuse it.
+- One PR per phase from `branch`; drive it until CI (GCC, Clang, MSVC, GPU suite, release workflow when
+  packaging changes) is green; the owner merges; the next phase starts after the merge. Stacking on an
+  open PR only when the owner says so.
+- Never merge (or recommend merging) with red or running CI. PR #11 (phases 21–23) was merged red and
+  broke `main`; PR #5/#6 likewise. Branch protection with required checks is recommended.
+- Commit messages and PRs carry no model identifiers.
+
+## 4. Pitfalls and lessons
+
+Build and CI
+- Compile the real targets with production warning flags; `-fsyntax-only` misses
+  `-Wunused-function` (ValidPhysicsScale incident).
+- MSVC-only failures seen repeatedly: C4458/C4456 shadowing (also a local in a nested `Impl` hiding a
+  member of the outer class, e.g. never name a local `settings` in `PhysicsWorld.cpp`), C4505 unused
+  functions, `fs::path` has no implicit conversion to `std::string` (use UTF-8 strings + `PathFromUtf8`),
+  non-`noexcept` moves of standard containers break the ECS component concept (use `FlatMap`), Windows
+  temp paths in short form (`RUNNER~1`) — compare paths with `fs::equivalent`. Before pushing, scan
+  changed files with `-Wshadow` via `build/compile_commands.json`.
+- Smoke tests need `xvfb-run -a ctest …`; without a display they fail instantly.
+- CPack: values with backslashes (NSIS registry commands) need `CPACK_VERBATIM_VARIABLES ON`. NSIS can
+  be tested on Linux (`apt install nsis`, mini project with `set(WIN32 TRUE)`).
+- The release workflow runs only on main, tags, manual runs and PRs touching packaging files.
+
+Vulkan and lavapipe
+- llvmpipe loads speculatively from buffer references even when a loop runs zero times → never pass
+  address 0 for lists read in loops (use a dummy element).
+- Reused staging/readback memory needs execution barriers (sync-validation WAR); a swapchain pass that
+  loads the image needs READ in the acquire barrier.
+- glslang with SPIR-V 1.6 turns `discard` into DemoteToHelperInvocation → target SPIR-V 1.5.
+- TAA jitter breaks pixel-exact comparisons → disable TAA in such tests. Fog history must reset on
+  settings changes.
+- Push constants must be re-pushed after switching from a depth-only to a fragment pipeline (lavapipe).
+
+Engine
+- Jolt objects (group filters, materials) must be created after `AcquireJolt` (allocator registration)
+  and released before `ReleaseJolt`. Jolt constraint body order: body 1 = B, body 2 = A. Height-field
+  holes are per vertex (a sample is removed only if all four cells are holes).
+- `OptimizeMeshes` must remap skin influences when reordering vertices (Phase 21 bug found in Phase 30
+  by looking at a screenshot) — look at a screenshot of every new model.
+- Foliage mesh frames must be rotations (otherwise lighting is mirrored).
+- Detour `findRandomPointAroundCircle` can return points outside the radius (retry).
+- Paths stored in assets must stay relative across folders (`../`), otherwise packaged games break.
+- Prefab fuzzing can grow exponentially; caps exist (≤ 300 entities, Apply only ≤ 24).
+
+Editor and tests
+- Always pair `PropertyRow` with `PopID` (ImGui ID stack assert). ImGui 1.92.9 swapped `AddRect`
+  thickness/flags. Re-fetch component pointers after operations that may reallocate pools
+  (e.g. `AssignMaterial`).
+- Test editors use `.layoutFile = {}`; the GLFW window must be large enough for floating windows;
+  under Xvfb the cursor lags one frame.
+- A crash in the GPU suite may be reported after the wrong test (stdout is buffered in a pipe) — use
+  ASan (`-fno-sanitize=vptr`, glslang has no RTTI) to find it. Never call `begin()`/`end()` on two
+  different temporaries.
+
+## 5. Audit priorities
+
+Covered so far by randomized lifecycle tests (`tests/LifecycleTests.cpp`, GPU `Asset_LifecycleStress`)
+and targeted tests. Still open:
+
+1. Real hardware: GTX 1070 Ti with validation + synchronization validation, the dedicated transfer
+   queue / ownership transfer path, real performance. (Needs the owner.)
+2. Windows runtime: process launch, command-line parsing, Unicode paths, installer (file association,
+   shortcuts, uninstall), Build & Run, packaged player. (Needs the owner.)
+3. Blueprint runtime: debugger state after recompilation, Open Level in the middle of a chain.
+4. Asset lifetime: shutdown with pending asset jobs under ASan for the newer tests; simultaneous
+   reload + release.
+
+## 6. Decision log (owner decisions)
+
+- 2026-10-05: work on `branch`; plan A → 24 → 25 → 26 → 27 → C phases; one PR per phase.
+- 24: additive sub-levels via volumes or Blueprint; async Open Level with a UI-canvas loading screen;
+  editor Levels panel with previews (edit by opening the file); cross-level references by UUID.
+- 25: one uncompressed pak (index + hashes; KTX2 textures, binary meshes, rest raw); everything from
+  `Content/`; project save version with a Migrate Save Game event, newer slots refused; built-in options
+  menu with remapping, saved per user.
+- 26: joints as a component (Fixed/Hinge/Slider/Ball/Distance/Cone/6DOF) + ragdolls; per-triangle
+  materials as `.uphysmat` per glTF material; contacts with point/normal/impulse/velocity/surfaces + Hit
+  and Persist events; character rotation modes, platforms, crouch, sliding, push strength.
+- 27: cues as `.ucue` wherever a sound path is accepted; priority 0–255 with stealing + per-cue/bus
+  limits; snapshots + sidechain ducking; multi-ray occlusion with absorption; no diffraction, no HRTF.
+- C phases (2026-10-14): 28 particles → 29 navmesh → 30 animation → 31 rendering → 32 terrain →
+  33 materials → 34 nested prefabs + settings undo, one PR each.
+- 28: modular emitter stacks, CPU simulation with jobs (not GPU), sprites/meshes/ribbons, sub-emitters,
+  physics-raycast collision, unlit + emissive.
+- 29: Recast/Detour tiled navmesh with runtime rebuild, DetourCrowd (direct or via character), agent
+  profiles in the project (one navmesh each), areas/costs, off-mesh links, TileCache obstacles, baked
+  `.unav`, full editor tools.
+- 30: `.uanim` state machines, 1D/2D blend spaces, layers + masks, notifies, IK (two-bone, foot, look-at,
+  FABRIK); Khronos Fox as test/template model.
+- 31: TAA with motion vectors (no upscaling/FXAA), clustered decals, Hi-Z SSR with temporal
+  accumulation, height + froxel volumetric fog with fog volumes.
+- 32: CDLOD terrain, Jolt height field, navmesh source, 8 splat layers with sculpt/paint undo, foliage,
+  heightmap import/export, holes, triplanar.
+- 33: node-graph materials with generated GLSL, instances, blend/shading models, WPO with velocity,
+  per-submesh overrides; glTF materials stay the default.
+- 34: nested prefabs with per-level apply, variants; undo for renderer/project/physics settings and the
+  editor view (camera only for jumps); asset windows keep their own undo.
+- 35–37 (2026-11-03): Blueprint inheritance like UE + recursion + nested containers; latent nodes in
+  functions + dispatcher checks + refactoring + utility nodes; CI-built installers (NSIS setup + ZIP,
+  Linux TGZ). 36 and 37 stacked on PR #24 at the owner's request.
+- 2026-11-06: documentation in English; `CLAUDE.md` becomes an index with rules, technical reference
+  split into `docs/`; pages for the non-code folders in `docs/folders/` (owner: all docs in one place); stacked on PR #25.
+
+## 7. Merge log
+
+| PR | Content | Merge |
+|---|---|---|
+| #11, #12 | Phases 21–23 (merged uncompiled) and their build repair (32ea260, 5e62aec) | 2026-10-05, 181cfc6 |
+| #13 | Phase A hardening | 2026-10-06 |
+| #14 | Phase 24 level streaming | f9a1699 |
+| #15 | Phase 25 cooked builds, savegames, options | 4c58715 |
+| #16 | Phase 26 physics tools | 2026-10-12 |
+| #17 | Phase 27 audio | 8377582, 2026-10-14 |
+| #18 | Phase 28 particles | fde7c2f, 2026-10-15 |
+| #19 | Phase 29 navigation | fa23918, 2026-10-22 |
+| #20 | Phase 30 animation | 2026-10-25 |
+| #21 | Phases 31 + 32 rendering, terrain | 83cdfcb, 2026-10-27 |
+| #22 | Phase 33 materials | 2026-11-02 |
+| #23 | Phase 34 nested prefabs, settings undo | 2026-11-03 |
+| #24 | Phases 35–37 Blueprints, installers | fc5e213, 2026-11-05 |
+| #25 | NSIS fix + documentation overhaul | open |

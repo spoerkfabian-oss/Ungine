@@ -1,217 +1,232 @@
 # Ungine
 
-C++20/Vulkan-1.3-Engine mit Editor (UE-/Unity-artig), Blueprint-Visual-Scripting, Jolt-Physik,
-3D-Audio (miniaudio) und einem Player für fertige Spiele.
+A C++20 / Vulkan 1.3 game engine with an Unreal/Unity-style editor, Blueprint visual scripting, Jolt
+physics, 3D audio, navigation, animation, particles, terrain, node-graph materials and a player for
+finished games.
 
-## Bauen (Windows, Visual Studio 2022)
+- **Users:** this file (installing, building, working with the editor).
+- **Developers:** [CLAUDE.md](CLAUDE.md) (rules and documentation map), [docs/](docs/README.md)
+  (technical reference), [MEMORY.md](MEMORY.md) (current state), [ROADMAP.md](ROADMAP.md).
+
+## Install
+
+Every tag `v<version>` (e.g. `v0.37.0`) builds tested packages with GitHub Actions (*Release*
+workflow) and attaches them to a GitHub release. Pushes to `main` and manual runs
+(*Actions → Release → Run workflow*) keep them as workflow artifacts for 14 days.
+
+| Package | Contents |
+|---|---|
+| `Ungine-<version>-windows-x64.exe` | Setup: Start menu and desktop shortcut **Ungine Editor**, `.ungineproj` files open in the editor on double-click, uninstall via "Apps & features" |
+| `Ungine-<version>-windows-x64.zip` | Portable, no installation (`bin/UngineEditor.exe`) |
+| `Ungine-<version>-linux-x64.tar.gz` | Unpack and run `bin/UngineEditor`; `bin/install-desktop-integration.sh` registers the menu entry, icon and file type |
+| `SHA256SUMS.txt` | Checksums |
+
+Running Ungine needs a Vulkan 1.3 driver (a current GPU driver). Before publishing, every package is
+tested: Release CPU tests, then a project from the Basic template is cooked with the packaged
+`UngineCook` (on Linux the cooked game is also started).
+
+## Build from source
+
+Requirements: CMake ≥ 3.25, Visual Studio 2022 (or GCC 13 / Clang on Linux), the Vulkan SDK (for
+`glslc`) and a Vulkan 1.3 driver. All libraries are downloaded by CMake.
 
 ```
 cmake -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
 
-Startprojekt in Visual Studio ist **UngineEditor**. Abhängigkeiten lädt CMake selbst (FetchContent);
-nötig sind nur das Vulkan SDK (für `glslc`) und ein Vulkan-1.3-Treiber.
+The Visual Studio start project is **UngineEditor**. Packages: `cpack -C Release` in the build
+directory (NSIS setup if `makensis` is installed, plus a ZIP; on Linux a `.tar.gz`). The version comes
+from `CMakeLists.txt` and can be overridden with `-DENGINE_PACKAGE_VERSION=…`. Linux builds, tests and
+options: [docs/build-and-test.md](docs/build-and-test.md).
 
-## Installer (Doppelklick-Editor)
+## Working with the editor
 
-**Fertige Pakete:** Jeder Tag `v<Version>` (z. B. `v0.37.0`) baut per GitHub Actions (*Release*-Workflow)
-geprüfte Pakete und hängt sie an ein GitHub-Release; Pushes auf `main` und manuelle Läufe
-(*Actions → Release → Run workflow*) legen sie 14 Tage als Workflow-Artefakte ab:
+### Projects
 
-- `Ungine-<Version>-windows-x64.exe` – Setup (NSIS): Startmenü- und Desktop-Verknüpfung
-  **Ungine Editor**, `.ungineproj`-Dateien öffnen sich per Doppelklick im Editor, Deinstallation über
-  „Apps & Features“.
-- `Ungine-<Version>-windows-x64.zip` – portabel, ohne Installation (`bin/UngineEditor.exe`).
-- `Ungine-<Version>-linux-x64.tar.gz` – entpacken, `bin/UngineEditor` starten;
-  `bin/install-desktop-integration.sh` registriert Menüeintrag, Icon und den Dateityp.
-- `SHA256SUMS.txt` – Prüfsummen.
+1. Start **UngineEditor** → project browser: recent projects, a new project from a template (*Blank*,
+   *Basic Scene*, *Physics Playground*) or *Open project…*.
+2. A project folder holds `<Name>.ungineproj`, `Content/` (scenes, Blueprints, models, textures,
+   sounds, …) and `Saved/` (caches and layout; not part of the game).
+3. **Content browser:** double-click opens scenes/Blueprints/assets or places models; drag files into
+   the viewport (models, prefabs, sounds, effects, terrains, materials onto meshes) or onto the
+   selection (Blueprints). *+ New* creates folders, Blueprints, scenes and every asset type.
+   *Import file…* copies models (`.glb`, `.gltf` with local files), textures and sounds into the
+   current folder. The selection shows a texture, model/material or audio preview. Right-click offers
+   *Move to folder…*, *Rename…* (references in scenes, Blueprints, prefabs and other assets are
+   repaired) and *Delete* (asks first; cannot be undone).
+4. **Play** (Ctrl+P) simulates physics, Blueprints, audio, particles and AI in the editor; *Stop*
+   restores the scene. Undo (Ctrl+Z) also covers renderer, physics and project settings and the
+   viewport view (overlays, debug view, camera fields, focus with F); view and project settings do not
+   mark the scene as changed.
+5. **Build → Build & Run** (Ctrl+B) saves everything and starts the game in **UnginePlayer**.
+   **Build → Package project…** creates a standalone game folder (`<Name>.exe`, shaders, project,
+   `Content.upak` = cooked content, `BuildReport.txt`); the *Package report* window lists warnings
+   (missing references) and errors. Without the editor: `UngineCook <project> <target>`.
+6. The player renders through the primary **Camera** component of the start scene (*File → Project
+   settings…*). In the editor, *Game cam* shows that view.
 
-Voraussetzung zum Ausführen: ein Vulkan-1.3-Treiber (aktueller GPU-Treiber). Vor dem Veröffentlichen
-wird jedes Paket getestet (Release-CPU-Tests, Projekt aus der Basic-Vorlage mit dem gepackten
-`UngineCook` kochen; unter Linux zusätzlich das gekochte Spiel starten).
+### Blueprints (visual scripting)
 
-**Selbst bauen:**
+- **Basics:** in the *Blueprint* tab, right-click searches nodes, drag pins to connect, variables on
+  the left, details below. Attach a script: Inspector → *Add component* → *Script (Blueprint)*.
+- **Functions and variables:** *Graphs* → *+ Function* (inputs, outputs, local variables, *Pure*);
+  call them through the node search (*Call …*). Variables can be arrays, maps, enums, structs and
+  nested containers (arrays of arrays, maps of arrays, …). The checkbox next to a variable makes it
+  *instance editable* (value per entity in the inspector, also references to other entities).
+- **Inheritance:** right-click a Blueprint in the content browser → *Create child blueprint* (or
+  *Class → Parent*); override inherited functions with *Override*, set defaults of inherited variables
+  under *Inherited variables*, call the parent version with *Call Parent*. *Is A* / *Cast To* check
+  classes. Renaming a variable or function updates child classes; *Move to parent class* moves it up.
+  Functions may call themselves (recursion).
+- **More building blocks:** *+ New* → *Enum*, *Struct*, *Interface* (edited in the *Blueprint types*
+  window) and *Blueprint library* (functions/macros for every Blueprint, called as
+  `Library.Function`). In the side bar: *+ Macro* (several exec pins, delays allowed), *Custom Events*
+  with parameters, *Event Dispatchers* (Call/Bind; parameters must match), *Interfaces*, *Timelines*
+  (curve editor: double-click adds a key, drag moves it). Nodes include *Switch*, *Select*, *Tween*
+  (Move/Rotate/Scale To), *Save Game*, *Open Level*, *Input Actions* (Project Settings → *Input*),
+  math/vector/string/array utilities and *Async Load Model*. Latent nodes such as *Delay* and
+  *AI Move To* also work inside functions.
+- **Construction Script** event: runs in the editor after every change and before BeginPlay; what it
+  creates is not saved (grey in the hierarchy).
+- **Debugger:** F9 sets a breakpoint (optional condition such as `health < 10` and hit count in the
+  details panel); in Play the game halts there; F5 continues, F10 steps over, F11 into, Shift+F11 out;
+  values and the call stack are in the *Debug* section and pin tooltips.
+- **Comfort:** double-click a link = reroute node, Shift+W/A/S/D aligns, M toggles the minimap, C wraps
+  the selection in a comment, Ctrl+F searches all Blueprints, right-click → *Collapse to function /
+  macro*.
 
-```
-cd build
-cpack -C Release
-```
+### Prefabs
 
-Ergebnis: `Ungine-<Version>-windows-x64.exe` (NSIS, falls installiert) und ein ZIP bzw. unter Linux
-das `.tar.gz`. Die Version kommt aus `CMakeLists.txt` (überschreibbar mit
-`-DENGINE_PACKAGE_VERSION=…`).
+Hierarchy → right-click → *Create prefab…* saves a subtree as `.uprefab`. Place prefabs by
+double-click or drag & drop; changes on an instance are *overrides* (revert one by one in the
+inspector), *Apply to prefab* writes them to all instances, *Unlink* breaks the connection. Prefabs
+can be nested (the inspector shows the levels under *From*; *Apply to…* writes into the outer or an
+inner prefab). *Variants* (*Create variant* in the content browser, or *Create prefab variant…* on an
+instance) take every change of their base except their own overrides. Blueprints spawn prefabs with
+*Spawn Prefab*; *Print String* output appears in the top-left corner of the player.
 
-## Arbeiten mit dem Editor
+### Physics
 
-1. **UngineEditor** starten → Projektbrowser: zuletzt geöffnete Projekte, neues Projekt aus einer
-   Vorlage (*Blank*, *Basic Scene*, *Physics Playground*) oder *Open project…*.
-2. Projektordner: `<Name>.ungineproj`, `Content/` (Szenen, Blueprints, Modelle, Texturen),
-   `Saved/` (Caches, Layout – nicht Teil des Spiels).
-3. **Content**-Browser: Doppelklick öffnet Szenen/Blueprints bzw. platziert Modelle; Dateien lassen
-   sich in den Viewport ziehen (Modelle) oder auf die Auswahl (Blueprints). *+ New* legt Ordner,
-   Blueprints und Szenen an. *Import file...* kopiert Modelle (.glb/.gltf samt lokalen Dateien),
-   Texturen und Sounds in den aktuellen Content-Ordner. Auswahl zeigt Textur-, Modell-/Material- oder
-   Audiovorschau; Rechtsklick bietet *Move to folder...*, *Rename...* und die bestätigungspflichtige
-   Löschung. Referenzen in unterstützten Szenen-, Blueprint-, Prefab- und glTF-Dateien werden bei
-   Verschieben/Umbenennen angepasst.
-4. **Blueprint**-Tab: Knoten per Rechtsklick suchen, Pins ziehen zum Verbinden, Variablen links,
-   Details/Parameter darunter. Script einer Entity zuweisen: Inspector → *Add component* →
-   *Script (Blueprint)*.
-   Vererbung: Content-Browser → Rechtsklick auf einen Blueprint → *Create child blueprint* (oder
-   *Class → Parent* im Blueprint-Tab); geerbte Funktionen per *Override*, Defaults geerbter
-   Variablen unter *Inherited variables*, die Eltern-Fassung per *Call Parent* (Palette).
-5. **Play** (Strg+P) simuliert Physik und Blueprints im Editor; *Stop* stellt die Szene wieder her.
-6. **Build → Build & Run** (Strg+B) speichert alles und startet das Spiel im **UnginePlayer**;
-   **Build → Package project…** erzeugt einen eigenständigen Spielordner (`<Name>.exe`, Shader,
-   Projekt, `Content.upak` = gekochter Inhalt, `BuildReport.txt`); das Fenster *Package report*
-   zeigt Warnungen (fehlende Referenzen) und Fehler. Ohne Editor: `UngineCook <projekt> <ziel>`.
-7. Der Player rendert durch die primäre **Camera**-Komponente der Startszene (*File → Project
-   settings…*). Im Editor zeigt *Game cam* diese Sicht.
-8. **Audio**: Sounds (WAV/OGG/MP3/FLAC) nach `Content/` kopieren. Doppelklick im Content-Browser
-   spielt sie an; in den Viewport ziehen legt eine **Audio Source** an (3D, Loop, Bus, Reichweite,
-   Occlusion – Inspector). **Reverb Zone** und **Audio Listener** über *Add component*. Mixer
-   (Master/World/Music/UI/Ambient) und Occlusion: Renderer-Panel → *Audio* (im Projekt gespeichert).
-   Blueprints: Kategorie *Audio* (Play Sound 2D, Play Sound at Location, Play/Stop Audio Source, …;
-   Pfade relativ zum Projektordner, z. B. `Content/Sounds/impact.wav`).
-9. **Blueprints für Fortgeschrittene**: links *Graphs* → *+ Function* (Ein-/Ausgänge, lokale
-   Variablen, *Pure*); Aufruf über die Knotensuche (*Call …*). Variablen können Arrays sein
-   (*For Each Loop*, *Add*, *Find*, …); das Häkchen neben einer Variable macht sie
-   *instance editable* (Wert pro Entity im Inspector, auch Verweise auf andere Entities).
-   **Debugger**: F9 setzt einen Breakpoint (roter Punkt, im Details-Panel optional mit Bedingung
-   wie `health < 10` und Hit-Count); im Play-Modus hält das Spiel dort an, F5 läuft weiter, F10
-   springt über Funktionsaufrufe, F11 hinein, Shift+F11 heraus; Werte und Call Stack stehen im
-   *Debug*-Bereich und im Pin-Tooltip. Komfort: Doppelklick auf eine Verbindung = Reroute-Knoten, Shift+W/A/S/D richtet
-   aus, M blendet die Minimap um, C setzt einen Kommentar um die Auswahl (Farben im Details-Panel).
-10. **Prefabs** (Blueprint-Klassen): Hierarchy → Rechtsklick → *Create prefab…* speichert den
-   Teilbaum als `.uprefab` (z. B. `Content/Prefabs/`). Prefabs per Doppelklick oder Ziehen aus dem
-   Content-Browser platzieren; Änderungen an einer Instanz sind *Overrides* (Inspector: einzeln
-   zurücksetzen), *Apply to prefab* überträgt sie auf alle Instanzen, *Unlink* löst die Verbindung.
-   Prefabs lassen sich verschachteln (Instanzen in einem Teilbaum bleiben beim *Create prefab…*
-   eigene Prefabs; der Inspector zeigt unter *From* die Ebenen, *Apply to…* schreibt in das äußere
-   oder ein inneres Prefab). *Varianten*: Content-Browser → Rechtsklick auf ein Prefab → *Create
-   variant* bzw. *Create prefab variant…* auf einer Instanz – eine Variante übernimmt alle Änderungen
-   ihrer Basis außer den eigenen Overrides. Blueprints erzeugen Prefabs zur Laufzeit mit *Spawn
-   Prefab*. *Print String* erscheint im Player oben links auf dem Bildschirm.
-   Undo (Strg+Z) deckt auch Renderer-, Physik- und Projekt-Settings sowie die Viewport-Ansicht
-   (Overlays, Debug-Ansicht, Kamerafelder, Fokus mit F) ab; Ansicht und Projekt-Settings markieren
-   die Szene nicht als geändert.
-11. **Blueprints 3**: Content → *+ New* → *Enum*, *Struct*, *Interface* (bearbeitet im Fenster
-   *Blueprint types*) und *Blueprint library* (Funktionen/Makros für alle Blueprints, Aufruf als
-   `Bibliothek.Funktion`). Variablen-Typen: Arrays, Maps (`Map<string, int>`), Enums, Structs. In der
-   Blueprint-Seitenleiste: *+ Macro* (mehrere Exec-Pins, Delays erlaubt), *Custom Events* mit
-   Parametern, *Event Dispatchers* (Call/Bind), *Interfaces* (fügt die Funktionen an),
-   *Timelines* (Kurven-Editor: Doppelklick = Key, Ziehen verschiebt). Knoten: *Switch*, *Select*,
-   *Tween* (Move/Rotate/Scale To), *Save Game*, *Open Level*, *Input Actions* (Project Settings →
-   *Input*). **Construction Script** (*Construction Script*-Event): läuft im Editor nach jeder
-   Änderung und vor BeginPlay; was es erzeugt, wird nicht gespeichert (grau in der Hierarchy).
-   Strg+F sucht in allen Blueprints, Rechtsklick → *Collapse to function / macro* fasst Knoten
-    zusammen.
-12. **Skeletal animation**: The *Basic Scene* template includes a waving glTF banner. Imported
-    animated models play their first clip automatically. Select the model instance to change its
-    clip, speed, looping, blend target and root-motion settings in the **Animator** inspector.
-    Blueprints can play, stop, select and blend clips, change speed/looping/root motion and query
-    playback. Supported glTF interpolation modes are STEP, LINEAR and CUBICSPLINE.
-13. **In-game UI**: Add a *UI Canvas* and child *UI Widget* components in the Inspector. Widgets
-    use parent-relative anchors and offsets, with a design resolution that scales into the game
-    viewport. Text, images, panels, buttons, checkboxes, sliders and progress bars are supported.
-    Buttons and values can raise Blueprint events (On UI Clicked, On UI Value Changed,
-    On UI Checked Changed). The standalone player opens its pause menu with Escape and supports
-    keyboard, mouse and mapped gamepad navigation.
-14. **Level-Streaming**: Hierarchy → *+ Add* → *Streaming Volume*, im Inspector die Level-Datei
-    wählen (*Browse…*). Im Spiel wird das Sub-Level additiv geladen, sobald die Kamera (bzw. eine
-    Entity mit *Streaming Source*) in der Box ist, und nach Verlassen der Box plus *Unload margin*
-    wieder entladen. Blueprints: *Load/Unload Stream Level*, *Is Level Loaded*, Events *Level
-    Loaded/Unloaded*; Verweise auf Entities eines entladenen Levels sind leer und werden beim Laden
-    wieder gültig. Im Editor zeigt das Fenster **Levels** Vorschauen (nur ansehen, nicht gespeichert;
-    bearbeitet wird ein Level durch Öffnen seiner Datei). *Open Level* lädt im Player im Hintergrund
-    hinter einem Ladebildschirm: eigene Gestaltung über *Project Settings → Loading screen* (Szene mit
-    UI-Canvas; ein Fortschrittsbalken mit dem Tag `LoadingProgress` zeigt den Fortschritt).
-15. **Optionen & Spielstände**: Das Pause-Menü des Players (Escape) hat *Options* mit Grafik
-    (Vollbild, VSync, Schattenqualität, AO, Bloom), Audio (Bus-Lautstärken) und Steuerung (Tasten
-    neu belegen inkl. Konflikt-Hinweis, Zurücksetzen); gespeichert pro Benutzer (`Settings.json`).
-    Blueprints: Kategorie *Options* und *Input → Remap Action*. *Project Settings → Save version*
-    versioniert Spielstände: ältere Slots lösen beim Laden das Event *Migrate Save Game* aus,
-    Slots einer neueren Spielversion werden abgelehnt (nicht gelesen, nicht überschrieben).
-16. **Physik-Werkzeuge**: *Content → + New → Physics material* legt ein `.uphysmat` an (Reibung,
-    Abprallen, Oberflächen-Name); im Collider-Inspector zuweisen, bei Mesh-Collidern auch pro
-    glTF-Material. Raycasts und Kollisions-Events melden Oberfläche, Kontaktpunkt, Normale und
-    Impuls (*On Hit* mit Mindest-Impuls, *On Collision Stay* jeden Step). *Add component → Joint*
-    verbindet zwei Körper (Fixed, Hinge, Slider, Ball, Distance, Cone, Swing-Twist, 6DOF) mit
-    Limits, Motor und Bruchkraft; den Joint-Anker verschiebt die Toolbar-Schaltfläche *Anchor* per
-    Gizmo. *Add component → Ragdoll (from skeleton)* auf einem animierten Modell erzeugt Knochen mit
-    Kapseln und Gelenken; *Simulate* (oder Blueprint *Set Ragdoll Simulating*) lässt es fallen.
-    Character Controller: Drehmodus (Bewegung/Kamera/Script), Ducken, bewegte Plattformen,
-    Rutschen an steilen Hängen.
-17. **Audio-Mixer & Sound-Cues**: *Content → + New → Sound cue* legt ein `.ucue` an: Varianten (Sounds
-    per „…“ oder aus dem Content-Browser hineinziehen) mit Gewicht, Zufalls-Lautstärke/-Tonhöhe,
-    ohne direkte Wiederholung, Priorität und Instanz-Limit. Ein Cue funktioniert überall wie ein
-    Sound (Audio Source, *Play Sound*-Knoten). Im Renderer-Panel unter *Audio*: Voice-Limits pro
-    Bus, **Snapshots** (benannte Bus-Mixe, per Blueprint *Activate/Deactivate Audio Snapshot*
-    überblendet) und **Ducking** (z. B. UI senkt Musik). Occlusion nutzt mehrere Strahlen pro
-    Quelle; Wände dämpfen nach der *Sound absorption* ihres Physik-Materials.
-18. **Partikel**: *Content → + New → Particle effect* legt ein `.uparticle` an und öffnet den
-    Partikel-Editor: Emitter mit Modul-Stacks (Spawn, Initialize, Update, Events – z. B. Spawn Rate,
-    Shape, Velocity, Gravity, Curl Noise, Color/Size over Life als Gradient/Kurve, Collision,
-    Sub Emitter) und Render-Einstellungen (Sprite mit Sprite-Sheet und weichen Kanten, Mesh, Ribbon
-    für Spuren; Alpha oder Additiv). Die Vorschau rechts zeigt jede Änderung sofort; die Szene
-    übernimmt sie ebenfalls, gespeichert wird mit *Save*. Platziert wird ein Effekt per Doppelklick
-    bzw. Drag & Drop in den Viewport (Komponente *Particle System*); Blueprint-Knoten *Spawn Emitter
-    at Location*, *Play/Stop Particles*, *Set Particle Scale/Tint*. Beispiele: Lagerfeuer (Basic),
-    Funkenbrunnen mit Kollision und Spuren (Physics).
-19. **Navigation (KI)**: Hierarchy → *+ Add* → *Nav Mesh Bounds* um den begehbaren Bereich legen –
-    das Navmesh entsteht aus den statischen Collidern darin und folgt jeder Änderung (Fenster
-    *Navigation*: Overlay, *Bake*, Testpfad per *Pick start/end* + Klick im Viewport). Gespeichert
-    wird es als `.unav` neben der Szene. *Nav Area* markiert Flächen (Kosten, *Blocked*), *Nav Link*
-    verbindet Punkte (Sprünge, Leitern), *Nav Obstacle* schneidet bewegliche Objekte heraus.
-    Figuren bekommen die Komponente *Nav Agent* und laufen per Blueprint *AI Move To* (weichen
-    einander aus; mit Character Controller über die Physik). Agenten-Profile (Radius/Höhe) und
-    Area-Typen: *File → Project settings → Navigation*. Beispiel: der Wanderer im Physics-Template.
-20. **Animation**: Content-Browser → *+ New → Animation graph* (`.uanim`) öffnet das Fenster
-    *Animation Graph*: Parameter (Float/Int/Bool/Trigger), Layer (mit Bone-Maske, Override oder
-    Additiv), States per Rechtsklick auf die Fläche (ein Clip oder ein 1D-/2D-Blend-Space),
-    Transitions per Rechtsklick auf einen State (Bedingungen, Überblendzeit, Exit Time), Notifies
-    (Sound/Effekt an einem Knochen) und IK-Ziele (Füße auf dem Boden, Two-Bone, Look-At, FABRIK).
-    Die Vorschau zeigt das Preview-Modell mit den eingestellten Parameterwerten. Zuweisen per
-    *Assign to selection* auf ein platziertes Modell (Komponente *Animation Controller*); gesteuert
-    per Blueprint *Set Anim Float/Bool/Trigger*, Events per *On Anim Notify*. Beispiel: der Fuchs
-    im Physics-Template (Gehen/Rennen nach Geschwindigkeit, Füße folgen dem Boden).
-21. **Bildqualität, Decals, Reflexionen, Nebel**: Im Renderer-Panel sind *Anti-aliasing (TAA)*
-    (glättet Kanten über mehrere Frames, mit Nachschärfen) und *Reflections (SSR)* (Spiegelungen
-    glatter Flächen aus dem Bild, sonst Himmel) standardmäßig an. *+ Add → Decal* projiziert eine
-    Textur (Albedo/Normal/Maske/Emissive, per Drag & Drop aus dem Content-Browser in den
-    Inspector) entlang −Z auf die Oberflächen in der Box; *Sort order* bestimmt, was oben liegt,
-    *Lifetime* lässt Decals im Spiel ausblenden (Blueprint *Spawn Decal at Location*). Unter *Fog*
-    wird Höhennebel eingeschaltet; *Volumetric* fügt Lichtstrahlen von Sonne und Lampen (mit
-    Schatten) hinzu, *+ Add → Fog Volume* setzt lokale Nebelboxen (auch leuchtend). Alle
-    Einstellungen werden mit der Szene gespeichert; die Toolbar *Volumes* zeigt Decal- und
-    Nebelboxen.
-22. **Terrain**: *+ Add → Terrain* (oder Content-Browser *+ New → Terrain*, `.uterrain` per
-    Doppelklick/Drag & Drop platzieren) legt ein 128-m-Terrain an. Im Fenster *Terrain* (bei
-    ausgewähltem Terrain) gibt es Pinsel *Raise/Lower/Smooth/Flatten* (Shift+Klick nimmt die
-    Flatten-Höhe), *Paint* (Layer in der Liste wählen), *Holes* und *Foliage*; Strg kehrt um
-    (senken/radieren), jeder Strich ist ein Undo-Schritt. Layer haben Albedo/Normal/ORM-Texturen
-    (Drag & Drop aus dem Content-Browser), Tint, Kachelung; steile Hänge werden triplanar
-    projiziert. Foliage-Layer sind prozedurale Grashalme, Textur-Karten oder Meshes (Dichte,
-    Größe, Wind, Sichtweite). Heightmaps (16-Bit-PNG/RAW) per *Import/Export*. Das Terrain
-    kollidiert (Physik), dient als Navmesh-Quelle und wird beim Speichern der Szene mitgespeichert;
-    Blueprint *Get Terrain Height* liefert Höhe und Normale.
-23. **Materialien**: Content-Browser *+ New → Material* legt einen Node-Graph (`.umat`) an,
-    *Create instance* bzw. *+ New → Material instance* eine Instanz (`.uminst`), die Parameter
-    überschreibt. Im Fenster *Material*: Rechtsklick auf die Fläche öffnet die Knotenauswahl (tippen,
-    Enter), Pins per Ziehen verbinden, Alt-Klick trennt, Entf löscht; links Blend-Modus (Opaque/
-    Masked/Translucent/Additive), Lit/Unlit, Two-sided, Parameter (Scalar/Vector/Texture) und die
-    Werte des gewählten Knotens; rechts die Vorschau (Kugel/Box/Ebene). *World Position Offset*
-    bewegt Vertices (für das Culling *Max displacement* setzen). Zuweisen: Material auf ein Mesh im
-    Viewport ziehen oder im Inspector (*Mesh Renderer → Materials*) pro Submesh ablegen; dort lassen
-    sich Parameter pro Objekt überschreiben. Blueprints: *Set Material*, *Set Material Scalar/Vector
-    Parameter*, *Clear Material Parameters*. Die Shader entstehen beim ersten Laden (Cache unter
-    `Saved/Cache/Shaders`); das Basic-Template zeigt ein pulsierendes Beispielmaterial.
+Add *Rigid Body*, *Collider* and *Character Controller* components in the inspector. *+ New → Physics
+material* creates a `.uphysmat` (friction, bounciness, surface name, sound absorption) for colliders,
+or per glTF material on mesh colliders. Raycasts and collision events report surface, contact point,
+normal and impulse (*On Hit* with a minimum impulse, *On Collision Stay* every step). *Add component →
+Joint* connects two bodies (Fixed, Hinge, Slider, Ball, Distance, Cone, Swing-Twist, 6DOF) with limits,
+motor and break force; the *Anchor* toolbar button moves the joint frame with the gizmo. *Add
+component → Ragdoll (from skeleton)* on an animated model creates bones with capsules and joints;
+*Simulate* (or Blueprint *Set Ragdoll Simulating*) lets it fall. Characters support rotation modes,
+crouching, moving platforms and sliding on steep slopes.
 
+### Audio
 
-## Entwicklung
+Copy sounds (WAV/OGG/MP3/FLAC) into `Content/`. Double-click previews them; dragging one into the
+viewport creates an **Audio Source** (3D, loop, bus, range, occlusion). **Reverb Zone** and **Audio
+Listener** via *Add component*. *+ New → Sound cue* creates a `.ucue` with weighted variants, random
+volume/pitch, no direct repeats, priority and an instance limit; a cue works wherever a sound does.
+Renderer panel → *Audio*: mixer (Master/World/Music/UI/Ambient), occlusion (several rays; walls damp by
+their physics material), voice limits, **snapshots** (named bus mixes, blended by Blueprint) and
+**ducking** (e.g. UI lowers music); saved with the project. Blueprint category *Audio*; paths are
+relative to the project folder, e.g. `Content/Sounds/impact.wav`.
 
-`Sandbox` ist die Test-/Demo-Anwendung der Engine (siehe `CLAUDE.md` für Architektur, Optionen
-und den Stand der Entwicklung). Tests: `EngineTests` (CPU), `EngineGpuTests` und Smoke-Tests per
-CTest mit `-DENGINE_GPU_TESTS=ON`. Geplante Engine-Erweiterungen und ihre Reihenfolge stehen in
-[ROADMAP.md](ROADMAP.md).
+### Particles
+
+*+ New → Particle effect* creates a `.uparticle` and opens the particle editor: emitters with module
+stacks (Spawn, Initialize, Update, Events — e.g. spawn rate, shape, velocity, gravity, curl noise,
+color/size over life, collision, sub-emitters) and render settings (sprites with sprite sheets and soft
+edges, meshes, ribbons for trails; alpha or additive). The preview and the scene update live; *Save*
+writes the file. Place an effect by double-click or drag & drop (component *Particle System*);
+Blueprint nodes *Spawn Emitter at Location*, *Play/Stop Particles*, *Set Particle Scale/Tint*.
+Examples: campfire (Basic), spark fountain with collision and trails (Physics).
+
+### Navigation (AI)
+
+Hierarchy → *+ Add* → *Nav Mesh Bounds* around the walkable area: the navmesh is built from the static
+colliders (and terrains) inside and follows every change (*Navigation* window: overlay, *Bake*, test
+path via *Pick start/end* + click). It is saved as `.unav` next to the scene. *Nav Area* marks surfaces
+(cost, *Blocked*), *Nav Link* connects points (jumps, ladders), *Nav Obstacle* cuts out moving objects.
+Characters get a *Nav Agent* and walk with the Blueprint node *AI Move To* (they avoid each other; with
+a Character Controller through physics). Agent profiles and area types: *File → Project settings →
+Navigation*. Example: the wanderer in the Physics template.
+
+### Animation
+
+Imported animated models play their first clip automatically; the **Animator** inspector selects
+clip, speed, looping, blend target and root motion. *+ New → Animation graph* (`.uanim`) opens the
+*Animation Graph* window: parameters (Float/Int/Bool/Trigger), layers (bone mask, override or
+additive), states (a clip or a 1D/2D blend space; right-click the canvas), transitions (right-click a
+state; conditions, blend time, exit time), notifies (sound/effect at a bone) and IK targets (feet on
+the ground, two-bone, look-at, FABRIK). Assign it with *Assign to selection* (component *Animation
+Controller*); drive it with *Set Anim Float/Bool/Trigger*, react with *On Anim Notify*. Example: the
+fox in the Physics template.
+
+### Runtime UI
+
+Add a *UI Canvas* and child *UI Widget* components: parent-relative anchors and offsets with a design
+resolution that scales to the game view. Text, images, panels, buttons, checkboxes, sliders and
+progress bars; Blueprint events *On UI Clicked*, *On UI Value Changed*, *On UI Checked Changed*. The
+player opens its pause menu with Escape (keyboard, mouse and gamepad navigation).
+
+### Levels and streaming
+
+Hierarchy → *+ Add* → *Streaming Volume*, choose the level file in the inspector. In the game the
+sub-level loads additively when the camera (or an entity with *Streaming Source*) enters the box and
+unloads after leaving the box plus the *Unload margin*. Blueprints: *Load/Unload Stream Level*, *Is
+Level Loaded*, *Level Loaded/Unloaded* events; references to entities in an unloaded level are empty
+and become valid again when it loads. The **Levels** window shows read-only previews (edit a level by
+opening its file). *Open Level* loads in the background behind a loading screen; customize it under
+*Project Settings → Loading screen* (a scene with a UI canvas; a progress bar tagged `LoadingProgress`
+shows the progress).
+
+### Options and save games
+
+The player's pause menu has *Options*: graphics (fullscreen, VSync, shadow quality, AO, bloom), audio
+(bus volumes) and controls (rebind keys with a conflict hint, reset), saved per user
+(`Settings.json`). Blueprint categories *Options* and *Input → Remap Action*. *Project Settings → Save
+version* versions save games: older slots fire *Migrate Save Game* when loaded; slots of a newer game
+version are refused (not read, not overwritten).
+
+### Rendering features
+
+The renderer panel holds lighting, post processing, shadows, AO, *Anti-aliasing (TAA)* and
+*Reflections (SSR)* (both on by default) and *Fog*. *+ Add → Decal* projects textures (albedo,
+normal, mask, emissive) along −Z onto surfaces in its box (*Sort order*, *Lifetime*; Blueprint *Spawn
+Decal at Location*). *Fog* enables height fog; *Volumetric* adds light shafts from the sun and lamps
+(with shadows); *+ Add → Fog Volume* places local (optionally glowing) fog boxes. All settings are saved
+with the scene; the *Volumes* toolbar toggle shows decal and fog boxes.
+
+### Terrain
+
+*+ Add → Terrain* (or *+ New → Terrain*; place the `.uterrain` by double-click or drag & drop) creates
+a 128 m terrain. The *Terrain* window (with a terrain selected) has brushes *Raise/Lower/Smooth/
+Flatten* (Shift+click picks the flatten height), *Paint* (choose the layer in the list), *Holes* and
+*Foliage*; Ctrl inverts; every stroke is one undo step. Layers have albedo/normal/ORM textures, tint and
+tiling; steep slopes are projected triplanar. Foliage layers are procedural grass blades, texture cards
+or meshes (density, size, wind, view distance). Heightmaps (16-bit PNG/RAW) via *Import/Export*. The
+terrain collides, feeds the navmesh and is saved with the scene; Blueprint *Get Terrain Height* returns
+height and normal.
+
+### Materials
+
+*+ New → Material* creates a node graph (`.umat`), *Create instance* (or *+ New → Material instance*)
+an instance (`.uminst`) that overrides parameters. In the *Material* window: right-click the canvas
+for the node palette (type, Enter), drag pins to connect, Alt-click disconnects, Delete removes; on the
+left blend mode (Opaque/Masked/Translucent/Additive), Lit/Unlit, two-sided, parameters
+(Scalar/Vector/Texture) and the selected node's values; on the right the preview (sphere/box/plane).
+*World Position Offset* moves vertices (set *Max displacement* for culling). Assign a material by
+dragging it onto a mesh in the viewport or into *Mesh Renderer → Materials* per submesh; parameters
+can be overridden per object. Blueprints: *Set Material*, *Set Material Scalar/Vector Parameter*,
+*Clear Material Parameters*. Shaders are compiled on first load (cached in `Saved/Cache/Shaders`); the
+Basic template shows a pulsing example material.
+
+## Development
+
+`Sandbox` is the engine's demo and test application. Tests: `EngineTests` (CPU), `EngineGpuTests` and
+smoke tests via CTest with `-DENGINE_GPU_TESTS=ON`. See [docs/build-and-test.md](docs/build-and-test.md)
+and [CLAUDE.md](CLAUDE.md).
+
+## Licenses of bundled content
+
+Sample models are Khronos glTF sample assets under CC0 or CC-BY 4.0 (see
+[assets/models/LICENSE.md](assets/models/LICENSE.md)); sample sounds are synthesized and CC0 (see
+[assets/sounds/LICENSE.md](assets/sounds/LICENSE.md)).
