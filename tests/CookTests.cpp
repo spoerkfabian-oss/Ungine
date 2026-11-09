@@ -424,6 +424,46 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
     fs::remove_all(dir, ec);
 }
 
+// A file symlink inside Content/ that points elsewhere on the machine must not be packaged (it would
+// leak that file into the game); links that stay inside Content/ are fine.
+TEST_CASE(Cook_SymlinksOutsideContentAreNotPackaged)
+{
+    const fs::path dir = TempDir("cook_symlink");
+    std::string    error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir, "LinkGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    WriteBytes(dir / "private.txt", Bytes("secret"));
+    WriteBytes(content / "Notes" / "real.txt", Bytes("inside"));
+    std::error_code ec;
+    fs::create_symlink(dir / "private.txt", content / "Notes" / "leak.txt", ec);
+    if (!ec)
+        fs::create_symlink(content / "Notes" / "real.txt", content / "Notes" / "alias.txt", ec);
+    if (ec) { // e.g. Windows without the symlink privilege
+        std::printf("  (skipped: cannot create symlinks: %s)\n", ec.message().c_str());
+        fs::remove_all(dir, ec);
+        return;
+    }
+    CookOptions options;
+    options.threads = 2;
+    const CookReport report = CookProjectContent(*project, dir / "Out" / "Content.upak", options);
+    CHECK(report.Ok());
+    const auto pak = PakFile::Open(dir / "Out" / "Content.upak");
+    CHECK(!pak->Find("Content/Notes/leak.txt"));
+    CHECK(pak->Find("Content/Notes/real.txt") && pak->Find("Content/Notes/alias.txt"));
+    CHECK(std::ranges::any_of(report.warnings, [](const std::string& w) {
+        return w.find("Notes/leak.txt") != std::string::npos && w.find("outside Content") != std::string::npos;
+    }));
+    for (const PakEntryInfo& e : pak->Entries())
+        CHECK(pak->Read(e) != Bytes("secret"));
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ParticleEffectReferences)
 {
     // Effect textures are cooked as color textures; missing / outside meshes and textures are reported;

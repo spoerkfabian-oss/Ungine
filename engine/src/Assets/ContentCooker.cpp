@@ -470,10 +470,14 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         return !relative.empty() && !GenericUtf8(relative).starts_with("..");
     };
 
-    // Every regular file below Content/ (sorted: the pak does not depend on directory order).
+    // Every regular file below Content/ (sorted: the pak does not depend on directory order). Symlinks
+    // are followed only when their target stays inside Content/: a link to a file elsewhere on the
+    // machine must not end up in a distributed game.
     std::vector<fs::path> files;
     {
         std::error_code ec;
+        const fs::path  realContent = fs::weakly_canonical(content, ec);
+        ec.clear();
         for (fs::recursive_directory_iterator it(content, fs::directory_options::skip_permission_denied, ec), end;
              !ec && it != end; it.increment(ec)) {
             std::error_code e;
@@ -482,6 +486,13 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             const std::string name = PathToUtf8(it->path().filename());
             if (name.starts_with(".") || name.ends_with(".tmp"))
                 continue;
+            const fs::path target   = fs::weakly_canonical(it->path(), e);
+            const fs::path relative = e ? fs::path() : target.lexically_relative(realContent);
+            if (relative.empty() || *relative.begin() == "..") {
+                report.warnings.push_back("'" + entryPath(it->path().lexically_normal()) +
+                                          "' links to a file outside Content/ and was not packaged");
+                continue;
+            }
             files.push_back(it->path().lexically_normal());
         }
         if (ec)
