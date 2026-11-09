@@ -109,6 +109,17 @@ bool PackageProject(const Project& project, const std::filesystem::path& playerE
                     const std::filesystem::path& outputDirectory, std::string* error = nullptr,
                     CookReport* report = nullptr, const PackageOptions* options = nullptr);
 
+// Patch for a game packaged into `outputDirectory` earlier: cooks the content like PackageProject,
+// compares it with the paks there (Content.upak and the patches before), and writes only the
+// changed and new entries plus deleted entries for removed ones as Patch_<n>.upak (n = the highest
+// existing + 1; signed like the base), with the project file. `patchFile` gets its path, empty when
+// nothing changed (no file is written then). The player and shaders are not patched.
+bool PackagePatch(const Project& project, const std::filesystem::path& outputDirectory, std::string* error = nullptr,
+                  CookReport* report = nullptr, const PackageOptions* options = nullptr,
+                  std::filesystem::path* patchFile = nullptr);
+// The patches in `directory` (Patch_<n>.upak) in mount order.
+[[nodiscard]] std::vector<std::filesystem::path> PakPatches(const std::filesystem::path& directory);
+
 // --- Pak signing (ProjectSettings::pakPublicKey) ----------------------------------------------------
 // The private key never goes into the project: it is kept per user in
 // UserConfigDirectory()/keys/<public key>.key (the seed as hex); copy that file to build machines

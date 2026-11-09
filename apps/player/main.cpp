@@ -597,7 +597,8 @@ int main(int argc, char** argv)
         return 1;
     }
     if (Vfs::Mounted())
-        ENGINE_INFO("Mounted the packaged content{}", project->settings.pakPublicKey.empty() ? "" : " (signatures checked)");
+        ENGINE_INFO("Mounted the packaged content ({} patch(es){})", PakPatches(project->Root()).size(),
+                    project->settings.pakPublicKey.empty() ? "" : ", signatures checked");
 
     // The player's options (window, graphics, mixer, keys), kept per user next to the saves.
     GameOptions options(project->settings, saved / "Settings.json");

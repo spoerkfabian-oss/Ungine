@@ -8,6 +8,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <unordered_map>
 #include <chrono>
 #include <format>
 #include <fstream>
@@ -434,6 +436,8 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     if (ec)
         return fail("copying the project file");
     fs::remove_all(outputDirectory / "Content", ec); // loose content of older packages
+    for (const fs::path& patch : PakPatches(outputDirectory)) // they would override the new pak
+        fs::remove(patch, ec);
     ec.clear();
 
     // The content: cooked into one pak (+ a build report next to it).
@@ -467,6 +471,185 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     ENGINE_INFO("Packaged '{}' into '{}': {} raw files, {} cooked models, {} cooked textures, {:.1f} MB pak",
                 project.settings.name, PathToUtf8(outputDirectory), report.rawFiles, report.cookedModels,
                 report.cookedTextures, report.pakBytes / 1048576.0);
+    step(1.0f, "Done");
+    return true;
+}
+
+// --- Patches -----------------------------------------------------------------------------------------
+
+namespace {
+
+// n of "Patch_<n>.upak", nullopt for other names.
+std::optional<std::uint32_t> PatchNumber(const fs::path& file)
+{
+    const std::string name = PathToUtf8(file.filename());
+    if (!name.starts_with("Patch_") || !name.ends_with(".upak") || name.size() <= 11 || name.size() > 16)
+        return std::nullopt;
+    std::uint32_t n = 0;
+    for (const char ch : std::string_view(name).substr(6, name.size() - 11)) {
+        if (ch < '0' || ch > '9')
+            return std::nullopt;
+        n = n * 10 + static_cast<std::uint32_t>(ch - '0');
+    }
+    return n;
+}
+
+} // namespace
+
+std::vector<fs::path> PakPatches(const fs::path& directory)
+{
+    std::vector<std::pair<std::uint32_t, fs::path>> found;
+    std::error_code                                 ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec))
+        if (const auto n = PatchNumber(it->path()); n && it->is_regular_file(ec))
+            found.emplace_back(*n, it->path());
+    std::ranges::sort(found);
+    std::vector<fs::path> files;
+    for (auto& [n, file] : found)
+        files.push_back(std::move(file));
+    return files;
+}
+
+bool PackagePatch(const Project& project, const fs::path& outputDirectory, std::string* error, CookReport* reportOut,
+                  const PackageOptions* packaging, fs::path* patchFile)
+{
+    if (patchFile)
+        patchFile->clear();
+    const auto step = [&](float value, const std::string& what) {
+        if (packaging && packaging->progress)
+            packaging->progress(value, what);
+    };
+    std::error_code ec;
+    const fs::path  base = outputDirectory / "Content.upak";
+    if (!fs::is_regular_file(base, ec)) {
+        SetError(error, "'" + PathToUtf8(outputDirectory) + "' holds no packaged game (Content.upak); package it first");
+        return false;
+    }
+    std::optional<PakKeyPair> signingKey;
+    if (!project.settings.pakPublicKey.empty()) {
+        std::string keyError;
+        signingKey = LoadPakSigningKey(project.settings, packaging ? packaging->keyFile : fs::path(), &keyError);
+        if (!signingKey) {
+            SetError(error, keyError);
+            return false;
+        }
+    }
+
+    // What the game has now: the newest entry per path over the base and its patches.
+    struct Shipped {
+        std::uint64_t hash = 0, size = 0;
+        bool          deleted = false;
+        std::string   path;
+    };
+    std::unordered_map<std::string, Shipped> shipped; // by lookup key (lowercase on Windows)
+    const auto key = [](std::string_view path) {
+#ifdef _WIN32
+        std::string lower(path);
+        std::ranges::transform(lower, lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return lower;
+#else
+        return std::string(path);
+#endif
+    };
+    std::vector<fs::path> layers{base};
+    const std::vector<fs::path> patches = PakPatches(outputDirectory);
+    layers.insert(layers.end(), patches.begin(), patches.end());
+    std::uint32_t next = 1;
+    try {
+        for (const fs::path& layer : layers) {
+            if (const auto n = PatchNumber(layer))
+                next = std::max(next, *n + 1);
+            const auto pak = PakFile::Open(layer, signingKey ? &signingKey->publicKey : nullptr);
+            for (const PakEntryInfo& e : pak->Entries())
+                shipped[key(e.path)] = {e.hash, e.size, e.Deleted(), e.path};
+        }
+    } catch (const std::exception& e) {
+        SetError(error, e.what());
+        return false;
+    }
+
+    // The current content, cooked into a temporary pak.
+    step(0.0f, "Cooking");
+    const fs::path temporary = outputDirectory / "Patch.tmp.upak";
+    CookOptions    options;
+    options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
+    options.progress = [&](float value, const std::string& what) { step(0.9f * value, what); };
+    if (packaging)
+        options.cancelled = packaging->cancelled;
+    CookReport report = CookProjectContent(project, temporary, options);
+    const auto cleanup = [&] {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+    };
+    if (std::ranges::find(report.errors, std::string(kCookCancelled)) != report.errors.end()) {
+        cleanup();
+        SetError(error, "packaging was cancelled");
+        return false;
+    }
+    if (!report.Ok()) {
+        cleanup();
+        if (reportOut)
+            *reportOut = report;
+        SetError(error, std::format("cooking failed with {} error(s), first: {}", report.errors.size(), report.errors.front()));
+        return false;
+    }
+
+    step(0.92f, "Comparing with the shipped content");
+    const fs::path file = outputDirectory / std::format("Patch_{}.upak", next);
+    CookReport     patchReport;
+    patchReport.warnings = report.warnings;
+    try {
+        const auto current = PakFile::Open(temporary);
+        PakWriter  writer(file);
+        for (const PakEntryInfo& e : current->Entries()) {
+            const auto it = shipped.find(key(e.path));
+            if (it != shipped.end() && !it->second.deleted && it->second.hash == e.hash && it->second.size == e.size) {
+                it->second.deleted = true; // seen: not removed below
+                continue;
+            }
+            if (it != shipped.end())
+                it->second.deleted = true;
+            const std::vector<std::byte> bytes = current->Read(e);
+            writer.Add(e.path, bytes, e.Compressed() ? PakCompression::Auto : PakCompression::None);
+            patchReport.entries.push_back({e.path, e.size, e.path.starts_with(kCookedPrefix) ? "cooked" : "changed"});
+        }
+        for (const auto& [lookup, s] : shipped)
+            if (!s.deleted) { // shipped before, gone now
+                writer.AddDeleted(s.path);
+                patchReport.entries.push_back({s.path, 0, "deleted"});
+            }
+        if (patchReport.entries.empty()) { // nothing changed: the writer removes its file
+            cleanup();
+            if (reportOut)
+                *reportOut = patchReport;
+            step(1.0f, "No changes");
+            return true;
+        }
+        writer.Finish(signingKey ? &*signingKey : nullptr);
+        patchReport.pakBytes = writer.BytesWritten();
+    } catch (const std::exception& e) {
+        cleanup();
+        SetError(error, e.what());
+        return false;
+    }
+    cleanup();
+    fs::copy_file(project.File(), outputDirectory / project.File().filename(), fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        SetError(error, "copying the project file: " + ec.message());
+        return false;
+    }
+    std::ranges::sort(patchReport.entries, {}, &CookReport::Entry::path);
+    patchReport.seconds = report.seconds;
+    {
+        std::ofstream text(outputDirectory / std::format("BuildReport_Patch_{}.txt", next), std::ios::binary | std::ios::trunc);
+        text << patchReport.Text();
+    }
+    if (reportOut)
+        *reportOut = patchReport;
+    if (patchFile)
+        *patchFile = file;
+    ENGINE_INFO("Patched '{}': {} with {} entries, {:.2f} MB", project.settings.name, PathToUtf8(file.filename()),
+                patchReport.entries.size(), patchReport.pakBytes / 1048576.0);
     step(1.0f, "Done");
     return true;
 }
@@ -533,12 +716,19 @@ bool MountPackagedContent(const Project& project, std::string* error)
     if (!fs::is_regular_file(base, ec))
         return true; // development: the loose Content/
     const std::optional<PakPublicKey> required = ParsePakKeyHex(project.settings.pakPublicKey);
-    try {
-        Vfs::Mount(PakFile::Open(base, required ? &*required : nullptr), project.Root());
+    std::vector<fs::path>             layers{base};
+    const std::vector<fs::path>       patches = PakPatches(project.Root());
+    layers.insert(layers.end(), patches.begin(), patches.end());
+    std::vector<std::shared_ptr<const PakFile>> paks;
+    try { // all or nothing: a refused patch must not leave a half-patched game mounted
+        for (const fs::path& layer : layers)
+            paks.push_back(PakFile::Open(layer, required ? &*required : nullptr));
     } catch (const std::exception& e) {
         SetError(error, e.what());
         return false;
     }
+    for (std::shared_ptr<const PakFile>& pak : paks)
+        Vfs::Mount(std::move(pak), project.Root());
     return true;
 }
 

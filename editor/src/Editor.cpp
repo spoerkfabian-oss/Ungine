@@ -490,6 +490,12 @@ void Editor::DrawMenuBar()
             m_DialogPurpose = DialogPurpose::Package;
             m_FileDialog->Open("Package into folder", FileDialog::Mode::Folder, m_Ctx.project->Root().parent_path(), {});
         }
+        if (ImGui::MenuItem("Package patch...", nullptr, false, !m_PackageWorker.joinable())) {
+            m_DialogPurpose = DialogPurpose::PackagePatch;
+            m_FileDialog->Open("Packaged game to patch", FileDialog::Mode::Folder, m_PackageOutput.empty() ? m_Ctx.project->Root().parent_path() : m_PackageOutput, {});
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Patch_<n>.upak with only what changed since the game in the chosen folder was packaged");
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {

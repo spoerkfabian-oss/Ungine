@@ -514,6 +514,80 @@ TEST_CASE(Pak_SigningAndSignedProjects)
     fs::remove_all(dir, ec);
 }
 
+// Patches: only what changed since the packaged build (changed, new and deleted files), nothing when
+// nothing changed, numbered in mount order, signed like the base (a foreign patch keeps the whole
+// game from mounting), and dropped by the next full packaging.
+TEST_CASE(Pak_PatchesAgainstThePackagedGame)
+{
+    const fs::path         dir = TempDir("pak_patch");
+    std::string            error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir / "Project", "PatchGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const PakKeyPair key     = GeneratePakKey();
+    const fs::path   keyFile = dir / "build.key";
+    std::ofstream(keyFile) << HexString(key.seed) << "\n";
+    project->settings.pakPublicKey = HexString(key.publicKey);
+    CHECK(project->Save());
+    PackageOptions options;
+    options.keyFile = keyFile;
+    const fs::path data = project->ContentDirectory() / "Data";
+    WriteBytes(data / "keep.txt", Bytes("keep"));
+    WriteBytes(data / "change.txt", Bytes("version 1"));
+    WriteBytes(data / "remove.txt", Bytes("remove me"));
+    const fs::path fakePlayer = dir / "UnginePlayer.bin";
+    std::ofstream(fakePlayer) << "player";
+    const fs::path game = dir / "Game";
+    CHECK(PackageProject(*project, fakePlayer, game, &error, nullptr, &options));
+
+    fs::path patch;
+    CookReport report;
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch.empty()); // nothing changed
+    CHECK(PakPatches(game).empty());
+
+    WriteBytes(data / "change.txt", Bytes("version 2"));
+    WriteBytes(data / "new.txt", Bytes("new"));
+    fs::remove(data / "remove.txt");
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch == game / "Patch_1.upak");
+    std::vector<std::string> kinds;
+    for (const CookReport::Entry& e : report.entries)
+        kinds.push_back(e.path + ":" + e.kind);
+    CHECK((kinds == std::vector<std::string>{"Content/Data/change.txt:changed", "Content/Data/new.txt:changed",
+                                             "Content/Data/remove.txt:deleted"}));
+    CHECK(PakFile::Open(patch, &key.publicKey)->Entries().size() == 3);
+
+    WriteBytes(data / "change.txt", Bytes("version 3"));
+    CHECK(PackagePatch(*project, game, &error, &report, &options, &patch) && patch == game / "Patch_2.upak");
+    CHECK(report.entries.size() == 1 && PakPatches(game) == (std::vector<fs::path>{game / "Patch_1.upak", game / "Patch_2.upak"}));
+
+    std::optional<Project> shipped = Project::Load(game / project->File().filename());
+    CHECK(shipped && MountPackagedContent(*shipped, &error));
+    const fs::path content = shipped->Root() / "Content" / "Data";
+    CHECK(Vfs::Read(content / "change.txt") == Bytes("version 3"));
+    CHECK(Vfs::Read(content / "keep.txt") == Bytes("keep") && Vfs::Read(content / "new.txt") == Bytes("new"));
+    CHECK(!Vfs::Exists(content / "remove.txt"));
+    Vfs::UnmountAll();
+
+    // A patch that is not signed by the project's key: the game refuses to start, nothing is mounted.
+    {
+        PakWriter rogue(game / "Patch_3.upak");
+        rogue.Add("Content/Data/keep.txt", Bytes("rogue"));
+        rogue.Finish();
+    }
+    CHECK(!MountPackagedContent(*shipped, &error) && error.find("not signed") != std::string::npos && !Vfs::Mounted());
+    fs::remove(game / "Patch_3.upak");
+
+    // A full packaging starts over: the old patches would override the new pak.
+    CHECK(PackageProject(*project, fakePlayer, game, &error, nullptr, &options));
+    CHECK(PakPatches(game).empty());
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ModelDataRoundTrip)
 {
     // Embedded textures (GLB), a skin with animations (the Basic template's banner) and an

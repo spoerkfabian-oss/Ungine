@@ -534,7 +534,7 @@ bool Editor::PackageProject(const fs::path& outputDirectory)
     return m_PackageOk;
 }
 
-bool Editor::StartPackaging(const fs::path& outputDirectory)
+bool Editor::StartPackaging(const fs::path& outputDirectory, bool patch)
 {
     if (!m_Ctx.project)
         return false;
@@ -544,6 +544,7 @@ bool Editor::StartPackaging(const fs::path& outputDirectory)
     }
     SaveAll(); // the worker reads the files, not the editor's state
     m_PackageOutput = outputDirectory;
+    m_PackageIsPatch = patch;
     m_PackagingReport = std::make_unique<CookReport>();
     m_PackageError.clear();
     m_PackageOk = false;
@@ -556,7 +557,7 @@ bool Editor::StartPackaging(const fs::path& outputDirectory)
     }
     m_Status = "Packaging " + m_Ctx.project->settings.name + "...";
     m_PackageWorker = std::jthread([this, project = *m_Ctx.project, player = SiblingExecutable("UnginePlayer"),
-                                    outputDirectory, report = m_PackagingReport.get()] {
+                                    outputDirectory, patch, report = m_PackagingReport.get()] {
         PackageOptions callbacks;
         callbacks.progress = [this](float value, const std::string& step) {
             m_PackageProgress.store(value, std::memory_order_relaxed);
@@ -567,7 +568,13 @@ bool Editor::StartPackaging(const fs::path& outputDirectory)
         std::string error;
         bool        ok = false;
         try {
-            ok = Engine::PackageProject(project, player, outputDirectory, &error, report, &callbacks);
+            if (patch) {
+                std::filesystem::path file;
+                ok = Engine::PackagePatch(project, outputDirectory, &error, report, &callbacks, &file);
+                if (ok && file.empty())
+                    report->warnings.insert(report->warnings.begin(), "No changes since the last build: no patch was written");
+            } else
+                ok = Engine::PackageProject(project, player, outputDirectory, &error, report, &callbacks);
         } catch (const std::exception& e) {
             error = e.what();
         }
@@ -592,7 +599,7 @@ void Editor::UpdatePackaging()
         m_Status = m_PackageCancel.load(std::memory_order_relaxed) ? "Packaging cancelled" : "Packaging failed (see Package report)";
         return;
     }
-    m_Status = "Packaged into " + PathToUtf8(m_PackageOutput);
+    m_Status = (m_PackageIsPatch ? "Patched " : "Packaged into ") + PathToUtf8(m_PackageOutput);
 }
 
 void Editor::DrawPackagingProgress()

@@ -67,7 +67,17 @@ if(ENGINE_GPU_TESTS)
     set_tests_properties(SmokePackageSetup PROPERTIES FIXTURES_SETUP smoke_package FIXTURES_REQUIRED smoke_switch
                          RESOURCE_LOCK smoke_switch)
     add_test(NAME UnginePackagedPlayerSmoke COMMAND ${smoke_package}/SwitchGame${CMAKE_EXECUTABLE_SUFFIX} --frames 200)
-    set_tests_properties(UnginePackagedPlayerSmoke PROPERTIES FIXTURES_REQUIRED smoke_package
+    set_tests_properties(UnginePackagedPlayerSmoke PROPERTIES FIXTURES_REQUIRED smoke_package RESOURCE_LOCK smoke_package
                          PASS_REGULAR_EXPRESSION "Playing 'SwitchGame' \\([^)]*Annex\\.scene\\.json\\)"
                          FAIL_REGULAR_EXPRESSION "\\[ERROR\\]|not used|not cooked into the pak")
+    # A patch on top (UngineCook --patch after a content change): the packaged player mounts it.
+    add_test(NAME SmokePatchSetup COMMAND ${CMAKE_COMMAND} -DCOOK=$<TARGET_FILE:UngineCook>
+             -DPROJECT=${smoke_switch}/SwitchGame.ungineproj -DPACKAGE=${smoke_package}
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/PatchSmoke.cmake)
+    set_tests_properties(SmokePatchSetup PROPERTIES FIXTURES_SETUP smoke_patch FIXTURES_REQUIRED "smoke_package;smoke_switch"
+                         RESOURCE_LOCK "smoke_switch;smoke_package")
+    add_test(NAME UnginePatchedPlayerSmoke COMMAND ${smoke_package}/SwitchGame${CMAKE_EXECUTABLE_SUFFIX} --frames 120)
+    set_tests_properties(UnginePatchedPlayerSmoke PROPERTIES FIXTURES_REQUIRED smoke_patch RESOURCE_LOCK smoke_package
+                         PASS_REGULAR_EXPRESSION "Mounted the packaged content \\(1 patch"
+                         FAIL_REGULAR_EXPRESSION "\\[ERROR\\]|not cooked into the pak")
 endif()

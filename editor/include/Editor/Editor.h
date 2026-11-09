@@ -204,7 +204,8 @@ public:
     bool PackageProject(const std::filesystem::path& outputDirectory); // blocking (StartPackaging + wait)
     // Background packaging (Build > Package project): a progress window shows the step and offers
     // Cancel; the report window opens when it ends. False if one is running or there is no project.
-    bool StartPackaging(const std::filesystem::path& outputDirectory);
+    // patch: Patch_<n>.upak against the game already packaged into outputDirectory (PackagePatch).
+    bool StartPackaging(const std::filesystem::path& outputDirectory, bool patch = false);
     [[nodiscard]] bool  PackagingBusy() const { return m_PackageWorker.joinable(); } // until its result is shown
     [[nodiscard]] float PackagingProgress() const { return m_PackageProgress.load(std::memory_order_relaxed); }
     void                CancelPackaging() { m_PackageCancel.store(true, std::memory_order_relaxed); }
@@ -606,7 +607,7 @@ private:
     std::string                 m_Status; // last file operation, shown in the menu bar
     std::function<void()>       m_PendingSceneChange; // waiting for "discard changes?"
     bool                        m_ConfirmDiscard = false;
-    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph, ImportHeightmap, ExportHeightmap, TerrainAsset, AssignTerrain } m_DialogPurpose = DialogPurpose::None;
+    enum class DialogPurpose { None, OpenScene, SaveScene, LoadModel, NewScript, AssignScript, AssignSound, Package, PackagePatch, CreatePrefab, ImportContent, MoveContent, AssignLevel, PreviewLevel, AssignPhysicsMaterial, AssignCueSound, AssignEffect, AssignAnimGraph, ImportHeightmap, ExportHeightmap, TerrainAsset, AssignTerrain } m_DialogPurpose = DialogPurpose::None;
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
@@ -615,6 +616,7 @@ private:
     std::unique_ptr<CookReport>  m_PackagingReport;
     std::string                  m_PackageError;
     bool                         m_PackageOk = false;
+    bool                         m_PackageIsPatch = false;
     std::atomic<bool>            m_PackageDone{false}, m_PackageCancel{false};
     std::atomic<float>           m_PackageProgress{0.0f};
     std::mutex                   m_PackageStepMutex;
