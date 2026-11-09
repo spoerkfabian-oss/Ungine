@@ -159,3 +159,59 @@ TEST_CASE(Malformed_CookedModelCounts)
         CHECK(rejected);
     }
 }
+
+namespace {
+
+ModelData OneTriangle(std::uint32_t lastIndex)
+{
+    ModelData d;
+    d.name     = "Tri";
+    d.vertices.resize(3);
+    d.vertices[1].position = {1.0f, 0.0f, 0.0f};
+    d.vertices[2].position = {0.0f, 1.0f, 0.0f};
+    d.indices  = {0, 1, lastIndex};
+    d.meshes.push_back(Mesh{.name = "Tri", .submeshes = {Submesh{.firstIndex = 0, .indexCount = 3}}});
+    return d;
+}
+
+} // namespace
+
+// Index values that address no vertex are rejected: in cooked models (no glTF validation on that
+// path) and in OptimizeMeshes, where the highest index 0xFFFFFFFF used to wrap the count to 0.
+TEST_CASE(Malformed_IndicesPastTheVertices)
+{
+    const fs::path             file = fs::temp_directory_path() / "Tri.glb";
+    const MeshOptimizeSettings settings;
+    const auto deserializes = [&](const ModelData& d) {
+        try {
+            return DeserializeModelData(SerializeModelData(d, file, settings), file, settings).indices.size() == 3;
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    };
+    CHECK(deserializes(OneTriangle(2)));
+    CHECK(!deserializes(OneTriangle(3)));
+    CHECK(!deserializes(OneTriangle(0xFFFFFFFFu)));
+    ModelData negative = OneTriangle(2);
+    negative.meshes[0].submeshes[0].vertexOffset = -1;
+    CHECK(!deserializes(negative));
+    ModelData lod = OneTriangle(2);
+    lod.indices.push_back(7);
+    lod.meshes[0].submeshes[0].lodCount = 2;
+    lod.meshes[0].submeshes[0].lods[1]  = {.firstIndex = 3, .indexCount = 1};
+    CHECK(!deserializes(lod));
+
+    for (const std::uint32_t last : {3u, 0xFFFFFFFFu}) {
+        ModelData d        = OneTriangle(last);
+        bool      rejected = false;
+        try {
+            (void)OptimizeMeshes(d, settings);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
+    ModelData valid = OneTriangle(2);
+    (void)OptimizeMeshes(valid, settings);
+    CHECK(valid.indices.size() >= 3);
+}

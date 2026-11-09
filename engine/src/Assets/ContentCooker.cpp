@@ -193,6 +193,27 @@ constexpr std::size_t kMinSkinBytes      = kCountBytes + 4 + kCountBytes;
 constexpr std::size_t kMinAnimationBytes = kCountBytes + 4 + kCountBytes;
 constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes;
 
+// Cooked models skip the glTF loader's checks: every index range must lie in the index buffer and
+// every index must address a vertex, or the GPU and the collision code read past the vertices.
+void ValidateGeometry(const ModelData& d)
+{
+    const auto checkRange = [&](std::uint32_t first, std::uint32_t count, std::int32_t vertexOffset) {
+        if (std::uint64_t{first} + count > d.indices.size())
+            throw std::runtime_error("cooked model: index range out of bounds");
+        for (std::uint32_t i = 0; i < count; ++i)
+            if (vertexOffset < 0 || std::uint64_t(vertexOffset) + d.indices[first + i] >= d.vertices.size())
+                throw std::runtime_error("cooked model: index out of the vertex range");
+    };
+    for (const Mesh& mesh : d.meshes)
+        for (const Submesh& sm : mesh.submeshes) {
+            if (sm.lodCount > kMaxLods)
+                throw std::runtime_error("cooked model: too many LODs");
+            checkRange(sm.firstIndex, sm.indexCount, sm.vertexOffset);
+            for (std::uint32_t l = 1; l < sm.lodCount; ++l)
+                checkRange(sm.lods[l].firstIndex, sm.lods[l].indexCount, sm.vertexOffset);
+        }
+}
+
 Light ReadLight(Reader& r)
 {
     Light l;
@@ -393,6 +414,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
         p = LoadPath(r.String(), modelDir);
     if (!r.AtEnd())
         throw std::runtime_error("cooked model: trailing data");
+    ValidateGeometry(d);
     d.optimized = true;
     return d;
 }
