@@ -154,6 +154,10 @@ Editor::~Editor()
         m_ImportWorker.request_stop();
         m_ImportWorker.join();
     }
+    if (m_PackageWorker.joinable()) {
+        CancelPackaging();
+        m_PackageWorker.join();
+    }
     Stop(); // leaving the editor while playing returns to the edit scene
     if (m_Ctx.streaming) { // previews belong to the editor
         m_Ctx.streaming->UnloadAll(m_Ctx.scene);
@@ -234,6 +238,7 @@ void Editor::Update(float dt)
         DrawProjectSettings();
     if (m_ShowPackageReport)
         DrawPackageReport();
+    DrawPackagingProgress();
     if (m_ShowTypes)
         DrawBlueprintTypes();
     if (m_ShowPhysicsMaterial)
@@ -262,6 +267,7 @@ void Editor::Update(float dt)
     TrackSettings();
     UpdatePendingInstances();
     UpdateContentImport(); // also with the content browser closed
+    UpdatePackaging();
     // Prefab files changed on disk (another editor, version control): instances follow.
     if (m_PlayState == PlayState::Edit && ImGui::GetTime() - m_PrefabPollTime > 1.0) {
         m_PrefabPollTime = ImGui::GetTime();
@@ -480,7 +486,7 @@ void Editor::DrawMenuBar()
     if (m_Ctx.project && ImGui::BeginMenu("Build")) {
         if (ImGui::MenuItem("Build & Run", "Ctrl+B"))
             BuildAndRun();
-        if (ImGui::MenuItem("Package project...")) {
+        if (ImGui::MenuItem("Package project...", nullptr, false, !m_PackageWorker.joinable())) {
             m_DialogPurpose = DialogPurpose::Package;
             m_FileDialog->Open("Package into folder", FileDialog::Mode::Folder, m_Ctx.project->Root().parent_path(), {});
         }

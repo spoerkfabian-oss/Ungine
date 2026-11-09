@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Engine {
@@ -38,7 +39,12 @@ struct CookOptions {
     MeshOptimizeSettings meshes{};
     std::uint32_t        threads = 0; // texture encoding; 0: hardware threads
     std::function<void(float progress, const std::string& step)> progress; // optional, any thread
+    // Optional, any thread: polled between files and texture jobs; true stops the cook early with
+    // kCookCancelled in the report's errors and no pak file.
+    std::function<bool()> cancelled;
 };
+
+inline constexpr std::string_view kCookCancelled = "cancelled";
 
 struct CookReport {
     struct Entry {

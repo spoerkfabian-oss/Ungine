@@ -201,7 +201,13 @@ public:
     // Run (saves, starts UnginePlayer with the project), packaging into a standalone game folder.
     [[nodiscard]] std::filesystem::path ContentRoot() const;
     bool BuildAndRun();
-    bool PackageProject(const std::filesystem::path& outputDirectory);
+    bool PackageProject(const std::filesystem::path& outputDirectory); // blocking (StartPackaging + wait)
+    // Background packaging (Build > Package project): a progress window shows the step and offers
+    // Cancel; the report window opens when it ends. False if one is running or there is no project.
+    bool StartPackaging(const std::filesystem::path& outputDirectory);
+    [[nodiscard]] bool  PackagingBusy() const { return m_PackageWorker.joinable(); } // until its result is shown
+    [[nodiscard]] float PackagingProgress() const { return m_PackageProgress.load(std::memory_order_relaxed); }
+    void                CancelPackaging() { m_PackageCancel.store(true, std::memory_order_relaxed); }
     // Cook report of the last packaging (null before), shown in the "Package report" window.
     [[nodiscard]] const CookReport* PackageReport() const { return m_PackageReport.get(); }
     // Navigation: rebuilds every tile now and saves the baked file next to the scene (if saved).
@@ -345,6 +351,8 @@ private:
     void ReleaseContentPreview();
     void ImportContentFile(const std::filesystem::path& source);
     void UpdateContentImport();
+    void UpdatePackaging();         // collects a finished background packaging
+    void DrawPackagingProgress();
     bool RelocateContentAsset(const std::filesystem::path& source, const std::filesystem::path& target);
     void PurgeTrash(); // Saved/Trash entries older than kTrashDays
     void DrawProjectSettings();
@@ -602,6 +610,15 @@ private:
     Entity                      m_LevelTarget  = NullEntity; // entity whose streaming volume the dialog fills
     std::unique_ptr<GameOptions> m_PlayOptions;   // user options while playing (Options nodes)
     std::unique_ptr<CookReport>  m_PackageReport; // last packaging
+    // Background packaging: the worker owns m_PackagingReport / m_PackageError until m_PackageDone.
+    std::jthread                 m_PackageWorker;
+    std::unique_ptr<CookReport>  m_PackagingReport;
+    std::string                  m_PackageError;
+    bool                         m_PackageOk = false;
+    std::atomic<bool>            m_PackageDone{false}, m_PackageCancel{false};
+    std::atomic<float>           m_PackageProgress{0.0f};
+    std::mutex                   m_PackageStepMutex;
+    std::string                  m_PackageStep; // guarded by m_PackageStepMutex
     std::filesystem::path        m_PackageOutput;
     Entity                      m_PrefabTarget = NullEntity; // subtree the "Create prefab" dialog saves
     Entity                      m_MaterialTarget = NullEntity; // collider the physics material dialog fills

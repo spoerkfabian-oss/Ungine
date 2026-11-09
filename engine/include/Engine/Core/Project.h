@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -92,8 +93,14 @@ struct CookReport;
 // project file, Content.upak (everything below Content/, cooked: CookProjectContent) and
 // BuildReport.txt. Texture encoding reuses the project's cache (Saved/Cache/Textures). Returns
 // false with a message in `error` (also when cooking reported errors); `report` gets the details.
+// `callbacks` (optional) are called on the packaging thread: progress 0..1 with the current step,
+// and a cancel poll; a cancelled build fails with "packaging was cancelled" and leaves no pak.
+struct PackageCallbacks {
+    std::function<void(float progress, const std::string& step)> progress;
+    std::function<bool()>                                        cancelled;
+};
 bool PackageProject(const Project& project, const std::filesystem::path& playerExecutable,
                     const std::filesystem::path& outputDirectory, std::string* error = nullptr,
-                    CookReport* report = nullptr);
+                    CookReport* report = nullptr, const PackageCallbacks* callbacks = nullptr);
 
 } // namespace Engine

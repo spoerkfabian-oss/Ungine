@@ -1814,6 +1814,13 @@ TEST_CASE(Editor_ProjectLauncherAndContent)
         // Packaging without a player fails the same way; the report window shows why.
         CHECK(!editor.PackageProject(root / "Package") && editor.PackageReport() && !editor.PackageReport()->Ok());
         runFrames(3); // content browser, project menus, package report
+        // In the background (Build menu): the progress window until the worker ends, then the report.
+        CHECK(editor.StartPackaging(root / "Package2") && !editor.StartPackaging(root / "Package3"));
+        CHECK(F().Pump([&] {
+            runFrames(1);
+            return !editor.PackagingBusy();
+        }));
+        CHECK(editor.PackageReport() && !editor.PackageReport()->Ok() && editor.Status().starts_with("Packaging failed"));
         editor.NewScene();
     }
     for (ModelHandle h : modelRefs)

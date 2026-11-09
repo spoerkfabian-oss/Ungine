@@ -356,8 +356,17 @@ void RemoveRecentProject(const fs::path& file, const fs::path& list)
 // --- Packaging ----------------------------------------------------------------------------------
 
 bool PackageProject(const Project& project, const fs::path& playerExecutable, const fs::path& outputDirectory,
-                    std::string* error, CookReport* reportOut)
+                    std::string* error, CookReport* reportOut, const PackageCallbacks* callbacks)
 {
+    const auto step = [&](float value, const std::string& what) {
+        if (callbacks && callbacks->progress)
+            callbacks->progress(value, what);
+    };
+    const auto cancelled = [&] { return callbacks && callbacks->cancelled && callbacks->cancelled(); };
+    const auto cancel    = [&] {
+        SetError(error, "packaging was cancelled");
+        return false;
+    };
     std::error_code ec;
     if (!fs::exists(playerExecutable, ec)) {
         SetError(error, "player executable not found: '" + PathToUtf8(playerExecutable) + "'");
@@ -385,11 +394,17 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
         SetError(error, what + ": " + ec.message());
         return false;
     };
+    step(0.0f, "Copying the player");
+    if (cancelled())
+        return cancel();
     // The game: player renamed after the project, finds the project file next to it.
     const fs::path game = outputDirectory / (PathFromUtf8(project.settings.name).string() + playerExecutable.extension().string());
     fs::copy_file(playerExecutable, game, fs::copy_options::overwrite_existing, ec);
     if (ec)
         return fail("copying the player");
+    step(0.01f, "Copying the shaders");
+    if (cancelled())
+        return cancel();
     for (const fs::directory_entry& e : fs::directory_iterator(ShaderDirectory(), ec))
         if (e.path().extension() == ".spv")
             fs::copy_file(e.path(), outputDirectory / "shaders" / e.path().filename(), fs::copy_options::overwrite_existing, ec);
@@ -407,8 +422,13 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     ec.clear();
 
     // The content: cooked into one pak (+ a build report next to it).
+    if (cancelled())
+        return cancel();
     CookOptions options;
     options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
+    options.progress = [&](float value, const std::string& what) { step(0.04f + 0.95f * value, what); };
+    if (callbacks)
+        options.cancelled = callbacks->cancelled;
     const CookReport report = CookProjectContent(project, outputDirectory / "Content.upak", options);
     {
         std::ofstream text(outputDirectory / "BuildReport.txt", std::ios::binary | std::ios::trunc);
@@ -416,6 +436,8 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     }
     if (reportOut)
         *reportOut = report;
+    if (std::ranges::find(report.errors, std::string(kCookCancelled)) != report.errors.end())
+        return cancel();
     if (!report.Ok()) {
         SetError(error, std::format("cooking failed with {} error(s), first: {} (see BuildReport.txt)", report.errors.size(),
                                     report.errors.front()));
@@ -429,6 +451,7 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     ENGINE_INFO("Packaged '{}' into '{}': {} raw files, {} cooked models, {} cooked textures, {:.1f} MB pak",
                 project.settings.name, PathToUtf8(outputDirectory), report.rawFiles, report.cookedModels,
                 report.cookedTextures, report.pakBytes / 1048576.0);
+    step(1.0f, "Done");
     return true;
 }
 

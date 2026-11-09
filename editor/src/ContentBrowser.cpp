@@ -526,22 +526,100 @@ bool Editor::BuildAndRun()
 
 bool Editor::PackageProject(const fs::path& outputDirectory)
 {
+    if (!StartPackaging(outputDirectory))
+        return false;
+    while (!m_PackageDone.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    UpdatePackaging();
+    return m_PackageOk;
+}
+
+bool Editor::StartPackaging(const fs::path& outputDirectory)
+{
     if (!m_Ctx.project)
         return false;
-    SaveAll();
-    std::string error;
-    m_PackageReport     = std::make_unique<CookReport>();
-    m_PackageOutput     = outputDirectory;
-    m_ShowPackageReport = true;
-    if (!Engine::PackageProject(*m_Ctx.project, SiblingExecutable("UnginePlayer"), outputDirectory, &error, m_PackageReport.get())) {
-        ENGINE_ERROR("Package: {}", error);
-        if (std::ranges::find(m_PackageReport->errors, error) == m_PackageReport->errors.end())
-            m_PackageReport->errors.push_back(error);
-        m_Status = "Packaging failed (see Package report)";
+    if (m_PackageWorker.joinable()) {
+        m_Status = "Packaging is already running";
         return false;
     }
-    m_Status = "Packaged into " + PathToUtf8(outputDirectory);
+    SaveAll(); // the worker reads the files, not the editor's state
+    m_PackageOutput = outputDirectory;
+    m_PackagingReport = std::make_unique<CookReport>();
+    m_PackageError.clear();
+    m_PackageOk = false;
+    m_PackageDone.store(false, std::memory_order_relaxed);
+    m_PackageCancel.store(false, std::memory_order_relaxed);
+    m_PackageProgress.store(0.0f, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock(m_PackageStepMutex);
+        m_PackageStep = "Starting";
+    }
+    m_Status = "Packaging " + m_Ctx.project->settings.name + "...";
+    m_PackageWorker = std::jthread([this, project = *m_Ctx.project, player = SiblingExecutable("UnginePlayer"),
+                                    outputDirectory, report = m_PackagingReport.get()] {
+        PackageCallbacks callbacks;
+        callbacks.progress = [this](float value, const std::string& step) {
+            m_PackageProgress.store(value, std::memory_order_relaxed);
+            std::scoped_lock lock(m_PackageStepMutex);
+            m_PackageStep = step;
+        };
+        callbacks.cancelled = [this] { return m_PackageCancel.load(std::memory_order_relaxed); };
+        std::string error;
+        bool        ok = false;
+        try {
+            ok = Engine::PackageProject(project, player, outputDirectory, &error, report, &callbacks);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        m_PackageOk    = ok;
+        m_PackageError = std::move(error);
+        m_PackageDone.store(true, std::memory_order_release);
+    });
     return true;
+}
+
+void Editor::UpdatePackaging()
+{
+    if (!m_PackageWorker.joinable() || !m_PackageDone.load(std::memory_order_acquire))
+        return;
+    m_PackageWorker.join();
+    m_PackageReport     = std::move(m_PackagingReport);
+    m_ShowPackageReport = true;
+    if (!m_PackageOk) {
+        ENGINE_ERROR("Package: {}", m_PackageError);
+        if (std::ranges::find(m_PackageReport->errors, m_PackageError) == m_PackageReport->errors.end())
+            m_PackageReport->errors.push_back(m_PackageError);
+        m_Status = m_PackageCancel.load(std::memory_order_relaxed) ? "Packaging cancelled" : "Packaging failed (see Package report)";
+        return;
+    }
+    m_Status = "Packaged into " + PathToUtf8(m_PackageOutput);
+}
+
+void Editor::DrawPackagingProgress()
+{
+    if (!m_PackageWorker.joinable())
+        return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::Begin("Packaging", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+        std::string step;
+        {
+            std::scoped_lock lock(m_PackageStepMutex);
+            step = m_PackageStep;
+        }
+        ImGui::Text("Packaging %s into %s", m_Ctx.project ? m_Ctx.project->settings.name.c_str() : "",
+                    PathToUtf8(m_PackageOutput).c_str());
+        ImGui::ProgressBar(PackagingProgress(), ImVec2(-1.0f, 0.0f));
+        ImGui::TextUnformatted(step.c_str());
+        const bool cancelling = m_PackageCancel.load(std::memory_order_relaxed);
+        ImGui::BeginDisabled(cancelling);
+        if (ImGui::Button(cancelling ? "Cancelling..." : "Cancel"))
+            CancelPackaging();
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
 }
 
 void Editor::DrawPackageReport()

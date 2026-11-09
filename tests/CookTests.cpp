@@ -22,11 +22,14 @@
 #include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -420,6 +423,33 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
     CHECK(PackageProject(*project, fakePlayer, dir / "Package", &error, &packaged) && packaged.Ok());
     CHECK(fs::exists(dir / "Package" / "Content.upak") && fs::exists(dir / "Package" / "BuildReport.txt") &&
           !fs::exists(dir / "Package" / "Content"));
+
+    // Progress from 0 to 1 (texture jobs report out of order); cancelling stops without a pak.
+    std::mutex         stepsMutex;
+    std::vector<float> steps;
+    PackageCallbacks   reporting;
+    reporting.progress = [&](float value, const std::string&) {
+        std::scoped_lock lock(stepsMutex);
+        steps.push_back(value);
+    };
+    CHECK(PackageProject(*project, fakePlayer, dir / "Package2", &error, nullptr, &reporting));
+    CHECK(steps.size() > 4 && steps.front() == 0.0f && steps.back() == 1.0f &&
+          std::ranges::all_of(steps, [](float v) { return v >= 0.0f && v <= 1.0f; }));
+    for (const int pollsBeforeCancel : {0, 3}) { // before anything is copied / inside the cook
+        std::atomic<int> polls{0};
+        PackageCallbacks cancelling;
+        cancelling.cancelled = [&] { return ++polls > pollsBeforeCancel; };
+        const fs::path   cancelledOut = dir / std::format("Cancelled{}", pollsBeforeCancel);
+        CookReport       partial;
+        error.clear();
+        CHECK(!PackageProject(*project, fakePlayer, cancelledOut, &error, &partial, &cancelling));
+        CHECK(error == "packaging was cancelled" && !fs::exists(cancelledOut / "Content.upak"));
+        CHECK((pollsBeforeCancel == 0) == partial.errors.empty()); // the cook ran and reported the cancel
+    }
+    CookOptions stopAtOnce;
+    stopAtOnce.cancelled = [] { return true; };
+    const CookReport stopped = CookProjectContent(*project, dir / "Stopped.upak", stopAtOnce);
+    CHECK(stopped.errors == std::vector<std::string>{std::string(kCookCancelled)} && !fs::exists(dir / "Stopped.upak"));
     std::error_code ec;
     fs::remove_all(dir, ec);
 }

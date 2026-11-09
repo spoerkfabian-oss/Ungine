@@ -674,7 +674,7 @@ void Editor::DrawDialogs()
             break;
         case DialogPurpose::Package:
             if (m_Ctx.project)
-                PackageProject(*path / PathFromUtf8(m_Ctx.project->settings.name));
+                StartPackaging(*path / PathFromUtf8(m_Ctx.project->settings.name));
             break;
         case DialogPurpose::CreatePrefab: {
             std::filesystem::path file = *path;

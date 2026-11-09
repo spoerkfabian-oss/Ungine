@@ -495,6 +495,12 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         if (options.progress)
             options.progress(value, step);
     };
+    const auto cancelled = [&] { return options.cancelled && options.cancelled(); };
+    const auto stopped   = [&] {
+        report.errors.push_back(std::string(kCookCancelled));
+        report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return report;
+    };
     const fs::path root    = fs::absolute(project.Root()).lexically_normal();
     const fs::path content = fs::absolute(project.ContentDirectory()).lexically_normal();
     const auto     entryPath = [&](const fs::path& file) { return GenericUtf8(file.lexically_relative(root)); };
@@ -560,6 +566,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         ++done;
         if (!IsModelFile(file))
             continue;
+        if (cancelled())
+            return stopped();
         progress(0.4f * static_cast<float>(done) / static_cast<float>(files.size()), "Cooking " + PathToUtf8(file.filename()));
         try {
             ModelData data = LoadGltf(file);
@@ -869,7 +877,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
         const std::uint32_t threads = std::max(1u, options.threads ? options.threads : std::thread::hardware_concurrency());
         std::mutex progressMutex;
         const auto work = [&] {
-            for (std::size_t i = next++; i < jobs.size(); i = next++) {
+            for (std::size_t i = next++; i < jobs.size() && !cancelled(); i = next++) {
                 const TextureJob& job = jobs[i]->second;
                 try {
                     const CookResult r = CookTexture(*job.source, job.kind, options.textures);
@@ -887,6 +895,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             pool.emplace_back(work);
         work();
         pool.clear();
+        if (cancelled())
+            return stopped();
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             if (!failures[i].empty()) {
                 report.errors.push_back(failures[i]);
@@ -902,6 +912,8 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
     try {
         PakWriter writer(pakFile);
         for (const fs::path& file : files) {
+            if (cancelled()) // the writer deletes the unfinished pak
+                throw std::runtime_error(std::string(kCookCancelled));
             if (replaced.contains(file)) {
                 ++report.replacedFiles;
                 continue;
