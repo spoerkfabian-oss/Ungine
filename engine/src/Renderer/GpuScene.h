@@ -91,6 +91,9 @@ struct LodChoice {
 // Mirrors SelectLod in scene_common.glsl (the CPU path must pick the same geometry).
 [[nodiscard]] LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
                                   std::uint32_t forced);
+// The same with other object-space bounds (skinned instances: the pose bounds).
+[[nodiscard]] LodChoice SelectLod(const GpuSubmesh& submesh, const glm::vec3& boundsMin, const glm::vec3& boundsMax,
+                                  const glm::mat4& model, const glm::vec4& lodCamera, std::uint32_t forced);
 
 // Persistent GPU copy of the scene's mesh instances for GPU-driven rendering (and the CPU path,
 // which draws the same records directly). Update() applies the spatial index's mesh changes on

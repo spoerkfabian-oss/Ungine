@@ -782,7 +782,10 @@ void SceneRenderer::GatherDraws(const Frustum& frustum, const glm::vec4& sphere,
             if (((!animated && perSubmesh) || (animated && skinBoundsValid)) &&
                 (!frustum.Intersects(box) || (range && !near(box))))
                 continue;
-            const LodChoice lod   = animated ? LodChoice{} : SelectLod(sm, inst->model, m_LodCamera, m_LodForced);
+            // Skinned meshes pick their LOD from the pose bounds (LOD 0 until those are known).
+            const LodChoice lod = animated && !skinBoundsValid
+                                      ? LodChoice{}
+                                      : SelectLod(sm, localBounds.min, localBounds.max, inst->model, m_LodCamera, m_LodForced);
             const std::uint32_t e = d | (lod.lod << kVisibleLodShift);
             if (mode == Gather::Transparent) {
                 sorted.emplace_back(glm::distance(glm::vec3(m_LodCamera), (box.min + box.max) * 0.5f), e); // xyz: camera

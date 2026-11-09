@@ -1384,6 +1384,53 @@ TEST_CASE(Asset_FailedModelPlaceholderAndRetry)
     fs::remove_all(dir);
 }
 
+TEST_CASE(Render_SkinnedMeshLods)
+{
+    // Skinned meshes pick LODs from their pose bounds like static ones (GPU and CPU culling agree).
+    // A capsule skinned to one joint (indexed, so it simplifies; the Fox is not indexed).
+    ModelData data = MakeCapsule("SkinnedBall", 1.0f, 0.0f, MaterialData{.name = "Ball", .metallic = 0.0f, .roughness = 0.5f}, 128, 64);
+    ModelNode bone;
+    bone.name = "Bone";
+    data.nodes.push_back(bone);
+    data.nodes[0].skin   = 0;
+    data.nodes[0].parent = -1;
+    Skin skin;
+    skin.name         = "Skin";
+    skin.skeletonRoot = 1;
+    skin.joints.push_back(SkinJoint{.node = 1, .inverseBindMatrix = glm::mat4(1.0f)});
+    data.skins.push_back(skin);
+    data.skinInfluences.assign(data.vertices.size(), VertexSkinInfluence{.joints = glm::u16vec4(0), .weights = {1.0f, 0.0f, 0.0f, 0.0f}});
+    const ModelHandle h = F().assets->CreateModel(std::move(data));
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model && !model->skins.empty() && model->meshes.at(0).submeshes.at(0).lodCount > 1);
+    if (!model) {
+        F().assets->Release(h);
+        return;
+    }
+    const Submesh& sm = model->meshes[0].submeshes[0];
+    Scene          scene;
+    (void)InstantiateModel(scene, h, *model);
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure  = false;
+    renderer.shadows.resolution = 512;
+    const auto measure = [&](bool gpu, float distance) { // GPU counters: two frames old
+        renderer.culling.gpuDriven = gpu;
+        (void)RenderImage(renderer, scene, FrontCamera(distance), gpu ? 5 : 2);
+        return std::pair{renderer.Stats().lodDraws, renderer.Stats().triangles};
+    };
+    const std::uint64_t full = sm.indexCount / 3, coarsest = sm.lods[sm.lodCount - 1].indexCount / 3;
+    const auto [nearGpuLods, nearGpu] = measure(true, 1.75f);
+    const auto [farGpuLods, farGpu]   = measure(true, 400.0f);
+    const auto [nearCpuLods, nearCpu] = measure(false, 1.75f);
+    const auto [farCpuLods, farCpu]   = measure(false, 400.0f);
+    CHECK(nearGpuLods == 0 && nearGpu == full && nearCpuLods == 0 && nearCpu == full);
+    CHECK(farGpuLods == 1 && farCpuLods == 1 && farGpu == coarsest && farCpu == coarsest);
+    F().assets->Release(h);
+    F().Pump([] { return false; }, 4);
+}
+
 TEST_CASE(Render_MeshLodSelection)
 {
     const ModelHandle h = F().assets->CreateModel(

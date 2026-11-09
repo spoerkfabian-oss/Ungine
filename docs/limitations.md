@@ -46,7 +46,8 @@ These are known, accepted limitations — not regressions. Unverified platforms 
   shadow tiles only frustum-culled, no material/depth sorting in opaque buckets, culling dispatch
   ≤ 4 M records, statistics two frames old, occlusion for the camera (and cascade casters) only;
   `RenderOutput` and swapchain share visibility. LODs are chosen by camera distance only (also for
-  shadows); shadows do not cross-fade LODs; skinned meshes stay on LOD 0.
+  shadows); shadows do not cross-fade LODs; LOD errors of skinned meshes are measured in the bind pose;
+non-indexed glTF meshes (e.g. the Fox) get no LODs (every edge is an open border).
 - TAA: no upscaling, no reactive mask (fast particles/transparents may smear), fixed 8 Halton
   positions; pixel-exact comparisons need TAA off.
 - Decals only on opaque surfaces, 32 per cluster, normal decals replace the normal proportionally, no

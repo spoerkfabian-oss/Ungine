@@ -88,6 +88,12 @@ GpuScene::~GpuScene()
 
 LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera, std::uint32_t forced)
 {
+    return SelectLod(submesh, submesh.boundsMin, submesh.boundsMax, model, lodCamera, forced);
+}
+
+LodChoice SelectLod(const GpuSubmesh& submesh, const glm::vec3& boundsMin, const glm::vec3& boundsMax, const glm::mat4& model,
+                    const glm::vec4& lodCamera, std::uint32_t forced)
+{
     constexpr float kFadeBand = 0.2f; // LOD_FADE_BAND
     if (submesh.lodCount <= 1)
         return {};
@@ -95,8 +101,8 @@ LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm
         return {.lod = std::min(forced - 1, submesh.lodCount - 1), .fade = 0};
     if (lodCamera.w <= 0.0f)
         return {};
-    const glm::vec3 c      = (submesh.boundsMin + submesh.boundsMax) * 0.5f;
-    const glm::vec3 e      = (submesh.boundsMax - submesh.boundsMin) * 0.5f;
+    const glm::vec3 c      = (boundsMin + boundsMax) * 0.5f;
+    const glm::vec3 e      = (boundsMax - boundsMin) * 0.5f;
     const glm::vec3 center = glm::vec3(model * glm::vec4(c, 1.0f));
     const glm::vec3 extent = glm::mat3(glm::abs(glm::vec3(model[0])), glm::abs(glm::vec3(model[1])),
                                        glm::abs(glm::vec3(model[2]))) * e;
