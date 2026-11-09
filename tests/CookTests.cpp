@@ -424,6 +424,96 @@ TEST_CASE(Pak_CompressionDeletedEntriesAndVersion1)
     fs::remove_all(dir, ec);
 }
 
+// Signed paks: the right key opens them, another key / no signature / a changed index is refused;
+// a project with a pakPublicKey packages with the key from the key store (or --key file) and only
+// mounts paks signed by it.
+TEST_CASE(Pak_SigningAndSignedProjects)
+{
+    const fs::path   dir   = TempDir("pak_signing");
+    const PakKeyPair key   = GeneratePakKey();
+    const PakKeyPair other = GeneratePakKey();
+    CHECK(key.publicKey != other.publicKey && PakKeyFromSeed(key.seed).publicKey == key.publicKey);
+    CHECK(ParsePakKeyHex(HexString(key.publicKey)) == std::optional<PakPublicKey>(key.publicKey));
+    CHECK(!ParsePakKeyHex("abc") && !ParsePakKeyHex(std::string(64, 'x')));
+    {
+        PakWriter writer(dir / "Signed.upak");
+        writer.Add("Content/a.txt", Bytes("signed content"));
+        writer.Finish(&key);
+        PakWriter unsigned_(dir / "Unsigned.upak");
+        unsigned_.Add("Content/a.txt", Bytes("signed content"));
+        unsigned_.Finish();
+    }
+    const auto refused = [](const fs::path& file, const PakPublicKey* required, std::string_view why) {
+        try {
+            (void)PakFile::Open(file, required);
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what()).find(why) != std::string::npos;
+        }
+        return false;
+    };
+    const auto pak = PakFile::Open(dir / "Signed.upak", &key.publicKey);
+    CHECK(pak->Signed() && pak->SignedBy() == std::optional<PakPublicKey>(key.publicKey));
+    CHECK(pak->Read(*pak->Find("Content/a.txt")) == Bytes("signed content"));
+    CHECK(PakFile::Open(dir / "Signed.upak")->Signed()); // no key required: still checked, accepted
+    CHECK(refused(dir / "Signed.upak", &other.publicKey, "signed by another key"));
+    CHECK(refused(dir / "Unsigned.upak", &key.publicKey, "not signed"));
+    // A changed index (with a fixed FNV index hash, as an attacker would) breaks the signature.
+    {
+        std::vector<std::byte> bytes = ReadAll(dir / "Signed.upak");
+        std::uint64_t          indexOffset = 0, indexSize = 0;
+        std::memcpy(&indexOffset, bytes.data() + 16, sizeof(indexOffset));
+        std::memcpy(&indexSize, bytes.data() + 24, sizeof(indexSize));
+        bytes[static_cast<std::size_t>(indexOffset + 4)] = static_cast<std::byte>('X'); // "Content/a.txt" -> "Xontent/a.txt"
+        const std::uint64_t hash = Fnv1a64(std::span<const std::byte>(bytes.data() + indexOffset, static_cast<std::size_t>(indexSize)));
+        std::memcpy(bytes.data() + 32, &hash, sizeof(hash));
+        WriteBytes(dir / "Forged.upak", bytes);
+        CHECK(refused(dir / "Forged.upak", nullptr, "signature is invalid"));
+    }
+
+    // A signed project: packaging needs the private key; the packaged game mounts only its paks.
+    std::string            error;
+    std::optional<Project> project;
+    for (const ProjectTemplate& t : ProjectTemplates())
+        if (t.id == "Blank")
+            project = Project::Create(dir / "Project", "SignedGame", t, &error);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path fakePlayer = dir / "UnginePlayer.bin";
+    std::ofstream(fakePlayer) << "player";
+    project->settings.pakPublicKey = HexString(key.publicKey);
+    CHECK(project->Save());
+    CHECK(Project::Load(project->File())->settings.pakPublicKey == HexString(key.publicKey));
+    const fs::path keyFile = dir / "build.key";
+    std::ofstream(keyFile) << HexString(key.seed) << "\n";
+    PackageOptions withKey;
+    withKey.keyFile = dir / "missing.key";
+    CHECK(!PackageProject(*project, fakePlayer, dir / "NoKey", &error, nullptr, &withKey));
+    CHECK(error.find("not on this machine") != std::string::npos && !fs::exists(dir / "NoKey"));
+    withKey.keyFile = keyFile;
+    CHECK(PackageProject(*project, fakePlayer, dir / "Game", &error, nullptr, &withKey));
+    CHECK(PakFile::Open(dir / "Game" / "Content.upak", &key.publicKey)->Signed());
+    std::optional<Project> game = Project::Load(dir / "Game" / project->File().filename());
+    CHECK(game.has_value() && MountPackagedContent(*game, &error) && Vfs::Mounted());
+    Vfs::UnmountAll();
+    game->settings.pakPublicKey = HexString(other.publicKey); // a game expecting another key
+    CHECK(!MountPackagedContent(*game, &error) && error.find("signed by another key") != std::string::npos && !Vfs::Mounted());
+    std::ofstream(keyFile) << HexString(other.seed) << "\n";
+    CHECK(!LoadPakSigningKey(project->settings, keyFile, &error) && error.find("another key") != std::string::npos);
+
+    // The key store: CreatePakSigningKey writes the seed below the user config directory.
+    Project fresh = *project;
+    fresh.settings.pakPublicKey.clear();
+    CHECK(CreatePakSigningKey(fresh, &error));
+    const std::optional<PakPublicKey> created = ParsePakKeyHex(fresh.settings.pakPublicKey);
+    CHECK(created && fs::exists(PakKeyFile(*created)));
+    CHECK(LoadPakSigningKey(fresh.settings).has_value());
+    std::error_code ec;
+    if (created)
+        fs::remove(PakKeyFile(*created), ec);
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE(Cook_ModelDataRoundTrip)
 {
     // Embedded textures (GLB), a skin with animations (the Basic template's banner) and an
@@ -566,7 +656,7 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
     // Progress from 0 to 1 (texture jobs report out of order); cancelling stops without a pak.
     std::mutex         stepsMutex;
     std::vector<float> steps;
-    PackageCallbacks   reporting;
+    PackageOptions     reporting;
     reporting.progress = [&](float value, const std::string&) {
         std::scoped_lock lock(stepsMutex);
         steps.push_back(value);
@@ -576,7 +666,7 @@ TEST_CASE(Cook_ProjectContentIntoPakAndPackagedView)
           std::ranges::all_of(steps, [](float v) { return v >= 0.0f && v <= 1.0f; }));
     for (const int pollsBeforeCancel : {0, 3}) { // before anything is copied / inside the cook
         std::atomic<int> polls{0};
-        PackageCallbacks cancelling;
+        PackageOptions   cancelling;
         cancelling.cancelled = [&] { return ++polls > pollsBeforeCancel; };
         const fs::path   cancelledOut = dir / std::format("Cancelled{}", pollsBeforeCancel);
         CookReport       partial;

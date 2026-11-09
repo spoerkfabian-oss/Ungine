@@ -2,6 +2,7 @@
 #include "Engine/Assets/MeshOptimizer.h"
 #include "Engine/Assets/Model.h"
 #include "Engine/Assets/TextureCooker.h"
+#include "Engine/Core/FileSystem.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,7 @@ struct CookOptions {
     // Optional, any thread: polled between files and texture jobs; true stops the cook early with
     // kCookCancelled in the report's errors and no pak file.
     std::function<bool()> cancelled;
+    std::optional<PakKeyPair> signingKey; // signs the pak (ProjectSettings::pakPublicKey)
 };
 
 inline constexpr std::string_view kCookCancelled = "cancelled";

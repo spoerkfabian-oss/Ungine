@@ -109,6 +109,11 @@ std::optional<Project> Project::Load(const fs::path& file, std::string* error)
         s.startScene                   = root->value("startScene", std::string());
         s.loadingScreen                = root->value("loadingScreen", std::string());
         s.saveVersion                  = std::max(root->value("saveVersion", 1u), 1u);
+        s.pakPublicKey                 = root->value("pakPublicKey", std::string());
+        if (!s.pakPublicKey.empty() && !ParsePakKeyHex(s.pakPublicKey)) {
+            SetError(error, "pakPublicKey is not a 64-digit hex key");
+            return std::nullopt;
+        }
         if (const auto w = root->find("window"); w != root->end()) {
             s.windowWidth  = std::clamp(w->value("width", s.windowWidth), 320u, 16384u);
             s.windowHeight = std::clamp(w->value("height", s.windowHeight), 200u, 16384u);
@@ -205,6 +210,7 @@ bool Project::Save(std::string* error) const
                     {"startScene", settings.startScene},
                     {"loadingScreen", settings.loadingScreen},
                     {"saveVersion", settings.saveVersion},
+                    {"pakPublicKey", settings.pakPublicKey},
                     {"window",
                      {{"width", settings.windowWidth},
                       {"height", settings.windowHeight},
@@ -356,17 +362,26 @@ void RemoveRecentProject(const fs::path& file, const fs::path& list)
 // --- Packaging ----------------------------------------------------------------------------------
 
 bool PackageProject(const Project& project, const fs::path& playerExecutable, const fs::path& outputDirectory,
-                    std::string* error, CookReport* reportOut, const PackageCallbacks* callbacks)
+                    std::string* error, CookReport* reportOut, const PackageOptions* packaging)
 {
     const auto step = [&](float value, const std::string& what) {
-        if (callbacks && callbacks->progress)
-            callbacks->progress(value, what);
+        if (packaging && packaging->progress)
+            packaging->progress(value, what);
     };
-    const auto cancelled = [&] { return callbacks && callbacks->cancelled && callbacks->cancelled(); };
+    const auto cancelled = [&] { return packaging && packaging->cancelled && packaging->cancelled(); };
     const auto cancel    = [&] {
         SetError(error, "packaging was cancelled");
         return false;
     };
+    std::optional<PakKeyPair> signingKey;
+    if (!project.settings.pakPublicKey.empty()) { // before anything is written
+        std::string keyError;
+        signingKey = LoadPakSigningKey(project.settings, packaging ? packaging->keyFile : fs::path(), &keyError);
+        if (!signingKey) {
+            SetError(error, keyError);
+            return false;
+        }
+    }
     std::error_code ec;
     if (!fs::exists(playerExecutable, ec)) {
         SetError(error, "player executable not found: '" + PathToUtf8(playerExecutable) + "'");
@@ -427,8 +442,9 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
     CookOptions options;
     options.textures.cacheDirectory = project.SavedDirectory() / "Cache" / "Textures";
     options.progress = [&](float value, const std::string& what) { step(0.04f + 0.95f * value, what); };
-    if (callbacks)
-        options.cancelled = callbacks->cancelled;
+    if (packaging)
+        options.cancelled = packaging->cancelled;
+    options.signingKey = signingKey;
     const CookReport report = CookProjectContent(project, outputDirectory / "Content.upak", options);
     {
         std::ofstream text(outputDirectory / "BuildReport.txt", std::ios::binary | std::ios::trunc);
@@ -452,6 +468,77 @@ bool PackageProject(const Project& project, const fs::path& playerExecutable, co
                 project.settings.name, PathToUtf8(outputDirectory), report.rawFiles, report.cookedModels,
                 report.cookedTextures, report.pakBytes / 1048576.0);
     step(1.0f, "Done");
+    return true;
+}
+
+// --- Pak signing / packaged content ------------------------------------------------------------------
+
+fs::path PakKeyFile(const PakPublicKey& publicKey)
+{
+    return UserConfigDirectory() / "keys" / (HexString(publicKey) + ".key");
+}
+
+bool CreatePakSigningKey(Project& project, std::string* error)
+{
+    PakKeyPair      key  = GeneratePakKey();
+    const fs::path  file = PakKeyFile(key.publicKey);
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << HexString(key.seed) << "\n";
+        if (!out) {
+            SetError(error, "cannot write the signing key '" + PathToUtf8(file) + "'");
+            return false;
+        }
+    }
+    fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, ec); // private (POSIX)
+    key.seed.fill(0);
+    project.settings.pakPublicKey = HexString(key.publicKey);
+    return true;
+}
+
+std::optional<PakKeyPair> LoadPakSigningKey(const ProjectSettings& settings, const fs::path& keyFile, std::string* error)
+{
+    const std::optional<PakPublicKey> publicKey = ParsePakKeyHex(settings.pakPublicKey);
+    if (!publicKey) {
+        SetError(error, "the project has no pak signing key");
+        return std::nullopt;
+    }
+    const fs::path file = keyFile.empty() ? PakKeyFile(*publicKey) : keyFile;
+    std::ifstream  in(file, std::ios::binary);
+    std::string    text;
+    if (!in || !std::getline(in, text)) {
+        SetError(error, "the private pak signing key is not on this machine (expected '" + PathToUtf8(file) + "')");
+        return std::nullopt;
+    }
+    const std::optional<PakPublicKey> seed = ParsePakKeyHex(text);
+    std::fill(text.begin(), text.end(), '\0');
+    if (!seed) {
+        SetError(error, "'" + PathToUtf8(file) + "' is not a pak signing key");
+        return std::nullopt;
+    }
+    PakKeyPair key = PakKeyFromSeed(*seed);
+    if (key.publicKey != *publicKey) {
+        SetError(error, "'" + PathToUtf8(file) + "' holds another key than the project's pakPublicKey");
+        return std::nullopt;
+    }
+    return key;
+}
+
+bool MountPackagedContent(const Project& project, std::string* error)
+{
+    std::error_code ec;
+    const fs::path  base = project.Root() / "Content.upak";
+    if (!fs::is_regular_file(base, ec))
+        return true; // development: the loose Content/
+    const std::optional<PakPublicKey> required = ParsePakKeyHex(project.settings.pakPublicKey);
+    try {
+        Vfs::Mount(PakFile::Open(base, required ? &*required : nullptr), project.Root());
+    } catch (const std::exception& e) {
+        SetError(error, e.what());
+        return false;
+    }
     return true;
 }
 

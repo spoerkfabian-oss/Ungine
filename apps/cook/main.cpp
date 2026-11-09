@@ -1,6 +1,7 @@
 // UngineCook: packages a project from the command line (CI, build scripts, smoke tests).
 //   UngineCook <project.ungineproj> <outputDirectory>             player + shaders + Content.upak
 //   UngineCook <project.ungineproj> <outputDirectory> --pak-only  only Content.upak + BuildReport.txt
+//   --key <file>  the pak signing key (projects with a pakPublicKey; default: the user's key store)
 // Exit code 0: packaged; 1: bad arguments or project; 2: cooking / packaging failed.
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Core/Log.h"
@@ -20,14 +21,17 @@ int main(int argc, char** argv)
     const std::vector<std::string> args = CommandLineUtf8(argc, argv);
     std::vector<std::string>       positional;
     bool                           pakOnly = false;
+    PackageOptions                 packaging;
     for (std::size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--pak-only")
             pakOnly = true;
+        else if (args[i] == "--key" && i + 1 < args.size())
+            packaging.keyFile = PathFromUtf8(args[++i]);
         else
             positional.push_back(args[i]);
     }
     if (positional.size() != 2) {
-        std::fprintf(stderr, "usage: UngineCook <project.ungineproj> <outputDirectory> [--pak-only]\n");
+        std::fprintf(stderr, "usage: UngineCook <project.ungineproj> <outputDirectory> [--pak-only] [--key <file>]\n");
         return 1;
     }
     std::string                  error;
@@ -41,11 +45,18 @@ int main(int argc, char** argv)
     if (pakOnly) {
         CookOptions options;
         options.textures.cacheDirectory = project->SavedDirectory() / "Cache" / "Textures";
+        if (!project->settings.pakPublicKey.empty()) {
+            options.signingKey = LoadPakSigningKey(project->settings, packaging.keyFile, &error);
+            if (!options.signingKey) {
+                ENGINE_ERROR("Packaging '{}' failed: {}", project->settings.name, error);
+                return 2;
+            }
+        }
         report = CookProjectContent(*project, out / "Content.upak", options);
         std::ofstream(out / "BuildReport.txt", std::ios::binary | std::ios::trunc) << report.Text();
         if (!report.Ok())
             error = report.errors.front();
-    } else if (!PackageProject(*project, SiblingExecutable("UnginePlayer"), out, &error, &report)) {
+    } else if (!PackageProject(*project, SiblingExecutable("UnginePlayer"), out, &error, &report, &packaging)) {
         report.errors.push_back(error);
     }
     for (const std::string& w : report.warnings)

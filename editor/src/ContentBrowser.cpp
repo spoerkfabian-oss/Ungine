@@ -557,7 +557,7 @@ bool Editor::StartPackaging(const fs::path& outputDirectory)
     m_Status = "Packaging " + m_Ctx.project->settings.name + "...";
     m_PackageWorker = std::jthread([this, project = *m_Ctx.project, player = SiblingExecutable("UnginePlayer"),
                                     outputDirectory, report = m_PackagingReport.get()] {
-        PackageCallbacks callbacks;
+        PackageOptions callbacks;
         callbacks.progress = [this](float value, const std::string& step) {
             m_PackageProgress.store(value, std::memory_order_relaxed);
             std::scoped_lock lock(m_PackageStepMutex);
@@ -2316,6 +2316,35 @@ void Editor::DrawProjectSettings()
             if (ImGui::Button("Apply (rebuilds the navmesh)"))
                 m_Ctx.navigation->SetSettings(next);
             ImGui::EndDisabled();
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::CollapsingHeader("Pak signing")) {
+        ImGui::PushID("signing");
+        if (const std::optional<PakPublicKey> key = ParsePakKeyHex(s.pakPublicKey)) {
+            std::error_code ec;
+            const fs::path  file    = PakKeyFile(*key);
+            const bool      present = fs::is_regular_file(file, ec);
+            ImGui::TextWrapped("Packaged paks are signed; the player refuses others. Public key: %s", s.pakPublicKey.c_str());
+            if (present)
+                ImGui::TextDisabled("Private key: %s (keep a backup; copy it to build machines)", PathToUtf8(file).c_str());
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "The private key is not on this machine (%s): packaging fails",
+                                   PathToUtf8(file).c_str());
+            if (ImGui::Button("Stop signing")) {
+                s.pakPublicKey.clear();
+                m_ProjectDirty = true;
+            }
+        } else {
+            ImGui::TextWrapped("Paks are not signed: players accept any Content.upak next to the game.");
+            if (ImGui::Button("Create signing key")) {
+                std::string error;
+                if (CreatePakSigningKey(project, &error)) {
+                    m_ProjectDirty = true;
+                    m_Status       = "Created a pak signing key (save the project)";
+                } else
+                    m_Status = "Signing key: " + error;
+            }
         }
         ImGui::PopID();
     }

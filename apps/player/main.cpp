@@ -590,18 +590,14 @@ int main(int argc, char** argv)
     fs::create_directories(saved, ec);
     (void)Log::OpenFile(PathToUtf8(saved / "player.log").c_str());
 
-    // Packaged game: the cooked content (Content.upak next to the project file) is mounted at the
-    // project root; without one the loose Content/ is used (development, Build & Run).
-    if (const fs::path pak = project->Root() / "Content.upak"; fs::is_regular_file(pak, ec)) {
-        try {
-            const std::shared_ptr<const PakFile> file = PakFile::Open(pak);
-            Vfs::Mount(file, project->Root());
-            ENGINE_INFO("Mounted '{}' ({} entries)", PathToUtf8(pak.filename()), file->Entries().size());
-        } catch (const std::exception& e) {
-            ENGINE_ERROR("Cannot use the game data: {}", e.what());
-            return 1;
-        }
+    // Packaged game: the cooked content (Content.upak and its patches next to the project file) is
+    // mounted at the project root; without it the loose Content/ is used (development, Build & Run).
+    if (std::string mountError; !MountPackagedContent(*project, &mountError)) {
+        ENGINE_ERROR("Cannot use the game data: {}", mountError);
+        return 1;
     }
+    if (Vfs::Mounted())
+        ENGINE_INFO("Mounted the packaged content{}", project->settings.pakPublicKey.empty() ? "" : " (signatures checked)");
 
     // The player's options (window, graphics, mixer, keys), kept per user next to the saves.
     GameOptions options(project->settings, saved / "Settings.json");

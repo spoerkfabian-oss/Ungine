@@ -946,7 +946,7 @@ CookReport CookProjectContent(const Project& project, const fs::path& pakFile, c
             report.entries.push_back({path, bytes.size(), path.starts_with(std::string(kCookedPrefix) + "models/") ? "model" : "texture"});
             report.cookedBytes += bytes.size();
         }
-        writer.Finish();
+        writer.Finish(options.signingKey ? &*options.signingKey : nullptr);
         report.pakBytes = writer.BytesWritten();
     } catch (const std::exception& e) {
         report.errors.push_back(e.what());
