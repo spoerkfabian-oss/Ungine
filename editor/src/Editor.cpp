@@ -85,8 +85,10 @@ Editor::Editor(const EditorContext& context)
     m_Ctx.camera.moveRequiresLook       = true; // WASD would fight the W/E/R gizmo hotkeys otherwise
     m_Ctx.sceneRenderer.overlay.picking = true;
     ReloadScriptRegistry();
-    if (m_Ctx.project)
+    if (m_Ctx.project) {
         m_Graphs->SetSearchRoot(m_Ctx.project->ContentDirectory()); // Find in Blueprints
+        PurgeTrash();
+    }
     if (m_Ctx.streaming) {
         m_Ctx.streaming->volumesEnabled = false; // edit mode: previews only
         if (m_Ctx.scripts) {

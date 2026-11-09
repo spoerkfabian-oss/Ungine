@@ -2731,6 +2731,90 @@ TEST_CASE(Editor_RuntimeUiInPlayMode)
     CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
 }
 
+TEST_CASE(Editor_ContentDeleteGoesToTrashAndUndoes)
+{
+    // Content browser delete: the scene and its baked navmesh move to Saved/Trash, the start scene
+    // and the open scene's file are forgotten; Undo / Redo move them back and forth; a name that is
+    // taken again blocks the restore; old trash folders are purged when an editor opens the project.
+    const std::uint32_t errorsBefore = VulkanContext::ValidationErrorCount();
+    const fs::path      root = fs::temp_directory_path() / std::format("ungine_trash_{}", std::random_device{}());
+    std::error_code     ec;
+    fs::create_directories(root, ec);
+    const auto templates = ProjectTemplates();
+    const auto blank     = std::ranges::find_if(templates, [](const ProjectTemplate& t) { return t.id == "Blank"; });
+    CHECK(blank != templates.end());
+    if (blank == templates.end())
+        return;
+    std::optional<Project> project = Project::Create(root / "Game", "TrashGame", *blank);
+    CHECK(project.has_value());
+    if (!project)
+        return;
+    const fs::path content = project->ContentDirectory();
+    const fs::path trash   = project->SavedDirectory() / "Trash";
+    fs::create_directories(trash / "20000101-000000-1", ec); // stale: purged on open
+    WriteFile(trash / "20000101-000000-1" / "old.txt", std::string_view("old"));
+    fs::last_write_time(trash / "20000101-000000-1", fs::file_time_type::clock::now() - std::chrono::hours(24 * 30), ec);
+    fs::create_directories(content / "Stuff", ec);
+    WriteFile(content / "Stuff" / "notes.txt", std::string_view("notes"));
+    const auto trashEntries = [&] {
+        std::size_t count = 0;
+        for (const fs::directory_entry& entry : fs::recursive_directory_iterator(trash, ec))
+            count += entry.is_regular_file() ? 1 : 0;
+        return count;
+    };
+
+    Scene                    scene;
+    SceneRenderer            sceneRenderer(*F().renderer, *F().context, *F().assets);
+    FlyCamera                camera;
+    std::vector<ModelHandle> modelRefs;
+    {
+        Editor editor({.window        = *F().window,
+                       .renderer      = *F().renderer,
+                       .scene         = scene,
+                       .assets        = *F().assets,
+                       .sceneRenderer = sceneRenderer,
+                       .camera        = camera,
+                       .modelRefs     = modelRefs,
+                       .project       = &*project,
+                       .layoutFile    = {}});
+        CHECK(!fs::exists(trash / "20000101-000000-1"));
+        const fs::path level = content / "Scenes" / "Level.scene.json";
+        fs::create_directories(level.parent_path(), ec);
+        CHECK(editor.SaveScene(level));
+        WriteFile(NavMeshFileFor(level), std::string_view("baked"));
+        project->settings.startScene = "Content/Scenes/Level.scene.json";
+        CHECK(project->Save());
+
+        CHECK(!editor.DeleteContent(root / "elsewhere.txt"));
+        CHECK(!editor.DeleteContent(content));
+        CHECK(editor.DeleteContent(level));
+        CHECK(!fs::exists(level) && !fs::exists(NavMeshFileFor(level)) && trashEntries() == 2);
+        CHECK(project->settings.startScene.empty() && editor.ScenePath().empty());
+        CHECK(editor.UndoLabel() == "Delete Level.scene.json");
+        CHECK(editor.Undo());
+        CHECK(fs::exists(level) && fs::exists(NavMeshFileFor(level)) && trashEntries() == 0);
+        CHECK(project->settings.startScene == "Content/Scenes/Level.scene.json" && editor.ScenePath() == level);
+        CHECK(Project::Load(project->File()).value().settings.startScene == "Content/Scenes/Level.scene.json");
+        CHECK(editor.Redo());
+        CHECK(!fs::exists(level) && trashEntries() == 2 && project->settings.startScene.empty());
+        CHECK(editor.Undo());
+        CHECK(fs::exists(level));
+
+        // A folder; its name is taken again before the undo, so the restore refuses to overwrite.
+        CHECK(editor.DeleteContent(content / "Stuff"));
+        CHECK(!fs::exists(content / "Stuff") && trashEntries() == 1);
+        fs::create_directories(content / "Stuff", ec);
+        CHECK(editor.Undo());
+        CHECK(editor.Status().starts_with("Cannot restore") && trashEntries() == 1);
+        CHECK(fs::is_empty(content / "Stuff"));
+        fs::remove(content / "Stuff", ec);
+        CHECK(editor.Redo() && editor.Undo()); // the command stays usable once the name is free
+        CHECK(fs::exists(content / "Stuff" / "notes.txt"));
+    }
+    CHECK(VulkanContext::ValidationErrorCount() == errorsBefore);
+    fs::remove_all(root, ec);
+}
+
 TEST_CASE(Editor_ContentImportAndReferenceRepair)
 {
     // Content browser: background import (unique names, glTF with its external files, target

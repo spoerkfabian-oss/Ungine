@@ -226,6 +226,11 @@ public:
     {
         return RelocateContentAsset(source, target);
     }
+    // Delete a file or folder below ContentRoot() (a scene takes its baked navmesh along). With a
+    // project it moves to Saved/Trash (kept for kTrashDays) and Undo restores it, the start scene
+    // included; without a project it is deleted for good. False: nothing changed (see Status()).
+    bool DeleteContent(const std::filesystem::path& target);
+    static constexpr int kTrashDays = 7;
     [[nodiscard]] const std::string& Status() const { return m_Status; } // last file operation
     // Part of a streamed sub-level (preview or play): shown read-only, never saved.
     [[nodiscard]] bool IsStreamed(Entity entity) const;
@@ -324,6 +329,7 @@ private:
     void ImportContentFile(const std::filesystem::path& source);
     void UpdateContentImport();
     bool RelocateContentAsset(const std::filesystem::path& source, const std::filesystem::path& target);
+    void PurgeTrash(); // Saved/Trash entries older than kTrashDays
     void DrawProjectSettings();
     void DrawPackageReport();
     void DrawBlueprintTypes();
@@ -522,6 +528,7 @@ private:
     bool                     m_NavOtherLevel = false; // Open Level while playing replaced the navmesh
     struct TypeEdit;                    // the enum / struct / interface edited there
     std::shared_ptr<TypeEdit> m_TypeEdit;
+    std::uint32_t m_TrashCounter = 0; // makes trash folders of one second unique
     bool m_ProjectDirty = false; // project settings changed outside the Project Settings window (audio)
     bool m_AskQuit = false, m_QuitConfirmed = false;
 
