@@ -55,6 +55,8 @@ Build and CI
   temp paths in short form (`RUNNER~1`) — compare paths with `fs::equivalent`. Before pushing, scan
   changed files with `-Wshadow` via `build/compile_commands.json`.
 - Smoke tests need `xvfb-run -a ctest …`; without a display they fail instantly.
+- Run `EngineGpuTests` from `build/`: editor tests without a project write into the working directory
+  (e.g. `Terrains/`), which pollutes the repository root.
 - CPack: values with backslashes (NSIS registry commands) need `CPACK_VERBATIM_VARIABLES ON`. NSIS can
   be tested on Linux (`apt install nsis`, mini project with `set(WIN32 TRUE)`).
 - The release workflow runs only on main, tags, manual runs and PRs touching packaging files.
