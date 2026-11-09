@@ -40,6 +40,7 @@ Blueprints (see [docs/history.md](docs/history.md)). The roadmap phases since th
 | 37 | Installers per CI: release workflow building and testing the Windows setup + ZIP and the Linux TGZ, GitHub releases on tags | Merged (PR #24); NSIS fix in PR #25 |
 | H2 | Hardening after an external audit (paks, cooks, malformed inputs, navmesh signatures) | PR #26 |
 | 38 | Tools: undoable content delete (project trash), nav-link and IK-target gizmos, bone overlay, background packaging with progress and cancel | PR #26 (stacked) |
+| 39 | Paks: zstd per entry, Ed25519 signatures with a key per project, delta patch paks | PR #26 (stacked) |
 
 ## Candidates for future phases
 
@@ -51,6 +52,6 @@ Not scheduled; to be discussed with the owner:
   area lights, temporal AO, TAA upscaling.
 - Content: material functions and static switches, custom materials on terrain/foliage/particles,
   GPU particles, mesh LODs for skinned meshes, morph targets, retargeting.
-- Tools: compressed/signed paks and patching, undo for asset-window deletes, a bone overlay in the
-  animation graph preview.
+- Tools: undo for asset-window deletes, a bone overlay in the animation graph preview; paks: key
+  rotation, DLC paks, an update client.
 - Known limitations per system are listed in [docs/limitations.md](docs/limitations.md).

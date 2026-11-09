@@ -83,9 +83,18 @@ textures → `BuildModelMaterials` (materials and `GpuSubmesh` records; CPU copy
   `Vfs::Read / ReadText / Locate / ModifiedTime / ListFiles`: assets (bytes + mtime), glTF buffers and
   images, scenes and prefabs, Blueprints, the script registry, sounds (miniaudio `ma_vfs` callbacks
   over pak ranges, streaming included).
-- Pak format v1 (`.upak`, uncompressed): 40-byte header (`UPAK`, version, count, flags, index
-  offset/size/hash), data aligned to 16 bytes, index at the end; FNV-1a 64 per entry (checked on every
-  read) and for the index (checked on open). Entries are paths relative to the project root
+- Pak format v2 (`.upak`; v1 paks are still read): 40-byte header (`UPAK`, version, count, flags,
+  index offset/size/FNV hash), data aligned to 16 bytes, index at the end, then (flag bit 0) a 64-byte
+  Ed25519 signature of the index and the 32-byte signer key. Index entry: path, offset, stored size,
+  size, FNV-1a 64 of the content (identity for patches), flags (bit 0 zstd frame, bit 1 deleted) and
+  the BLAKE2b-256 digest of the stored bytes (checked on every read, before decompressing; the
+  signature covers it through the index). `PakWriter::Add(path, bytes, PakCompression)` compresses
+  with zstd (level 9) when it saves ≥ 10 % and the ratio stays ≤ 1:1024 (the reader refuses larger
+  claimed sizes); `PakCompression::None` keeps bytes as they are (the cooker does so for sounds,
+  which miniaudio streams from the pak; a compressed sound is decompressed into memory). A deleted
+  entry (`AddDeleted`) hides the file of older mounts and the disk (`Read`, `Exists`, `Locate`,
+  `ListFiles`, cooked data). `PakFile::Open(file, requiredKey)` refuses unsigned and foreign paks.
+  Entries are paths relative to the project root
   (`Content/...`, case-insensitive on Windows); entries with `..`, `.`, empty components, `\` or `:`
   are refused by `PakWriter::Add` and by `PakFile::Open`, and `ListFiles` only returns files inside
   the mount root; cooked data lives under `:cooked/…`
@@ -120,10 +129,22 @@ with a warning), sorted, reproducibly:
 - `PackageProject(..., callbacks)`: optional progress (0..1 + step) and cancel poll, both on the
   packaging thread; `CookOptions::cancelled` is polled between model files, texture jobs and pak
   entries, a cancelled cook reports `kCookCancelled` and deletes its unfinished pak.
-- **UngineCook** (`apps/cook`, console): `UngineCook <project> <out> [--pak-only]`; exit 0 success,
-  1 arguments/project, 2 cooking.
-- The player mounts `<root>/Content.upak` at startup. The editor shows the **Package report**
-  window after *Build → Package project…*.
+- **Signing:** `ProjectSettings::pakPublicKey` (hex Ed25519). Packaging then signs every pak with
+  the private key from `UserConfigDirectory()/keys/<public key>.key` (hex seed, owner-only
+  permissions; `CreatePakSigningKey` makes it, the editor's Project Settings → Pak signing too) or
+  `PackageOptions::keyFile` / `UngineCook --key`. A missing or foreign key fails before anything is
+  written.
+- **Patches:** `PackagePatch(project, packagedDir)` cooks into `Patch.tmp.upak`, compares it with
+  `Content.upak` + the existing `Patch_<n>.upak` (newest entry per path, by content hash and size)
+  and writes `Patch_<n+1>.upak` with changed/new entries and deleted entries for removed files,
+  signed like the base, plus the project file and `BuildReport_Patch_<n>.txt`; nothing is written
+  when nothing changed. A full `PackageProject` removes old patches. The player and shaders are not
+  patched.
+- **UngineCook** (`apps/cook`, console): `UngineCook <project> <out> [--pak-only | --patch] [--key
+  <file>]`; exit 0 success, 1 arguments/project, 2 cooking.
+- The player mounts the content with `MountPackagedContent`: `<root>/Content.upak`, then
+  `Patch_<n>.upak` in increasing n, all or nothing, each checked against `pakPublicKey` when set. The
+  editor shows the **Package report** window after *Build → Package project…* / *Package patch…*.
 
 ## Content import (editor)
 

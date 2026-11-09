@@ -125,7 +125,10 @@ and terrains. `EditorContext::modelRefs` owns all models the editor acquired (re
   **Packaging** window shows the progress bar, the current step and **Cancel** (no pak is left
   behind; copied player/shaders stay) → **Package report** window (result, counts, errors, warnings,
   pak entries, Show folder). The editor saves everything first; edits made while packaging are not
-  part of the build. `Editor::PackageProject` blocks until done (tools, tests).
+  part of the build. `Editor::PackageProject` blocks until done (tools, tests). **Package patch…**
+  picks a folder with a packaged game and writes `Patch_<n>.upak` the same way (`StartPackaging(dir,
+  true)`). Project Settings → **Pak signing** creates the project's signing key and shows where the
+  private key lives (warns when it is missing on this machine).
 
 ## UnginePlayer (`apps/player`)
 
@@ -147,7 +150,8 @@ and terrains. `EditorContext::modelRefs` owns all models the editor acquired (re
 
 ## UngineCook (`apps/cook`)
 
-Console tool: `UngineCook <project> <out> [--pak-only]` (see [assets.md](assets.md#packaging)).
+Console tool: `UngineCook <project> <out> [--pak-only | --patch] [--key <file>]` (see
+[assets.md](assets.md#cooker)).
 
 ## Sandbox (`apps/sandbox`)
 

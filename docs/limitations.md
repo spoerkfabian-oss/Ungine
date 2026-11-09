@@ -149,11 +149,13 @@ These are known, accepted limitations — not regressions. Unverified platforms 
   always marks the project dirty; navigation settings apply immediately (may rebuild); not in Play;
   gizmo mode, anchor mode and window visibility are not part of the view state; the camera only on
   jumps; construction scripts re-run after every history step.
-- Pak: uncompressed and unsigned (hashes detect corruption only); entries are read whole (except
-  streamed sounds); source images also ship raw; always everything below `Content/`; shaders ship as a
-  folder (incl. GLSL sources for materials); models are re-optimized on every cook; editor packaging is
-  synchronous; cooked models need identical `MeshOptimizeSettings` in cooker and player; reference
-  checks only for known formats; unreferenced images are cooked as Color; no patch/DLC workflow.
+- Pak: entries are read whole (except streamed sounds); zstd only per entry (no shared dictionary);
+  source images also ship raw; always everything below `Content/`; shaders ship as a folder (incl.
+  GLSL sources for materials); models are re-optimized on every cook; cooked models need identical
+  `MeshOptimizeSettings` in cooker and player; reference checks only for known formats; unreferenced
+  images are cooked as Color. Signing needs the private key on the build machine (no key rotation or
+  revocation; losing it means a new key and a full re-release). Patches cover `Content/` and the
+  project file, not the player or shaders; no DLC or download/update client.
 - Save versions: migration only via the Blueprint event, the version is raised by hand.
 - Options: the menu shows/remaps only an action's first key; no resolution/monitor/LOD/texture
   quality; axis remap changes keys only; no gamepad bindings; graphics options cap the level settings

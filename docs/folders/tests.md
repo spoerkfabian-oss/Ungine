@@ -32,7 +32,9 @@ two frames.
   - `SmokeBasicProjectSetup` (Basic template) → `UnginePlayerBasicSmoke`
   - `SmokeLevelSwitchProjectSetup` (Basic + level switch + textured model) →
     `UnginePlayerLevelSwitchSmoke`, then `SmokePackageSetup` (`UngineCook`) →
-    `UnginePackagedPlayerSmoke` (plays from `Content.upak`; fails on "not cooked into the pak")
+    `UnginePackagedPlayerSmoke` (plays from `Content.upak`; fails on "not cooked into the pak"),
+    then `SmokePatchSetup` (`PatchSmoke.cmake`: a content change + `UngineCook --patch`) →
+    `UnginePatchedPlayerSmoke` (the packaged player mounts `Patch_1.upak`)
 
 Smokes need a display: run CTest under `xvfb-run -a` on headless Linux.
 

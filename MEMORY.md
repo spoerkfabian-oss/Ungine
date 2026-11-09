@@ -28,7 +28,8 @@ project state materially changes.
   cooked-model counts, navmesh mesh signatures with a geometry hash, indices past the vertices; new
   `tests/MalformedInputTests.cpp` + `tests/AllocationProbe.*`. (2) Phase 38 Tools stacked on it at the
   owner's request: undoable content delete (`Saved/Trash`), nav-link / IK-target gizmos, bone overlay,
-  background packaging with progress + cancel.
+  background packaging with progress + cancel. (3) Phase 39 Paks, also stacked: pak v2 (zstd per entry,
+  BLAKE2b digests, deleted entries; v1 still read), Ed25519 signing with a key per project, patch paks.
 - Tag `v0.37.0` (first GitHub release) still to push — owner decides when.
 - Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
 
@@ -87,6 +88,9 @@ Engine
 - Navmesh source signatures are stored in `.unav` bake files: only use values that are stable across
   sessions (content hashes, not asset revisions).
 - Prove "no huge allocation" with `AllocationProbe` (tests) instead of relying on a crash.
+- Pak decompression bombs: the writer stores entries raw beyond 1:1024 and the reader refuses larger
+  claimed sizes before allocating; digests are checked before zstd runs. FNV is not a security hash:
+  signatures rely on the per-entry BLAKE2b digests in the signed index.
 
 Editor and tests
 - GCC 13 crashed (ICE) on a designated-initializer `EditCommand` with lambdas while `History.h` was
@@ -153,6 +157,9 @@ and targeted tests. Still open:
 - 2026-11-09: external audit — verify every finding, fix the real ones, one hardening PR.
 - 2026-11-09: phase 38 = Tools (content delete undo, nav-link/IK gizmos, bone overlay, packaging
   progress), stacked on PR #26.
+- 2026-11-09: phase 39 = Paks, stacked on PR #26: zstd per entry; Ed25519 via Monocypher with the
+  private key per user outside the repo (`UserConfigDirectory()/keys`), public key in the project;
+  delta patch paks (`Patch_<n>.upak`) over the shipped base.
 
 ## 7. Merge log
 
@@ -172,4 +179,4 @@ and targeted tests. Still open:
 | #23 | Phase 34 nested prefabs, settings undo | 2026-11-03 |
 | #24 | Phases 35–37 Blueprints, installers | fc5e213, 2026-11-05 |
 | #25 | NSIS fix + documentation overhaul | c917f0a, 2026-11-09 |
-| #26 | Hardening after the external audit (BUG-002…008) + phase 38 tools | open |
+| #26 | Hardening after the external audit (BUG-002…008) + phases 38 (tools) and 39 (paks) | open |
