@@ -716,6 +716,9 @@ void Editor::DrawViewport()
         iconHit = DrawAudioOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowParticles)
         iconHit = DrawParticleOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
+    m_DrawnBones = 0;
+    if (m_ShowBones)
+        iconHit = DrawBoneOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height), clicked && !iconHit) || iconHit;
     if (m_ShowBvh)
         DrawBvhOverlay(origin.x, origin.y, static_cast<float>(width), static_cast<float>(height));
     if (m_ShowColliders && m_Ctx.physics) {
@@ -853,6 +856,10 @@ void Editor::DrawViewport()
     }
     if (toolButton("Audio", m_ShowAudio))
         m_ShowAudio = !m_ShowAudio;
+    if (toolButton("Bones", m_ShowBones))
+        m_ShowBones = !m_ShowBones;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Skeletons of the selected model instances (click a joint to select it)");
     if (toolButton("FX", m_ShowParticles))
         m_ShowParticles = !m_ShowParticles;
     if (ImGui::IsItemHovered())
@@ -1242,6 +1249,72 @@ bool Editor::DrawAudioOverlay(float x, float y, float width, float height, bool 
                 projector.Circle(list, pos, {0, 1, 0}, {0, 0, 1}, radius, color);
             }
     });
+    if (clicked && hit != NullEntity)
+        SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
+    list->PopClipRect();
+    return clicked && hit != NullEntity;
+}
+
+bool Editor::DrawBoneOverlay(float x, float y, float width, float height, bool clicked)
+{
+    Registry& registry = m_Ctx.scene.GetRegistry();
+    // Instances with a selected root or a selected node.
+    std::vector<Entity> roots;
+    for (const Entity e : m_Selection) {
+        if (!registry.Valid(e))
+            continue;
+        const ModelNodeRef* ref  = registry.TryGet<ModelNodeRef>(e);
+        const Entity        root = registry.Has<ModelInstance>(e) ? e : ref ? ref->instanceRoot : NullEntity;
+        if (root != NullEntity && registry.Valid(root) && std::ranges::find(roots, root) == roots.end())
+            roots.push_back(root);
+    }
+    if (roots.empty())
+        return false;
+
+    const CameraData        camera = m_Ctx.camera.GetData(width / std::max(height, 1.0f));
+    const ViewportProjector projector{camera.projection * camera.view, ImVec2(x, y), ImVec2(width, height)};
+    ImDrawList*             list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+    constexpr float kJoint      = 3.5f;
+    const ImVec2    mouse       = ImGui::GetIO().MousePos;
+    Entity          hit         = NullEntity;
+    float           hitDistance = kJoint + 4.0f;
+    for (const Entity root : roots) {
+        const Model* model = m_Ctx.assets.Get(registry.Get<ModelInstance>(root).model);
+        if (!model)
+            continue;
+        std::vector<bool> joint(model->nodes.size(), false);
+        for (const Skin& skin : model->skins)
+            for (const SkinJoint& j : skin.joints)
+                if (j.node >= 0 && static_cast<std::size_t>(j.node) < joint.size())
+                    joint[static_cast<std::size_t>(j.node)] = true;
+        registry.ViewOf<ModelNodeRef, WorldTransform>().Each([&](Entity e, ModelNodeRef& ref, WorldTransform& world) {
+            if (ref.instanceRoot != root || ref.node >= joint.size() || !joint[ref.node])
+                return;
+            const glm::vec3 position = glm::vec3(world.matrix[3]);
+            const bool      selected = IsSelected(e);
+            const ImU32     color    = selected ? IM_COL32(255, 200, 40, 255) : IM_COL32(120, 220, 255, 230);
+            // The bone: from the parent joint to this one.
+            if (const Hierarchy* h = registry.TryGet<Hierarchy>(e); h && registry.Valid(h->parent))
+                if (const ModelNodeRef* parent = registry.TryGet<ModelNodeRef>(h->parent);
+                    parent && parent->instanceRoot == root && parent->node < joint.size() && joint[parent->node])
+                    projector.Line(list, glm::vec3(registry.Get<WorldTransform>(h->parent).matrix[3]), position, color);
+            ImVec2 p;
+            if (!projector.Project(position, p))
+                return;
+            ++m_DrawnBones;
+            list->AddCircleFilled(p, kJoint, color);
+            list->AddCircle(p, kJoint + 1.0f, IM_COL32(0, 0, 0, 200));
+            if (selected)
+                if (const Name* name = registry.TryGet<Name>(e))
+                    list->AddText(ImVec2(p.x + kJoint + 4.0f, p.y - kJoint - 6.0f), IM_COL32(230, 230, 230, 230), name->value.c_str());
+            const float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+            if (d < hitDistance) {
+                hitDistance = d;
+                hit         = e;
+            }
+        });
+    }
     if (clicked && hit != NullEntity)
         SelectFromClick(hit, ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift);
     list->PopClipRect();

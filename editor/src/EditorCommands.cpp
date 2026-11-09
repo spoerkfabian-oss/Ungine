@@ -60,6 +60,7 @@ Editor::ViewState Editor::CaptureView() const
     v.particles  = m_ShowParticles;
     v.volumes    = m_ShowVolumes;
     v.navMesh    = m_ShowNavMesh;
+    v.bones      = m_ShowBones;
     v.gameCamera = m_GameCamera;
     v.bvhDepth   = m_BvhDepth;
     v.debugView  = static_cast<std::uint32_t>(m_Ctx.sceneRenderer.post.debugView);
@@ -75,6 +76,7 @@ void Editor::ApplyView(const ViewState& v)
     m_ShowParticles  = v.particles;
     m_ShowVolumes    = v.volumes;
     m_ShowNavMesh    = v.navMesh;
+    m_ShowBones      = v.bones;
     m_GameCamera     = v.gameCamera;
     m_BvhDepth       = v.bvhDepth;
     m_Ctx.sceneRenderer.post.debugView = static_cast<DebugView>(v.debugView);

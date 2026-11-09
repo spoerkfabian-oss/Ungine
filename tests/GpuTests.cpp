@@ -3936,6 +3936,43 @@ TEST_CASE(Editor_AnimationGraphWindowAndPlay)
     runFrames(20);
     CHECK(poseDifference(rest, pose()) < 1e-6f && !animation.HasInstance(root)); // edit mode: no animation
 
+    // Bone overlay: every joint of the selected instance; a click on one selects its node entity.
+    const auto boneNamed = [&](std::string_view name) {
+        Entity found = NullEntity;
+        r.ViewOf<Name>().Each([&](Entity e, Name& n) { found = n.value == name ? e : found; });
+        return found;
+    };
+    const Entity head = boneNamed("b_Head_05");
+    editor.Select(boneNamed("b_LeftFoot02_018")); // the gizmo sits at the foot, away from the head
+    editor.SetShowBones(true);
+    int windowWidth = 0, windowHeight = 0;
+    glfwGetWindowSize(F().window->Native(), &windowWidth, &windowHeight);
+    glfwSetWindowSize(F().window->Native(), 1600, 900); // a viewport large enough to aim at one joint
+    runFrames(10);
+    CHECK(editor.DrawnBones() == foxModel->skins.at(0).joints.size());
+    {
+        const glm::vec4  rect = editor.ViewportRect();
+        const CameraData view = camera.GetData(rect.z / std::max(rect.w, 1.0f));
+        const glm::vec4  clip = view.projection * view.view * glm::vec4(glm::vec3(r.Get<WorldTransform>(head).matrix[3]), 1.0f);
+        const glm::vec2  ndc  = glm::vec2(clip) / clip.w;
+        const glm::vec2  at{rect.x + (ndc.x * 0.5f + 0.5f) * rect.z, rect.y + (0.5f - ndc.y * 0.5f) * rect.w};
+        for (const bool down : {true, false}) {
+            for (int i = 0; i < 2; ++i) { // under Xvfb the warped pointer reaches ImGui a frame later
+                editor.SimulateMouse(at);
+                runFrames(1);
+            }
+            editor.SimulateMouse(at, 0, down);
+            runFrames(2);
+        }
+        CHECK(editor.Selected() == head);
+    }
+    editor.SetShowBones(false);
+    if (!screenshot)
+        glfwSetWindowSize(F().window->Native(), windowWidth, windowHeight);
+    runFrames(3);
+    CHECK(editor.DrawnBones() == 0);
+    editor.Select(root);
+
     // The window + preview (the template's Fox).
     editor.OpenAsset(file);
     AnimGraphEditor& ag = editor.AnimGraphs();

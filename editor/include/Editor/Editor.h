@@ -147,6 +147,11 @@ public:
     // The same as a gizmo drag to `world` (tests, scripted tools). False: nothing to move.
     bool MoveGizmoTarget(const glm::vec3& world);
 
+    // Bone overlay (toolbar "Bones"): the skeletons of selected model instances; a click on a joint
+    // selects its node entity. DrawnBones: joints drawn in the last frame.
+    void SetShowBones(bool show) { m_ShowBones = show; }
+    [[nodiscard]] std::size_t DrawnBones() const { return m_DrawnBones; }
+
     // Edit operations (menu / hotkeys), all undoable.
     void DuplicateSelection(); // Ctrl+D
     void DeleteSelection();    // Del
@@ -366,7 +371,7 @@ private:
     // Compared every frame after the panels; a change becomes one step once no widget is active.
     struct ViewState {
         bool          lights = true, bvh = false, colliders = true, audio = true, particles = true;
-        bool          volumes = true, navMesh = true, gameCamera = false;
+        bool          volumes = true, navMesh = true, gameCamera = false, bones = false;
         int           bvhDepth  = 8;
         std::uint32_t debugView = 0;
         bool          operator==(const ViewState&) const = default;
@@ -407,6 +412,7 @@ private:
     Entity CreateParticleEntity(const std::filesystem::path& effect, const glm::vec3& position); // + undo
     // Particle system icons (click selects), bounds of the selected one's particles.
     bool DrawParticleOverlay(float x, float y, float width, float height, bool clicked);
+    bool DrawBoneOverlay(float x, float y, float width, float height, bool clicked);
     void   DestroyByUuids(std::span<const std::uint64_t> uuids);
     [[nodiscard]] std::uint64_t UuidOf(Entity entity) const;
 
@@ -473,6 +479,8 @@ private:
     bool                m_ShowColliders   = true;
     bool                m_EditJointAnchor = false; // the gizmo moves the selected joint's anchor
     bool                m_ShowAudio       = true; // audio source icons / ranges, reverb zones
+    bool                m_ShowBones       = false; // skeletons of selected model instances
+    std::size_t         m_DrawnBones      = 0;
     bool                m_ShowParticles   = true; // particle system icons / bounds
     bool                m_GameCamera      = false; // viewport renders through the scene's primary camera
 
