@@ -83,6 +83,9 @@ struct FrameUniforms { // mirrors FrameData in frame.glsl
     VkDeviceAddress decalClusters;
     VkDeviceAddress fogVolumes;
     VkDeviceAddress materialParams; // GPU scene: custom material parameter blocks
+    VkDeviceAddress morphDeltas;    // geometry pool
+    VkDeviceAddress morphWeights;   // GPU scene: per-instance weights (GpuInstance::morphWeightOffset)
+    VkDeviceAddress prevMorphWeights;
 };
 
 struct MeshPush { // mirrors MeshPush in mesh_common.glsl
@@ -1404,7 +1407,11 @@ void SceneRenderer::Render(const FrameContext& frame, Scene& scene, const Camera
           .decals          = decalAddress,
           .decalClusters   = m_DecalClusters.Address(),
           .fogVolumes      = fogVolumeAddress,
-          .materialParams  = m_GpuScene->MaterialParamAddress()};
+          .materialParams  = m_GpuScene->MaterialParamAddress(),
+          .morphDeltas     = m_Renderer.Geometry().Address(GeometryKind::Morphs),
+          .morphWeights    = m_GpuScene->MorphWeightAddress(),
+          .prevMorphWeights = m_GpuScene->PrevMorphWeightAddress() ? m_GpuScene->PrevMorphWeightAddress()
+                                                                   : m_GpuScene->MorphWeightAddress()};
     ++m_FrameCounter;
     for (std::uint32_t c = 0; c < kMaxCascades; ++c) {
         uniforms.cascadeViewProj[c] = cascades[c].viewProj;

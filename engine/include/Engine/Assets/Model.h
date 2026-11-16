@@ -214,8 +214,11 @@ struct GpuSubmesh {
     glm::uvec4    lodFirstIndex{0}; // per LOD, absolute
     glm::uvec4    lodIndexCount{0};
     glm::vec4     lodError{0.0f};   // object space
+    // Morph targets of the mesh: x first delta (geometry pool morphs), y target count (0: none),
+    // z first vertex of the mesh (geometry pool vertices), w vertex count.
+    glm::uvec4    morph{0};
 };
-static_assert(sizeof(GpuSubmesh) == 96);
+static_assert(sizeof(GpuSubmesh) == 112);
 
 inline constexpr std::uint32_t kMaterialAlphaMask   = 1u << 0;
 inline constexpr std::uint32_t kMaterialDoubleSided = 1u << 1;
@@ -228,6 +231,7 @@ struct Model {
     PoolRange                  indices;   // Submesh::firstIndex is relative to indices.offset
     PoolRange                  materials; // Submesh::material is relative to materials.offset
     PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
+    PoolRange                  morphs;    // morph deltas of all meshes (Mesh::morphOffset); the CPU copies are dropped
     std::vector<GpuSubmesh>    gpuSubmeshes; // CPU copy of those records (index: firstGpuSubmesh - submeshes.offset)
     std::vector<TextureHandle> textures;  // per ModelData texture; owned (released) by the AssetManager
     std::vector<MaterialData>  previewMaterials; // CPU-side material preview data

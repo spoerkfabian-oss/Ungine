@@ -53,6 +53,7 @@ struct GpuSubmesh {
     uvec4 lodFirstIndex; // per LOD (up to 4), absolute
     uvec4 lodIndexCount;
     vec4  lodError;      // object-space deviation from LOD 0
+    uvec4 morph;         // x: first delta, y: target count (0: none), z: first vertex of the mesh, w: vertex count
 };
 
 // One MeshRenderer entity.
@@ -68,10 +69,14 @@ struct GpuInstance {
     uint jointOffset;
     uint jointCount;
     uint prevJointOffset; // last frame's palette (FrameData.prevJointMatrices), ~0u: none
-    uint pad1;
+    uint morphWeightOffset; // FrameData.morphWeights, ~0u: no morph targets
     vec4 skinnedBoundsMin;
     vec4 skinnedBoundsMax;
     mat4 prevModel; // last frame's model matrix (motion vectors)
+    uint prevMorphWeightOffset; // FrameData.prevMorphWeights, ~0u: none
+    uint morphWeightCount;
+    uint pad2;
+    uint pad3;
 };
 #define INSTANCE_MIRRORED 1u
 #define INSTANCE_SKINNED  2u
@@ -109,6 +114,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Jo
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DrawBuffer     { GpuDraw     d[]; };
 // Parameter blocks of custom (node graph) materials, one vec4 per slot (material_common.glsl).
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MaterialParamBuffer { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MorphDeltaBuffer { vec4 d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer MorphWeightBuffer { float w[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BatchBuffer    { GpuBatch    b[]; };
 // Draw record per drawn instance (indexed by gl_InstanceIndex: firstInstance selects the slice).
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer VisibleBuffer   { uint        v[]; };

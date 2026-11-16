@@ -16,10 +16,11 @@ struct GeometryPoolDesc {
     std::uint32_t maxVertices  = 4u << 20;  // 80 B each (320 MB)
     std::uint32_t maxIndices   = 16u << 20; // 4 B each (64 MB)
     std::uint32_t maxMaterials = 1u << 16;  // 80 B each
-    std::uint32_t maxSubmeshes = 1u << 18;  // 96 B each (GpuSubmesh, 24 MB)
+    std::uint32_t maxSubmeshes = 1u << 18;  // 112 B each (GpuSubmesh, 28 MB)
+    std::uint32_t maxMorphs    = 4u << 20;  // 16 B each (morph deltas, 64 MB)
 };
 
-enum class GeometryKind : std::uint32_t { Vertices, Indices, Materials, Submeshes, Count };
+enum class GeometryKind : std::uint32_t { Vertices, Indices, Materials, Submeshes, Morphs, Count };
 
 // Elements [offset, offset + count) of one pool buffer.
 struct PoolRange {

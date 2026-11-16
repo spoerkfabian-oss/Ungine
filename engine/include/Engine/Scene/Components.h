@@ -51,6 +51,13 @@ struct Hierarchy {
 };
 
 // Resolved through the AssetManager each frame; renders nothing until the model is Ready.
+// Morph target weights of the mesh on this entity (MeshRenderer), one per target of the mesh;
+// missing entries use the mesh's default weights. Animation clips with weight channels and the
+// "Set Morph Weight" node write them.
+struct MorphWeights {
+    std::vector<float> weights;
+};
+
 struct MeshRenderer {
     ModelHandle   model;
     std::uint32_t meshIndex = 0;

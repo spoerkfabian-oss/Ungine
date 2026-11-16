@@ -7,9 +7,9 @@
 namespace Engine {
 
 namespace {
-constexpr std::array<std::uint32_t, 4> kStrides{sizeof(Vertex), sizeof(std::uint32_t), sizeof(GpuMaterial),
-                                                sizeof(GpuSubmesh)};
-constexpr std::array<const char*, 4>   kNames{"vertices", "indices", "materials", "submeshes"};
+constexpr std::array<std::uint32_t, 5> kStrides{sizeof(Vertex), sizeof(std::uint32_t), sizeof(GpuMaterial),
+                                                sizeof(GpuSubmesh), sizeof(glm::vec4)};
+constexpr std::array<const char*, 5>   kNames{"vertices", "indices", "materials", "submeshes", "morph deltas"};
 } // namespace
 
 std::uint32_t GeometryPool::Stride(GeometryKind kind)
@@ -20,10 +20,11 @@ std::uint32_t GeometryPool::Stride(GeometryKind kind)
 GeometryPool::GeometryPool(const VulkanContext& ctx, UploadQueue& uploader, const GeometryPoolDesc& desc)
     : m_Uploader(uploader)
 {
-    const std::array<std::uint32_t, 4> capacity{desc.maxVertices, desc.maxIndices, desc.maxMaterials, desc.maxSubmeshes};
+    const std::array<std::uint32_t, 5> capacity{desc.maxVertices, desc.maxIndices, desc.maxMaterials, desc.maxSubmeshes,
+                                                desc.maxMorphs};
     constexpr VkBufferUsageFlags       kUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    constexpr std::array<const char*, 4> kDebugNames{"GeometryVertices", "GeometryIndices", "GeometryMaterials",
-                                                     "GeometrySubmeshes"};
+    constexpr std::array<const char*, 5> kDebugNames{"GeometryVertices", "GeometryIndices", "GeometryMaterials",
+                                                     "GeometrySubmeshes", "GeometryMorphs"};
     for (std::size_t i = 0; i < m_Pools.size(); ++i) {
         Slot& pool  = m_Pools[i];
         pool.stride = kStrides[i];

@@ -46,6 +46,28 @@ mat4 SkinMatrix(GpuInstance instance, Vertex vertex)
     return total > 1.0e-6 ? result / total : mat4(1.0);
 }
 
+// Morph targets (GpuSubmesh.morph): adds the weighted (position, normal) deltas of the mesh's
+// targets for this vertex (a geometry pool index). previous: last frame's weights (motion vectors;
+// the current ones without last frame's).
+void ApplyMorph(GpuInstance instance, GpuSubmesh sm, uint vertexIndex, bool previous, inout vec3 position, inout vec3 normal)
+{
+    if (sm.morph.y == 0u || instance.morphWeightOffset == 0xFFFFFFFFu || vertexIndex < sm.morph.z ||
+        vertexIndex - sm.morph.z >= sm.morph.w)
+        return;
+    const bool  usePrevious = previous && instance.prevMorphWeightOffset != 0xFFFFFFFFu;
+    const uint  offset      = usePrevious ? instance.prevMorphWeightOffset : instance.morphWeightOffset;
+    const uint  vertex      = vertexIndex - sm.morph.z;
+    const uint  targets     = min(sm.morph.y, instance.morphWeightCount);
+    for (uint t = 0u; t < targets; ++t) {
+        const float w = usePrevious ? pc.frame.prevMorphWeights.w[offset + t] : pc.frame.morphWeights.w[offset + t];
+        if (w == 0.0)
+            continue;
+        const uint d = sm.morph.x + (t * sm.morph.w + vertex) * 2u;
+        position += w * pc.frame.morphDeltas.d[d].xyz;
+        normal   += w * pc.frame.morphDeltas.d[d + 1u].xyz;
+    }
+}
+
 // Last frame's skin matrix (motion vectors); without a palette of last frame the current one.
 mat4 PrevSkinMatrix(GpuInstance instance, Vertex vertex, mat4 current)
 {

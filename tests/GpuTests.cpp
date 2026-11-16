@@ -1,5 +1,6 @@
 // Integration tests on a real Vulkan device (needs a display; CI: Xvfb + lavapipe).
 #include "Test.h"
+#include "MorphTestUtil.h"
 
 #include "Editor/Editor.h"
 #include "Editor/ProjectLauncher.h"
@@ -1429,6 +1430,53 @@ TEST_CASE(Render_SkinnedMeshLods)
     CHECK(farGpuLods == 1 && farCpuLods == 1 && farGpu == coarsest && farCpu == coarsest);
     F().assets->Release(h);
     F().Pump([] { return false; }, 4);
+}
+
+TEST_CASE(Render_MorphTargets)
+{
+    // The Face quad: "Raise" lifts its top edge by 0.5. A pixel just above the edge is sky with the
+    // default weights (0.25 -> +0.125) and covered with Raise = 1, on the GPU and the CPU path.
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_gpu_morph_{}", std::random_device{}());
+    fs::create_directories(dir);
+    std::ofstream(dir / "Face.gltf") << MorphTest::FaceGltf();
+    const ModelHandle face = F().assets->LoadModel(dir / "Face.gltf");
+    CHECK(F().Pump([&] { return Settled(face); }));
+    const Model* model = F().assets->Get(face);
+    CHECK(model && model->meshes.size() == 1 && model->meshes[0].morph.TargetCount() == 2 && model->morphs.count == 16 &&
+          model->meshes[0].morph.deltas.empty()); // the GPU keeps the only copy
+    if (!model) {
+        F().assets->Release(face);
+        return;
+    }
+    Scene        scene;
+    const Entity root = InstantiateModel(scene, face, *model);
+    Entity       mesh = NullEntity;
+    scene.GetRegistry().ViewOf<MeshRenderer>().Each([&](Entity e, MeshRenderer&) { mesh = e; });
+    CHECK(mesh != NullEntity && root != NullEntity);
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure  = false;
+    renderer.shadows.resolution = 512;
+    renderer.taa.enabled        = false;
+    // World y = 1.25 at distance 4: NDC 1.25 / 4 / tan(30 deg) -> row (0.5 - ndc / 2) * 120.
+    const int  row   = static_cast<int>((0.5f - 0.5f * 1.25f / 4.0f / std::tan(glm::radians(30.0f))) * 120.0f);
+    const auto pixel = [&](bool gpu) {
+        renderer.culling.gpuDriven = gpu;
+        const std::vector<std::uint8_t> image = RenderImage(renderer, scene, FrontCamera(4.0f), 4);
+        const std::size_t               i     = (static_cast<std::size_t>(row) * 160 + 80) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const auto distance = [](glm::ivec3 a, glm::ivec3 b) { return std::abs(a.r - b.r) + std::abs(a.g - b.g) + std::abs(a.b - b.b); };
+    const glm::ivec3 sky = pixel(true);
+    scene.GetRegistry().Emplace<MorphWeights>(mesh, MorphWeights{.weights = {1.0f, 0.0f}});
+    const glm::ivec3 raisedGpu = pixel(true), raisedCpu = pixel(false);
+    CHECK(distance(sky, raisedGpu) > 60 && distance(raisedGpu, raisedCpu) < 6);
+    scene.GetRegistry().Get<MorphWeights>(mesh).weights = {0.0f, 0.0f};
+    CHECK(distance(sky, pixel(true)) < 6 && distance(sky, pixel(false)) < 6);
+    F().assets->Release(face);
+    F().Pump([] { return false; }, 4);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 TEST_CASE(Render_MeshLodSelection)
