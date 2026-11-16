@@ -99,6 +99,16 @@ MeshOptimizeStats OptimizeMeshes(ModelData& data, const MeshOptimizeSettings& se
                         meshopt_remapVertexBuffer(data.skinInfluences.data() + sm.vertexOffset,
                                                   data.skinInfluences.data() + sm.vertexOffset, vertexCount,
                                                   sizeof(VertexSkinInfluence), remap.data());
+                    // So do the morph deltas: per target the (position, normal) pairs of this range.
+                    MeshMorph& morph = mesh.morph;
+                    if (morph.TargetCount() > 0 && sm.vertexOffset >= static_cast<std::int32_t>(morph.vertexBase) &&
+                        std::uint64_t(sm.vertexOffset) + vertexCount <= std::uint64_t{morph.vertexBase} + morph.vertexCount) {
+                        const std::uint32_t first = static_cast<std::uint32_t>(sm.vertexOffset) - morph.vertexBase;
+                        for (std::uint32_t t = 0; t < morph.TargetCount(); ++t) {
+                            glm::vec4* pairs = morph.deltas.data() + (std::size_t{t} * morph.vertexCount + first) * 2;
+                            meshopt_remapVertexBuffer(pairs, pairs, vertexCount, 2 * sizeof(glm::vec4), remap.data());
+                        }
+                    }
                     meshopt_remapIndexBuffer(indices.data(), indices.data(), indices.size(), remap.data());
                     ++stats.reorderedMeshes;
                 }

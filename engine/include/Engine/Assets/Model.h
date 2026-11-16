@@ -63,10 +63,27 @@ struct Submesh {
     std::array<SubmeshLod, kMaxLods> lods{};
 };
 
+// Morph targets (glTF blend shapes) of a mesh. All submeshes of the mesh share them; the deltas
+// cover the mesh's vertex range [vertexBase, vertexBase + vertexCount) of the model's vertices.
+inline constexpr std::uint32_t kMaxMorphTargets = 64;
+struct MeshMorph {
+    std::vector<std::string> targetNames{};    // one per target ("Target <i>" when the file has none)
+    std::vector<float>       defaultWeights{}; // one per target (glTF mesh weights, else 0)
+    std::uint32_t            vertexBase  = 0;
+    std::uint32_t            vertexCount = 0;
+    // Per target and vertex a position and a normal delta (xyz):
+    // deltas[(target * vertexCount + vertex) * 2 + 0 / 1].
+    std::vector<glm::vec4>   deltas{};
+
+    [[nodiscard]] std::uint32_t TargetCount() const { return static_cast<std::uint32_t>(targetNames.size()); }
+};
+
 struct Mesh {
     std::string          name;
     std::vector<Submesh> submeshes;
     std::uint32_t        firstGpuSubmesh = 0; // Model: index of submeshes[0] in the geometry pool's submesh records
+    MeshMorph            morph{};             // no targets: none
+    std::uint32_t        morphOffset = 0;     // Model: first delta (vec4) in the geometry pool's morph buffer
 };
 
 // Nodes are stored parents-before-children (topological order).
