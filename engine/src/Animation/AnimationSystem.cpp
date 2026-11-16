@@ -1,4 +1,5 @@
 #include "Engine/Animation/AnimationSystem.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Animation/AnimIk.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
@@ -171,7 +172,7 @@ struct AnimationSystem::Impl {
         inst.version       = ref.version;
         inst.model         = model;
         inst.modelRevision = revision;
-        inst.pose.assign(model->nodes.size(), Transform{});
+        inst.pose.assign(AnimationPoseSize(*model), Transform{});
         inst.feet.assign(inst.player.Graph()->ik.size(), FootIkState{});
         for (const auto& [name, value] : inst.pending)
             inst.player.SetParameter(name, value);
@@ -399,9 +400,10 @@ void AnimationSystem::Impl::Update(Scene& scene, float dt, bool fireActions)
         auto& nodes = nodeEntities[item.entity];
         if (nodes.size() < inst.pose.size())
             nodes.resize(inst.pose.size(), NullEntity);
-        for (std::size_t i = 0; i < inst.pose.size(); ++i)
+        for (std::size_t i = 0; i < inst.model->nodes.size() && i < inst.pose.size(); ++i)
             if (touched[i] && nodes[i] != NullEntity && registry.Valid(nodes[i]) && scene.GetTransform(nodes[i]) != inst.pose[i])
                 scene.SetTransform(nodes[i], inst.pose[i]);
+        ApplyMorphPose(registry, *inst.model, inst.pose, nodes, touched);
 
         // Root motion: the bone's movement (parent space of the bone) -> model -> world.
         const int rootNode = inst.player.RootMotionNode();

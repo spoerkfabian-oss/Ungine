@@ -79,16 +79,48 @@ glm::vec3 RootMotionAt(const AnimationClip& clip, std::uint32_t node, float time
 
 } // namespace
 
+std::size_t AnimationPoseSize(const Model& model)
+{
+    const bool morphs = model.morphPoseFirst.size() == model.nodes.size();
+    return model.nodes.size() + (morphs ? (std::size_t{model.morphPoseWeights} + 2) / 3 : 0);
+}
+
+std::optional<std::pair<std::size_t, int>> MorphPoseSlot(const Model& model, std::uint32_t node, std::uint32_t target)
+{
+    if (model.morphPoseFirst.size() != model.nodes.size() || node >= model.nodes.size() || model.morphPoseFirst[node] == ~0u)
+        return std::nullopt;
+    const std::int32_t mesh = model.nodes[node].mesh;
+    if (mesh < 0 || static_cast<std::size_t>(mesh) >= model.meshes.size() ||
+        target >= model.meshes[static_cast<std::size_t>(mesh)].morph.TargetCount())
+        return std::nullopt;
+    const std::uint32_t weight = model.morphPoseFirst[node] + target;
+    return std::pair{model.nodes.size() + weight / 3, static_cast<int>(weight % 3)};
+}
+
+void RestPose(const Model& model, std::span<Transform> pose)
+{
+    for (std::size_t i = 0; i < pose.size(); ++i)
+        pose[i] = i < model.nodes.size() ? model.nodes[i].local : Transform{};
+    for (std::uint32_t n = 0; n < model.nodes.size(); ++n) {
+        const std::int32_t mesh = model.nodes[n].mesh;
+        if (mesh < 0 || static_cast<std::size_t>(mesh) >= model.meshes.size())
+            continue;
+        const MeshMorph& morph = model.meshes[static_cast<std::size_t>(mesh)].morph;
+        for (std::uint32_t t = 0; t < morph.TargetCount(); ++t)
+            if (const auto slot = MorphPoseSlot(model, n, t); slot && slot->first < pose.size())
+                pose[slot->first].position[slot->second] = morph.defaultWeights[t];
+    }
+}
+
 void EvaluateAnimation(const Model& model, const AnimationClip& clip, float timeSeconds,
                        AnimationPlayback playback, std::span<Transform> pose)
 {
-    if (pose.size() != model.nodes.size())
-        throw std::invalid_argument("EvaluateAnimation: pose size must match model nodes");
+    if (pose.size() != AnimationPoseSize(model))
+        throw std::invalid_argument("EvaluateAnimation: pose size must match the model (AnimationPoseSize)");
     if (!std::isfinite(timeSeconds))
         throw std::invalid_argument("EvaluateAnimation: time must be finite");
 
-    for (std::size_t i = 0; i < model.nodes.size(); ++i)
-        pose[i] = model.nodes[i].local;
+    RestPose(model, pose);
 
     float time = std::max(timeSeconds, 0.0f);
     if (clip.duration > 0.0f) {
@@ -99,11 +131,15 @@ void EvaluateAnimation(const Model& model, const AnimationClip& clip, float time
     }
 
     for (const AnimationTrack& track : clip.tracks) {
-        if (track.node >= pose.size() || track.times.empty() || track.values.empty())
+        if (track.node >= model.nodes.size() || track.times.empty() || track.values.empty())
             continue;
         const glm::vec4 value = Sample(track, time);
         Transform& target = pose[track.node];
         switch (track.path) {
+        case AnimationPath::Weights:
+            if (const auto slot = MorphPoseSlot(model, track.node, track.morphTarget))
+                pose[slot->first].position[slot->second] = std::isfinite(value.x) ? value.x : 0.0f;
+            break;
         case AnimationPath::Translation: target.position = glm::vec3(value); break;
         case AnimationPath::Scale: target.scale = glm::vec3(value); break;
         case AnimationPath::Rotation: {
@@ -112,6 +148,43 @@ void EvaluateAnimation(const Model& model, const AnimationClip& clip, float time
             break;
         }
         }
+    }
+}
+
+void MarkMorphDriven(const Model& model, const AnimationClip& clip, std::span<std::uint8_t> driven)
+{
+    for (const AnimationTrack& track : clip.tracks)
+        if (track.path == AnimationPath::Weights)
+            if (const auto slot = MorphPoseSlot(model, track.node, track.morphTarget); slot && slot->first < driven.size())
+                driven[slot->first] = 1;
+}
+
+void ApplyMorphPose(Registry& registry, const Model& model, std::span<const Transform> pose,
+                    std::span<const Entity> nodeEntities, std::span<const std::uint8_t> driven)
+{
+    if (model.morphPoseFirst.size() != model.nodes.size())
+        return;
+    for (std::uint32_t n = 0; n < model.nodes.size() && n < nodeEntities.size(); ++n) {
+        const Entity e = nodeEntities[n];
+        if (model.morphPoseFirst[n] == ~0u || e == NullEntity || !registry.Valid(e))
+            continue;
+        const MeshMorph& morph = model.meshes[static_cast<std::size_t>(model.nodes[n].mesh)].morph;
+        std::vector<float> weights(morph.TargetCount());
+        bool               any = false;
+        for (std::uint32_t t = 0; t < morph.TargetCount(); ++t) {
+            const auto slot = MorphPoseSlot(model, n, t);
+            if (!slot || slot->first >= pose.size())
+                continue;
+            weights[t] = pose[slot->first].position[slot->second];
+            any |= slot->first < driven.size() && driven[slot->first] != 0;
+        }
+        if (!any)
+            continue;
+        if (MorphWeights* current = registry.TryGet<MorphWeights>(e)) {
+            if (current->weights != weights)
+                current->weights = std::move(weights);
+        } else
+            registry.Emplace<MorphWeights>(e, MorphWeights{.weights = std::move(weights)});
     }
 }
 
@@ -250,7 +323,7 @@ void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
         if (nodeEntities.size() < model->nodes.size())
             nodeEntities.resize(model->nodes.size(), NullEntity);
 
-        std::vector<Transform> pose(model->nodes.size());
+        std::vector<Transform> pose(AnimationPoseSize(*model));
         EvaluateAnimation(*model, clip, animator.timeSeconds,
                           animator.looping ? AnimationPlayback::Loop : AnimationPlayback::Once, pose);
         const bool blending = animator.blendClipIndex < model->animations.size() &&
@@ -292,17 +365,20 @@ void UpdateAnimations(Scene& scene, AssetManager& assets, float deltaSeconds)
             }
             pose[animator.rootMotionNode].position = model->nodes[animator.rootMotionNode].local.position;
         }
-        std::vector<std::uint8_t> animated(model->nodes.size(), 0);
-        for (const AnimationClip& candidate : model->animations)
+        std::vector<std::uint8_t> animated(pose.size(), 0);
+        for (const AnimationClip& candidate : model->animations) {
             for (const AnimationTrack& track : candidate.tracks)
-                if (track.node < animated.size())
+                if (track.node < model->nodes.size() && track.path != AnimationPath::Weights)
                     animated[track.node] = 1;
+            MarkMorphDriven(*model, candidate, animated);
+        }
         // Unchanged poses (stopped or paused clips) are not written: a dirty transform costs BVH
         // updates and invalidates cached local shadows every frame.
-        for (std::size_t i = 0; i < animated.size(); ++i)
+        for (std::size_t i = 0; i < model->nodes.size(); ++i)
             if (animated[i] && nodeEntities[i] != NullEntity && registry.Valid(nodeEntities[i]) &&
                 scene.GetTransform(nodeEntities[i]) != pose[i])
                 scene.SetTransform(nodeEntities[i], pose[i]);
+        ApplyMorphPose(registry, *model, pose, nodeEntities, animated);
     });
 }
 

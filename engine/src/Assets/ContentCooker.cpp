@@ -192,7 +192,7 @@ constexpr std::size_t kMinMeshBytes      = 2 * kCountBytes + kCountBytes + kCoun
 constexpr std::size_t kMinNodeBytes      = kCountBytes + 2 * sizeof(glm::vec3) + sizeof(glm::quat) + 3 * 4 + 1;
 constexpr std::size_t kMinSkinBytes      = kCountBytes + 4 + kCountBytes;
 constexpr std::size_t kMinAnimationBytes = kCountBytes + 4 + kCountBytes;
-constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes;
+constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes + 4;
 
 // Cooked models skip the glTF loader's checks: every index range must lie in the index buffer and
 // every index must address a vertex, or the GPU and the collision code read past the vertices.
@@ -331,6 +331,7 @@ std::vector<std::byte> SerializeModelData(const ModelData& d, const fs::path& mo
             w.Array(t.values);
             w.Array(t.inTangents);
             w.Array(t.outTangents);
+            w.U32(t.morphTarget);
         }
     }
     w.Pod(d.boundsMin);
@@ -427,6 +428,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
             t.values        = r.Array<glm::vec4>();
             t.inTangents    = r.Array<glm::vec4>();
             t.outTangents   = r.Array<glm::vec4>();
+            t.morphTarget   = r.U32();
         }
     }
     d.boundsMin = r.Pod<glm::vec3>();

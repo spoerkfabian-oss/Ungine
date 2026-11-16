@@ -130,10 +130,10 @@ void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* 
         m_Values.push_back(value);
     }
     const std::size_t nodes = m_Model->nodes.size();
-    m_Rest.resize(nodes);
-    for (std::size_t i = 0; i < nodes; ++i)
-        m_Rest[i] = m_Model->nodes[i].local;
-    m_Driven.assign(nodes, 0);
+    const std::size_t poseSize = AnimationPoseSize(*m_Model); // nodes, then morph weights
+    m_Rest.resize(poseSize);
+    RestPose(*m_Model, m_Rest);
+    m_Driven.assign(poseSize, 0);
     m_RootMotionNode = NodeIndex(m_Graph->rootMotionBone);
 
     for (const AnimLayer& source : m_Graph->layers) {
@@ -176,7 +176,9 @@ void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* 
         layer.weightParam = source.weightParameter.empty() || weightParam == m_Graph->parameters.end()
                                 ? -1
                                 : static_cast<int>(weightParam - m_Graph->parameters.begin());
-        layer.mask.assign(nodes, source.mask.empty() ? 1.0f : 0.0f);
+        layer.mask.assign(poseSize, source.mask.empty() ? 1.0f : 0.0f);
+        for (std::size_t i = nodes; i < poseSize; ++i) // morph weights: every layer blends them
+            layer.mask[i] = 1.0f;
         for (const AnimBoneMask& m : source.mask) {
             const int bone = NodeIndex(m.bone);
             if (bone < 0)
@@ -221,8 +223,9 @@ void AnimGraphPlayer::ResolveState(State& state, const AnimState& source)
         if (clip < 0)
             return;
         for (const AnimationTrack& track : m_Model->animations[static_cast<std::size_t>(clip)].tracks)
-            if (track.node < m_Driven.size())
+            if (track.node < m_Model->nodes.size() && track.path != AnimationPath::Weights)
                 m_Driven[track.node] = 1;
+        MarkMorphDriven(*m_Model, m_Model->animations[static_cast<std::size_t>(clip)], m_Driven);
     };
     state.speedParam = param(source.speedParameter);
     if (source.kind == AnimStateKind::Clip) {

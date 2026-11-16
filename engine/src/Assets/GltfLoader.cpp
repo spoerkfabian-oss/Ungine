@@ -510,6 +510,53 @@ private:
         }
     }
 
+    // A weights channel: one track per morph target of the node's mesh (glTF stores the values of
+    // all targets per key; cubic splines as in-tangents, values, out-tangents per key).
+    void ParseWeightChannel(AnimationClip& clip, const cgltf_animation_channel& channel, std::int32_t node, cgltf_size ci)
+    {
+        const cgltf_mesh*              mesh    = channel.target_node->mesh;
+        const cgltf_size               targets = mesh && mesh->primitives_count > 0 ? mesh->primitives[0].targets_count : 0;
+        const cgltf_animation_sampler& sampler = *channel.sampler;
+        const bool                     cubic   = sampler.interpolation == cgltf_interpolation_type_cubic_spline;
+        const cgltf_size               keys    = sampler.input->count;
+        if (targets == 0 || keys == 0 || sampler.input->type != cgltf_type_scalar || cgltf_num_components(sampler.output->type) != 1 ||
+            sampler.output->count != keys * targets * (cubic ? 3 : 1)) {
+            ENGINE_WARN("glTF: animation '{}' channel {} (weights) does not match the mesh's targets - skipped", clip.name, ci);
+            return;
+        }
+        Unpack(*sampler.input, 1);
+        const std::vector<float> times = m_Scratch;
+        if (std::ranges::any_of(times, [](float t) { return !std::isfinite(t); }) ||
+            std::adjacent_find(times.begin(), times.end(), [](float x, float y) { return x >= y; }) != times.end()) {
+            ENGINE_WARN("glTF: animation '{}' channel {} has non-finite or unordered key times - skipped", clip.name, ci);
+            return;
+        }
+        Unpack(*sampler.output, 1);
+        for (cgltf_size t = 0; t < targets && t < kMaxMorphTargets; ++t) {
+            AnimationTrack track;
+            track.node          = static_cast<std::uint32_t>(node);
+            track.path          = AnimationPath::Weights;
+            track.morphTarget   = static_cast<std::uint32_t>(t);
+            track.interpolation = sampler.interpolation == cgltf_interpolation_type_step ? AnimationInterpolation::Step
+                                  : cubic                                                ? AnimationInterpolation::CubicSpline
+                                                                                         : AnimationInterpolation::Linear;
+            track.times = times;
+            const auto at = [&](cgltf_size key, cgltf_size part) {
+                return glm::vec4(m_Scratch[(key * (cubic ? 3 : 1) + part) * targets + t], 0.0f, 0.0f, 0.0f);
+            };
+            for (cgltf_size key = 0; key < keys; ++key) {
+                if (cubic) {
+                    track.inTangents.push_back(at(key, 0));
+                    track.values.push_back(at(key, 1));
+                    track.outTangents.push_back(at(key, 2));
+                } else
+                    track.values.push_back(at(key, 0));
+            }
+            clip.tracks.push_back(std::move(track));
+        }
+        clip.duration = std::max(clip.duration, times.back());
+    }
+
     void ParseAnimations()
     {
         for (cgltf_size ai = 0; ai < m_Data.animations_count; ++ai) {
@@ -536,7 +583,7 @@ private:
                 case cgltf_animation_path_type_rotation: path = AnimationPath::Rotation; components = 4; break;
                 case cgltf_animation_path_type_scale: path = AnimationPath::Scale; break;
                 case cgltf_animation_path_type_weights:
-                    ENGINE_WARN("glTF: animation '{}' morph-weight channel is not supported yet - skipped", clip.name);
+                    ParseWeightChannel(clip, channel, node, ci);
                     continue;
                 default:
                     ENGINE_WARN("glTF: animation '{}' has an unknown target path - skipped", clip.name);

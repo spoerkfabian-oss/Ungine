@@ -67,6 +67,7 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
                     throw std::runtime_error("BuildModel: '" + data.name + "' has an index range out of bounds");
         }
     out.nodes      = data.nodes;
+    BuildMorphPoseLayout(out);
     out.skinInfluences = data.skinInfluences;
     out.skins      = data.skins;
     out.animations = data.animations;
@@ -155,6 +156,20 @@ void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> mater
             mesh.firstGpuSubmesh += out.submeshes.offset;
     }
     out.gpuSubmeshes = std::move(records);
+}
+
+void BuildMorphPoseLayout(Model& model)
+{
+    model.morphPoseFirst.assign(model.nodes.size(), ~0u);
+    model.morphPoseWeights = 0;
+    for (std::size_t n = 0; n < model.nodes.size(); ++n)
+        if (const std::int32_t mesh = model.nodes[n].mesh; mesh >= 0 && static_cast<std::size_t>(mesh) < model.meshes.size())
+            if (const std::uint32_t targets = model.meshes[static_cast<std::size_t>(mesh)].morph.TargetCount(); targets > 0) {
+                model.morphPoseFirst[n] = model.morphPoseWeights;
+                model.morphPoseWeights += targets;
+            }
+    if (model.morphPoseWeights == 0)
+        model.morphPoseFirst.clear();
 }
 
 void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket)

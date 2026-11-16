@@ -4,7 +4,12 @@
 
 #include "Engine/Assets/ContentCooker.h"
 #include "Engine/Assets/GltfLoader.h"
+#include "Engine/Animation/AnimGraph.h"
+#include "Engine/Animation/AnimGraphPlayer.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Assets/MeshOptimizer.h"
+#include "Engine/Scene/Components.h"
+#include "Engine/Scene/Scene.h"
 
 #include <filesystem>
 #include <format>
@@ -72,6 +77,79 @@ TEST_CASE(Morph_GltfImportOptimizeAndCook)
         refused = std::string(e.what()).find("morph") != std::string::npos;
     }
     CHECK(refused);
+    std::error_code ec;
+    fs::remove_all(file.parent_path(), ec);
+}
+
+namespace {
+
+Model FaceModel(const fs::path& file)
+{
+    ModelData data = LoadGltf(file);
+    Model     model;
+    model.name       = data.name;
+    model.nodes      = std::move(data.nodes);
+    model.meshes     = std::move(data.meshes);
+    model.animations = std::move(data.animations);
+    BuildMorphPoseLayout(model);
+    return model;
+}
+
+float Weight(const Model& model, std::span<const Transform> pose, std::uint32_t target)
+{
+    const auto slot = MorphPoseSlot(model, 0, target);
+    return slot ? pose[slot->first].position[slot->second] : -1.0f;
+}
+
+} // namespace
+
+// Weight channels: one track per target, sampled into the pose's morph entries, blended by the
+// graph player (crossfades included) and written to MorphWeights only where clips drive them.
+TEST_CASE(Morph_AnimationWeights)
+{
+    const fs::path file  = WriteFace("morph_anim");
+    const Model    model = FaceModel(file);
+    CHECK(model.animations.size() == 1 && model.animations[0].tracks.size() == 2);
+    CHECK(model.animations[0].tracks[0].path == AnimationPath::Weights && model.animations[0].tracks[1].morphTarget == 1);
+    CHECK(model.morphPoseFirst.size() == 1 && model.morphPoseWeights == 2 && AnimationPoseSize(model) == 2);
+
+    std::vector<Transform> pose(AnimationPoseSize(model));
+    RestPose(model, pose);
+    CHECK(Weight(model, pose, 0) == 0.25f && Weight(model, pose, 1) == 0.0f); // the mesh's default weights
+    EvaluateAnimation(model, model.animations[0], 0.5f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(Weight(model, pose, 0) - 0.5f) < 1e-5f && Weight(model, pose, 1) == 0.0f);
+    EvaluateAnimation(model, model.animations[0], 1.0f, AnimationPlayback::Once, pose);
+    CHECK(std::abs(Weight(model, pose, 0) - 1.0f) < 1e-5f);
+
+    // Graph: Blink, then a 1 s crossfade to a state without a clip (rest pose: default weights).
+    AnimGraph graph;
+    graph.parameters = {{.name = "Rest", .type = AnimParamType::Trigger}};
+    AnimLayer layer;
+    layer.entryState = "Blink";
+    layer.states.push_back(AnimState{.name = "Blink", .clip = "Blink", .loop = false});
+    layer.states.push_back(AnimState{.name = "Rest", .clip = ""});
+    layer.transitions.push_back(AnimTransition{.from = "Blink", .to = "Rest", .duration = 1.0f,
+                                               .conditions = {{.parameter = "Rest", .op = AnimCompare::Triggered}}});
+    graph.layers.push_back(layer);
+    AnimGraphPlayer player;
+    player.Bind(std::make_shared<const AnimGraph>(graph), &model);
+    player.Update(1.0f, pose); // Blink at 1 s: Raise = 1
+    CHECK(std::abs(Weight(model, pose, 0) - 1.0f) < 1e-4f);
+    CHECK(player.DrivenNodes().size() == pose.size() && player.DrivenNodes()[1] == 1 && player.DrivenNodes()[0] == 0);
+    CHECK(player.SetTrigger("Rest"));
+    player.Update(0.5f, pose); // halfway: Blink at 1.5 s (0.5) blended with rest (0.25) -> 0.375
+    CHECK(std::abs(Weight(model, pose, 0) - 0.375f) < 1e-3f);
+
+    // Into the component of the mesh entity; undriven entries leave it alone.
+    Scene        scene;
+    const Entity face = scene.CreateEntity("Face");
+    const std::vector<Entity>       nodes{face};
+    const std::vector<std::uint8_t> none(pose.size(), 0);
+    ApplyMorphPose(scene.GetRegistry(), model, pose, nodes, none);
+    CHECK(!scene.GetRegistry().Has<MorphWeights>(face));
+    ApplyMorphPose(scene.GetRegistry(), model, pose, nodes, player.DrivenNodes());
+    const MorphWeights* weights = scene.GetRegistry().TryGet<MorphWeights>(face);
+    CHECK(weights && weights->weights.size() == 2 && std::abs(weights->weights[0] - 0.375f) < 1e-3f);
     std::error_code ec;
     fs::remove_all(file.parent_path(), ec);
 }
