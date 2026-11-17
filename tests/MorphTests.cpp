@@ -10,6 +10,7 @@
 #include "Engine/Assets/MeshOptimizer.h"
 #include "Engine/Scene/Components.h"
 #include "Engine/Scene/Scene.h"
+#include "Engine/Scene/SceneSerializer.h"
 
 #include <filesystem>
 #include <format>
@@ -152,4 +153,22 @@ TEST_CASE(Morph_AnimationWeights)
     CHECK(weights && weights->weights.size() == 2 && std::abs(weights->weights[0] - 0.375f) < 1e-3f);
     std::error_code ec;
     fs::remove_all(file.parent_path(), ec);
+}
+
+// Scene files keep a mesh entity's morph weights (non-finite values become 0).
+TEST_CASE(Morph_WeightsInSceneFiles)
+{
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_morph_scene_{}", std::random_device{}());
+    fs::create_directories(dir);
+    Scene        scene;
+    const Entity face = scene.CreateEntity("Face");
+    scene.GetRegistry().Emplace<MorphWeights>(face, MorphWeights{.weights = {0.5f, 1.0f, std::nanf("")}});
+    SaveSceneFile(dir / "Face.scene.json", scene, nullptr);
+    Scene loaded;
+    (void)LoadSceneFile(dir / "Face.scene.json", loaded, nullptr);
+    const Entity e = loaded.FindByUuid(scene.GetRegistry().Get<Uuid>(face).value);
+    const MorphWeights* weights = e != NullEntity ? loaded.GetRegistry().TryGet<MorphWeights>(e) : nullptr;
+    CHECK(weights && (weights->weights == std::vector<float>{0.5f, 1.0f, 0.0f}));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

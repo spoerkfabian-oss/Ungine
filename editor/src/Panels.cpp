@@ -566,6 +566,21 @@ void Editor::DrawInspector()
                 PropertyRow("Submeshes");
                 ImGui::Text("%zu  (%llu tris)", m.submeshes.size(), static_cast<unsigned long long>(triangles));
                 ImGui::PopID();
+                // Morph targets: a slider each (the component is added on the first change).
+                for (std::uint32_t t = 0; t < m.morph.TargetCount(); ++t) {
+                    const MorphWeights* current = registry.TryGet<MorphWeights>(e);
+                    float value = current && t < current->weights.size() ? current->weights[t] : m.morph.defaultWeights[t];
+                    PropertyRow(m.morph.targetNames[t].c_str());
+                    if (ImGui::SliderFloat("##morph", &value, 0.0f, 1.0f)) {
+                        if (!registry.Has<MorphWeights>(e))
+                            registry.Emplace<MorphWeights>(e, MorphWeights{.weights = m.morph.defaultWeights});
+                        std::vector<float>& weights = registry.Get<MorphWeights>(e).weights;
+                        if (weights.size() < m.morph.TargetCount())
+                            weights.resize(m.morph.TargetCount(), 0.0f);
+                        weights[t] = value;
+                    }
+                    ImGui::PopID();
+                }
             }
         }
         ImGui::EndTable();

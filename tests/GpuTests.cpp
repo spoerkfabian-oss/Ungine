@@ -1,5 +1,6 @@
 // Integration tests on a real Vulkan device (needs a display; CI: Xvfb + lavapipe).
 #include "Test.h"
+#include "BlueprintTestUtil.h"
 #include "MorphTestUtil.h"
 
 #include "Editor/Editor.h"
@@ -1473,6 +1474,30 @@ TEST_CASE(Render_MorphTargets)
     CHECK(distance(sky, raisedGpu) > 60 && distance(raisedGpu, raisedCpu) < 6);
     scene.GetRegistry().Get<MorphWeights>(mesh).weights = {0.0f, 0.0f};
     CHECK(distance(sky, pixel(true)) < 6 && distance(sky, pixel(false)) < 6);
+
+    // Blueprint nodes: by target name on the meshes below the target; unknown names are errors.
+    scene.GetRegistry().Remove<MorphWeights>(mesh);
+    {
+        BlueprintTest::Graph b;
+        const auto begin = b.Node("Event.BeginPlay");
+        const auto set   = b.Node("Morph.SetWeight");
+        b.Set(set, "Morph Target", std::string("Push"));
+        b.Set(set, "Weight", 0.75f);
+        const auto wrong = b.Node("Morph.SetWeight");
+        b.Set(wrong, "Morph Target", std::string("Smile"));
+        b.Link(begin, "Out", set, "In");
+        b.Link(set, "Then", wrong, "In");
+        CHECK(b.Valid());
+        ScriptSystem scripts(F().events, nullptr, nullptr, F().assets.get());
+        scene.GetRegistry().Emplace<ScriptComponent>(root, ScriptComponent{"morph.ugraph"});
+        scripts.Provide("morph.ugraph", b.g);
+        scripts.Begin(scene);
+        scripts.Update(scene, 0.1f);
+        const MorphWeights* weights = scene.GetRegistry().TryGet<MorphWeights>(mesh);
+        CHECK(weights && (weights->weights == std::vector<float>{0.25f, 0.75f})); // Raise keeps its default
+        CHECK(scripts.Stats().errors >= 1);
+        scripts.End(scene);
+    }
     F().assets->Release(face);
     F().Pump([] { return false; }, 4);
     std::error_code ec;

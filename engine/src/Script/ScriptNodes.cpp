@@ -1035,6 +1035,62 @@ std::vector<NodeDesc> BuildRegistry()
                    if (const auto e = ControllerTarget(c, 2))
                        ikGoal(c, c.Animation()->SetIkEnabled(*e, c.InString(3), c.InBool(4)));
                }));
+    // Morph targets by name on every mesh below the target (the target itself included).
+    const auto morphOf = [](ScriptContext& c, Entity mesh) -> const MeshMorph* {
+        AssetManager* assets = c.Assets();
+        const Model*  model  = assets ? assets->Get(c.GetScene().GetRegistry().Get<MeshRenderer>(mesh).model) : nullptr;
+        const std::uint32_t index = c.GetScene().GetRegistry().Get<MeshRenderer>(mesh).meshIndex;
+        return model && index < model->meshes.size() ? &model->meshes[index].morph : nullptr;
+    };
+    add(Action("Morph.SetWeight", "Set Morph Weight", "Animation",
+               {In("Target", P::Entity), In("Morph Target", P::String), In("Weight", P::Float)}, [=](ScriptContext& c) {
+                   const auto e = Target(c, 2);
+                   if (!e)
+                       return;
+                   const std::string name   = c.InString(3);
+                   const float       weight = c.InFloat(4);
+                   Registry&         r      = c.GetScene().GetRegistry();
+                   std::uint32_t     found  = 0;
+                   ForEachMeshBelow(c, *e, [&](Entity mesh) {
+                       const MeshMorph* morph = morphOf(c, mesh);
+                       if (!morph)
+                           return;
+                       const auto it = std::ranges::find(morph->targetNames, name);
+                       if (it == morph->targetNames.end())
+                           return;
+                       MorphWeights* weights = r.TryGet<MorphWeights>(mesh);
+                       if (!weights)
+                           weights = &r.Emplace<MorphWeights>(mesh, MorphWeights{.weights = morph->defaultWeights});
+                       if (weights->weights.size() < morph->TargetCount())
+                           weights->weights.resize(morph->TargetCount(), 0.0f);
+                       weights->weights[static_cast<std::size_t>(it - morph->targetNames.begin())] =
+                           std::isfinite(weight) ? weight : 0.0f;
+                       ++found;
+                   });
+                   if (found == 0)
+                       c.Error("No mesh with the morph target '" + name + "'");
+               }, "Weight of a morph target (blend shape) by name on the meshes below the target; clips that animate it override it"));
+    add(Pure("Morph.GetWeight", "Get Morph Weight", "Animation",
+             {In("Target", P::Entity), In("Morph Target", P::String), Out("Weight", P::Float), Out("Found", P::Bool)},
+             [=](ScriptContext& c) {
+                 float value = 0.0f;
+                 bool  found = false;
+                 if (const auto e = Target(c, 0))
+                     ForEachMeshBelow(c, *e, [&](Entity mesh) {
+                         const MeshMorph* morph = found ? nullptr : morphOf(c, mesh);
+                         if (!morph)
+                             return;
+                         const auto it = std::ranges::find(morph->targetNames, c.InString(1));
+                         if (it == morph->targetNames.end())
+                             return;
+                         const auto  t       = static_cast<std::size_t>(it - morph->targetNames.begin());
+                         const auto* weights = c.GetScene().GetRegistry().TryGet<MorphWeights>(mesh);
+                         value = weights && t < weights->weights.size() ? weights->weights[t] : morph->defaultWeights[t];
+                         found = true;
+                     });
+                 c.Out(2, value);
+                 c.Out(3, found);
+             }));
     add(Action("Animation.SetRootMotion", "Set Root Motion", "Animation",
                {In("Target", P::Entity), In("Enabled", P::Bool)}, [](ScriptContext& c) {
                    if (const auto entity = AnimatorTarget(c, 2))
