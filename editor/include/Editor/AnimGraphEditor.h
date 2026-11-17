@@ -87,6 +87,7 @@ private:
     void DrawPreview(float dt);
     bool PathField(const char* label, std::string& path, const std::vector<std::string>& extensions, int purpose,
                    std::size_t index = 0);
+    std::vector<std::shared_ptr<const Model>> LoadedSources(); // animation sources through the preview system
     bool ClipCombo(const char* label, std::string& clip);
     bool BoneCombo(const char* label, std::string& bone);
     bool ParameterCombo(const char* label, std::string& parameter, bool numericOnly);

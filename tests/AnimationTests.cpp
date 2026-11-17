@@ -6,6 +6,7 @@
 #include "Engine/Animation/AnimGraph.h"
 #include "Engine/Animation/AnimGraphPlayer.h"
 #include "Engine/Animation/AnimIk.h"
+#include "Engine/Animation/AnimRetarget.h"
 #include "Engine/Animation/AnimationSystem.h"
 #include "Engine/Assets/Animation.h"
 #include "Engine/Assets/GltfLoader.h"
@@ -20,9 +21,12 @@
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <random>
 #include <thread>
 
 using namespace Engine;
@@ -740,4 +744,85 @@ TEST_CASE(Animation_BlueprintNodesAndSerialization)
     CHECK(r.Printed("Step"));
     CHECK(anim.Stats().ikSolved >= 1); // the head looks at the target
     CHECK(r.scripts.Stats().errors >= 1); // unknown trigger reported
+}
+
+namespace {
+
+Model Skeleton(std::vector<std::pair<std::string, int>> bones, std::vector<glm::vec3> offsets, std::vector<glm::quat> rotations)
+{
+    Model model;
+    for (std::size_t i = 0; i < bones.size(); ++i) {
+        ModelNode node;
+        node.name           = bones[i].first;
+        node.parent         = bones[i].second;
+        node.local.position = offsets[i];
+        node.local.rotation = rotations[i];
+        model.nodes.push_back(node);
+    }
+    BuildMorphPoseLayout(model);
+    return model;
+}
+
+} // namespace
+
+// Retargeting: a clip of another skeleton (prefixed names, other proportions and rest rotations)
+// plays by bone name; rotations relative to the rest poses, the root's translation and root motion
+// scaled by the rest offsets; unmapped bones keep their rest pose.
+TEST_CASE(Animation_RetargetedClipsFromSources)
+{
+    const glm::quat id(1.0f, 0.0f, 0.0f, 0.0f);
+    const glm::quat turn = glm::angleAxis(glm::half_pi<float>(), glm::vec3(0.0f, 0.0f, 1.0f));
+    const glm::quat tilt = glm::angleAxis(0.3f, glm::vec3(1.0f, 0.0f, 0.0f));
+    Model source = Skeleton({{"Armature", -1}, {"mixamorig:Hips", 0}, {"mixamorig:Spine", 1}, {"mixamorig:Head", 2}},
+                            {glm::vec3(0.0f), {0.0f, 1.0f, 0.0f}, {0.0f, 0.2f, 0.0f}, {0.0f, 0.3f, 0.0f}}, {id, id, id, id});
+    AnimationClip wave;
+    wave.name     = "Wave";
+    wave.duration = 1.0f;
+    wave.tracks.push_back(AnimationTrack{.node = 2, .path = AnimationPath::Rotation, .times = {0.0f, 1.0f},
+                                         .values = {glm::vec4(0, 0, 0, 1), glm::vec4(turn.x, turn.y, turn.z, turn.w)}});
+    wave.tracks.push_back(AnimationTrack{.node = 1, .path = AnimationPath::Translation, .times = {0.0f, 1.0f},
+                                         .values = {glm::vec4(0, 1, 0, 0), glm::vec4(0, 1, 2, 0)}});
+    source.animations.push_back(wave);
+    const auto sourcePtr = std::make_shared<const Model>(source);
+    const Model hero = Skeleton({{"Root", -1}, {"Hips", 0}, {"SPINE", 1}, {"Head", 2}, {"Tail", 1}},
+                                {glm::vec3(0.0f), {0.0f, 2.0f, 0.0f}, {0.0f, 0.4f, 0.0f}, {0.0f, 0.6f, 0.0f}, {0.0f, 0.0f, -0.5f}},
+                                {id, id, tilt, id, tilt});
+
+    const AnimRetarget map = BuildRetarget(hero, source);
+    CHECK((map.sourceOf == std::vector<int>{-1, 1, 2, 3, -1}) && map.Mapped() == 3);
+    CHECK(map.root[1] == 1 && map.root[2] == 0 && Near(map.scale[1], 2.0f, 1e-5f));
+
+    AnimGraph graph;
+    AnimLayer layer;
+    layer.entryState = "Wave";
+    layer.states.push_back(AnimState{.name = "Wave", .clip = "Wave", .loop = false});
+    graph.layers.push_back(layer);
+    graph.rootMotionBone = "Hips";
+    graph.animationSources = {"lib.glb"};
+    CHECK(ValidateAnimGraph(graph, &hero, std::vector<std::shared_ptr<const Model>>{sourcePtr}).empty());
+    const auto missing = ValidateAnimGraph(graph, &hero, std::vector<std::shared_ptr<const Model>>{nullptr});
+    CHECK(std::ranges::any_of(missing, [](const std::string& p) { return p.find("cannot be loaded") != std::string::npos; }));
+
+    AnimGraphPlayer player;
+    player.Bind(std::make_shared<const AnimGraph>(graph), &hero, {sourcePtr});
+    CHECK(player.RetargetedClipCount() == 1);
+    std::vector<Transform> pose(AnimationPoseSize(hero));
+    glm::vec3              rootMotion(0.0f);
+    player.Update(1.0f, pose, nullptr, &rootMotion);
+    CHECK(Near(pose[2].rotation, tilt * turn, 1e-4f));                    // target rest * source delta
+    CHECK(Near(pose[2].position, glm::vec3(0.0f, 0.4f, 0.0f), 1e-5f));  // proportions stay the hero's
+    CHECK(Near(pose[4].rotation, tilt, 1e-5f) && Near(pose[0].position, glm::vec3(0.0f), 1e-6f)); // unmapped: rest
+    CHECK(Near(rootMotion, glm::vec3(0.0f, 0.0f, 4.0f), 1e-4f));          // 2 m of the source, scaled x2
+    CHECK(Near(pose[1].position, glm::vec3(0.0f, 2.0f, 0.0f), 1e-5f));   // root motion bone back at rest
+    CHECK(player.DrivenNodes()[1] && player.DrivenNodes()[2] && !player.DrivenNodes()[4]);
+
+    // Paths are stored relative to the graph's folder.
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_retarget_{}", std::random_device{}());
+    fs::create_directories(dir / "Lib");
+    graph.animationSources = {PathToUtf8(dir / "Lib" / "lib.glb")};
+    CHECK(SaveAnimGraph(dir / "Hero.uanim", graph));
+    const auto loaded = LoadAnimGraph(dir / "Hero.uanim");
+    CHECK(loaded && loaded->animationSources == graph.animationSources);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

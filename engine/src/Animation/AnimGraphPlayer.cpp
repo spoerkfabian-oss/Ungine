@@ -102,7 +102,8 @@ void AddWeighted(std::vector<Transform>& acc, std::span<const Transform> pose, f
 
 } // namespace
 
-void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* model)
+void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* model,
+                           std::vector<std::shared_ptr<const Model>> sources)
 {
     // Keep parameter values that survive (same name and type).
     std::vector<std::pair<AnimParameter, float>> old;
@@ -112,6 +113,9 @@ void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* 
 
     m_Graph = std::move(graph);
     m_Model = model;
+    m_Sources = std::move(sources);
+    m_Retargets.clear();
+    m_External.clear();
     m_Layers.clear();
     m_Values.clear();
     m_Driven.clear();
@@ -128,6 +132,14 @@ void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* 
             if (previous.name == p.name && previous.type == p.type)
                 value = previousValue;
         m_Values.push_back(value);
+    }
+    // Clips of the animation sources (after the model's own; the first source with a name wins).
+    for (const std::shared_ptr<const Model>& source : m_Sources) {
+        if (!source)
+            continue;
+        m_Retargets.push_back(BuildRetarget(*m_Model, *source));
+        for (std::size_t c = 0; c < source->animations.size(); ++c)
+            m_External.push_back(ExternalClip{.source = source, .clip = c, .map = m_Retargets.size() - 1});
     }
     const std::size_t nodes = m_Model->nodes.size();
     const std::size_t poseSize = AnimationPoseSize(*m_Model); // nodes, then morph weights
@@ -205,12 +217,7 @@ void AnimGraphPlayer::Bind(std::shared_ptr<const AnimGraph> graph, const Model* 
 void AnimGraphPlayer::ResolveState(State& state, const AnimState& source)
 {
     state.source = &source;
-    const auto clipIndex = [&](const std::string& name) {
-        for (std::size_t i = 0; i < m_Model->animations.size(); ++i)
-            if (m_Model->animations[i].name == name)
-                return static_cast<int>(i);
-        return -1;
-    };
+    const auto clipIndex = [&](const std::string& name) { return ClipIndex(name); };
     const auto param = [&](const std::string& name) {
         if (name.empty())
             return -1;
@@ -222,6 +229,13 @@ void AnimGraphPlayer::ResolveState(State& state, const AnimState& source)
     const auto drive = [&](int clip) {
         if (clip < 0)
             return;
+        if (static_cast<std::size_t>(clip) >= m_Model->animations.size()) { // retargeted: every mapped bone
+            const AnimRetarget& map = m_Retargets[m_External[static_cast<std::size_t>(clip) - m_Model->animations.size()].map];
+            for (std::size_t n = 0; n < map.sourceOf.size(); ++n)
+                if (map.sourceOf[n] >= 0)
+                    m_Driven[n] = 1;
+            return;
+        }
         for (const AnimationTrack& track : m_Model->animations[static_cast<std::size_t>(clip)].tracks)
             if (track.node < m_Model->nodes.size() && track.path != AnimationPath::Weights)
                 m_Driven[track.node] = 1;
@@ -319,9 +333,55 @@ float AnimGraphPlayer::Value(int param) const
     return param >= 0 && static_cast<std::size_t>(param) < m_Values.size() ? m_Values[static_cast<std::size_t>(param)] : 0.0f;
 }
 
+int AnimGraphPlayer::ClipIndex(const std::string& name) const
+{
+    if (name.empty())
+        return -1;
+    for (std::size_t i = 0; i < m_Model->animations.size(); ++i)
+        if (m_Model->animations[i].name == name)
+            return static_cast<int>(i);
+    for (std::size_t i = 0; i < m_External.size(); ++i)
+        if (m_External[i].source->animations[m_External[i].clip].name == name)
+            return static_cast<int>(m_Model->animations.size() + i);
+    return -1;
+}
+
+void AnimGraphPlayer::EvaluateClip(int clip, float seconds, AnimationPlayback playback, std::span<Transform> pose)
+{
+    const std::size_t own = m_Model->animations.size();
+    if (static_cast<std::size_t>(clip) < own) {
+        EvaluateAnimation(*m_Model, m_Model->animations[static_cast<std::size_t>(clip)], seconds, playback, pose);
+        return;
+    }
+    const ExternalClip& external = m_External[static_cast<std::size_t>(clip) - own];
+    m_SourcePose.resize(AnimationPoseSize(*external.source));
+    EvaluateAnimation(*external.source, external.source->animations[external.clip], seconds, playback, m_SourcePose);
+    RetargetPose(m_Retargets[external.map], *m_Model, m_SourcePose, pose);
+}
+
+glm::vec3 AnimGraphPlayer::ClipRootMotion(int clip, float seconds, bool loop) const
+{
+    const auto        node = static_cast<std::uint32_t>(m_RootMotionNode);
+    const std::size_t own  = m_Model->animations.size();
+    if (static_cast<std::size_t>(clip) < own)
+        return SampleRootMotion(m_Model->animations[static_cast<std::size_t>(clip)], node, seconds, loop);
+    const ExternalClip& external = m_External[static_cast<std::size_t>(clip) - own];
+    const AnimRetarget& map      = m_Retargets[external.map];
+    if (node >= map.sourceOf.size() || map.sourceOf[node] < 0)
+        return glm::vec3(0.0f);
+    return SampleRootMotion(external.source->animations[external.clip], static_cast<std::uint32_t>(map.sourceOf[node]),
+                            seconds, loop) * map.scale[node];
+}
+
 float AnimGraphPlayer::ClipDuration(int clip) const
 {
-    return clip >= 0 ? m_Model->animations[static_cast<std::size_t>(clip)].duration : 0.0f;
+    if (clip < 0)
+        return 0.0f;
+    const std::size_t own = m_Model->animations.size();
+    if (static_cast<std::size_t>(clip) < own)
+        return m_Model->animations[static_cast<std::size_t>(clip)].duration;
+    const ExternalClip& external = m_External[static_cast<std::size_t>(clip) - own];
+    return external.source->animations[external.clip].duration;
 }
 
 void AnimGraphPlayer::Weights(const State& state, std::vector<float>& out) const
@@ -448,7 +508,7 @@ void AnimGraphPlayer::EvaluateState(const State& state, float time, std::span<Tr
             std::ranges::copy(m_Rest, pose.begin());
             return;
         }
-        EvaluateAnimation(*m_Model, m_Model->animations[static_cast<std::size_t>(state.clip)], clipTime(state.clip),
+        EvaluateClip(state.clip, clipTime(state.clip),
                           playback, pose);
         return;
     }
@@ -463,7 +523,7 @@ void AnimGraphPlayer::EvaluateState(const State& state, float time, std::span<Tr
     }
     if (active == 1) {
         const int clip = state.samples[last].clip;
-        EvaluateAnimation(*m_Model, m_Model->animations[static_cast<std::size_t>(clip)], clipTime(clip), playback, pose);
+        EvaluateClip(clip, clipTime(clip), playback, pose);
         return;
     }
     const std::vector<float> weights = m_WeightScratch; // EvaluateAnimation does not touch it, but stay safe
@@ -475,7 +535,7 @@ void AnimGraphPlayer::EvaluateState(const State& state, float time, std::span<Tr
         if (weights[i] <= 1.0e-5f)
             continue;
         const int clip = state.samples[i].clip;
-        EvaluateAnimation(*m_Model, m_Model->animations[static_cast<std::size_t>(clip)], clipTime(clip), playback, m_Scratch);
+        EvaluateClip(clip, clipTime(clip), playback, m_Scratch);
         AddWeighted(m_Accum, m_Scratch, weights[i], first);
         first = false;
         total += weights[i];
@@ -494,11 +554,10 @@ glm::vec3 AnimGraphPlayer::RootDelta(const State& state, float from, float to) c
     const auto delta = [&](int clip, float weight) {
         if (clip < 0 || weight <= 0.0f)
             return glm::vec3(0.0f);
-        const AnimationClip& c        = m_Model->animations[static_cast<std::size_t>(clip)];
-        const auto           node     = static_cast<std::uint32_t>(m_RootMotionNode);
-        const bool           loop     = state.source->loop;
-        return weight * (SampleRootMotion(c, node, std::max(to, 0.0f) * c.duration, loop) -
-                         SampleRootMotion(c, node, std::max(from, 0.0f) * c.duration, loop));
+        const float duration = ClipDuration(clip);
+        const bool  loop     = state.source->loop;
+        return weight * (ClipRootMotion(clip, std::max(to, 0.0f) * duration, loop) -
+                         ClipRootMotion(clip, std::max(from, 0.0f) * duration, loop));
     };
     if (state.source->kind == AnimStateKind::Clip)
         return delta(state.clip, 1.0f);

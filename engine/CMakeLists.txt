@@ -67,6 +67,7 @@ add_library(Engine STATIC
     src/Animation/AnimGraph.cpp
     src/Animation/AnimGraphPlayer.cpp
     src/Animation/AnimIk.cpp
+    src/Animation/AnimRetarget.cpp
     src/Animation/AnimationSystem.cpp
     src/Physics/PhysicsMaterial.cpp
     src/Physics/PhysicsWorld.cpp

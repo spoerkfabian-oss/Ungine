@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -144,6 +146,9 @@ struct AnimGraph {
     std::vector<AnimIk>        ik{};
     std::string                rootMotionBone{}; // applied when the controller enables root motion
     std::string                previewModel{};   // editor preview (absolute in memory)
+    // Models whose clips the graph may play too, retargeted by bone name (AnimRetarget.h): a clip
+    // name not found on the driven model is looked up here in order (absolute in memory).
+    std::vector<std::string>   animationSources{};
     bool operator==(const AnimGraph&) const = default;
 
     [[nodiscard]] const AnimParameter* FindParameter(std::string_view name) const;
@@ -162,7 +167,9 @@ bool SaveAnimGraph(const std::filesystem::path& file, const AnimGraph& graph, st
 [[nodiscard]] std::string AnimGraphToJson(const AnimGraph& graph, const std::filesystem::path& folder);
 // Problems an author should know about (one line each): unknown parameters / states, duplicate
 // names, empty blend spaces, degenerate 2D spaces; with a model also unknown clips and bones.
-[[nodiscard]] std::vector<std::string> ValidateAnimGraph(const AnimGraph& graph, const Model* model = nullptr);
+// `sources`: the loaded animationSources (null: could not be loaded); their clips count as known.
+[[nodiscard]] std::vector<std::string> ValidateAnimGraph(const AnimGraph& graph, const Model* model = nullptr,
+                                                         std::span<const std::shared_ptr<const Model>> sources = {});
 
 [[nodiscard]] const char* AnimParamTypeName(AnimParamType type);
 [[nodiscard]] const char* AnimCompareName(AnimCompare op);

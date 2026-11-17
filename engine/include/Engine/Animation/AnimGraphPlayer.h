@@ -1,4 +1,6 @@
 #pragma once
+#include "Engine/Animation/AnimRetarget.h"
+#include "Engine/Assets/Animation.h"
 #include "Engine/Animation/AnimGraph.h"
 #include "Engine/Scene/Components.h"
 
@@ -40,7 +42,10 @@ class AnimGraphPlayer {
 public:
     // Resolves clips / bones / parameters by name and starts every layer in its entry state.
     // Parameter values whose name and type stay are kept. A null graph or model unbinds.
-    void Bind(std::shared_ptr<const AnimGraph> graph, const Model* model);
+    // `sources`: the loaded AnimGraph::animationSources (null entries: missing); their clips play
+    // retargeted (AnimRetarget.h) when the model has no clip of that name.
+    void Bind(std::shared_ptr<const AnimGraph> graph, const Model* model,
+              std::vector<std::shared_ptr<const Model>> sources = {});
     [[nodiscard]] bool              Bound() const { return m_Graph && m_Model; }
     [[nodiscard]] const AnimGraph*  Graph() const { return m_Graph.get(); }
     [[nodiscard]] const Model*      BoundModel() const { return m_Model; }
@@ -69,8 +74,16 @@ public:
 
     // Blend space weights of the current state of a layer at the current parameters (editor).
     [[nodiscard]] std::vector<float> BlendWeights(std::size_t layer) const;
+    // Clips found in the animation sources (editor, diagnostics): "Source clip name" per entry.
+    [[nodiscard]] std::size_t RetargetedClipCount() const { return m_External.size(); }
 
 private:
+    // Clip indices >= the model's clip count refer to m_External (retargeted source clips).
+    struct ExternalClip {
+        std::shared_ptr<const Model> source;
+        std::size_t                  clip = 0;
+        std::size_t                  map  = 0; // m_Retargets
+    };
     struct Sample {
         int       clip = -1;
         glm::vec2 position{0.0f};
@@ -119,6 +132,9 @@ private:
     [[nodiscard]] bool  Holds(const Transition& transition, const Layer& layer) const;
     [[nodiscard]] float StateRate(const State& state) const; // normalized time per second
     [[nodiscard]] float ClipDuration(int clip) const;
+    [[nodiscard]] int   ClipIndex(const std::string& name) const; // -1: unknown
+    void  EvaluateClip(int clip, float seconds, AnimationPlayback playback, std::span<Transform> pose);
+    [[nodiscard]] glm::vec3 ClipRootMotion(int clip, float seconds, bool loop) const;
     void  Weights(const State& state, std::vector<float>& out) const;
     void  EvaluateState(const State& state, float time, std::span<Transform> pose);
     [[nodiscard]] glm::vec3 RootDelta(const State& state, float from, float to) const;
@@ -133,7 +149,10 @@ private:
     std::vector<std::uint8_t>        m_Driven;
     std::vector<Transform>           m_Rest;
     int                              m_RootMotionNode = -1;
-    std::vector<Transform>           m_Scratch, m_Accum;
+    std::vector<Transform>           m_Scratch, m_Accum, m_SourcePose;
+    std::vector<std::shared_ptr<const Model>> m_Sources;
+    std::vector<AnimRetarget>        m_Retargets; // per source
+    std::vector<ExternalClip>        m_External;
     mutable std::vector<float>       m_WeightScratch;
 };
 

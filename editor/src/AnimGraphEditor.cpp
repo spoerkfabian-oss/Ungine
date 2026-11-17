@@ -230,7 +230,7 @@ void AnimGraphEditor::Apply()
         m_Preview->Provide(key, shared);
     if (m_Ctx.sceneAnimation)
         m_Ctx.sceneAnimation->Provide(key, shared);
-    m_Problems = ValidateAnimGraph(m_Graph, PreviewModel());
+    m_Problems = ValidateAnimGraph(m_Graph, PreviewModel(), LoadedSources());
     LoadPreviewModel();
 }
 
@@ -287,18 +287,36 @@ bool AnimGraphEditor::PathField(const char* label, std::string& path, const std:
     return changed;
 }
 
+std::vector<std::shared_ptr<const Model>> AnimGraphEditor::LoadedSources()
+{
+    std::vector<std::shared_ptr<const Model>> sources;
+    for (const std::string& path : m_Graph.animationSources)
+        sources.push_back(m_Preview->AnimationSource(path));
+    return sources;
+}
+
 bool AnimGraphEditor::ClipCombo(const char* label, std::string& clip)
 {
-    const Model* model = PreviewModel();
-    if (!model || model->animations.empty())
+    // The preview model's clips, then those of the animation sources (played retargeted).
+    std::vector<std::pair<std::string, std::string>> clips; // name, source file ("" = the model's own)
+    if (const Model* model = PreviewModel())
+        for (const AnimationClip& c : model->animations)
+            clips.emplace_back(c.name, std::string());
+    for (const std::string& path : m_Graph.animationSources)
+        if (const std::shared_ptr<const Model> source = m_Preview->AnimationSource(path))
+            for (const AnimationClip& c : source->animations)
+                clips.emplace_back(c.name, PathToUtf8(PathFromUtf8(path).filename()));
+    if (clips.empty())
         return ImGui::InputText(label, &clip); // no preview model: type the clip name
     bool changed = false;
     if (ImGui::BeginCombo(label, clip.empty() ? "(none)" : clip.c_str())) {
-        for (const AnimationClip& c : model->animations)
-            if (ImGui::Selectable(c.name.c_str(), c.name == clip)) {
-                clip    = c.name;
+        for (const auto& [name, from] : clips) {
+            const std::string text = from.empty() ? name : name + "  (" + from + ", retargeted)";
+            if (ImGui::Selectable(text.c_str(), name == clip)) {
+                clip    = name;
                 changed = true;
             }
+        }
         ImGui::EndCombo();
     }
     return changed;
@@ -415,7 +433,12 @@ void AnimGraphEditor::Draw(float dt)
         const std::string path = PathToUtf8(chosen->lexically_normal());
         if (m_DialogPurpose == 1)
             m_Graph.previewModel = path;
-        else if (m_Layer < m_Graph.layers.size() && m_State >= 0 &&
+        else if (m_DialogPurpose == 4) {
+            if (m_DialogIndex < m_Graph.animationSources.size())
+                m_Graph.animationSources[m_DialogIndex] = path;
+            else if (std::ranges::find(m_Graph.animationSources, path) == m_Graph.animationSources.end())
+                m_Graph.animationSources.push_back(path);
+        } else if (m_Layer < m_Graph.layers.size() && m_State >= 0 &&
                  static_cast<std::size_t>(m_State) < m_Graph.layers[m_Layer].states.size()) {
             auto& notifies = m_Graph.layers[m_Layer].states[static_cast<std::size_t>(m_State)].notifies;
             if (m_DialogIndex < notifies.size())
@@ -480,6 +503,30 @@ void AnimGraphEditor::DrawGraphSettings()
     PathField("Preview model", m_Graph.previewModel, {".glb", ".gltf"}, 1);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Model shown in the preview; its clips and bones fill the lists");
+    // Animation sources: clips of other models with the same bone names, played retargeted.
+    ImGui::TextDisabled("Animation sources (retargeted by bone name):");
+    for (std::size_t i = 0; i < m_Graph.animationSources.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        std::string path = m_Graph.animationSources[i];
+        PathField("Source", path, {".glb", ".gltf"}, 4, i);
+        if (path != m_Graph.animationSources[i]) {
+            if (path.empty())
+                m_Graph.animationSources.erase(m_Graph.animationSources.begin() + static_cast<std::ptrdiff_t>(i));
+            else
+                m_Graph.animationSources[i] = path;
+            Commit();
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::SmallButton("+ Source")) {
+        m_DialogPurpose = 4;
+        m_DialogIndex   = m_Graph.animationSources.size();
+        m_Dialog->Open("Choose an animation source", FileDialog::Mode::Open, m_File.parent_path(), {".glb", ".gltf"});
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A model whose clips this graph may play on its own model (same bone names, same bone axes)");
     BoneCombo("Root motion bone", m_Graph.rootMotionBone);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Its movement moves the entity (or its character) when the controller applies root motion");
@@ -1136,7 +1183,7 @@ void AnimGraphEditor::DrawPreview(float dt)
         if (model && m_PreviewRoot == NullEntity) {
             m_PreviewRoot = InstantiateModel(*m_Scene, m_Model, *model);
             m_Scene->GetRegistry().Emplace<AnimationController>(m_PreviewRoot, AnimationController{.graph = PathToUtf8(m_File)});
-            m_Problems = ValidateAnimGraph(m_Graph, model); // clips / bones can be checked now
+            m_Problems = ValidateAnimGraph(m_Graph, model, LoadedSources()); // clips / bones can be checked now
         }
         if (model && !m_Framed) {
             const glm::vec3 lo = model->boundsMin, hi = model->boundsMax;
