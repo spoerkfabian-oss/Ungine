@@ -23,8 +23,11 @@ allocator is registered and released before it is.
 ## World
 
 - Job system: `JobSystemWithBarrier` on the engine ThreadPool (jobs via `Enqueue`; the main thread
-  works inside the barrier wait, so a busy pool cannot stall it; the destructor waits for pool
-  closures). Limits: 65 536 bodies/pairs, 20 480 contacts, 32 MB temp allocator.
+  works inside the barrier wait, so a busy pool cannot stall it). Pool closures take their jobs
+  from an own queue; after the barrier, `WaitForJobs` releases the still-queued jobs on the main
+  thread and waits for the closures that are running one, so no closure touches a job or the
+  step data after `PhysicsSystem::Update` returned (TSan race, fixed in the debug pass). The
+  destructor waits for all pool closures. Limits: 65 536 bodies/pairs, 20 480 contacts, 32 MB temp allocator.
 - Layers: object layer = `userLayer << 1 | moving`; a collision matrix in `PhysicsSettings`
   (`SetLayerCollision`/`LayersCollide` validate indices); static vs. static never collides.
 - **`Sync(scene)`**: `UpdateTransforms`, then O(bodies) over the physics views. Bodies are (re)created

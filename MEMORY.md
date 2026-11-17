@@ -25,9 +25,12 @@ project state materially changes.
   [docs/history.md](docs/history.md)).
 - **Phase 40 Content** (skinned-mesh LODs, morph targets incl. animation/Blueprint/inspector,
   retargeted clips from animation sources) is built on `branch` and goes up as a new PR.
-- Next, at the owner's request (2026-11-16): **debug pass** over the whole engine (ASan/UBSan builds
-  of all suites, fixes with regression tests), then a **one-click release workflow** on GitHub
-  ("Run workflow" with a version builds, tests and publishes the Windows setup/ZIP and Linux TGZ).
+- **Debug pass** (owner request 2026-11-16, local branch `debug-41`, goes up after the phase 40 PR):
+  ASan/UBSan over CPU, GPU and smoke suites, TSan over the CPU suite. Found and fixed: physics job
+  closures outliving `PhysicsSystem::Update` (TSan), alloc-dealloc mismatch in the test
+  `AllocationProbe`. Commands in [docs/build-and-test.md](docs/build-and-test.md).
+- **One-click release workflow** (same PR): "Run workflow" with a version builds, tests and
+  publishes the Windows setup/ZIP and Linux TGZ (README, "Making a release").
 - No GitHub release published yet; the one-click release workflow replaces pushing tags by hand.
 - Next phases: not scheduled; candidates in [ROADMAP.md](ROADMAP.md). Ask the owner first.
 
@@ -96,6 +99,9 @@ Engine
 - Pak decompression bombs: the writer stores entries raw beyond 1:1024 and the reader refuses larger
   claimed sizes before allocating; digests are checked before zstd runs. FNV is not a security hash:
   signatures rely on the per-entry BLAKE2b digests in the signed index.
+- Jolt's barrier waits for jobs, not for engine closures that run them: `EngineJobSystem` drains
+  its own queue in `WaitForJobs` (TSan found closures racing with the next update). Verify
+  threading changes with the TSan build (docs/build-and-test.md).
 
 Editor and tests
 - GCC 13 crashed (ICE) on a designated-initializer `EditCommand` with lambdas while `History.h` was

@@ -54,6 +54,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -116,6 +117,10 @@ void ReleaseJolt()
 // Every job of a PhysicsSystem::Update is also added to its barrier: the main thread executes
 // whatever the pool has not picked up yet while it waits (Job::Execute runs a job only once),
 // so a pool busy with asset loading slows physics down but cannot stall it.
+// The barrier only waits for the jobs, not for the pool closures that run them (see the Jolt
+// JobSystem docs): a closure could still execute or release a job after Update returned, racing
+// with the next update. So the closures take their jobs from m_Queue, and WaitForJobs releases
+// the jobs still queued on the calling thread and waits for the closures that are running one.
 class EngineJobSystem final : public JPH::JobSystemWithBarrier {
 public:
     EngineJobSystem(ThreadPool& pool, JPH::uint maxJobs, JPH::uint maxBarriers)
@@ -125,7 +130,8 @@ public:
     }
     ~EngineJobSystem() override
     {
-        while (m_InFlight.load() != 0) // pool closures still reference m_Jobs
+        RunQueued();
+        while (m_InFlight.load() != 0) // pool closures still reference this
             std::this_thread::yield();
     }
 
@@ -144,14 +150,38 @@ public:
         return handle;
     }
 
+    void WaitForJobs(Barrier* barrier) override
+    {
+        JobSystemWithBarrier::WaitForJobs(barrier);
+        RunQueued(); // all jobs are done: this only releases the references of the queue
+        while (m_Running.load(std::memory_order_acquire) != 0)
+            std::this_thread::yield();
+    }
+
 protected:
     void QueueJob(Job* job) override
     {
         job->AddRef();
+        {
+            std::scoped_lock lock(m_QueueMutex);
+            m_Queue.push_back(job);
+        }
         m_InFlight.fetch_add(1);
-        m_Pool.Enqueue([this, job] {
-            job->Execute();
-            job->Release();
+        m_Pool.Enqueue([this] {
+            Job* next = nullptr;
+            {
+                std::scoped_lock lock(m_QueueMutex);
+                if (!m_Queue.empty()) {
+                    next = m_Queue.front();
+                    m_Queue.pop_front();
+                    m_Running.fetch_add(1, std::memory_order_relaxed); // under the lock: WaitForJobs sees it
+                }
+            }
+            if (next) {
+                next->Execute();
+                next->Release();
+                m_Running.fetch_sub(1, std::memory_order_release);
+            }
             m_InFlight.fetch_sub(1); // last access to this
         });
     }
@@ -163,10 +193,26 @@ protected:
     void FreeJob(Job* job) override { m_Jobs.DestructObject(job); }
 
 private:
+    void RunQueued()
+    {
+        std::deque<Job*> queued;
+        {
+            std::scoped_lock lock(m_QueueMutex);
+            queued.swap(m_Queue);
+        }
+        for (Job* job : queued) {
+            job->Execute(); // no-op for a job that already ran
+            job->Release();
+        }
+    }
+
     using Jobs = JPH::FixedSizeFreeList<Job>;
     ThreadPool&      m_Pool;
     Jobs             m_Jobs;
-    std::atomic<int> m_InFlight{0};
+    std::mutex       m_QueueMutex;
+    std::deque<Job*> m_Queue;
+    std::atomic<int> m_Running{0};  // closures executing a job taken from m_Queue
+    std::atomic<int> m_InFlight{0}; // closures not finished yet
 };
 
 // --- Layers: object layer = user collision layer << 1 | moving. Static bodies never collide

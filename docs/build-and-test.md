@@ -26,6 +26,17 @@ For sanitizer builds use separate FetchContent binary folders
 (`-DFETCHCONTENT_BASE_DIR=<build>/_deps -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 -DFETCHCONTENT_SOURCE_DIR_<DEP>=.deps/<dep>-src`) and `-fno-sanitize=vptr` (glslang has no RTTI).
 
+Sanitizer runs (debug pass, 2026-11-17; repeat after threading or lifetime changes):
+
+- ASan/UBSan (`-fsanitize=address,undefined -fno-sanitize=vptr`): `EngineTests` with
+  `LSAN_OPTIONS=suppressions=tests/sanitizers/lsan.supp` (PulseAudio and `dlopen` initialisers
+  leak), `EngineGpuTests` and the smokes with `ASAN_OPTIONS=detect_leaks=0` (the Mesa driver leaks
+  from an unloaded module, no engine frames).
+- TSan (`-fsanitize=thread`, CPU suite only): `setarch -R build-tsan/tests/EngineTests` (ASLR off, as in
+  the recorded run).
+- `tests/AllocationProbe.cpp` replaces every `operator new/delete` form; replacing only some of
+  them makes ASan report alloc-dealloc mismatches.
+
 ## Apps
 
 | Command | Purpose |
