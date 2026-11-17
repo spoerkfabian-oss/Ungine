@@ -1,0 +1,7 @@
+# LeakSanitizer suppressions for sanitizer runs of the test suites (LSAN_OPTIONS=suppressions=...).
+# Only third-party code that keeps allocations on purpose or leaks outside the engine's control:
+# PulseAudio's client context (miniaudio probes it; there is no server on CI / headless machines)
+leak:libpulse.so
+leak:libpulsecommon
+# constructors of shared libraries loaded with dlopen (audio and Vulkan driver plugins)
+leak:_dl_init

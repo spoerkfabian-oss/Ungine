@@ -47,5 +47,23 @@ void* operator new(std::size_t size)
     throw std::bad_alloc();
 }
 
+// Every other replaceable form goes through the same pair, so no allocation of the standard
+// library (e.g. std::stable_sort's nothrow temporary buffer) mixes this malloc/free with another
+// allocator (ASan reports that as alloc-dealloc-mismatch). Aligned forms are left to the library.
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept
+{
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+void* operator new[](std::size_t size, const std::nothrow_t& tag) noexcept { return ::operator new(size, tag); }
+
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
