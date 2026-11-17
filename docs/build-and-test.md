@@ -90,10 +90,14 @@ frame (hold end positions for two frames). See [folders/tests.md](folders/tests.
   with `/W4 /WX` + `EngineTests` (latest Vulkan SDK only for glslc; version from
   `vulkan.lunarg.com/sdk/latest/windows.txt`, cached per version). FetchContent sources are cached in
   `.deps` (build folders removed before saving).
-- **`.github/workflows/release.yml`**: tag `v<version>` → GitHub release with packages,
-  `SHA256SUMS.txt`, generated notes (prerelease when the version contains `-`); pushes to main,
-  manual runs (input `version`) and PRs touching packaging files → workflow artifacts (14 days).
-  Version: tag without `v` > input > `CMakeLists.txt` + `-dev.<run>`. Linux: Release build,
+- **`.github/workflows/release.yml`**: one-click releases — *Run workflow* on `main` with `version`
+  (empty: `CMakeLists.txt`), `publish` (default on) and `prerelease` builds and tests both platforms,
+  then creates the tag `v<version>` on the tested commit and the GitHub release (packages,
+  `SHA256SUMS.txt`, a download table plus generated notes; prerelease when asked or when the version
+  contains `-`). Publishing refuses other branches and versions that are tagged already. A pushed tag
+  `v<version>` publishes the same way; pushes to main, runs with `publish` off and PRs touching
+  packaging files keep workflow artifacts (14 days). Version: tag > input > `CMakeLists.txt` (+
+  `-dev.<run>` when not publishing). It only names the packages and the installer. Linux: Release build,
   `EngineTests`, `cpack -G TGZ`, unpack, `tests/PackageSmoke.cmake` with `RUN_PLAYER=ON` under Xvfb.
   Windows: VS 2022 Release, glslc from the SDK, NSIS (installed via choco if missing), `EngineTests`,
   `cpack -G "NSIS;ZIP"` (prints the NSIS log on failure), unzip + package smoke without the player (no
