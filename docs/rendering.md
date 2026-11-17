@@ -124,6 +124,14 @@ shadows). `CullingSettings`: lod, lodPixelError (1 px, saved in scenes), forceLo
 Skinned meshes choose from their pose bounds (`skinnedBoundsMin/Max`, LOD 0 until those are known);
 the simplifier keeps existing vertices, so every level keeps its skin influences.
 
+## Morph targets
+
+`mesh.vert` and `shadow.vert` call `ApplyMorph` (mesh_common.glsl) for instances with
+`morphWeightOffset != ~0u`: the weighted deltas of `FrameData.morphDeltas` (pool) for the vertex's
+index inside `GpuSubmesh.morph` (first delta, targets, first vertex, count), with
+`FrameData.morphWeights` (this frame) and `prevMorphWeights` (motion vectors). See
+[scene.md](scene.md#skeletal-animation-playback).
+
 ## Transparency
 
 Alpha-blended submeshes go through `mesh_blend.frag`, sorted back to front per object; shadows use the

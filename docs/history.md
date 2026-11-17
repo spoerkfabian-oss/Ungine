@@ -46,6 +46,7 @@ Each phase was delivered as one or more commits and, from Phase 24 on, as one pu
 | H2 | Hardening after an external audit: pak/VFS paths, cook symlinks, malformed terrain/KTX2/cooked models, navmesh reload signatures |
 | 38 | Tools: undoable content delete via `Saved/Trash`, nav-link and IK-target gizmos, bone overlay, background packaging with progress and cancel |
 | 39 | Paks: format v2 with zstd per entry and BLAKE2b digests, Ed25519-signed paks with a key per project, delta patch paks |
+| 40 | Content: LODs for skinned meshes, morph targets (import, GPU, animation, Blueprint, inspector), retargeted clips from animation sources |
 
 Details of each phase's verification are in [verification.md](verification.md); decisions and lessons
 are in [MEMORY.md](../MEMORY.md).

@@ -1049,7 +1049,7 @@ std::vector<NodeDesc> BuildRegistry()
                        return;
                    const std::string name   = c.InString(3);
                    const float       weight = c.InFloat(4);
-                   Registry&         r      = c.GetScene().GetRegistry();
+                   Registry&         reg    = c.GetScene().GetRegistry();
                    std::uint32_t     found  = 0;
                    ForEachMeshBelow(c, *e, [&](Entity mesh) {
                        const MeshMorph* morph = morphOf(c, mesh);
@@ -1058,9 +1058,9 @@ std::vector<NodeDesc> BuildRegistry()
                        const auto it = std::ranges::find(morph->targetNames, name);
                        if (it == morph->targetNames.end())
                            return;
-                       MorphWeights* weights = r.TryGet<MorphWeights>(mesh);
+                       MorphWeights* weights = reg.TryGet<MorphWeights>(mesh);
                        if (!weights)
-                           weights = &r.Emplace<MorphWeights>(mesh, MorphWeights{.weights = morph->defaultWeights});
+                           weights = &reg.Emplace<MorphWeights>(mesh, MorphWeights{.weights = morph->defaultWeights});
                        if (weights->weights.size() < morph->TargetCount())
                            weights->weights.resize(morph->TargetCount(), 0.0f);
                        weights->weights[static_cast<std::size_t>(it - morph->targetNames.begin())] =
