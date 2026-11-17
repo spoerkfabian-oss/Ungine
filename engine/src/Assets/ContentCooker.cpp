@@ -35,7 +35,7 @@ using json   = nlohmann::json;
 namespace {
 
 constexpr char          kModelMagic[4] = {'U', 'M', 'D', 'L'};
-constexpr std::uint32_t kModelVersion  = 1; // bump when the layout below changes
+constexpr std::uint32_t kModelVersion  = 2; // bump when the layout below changes (2: morph targets)
 
 std::string GenericUtf8(const fs::path& path)
 {
@@ -188,11 +188,11 @@ void WriteLight(Writer& w, const Light& l)
 constexpr std::size_t kCountBytes        = sizeof(std::uint64_t); // String / Array length prefix
 constexpr std::size_t kMinTextureBytes   = kCountBytes + 1 + kCountBytes + kCountBytes + 8;
 constexpr std::size_t kMinMaterialBytes  = kCountBytes + sizeof(glm::vec4) + sizeof(glm::vec3) + 5 * 4 + 3 + 5 * 4;
-constexpr std::size_t kMinMeshBytes      = 2 * kCountBytes;
+constexpr std::size_t kMinMeshBytes      = 2 * kCountBytes + kCountBytes + kCountBytes + 2 * 4 + kCountBytes;
 constexpr std::size_t kMinNodeBytes      = kCountBytes + 2 * sizeof(glm::vec3) + sizeof(glm::quat) + 3 * 4 + 1;
 constexpr std::size_t kMinSkinBytes      = kCountBytes + 4 + kCountBytes;
 constexpr std::size_t kMinAnimationBytes = kCountBytes + 4 + kCountBytes;
-constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes;
+constexpr std::size_t kMinTrackBytes     = 4 + 1 + 1 + 4 * kCountBytes + 4;
 
 // Cooked models skip the glTF loader's checks: every index range must lie in the index buffer and
 // every index must address a vertex, or the GPU and the collision code read past the vertices.
@@ -205,6 +205,13 @@ void ValidateGeometry(const ModelData& d)
             if (vertexOffset < 0 || std::uint64_t(vertexOffset) + d.indices[first + i] >= d.vertices.size())
                 throw std::runtime_error("cooked model: index out of the vertex range");
     };
+    for (const Mesh& mesh : d.meshes) {
+        const MeshMorph& morph = mesh.morph;
+        if (morph.TargetCount() > kMaxMorphTargets || morph.defaultWeights.size() != morph.targetNames.size() ||
+            morph.deltas.size() != std::size_t{morph.TargetCount()} * morph.vertexCount * 2 ||
+            (morph.TargetCount() > 0 && std::uint64_t{morph.vertexBase} + morph.vertexCount > d.vertices.size()))
+            throw std::runtime_error("cooked model: invalid morph targets");
+    }
     for (const Mesh& mesh : d.meshes)
         for (const Submesh& sm : mesh.submeshes) {
             if (sm.lodCount > kMaxLods)
@@ -285,6 +292,13 @@ std::vector<std::byte> SerializeModelData(const ModelData& d, const fs::path& mo
     for (const Mesh& m : d.meshes) {
         w.String(m.name);
         w.Array(m.submeshes);
+        w.U64(m.morph.targetNames.size());
+        for (const std::string& name : m.morph.targetNames)
+            w.String(name);
+        w.Array(m.morph.defaultWeights);
+        w.U32(m.morph.vertexBase);
+        w.U32(m.morph.vertexCount);
+        w.Array(m.morph.deltas);
     }
     w.U64(d.nodes.size());
     for (const ModelNode& n : d.nodes) {
@@ -317,6 +331,7 @@ std::vector<std::byte> SerializeModelData(const ModelData& d, const fs::path& mo
             w.Array(t.values);
             w.Array(t.inTangents);
             w.Array(t.outTangents);
+            w.U32(t.morphTarget);
         }
     }
     w.Pod(d.boundsMin);
@@ -375,6 +390,13 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
     for (Mesh& m : d.meshes) {
         m.name      = r.String();
         m.submeshes = r.Array<Submesh>();
+        m.morph.targetNames.resize(r.Count(kCountBytes));
+        for (std::string& name : m.morph.targetNames)
+            name = r.String();
+        m.morph.defaultWeights = r.Array<float>();
+        m.morph.vertexBase     = r.U32();
+        m.morph.vertexCount    = r.U32();
+        m.morph.deltas         = r.Array<glm::vec4>();
     }
     d.nodes.resize(r.Count(kMinNodeBytes));
     for (ModelNode& n : d.nodes) {
@@ -406,6 +428,7 @@ ModelData DeserializeModelData(std::span<const std::byte> bytes, const fs::path&
             t.values        = r.Array<glm::vec4>();
             t.inTangents    = r.Array<glm::vec4>();
             t.outTangents   = r.Array<glm::vec4>();
+            t.morphTarget   = r.U32();
         }
     }
     d.boundsMin = r.Pod<glm::vec3>();

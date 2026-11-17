@@ -25,11 +25,14 @@ void main()
     const mat4        viewProj = pc.cascade < 4u ? frame.cascadeViewProj[pc.cascade]
                                                  : frame.shadowViews.v[pc.cascade - 4u].viewProj;
     const mat4        skin     = SkinMatrix(inst, v);
+    vec3 position = v.position, normal = v.normal;
+    if (inst.morphWeightOffset != 0xFFFFFFFFu)
+        ApplyMorph(inst, frame.submeshes.s[draw.submesh], gl_VertexIndex, false, position, normal);
     outUV       = vec2(v.uvX, v.uvY);
-    vec4 world  = inst.model * skin * vec4(v.position, 1.0);
+    vec4 world  = inst.model * skin * vec4(position, 1.0);
 #ifdef CUSTOM_MATERIAL
     outMaterial       = draw.params;
-    outNormal         = NormalMatrix(inst) * mat3(skin) * v.normal;
+    outNormal         = NormalMatrix(inst) * mat3(skin) * normal;
     outObjectPosition = inst.model[3].xyz;
 #ifdef MATERIAL_HAS_WPO
     world.xyz += EvaluateMaterialOffset(MaterialContextOf(world.xyz, outNormal, outUV, inst.model[3].xyz,

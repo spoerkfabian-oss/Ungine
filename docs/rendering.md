@@ -121,7 +121,16 @@ Meshes get up to 4 LODs at import (see [assets.md](assets.md)). `SelectLod` (ide
 C++) picks the coarsest level with `error · maxScale · pixelsPerUnit / lodPixelError ≤ distance −
 radius`; all views choose by the camera. LOD changes cross-fade with a dither over a 20 % band (not in
 shadows). `CullingSettings`: lod, lodPixelError (1 px, saved in scenes), forceLod. Debug view `Lod`.
-Skinned meshes stay on LOD 0.
+Skinned meshes choose from their pose bounds (`skinnedBoundsMin/Max`, LOD 0 until those are known);
+the simplifier keeps existing vertices, so every level keeps its skin influences.
+
+## Morph targets
+
+`mesh.vert` and `shadow.vert` call `ApplyMorph` (mesh_common.glsl) for instances with
+`morphWeightOffset != ~0u`: the weighted deltas of `FrameData.morphDeltas` (pool) for the vertex's
+index inside `GpuSubmesh.morph` (first delta, targets, first vertex, count), with
+`FrameData.morphWeights` (this frame) and `prevMorphWeights` (motion vectors). See
+[scene.md](scene.md#skeletal-animation-playback).
 
 ## Transparency
 

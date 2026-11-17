@@ -53,14 +53,36 @@ This document covers animation graphs (`engine/include/Engine/Animation/`).
 ## Blueprint nodes (category Animation)
 
 Set Anim Float/Bool/Int/Trigger, Get Anim Parameter, Get Anim State, Set Anim Layer Weight,
-Set/Clear IK Target (position or entity), Set IK Weight/Enabled, event On Anim Notify (name, state,
+Set/Clear IK Target (position or entity), Set IK Weight/Enabled, Set/Get Morph Weight (by target name
+on the meshes below the target), event On Anim Notify (name, state,
 location; fired on the controller and its ancestors). The target is the entity itself or the first
 controller below it. The cooker checks notify sounds/effects and reports validation problems.
+
+## Retargeting (`AnimRetarget.h`)
+
+`AnimGraph::animationSources` lists models (paths relative to the graph) whose clips the graph may
+play on its own model: a clip name the model lacks is looked up in the sources in order.
+`BuildRetarget` maps bones by name (case-insensitive, a `namespace:` prefix such as `mixamorig:` is
+ignored); `RetargetPose` applies `target rest × inverse(source rest) × source` to every mapped bone,
+moves only mapped root bones (offset from rest × ratio of the rest offsets; root motion scaled the
+same) and leaves unmapped bones at rest. The `AnimationSystem` loads each source once
+(`AnimationSource`: cooked data from a mounted pak, else the glTF) as a CPU-only model.
+`ValidateAnimGraph(graph, model, sources)` reports unloadable sources and sources without shared
+bone names.
+
+## Morph weights in poses
+
+Poses (`AnimationPoseSize`) hold the node transforms, then the morph weights of the model's morph
+meshes, three per entry in `Transform::position` (`Model::morphPoseFirst`), so crossfades, blend
+spaces and layers blend weights like bones. glTF weight channels become one `AnimationPath::Weights`
+track per target. `ApplyMorphPose` writes driven weights into the `MorphWeights` component of the
+mesh entity.
 
 ## Editor
 
 - **Animation Graph** window (`AnimGraphEditor`): toolbar (Save, Revert, Undo/Redo, Restart, Pause,
-  Speed), side bar (graph, preview model, root-motion bone, parameters with preview values and Fire,
+  Speed), side bar (graph, preview model, animation sources (+ Source, clips listed as
+  "retargeted"), root-motion bone, parameters with preview values and Fire,
   layers, IK targets, problems), state machine canvas (right-click: state/transition, drag, entry, Any
   State), details (state: clip or blend space with plot and samples, notifies; transition: duration,
   exit time, conditions), live preview (own scene + SceneRenderer + AnimationSystem, orbit camera).

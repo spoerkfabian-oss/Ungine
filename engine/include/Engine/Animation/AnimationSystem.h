@@ -106,6 +106,8 @@ public:
 
     // Loaded (cached) graph; nullptr if missing / broken (logged once per change).
     [[nodiscard]] std::shared_ptr<const AnimGraph> Graph(const std::string& path);
+    // A loaded animation source (AnimGraph::animationSources; cached, null when it cannot be loaded).
+    [[nodiscard]] std::shared_ptr<const Model> AnimationSource(const std::string& path);
     // Editor: an unsaved version of a graph file (null: back to the file). Instances rebind.
     void Provide(const std::string& path, std::shared_ptr<const AnimGraph> graph);
 

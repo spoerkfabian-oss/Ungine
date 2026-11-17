@@ -1,4 +1,7 @@
 #include "Engine/Animation/AnimationSystem.h"
+#include "Engine/Assets/Animation.h"
+#include "Engine/Assets/ContentCooker.h"
+#include "Engine/Assets/GltfLoader.h"
 #include "Engine/Animation/AnimIk.h"
 #include "Engine/Assets/AssetManager.h"
 #include "Engine/Assets/Model.h"
@@ -164,14 +167,39 @@ struct AnimationSystem::Impl {
         return true;
     }
 
+    // Animation sources (AnimGraph::animationSources): CPU models with the clips, loaded once from
+    // the cooked data of a mounted pak or the glTF file; null when they cannot be loaded.
+    std::unordered_map<std::string, std::shared_ptr<const Model>> sources;
+    std::shared_ptr<const Model> Source(const std::string& path)
+    {
+        if (const auto it = sources.find(path); it != sources.end())
+            return it->second;
+        std::shared_ptr<const Model> model;
+        try {
+            const std::filesystem::path file = PathFromUtf8(path);
+            std::optional<ModelData> data = LoadCookedModel(file, MeshOptimizeSettings{});
+            if (!data)
+                data = LoadGltf(file);
+            model = std::make_shared<const Model>(AnimationSourceModel(std::move(*data)));
+        } catch (const std::exception& e) {
+            ENGINE_WARN("Animation source '{}': {}", path, e.what());
+        }
+        sources.emplace(path, model);
+        return model;
+    }
+
     void Bind(Instance& inst, const std::string& key, const GraphRef& ref, const Model* model, std::uint32_t revision)
     {
-        inst.player.Bind(Current(ref), model);
+        std::vector<std::shared_ptr<const Model>> clipSources;
+        if (const std::shared_ptr<const AnimGraph> graph = Current(ref))
+            for (const std::string& path : graph->animationSources)
+                clipSources.push_back(Source(path));
+        inst.player.Bind(Current(ref), model, std::move(clipSources));
         inst.graphKey      = key;
         inst.version       = ref.version;
         inst.model         = model;
         inst.modelRevision = revision;
-        inst.pose.assign(model->nodes.size(), Transform{});
+        inst.pose.assign(AnimationPoseSize(*model), Transform{});
         inst.feet.assign(inst.player.Graph()->ik.size(), FootIkState{});
         for (const auto& [name, value] : inst.pending)
             inst.player.SetParameter(name, value);
@@ -399,9 +427,10 @@ void AnimationSystem::Impl::Update(Scene& scene, float dt, bool fireActions)
         auto& nodes = nodeEntities[item.entity];
         if (nodes.size() < inst.pose.size())
             nodes.resize(inst.pose.size(), NullEntity);
-        for (std::size_t i = 0; i < inst.pose.size(); ++i)
+        for (std::size_t i = 0; i < inst.model->nodes.size() && i < inst.pose.size(); ++i)
             if (touched[i] && nodes[i] != NullEntity && registry.Valid(nodes[i]) && scene.GetTransform(nodes[i]) != inst.pose[i])
                 scene.SetTransform(nodes[i], inst.pose[i]);
+        ApplyMorphPose(registry, *inst.model, inst.pose, nodes, touched);
 
         // Root motion: the bone's movement (parent space of the bone) -> model -> world.
         const int rootNode = inst.player.RootMotionNode();
@@ -629,6 +658,11 @@ bool AnimationSystem::HasInstance(Entity entity) const
 {
     const Impl::Instance* inst = m_Impl->FindInstance(entity);
     return inst && inst->player.Bound();
+}
+
+std::shared_ptr<const Model> AnimationSystem::AnimationSource(const std::string& path)
+{
+    return m_Impl->Source(path);
 }
 
 std::shared_ptr<const AnimGraph> AnimationSystem::Graph(const std::string& path)

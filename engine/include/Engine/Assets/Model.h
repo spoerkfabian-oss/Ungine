@@ -63,10 +63,27 @@ struct Submesh {
     std::array<SubmeshLod, kMaxLods> lods{};
 };
 
+// Morph targets (glTF blend shapes) of a mesh. All submeshes of the mesh share them; the deltas
+// cover the mesh's vertex range [vertexBase, vertexBase + vertexCount) of the model's vertices.
+inline constexpr std::uint32_t kMaxMorphTargets = 64;
+struct MeshMorph {
+    std::vector<std::string> targetNames{};    // one per target ("Target <i>" when the file has none)
+    std::vector<float>       defaultWeights{}; // one per target (glTF mesh weights, else 0)
+    std::uint32_t            vertexBase  = 0;
+    std::uint32_t            vertexCount = 0;
+    // Per target and vertex a position and a normal delta (xyz):
+    // deltas[(target * vertexCount + vertex) * 2 + 0 / 1].
+    std::vector<glm::vec4>   deltas{};
+
+    [[nodiscard]] std::uint32_t TargetCount() const { return static_cast<std::uint32_t>(targetNames.size()); }
+};
+
 struct Mesh {
     std::string          name;
     std::vector<Submesh> submeshes;
     std::uint32_t        firstGpuSubmesh = 0; // Model: index of submeshes[0] in the geometry pool's submesh records
+    MeshMorph            morph{};             // no targets: none
+    std::uint32_t        morphOffset = 0;     // Model: first delta (vec4) in the geometry pool's morph buffer
 };
 
 // Nodes are stored parents-before-children (topological order).
@@ -90,7 +107,7 @@ struct Skin {
     std::vector<SkinJoint> joints;
 };
 
-enum class AnimationPath : std::uint8_t { Translation, Rotation, Scale };
+enum class AnimationPath : std::uint8_t { Translation, Rotation, Scale, Weights };
 enum class AnimationInterpolation : std::uint8_t { Linear, Step, CubicSpline };
 
 struct AnimationTrack {
@@ -103,6 +120,7 @@ struct AnimationTrack {
     std::vector<glm::vec4> values;
     std::vector<glm::vec4> inTangents{};
     std::vector<glm::vec4> outTangents{};
+    std::uint32_t          morphTarget = 0; // Weights: the target of the node's mesh (values: x)
 };
 
 struct AnimationClip {
@@ -197,8 +215,11 @@ struct GpuSubmesh {
     glm::uvec4    lodFirstIndex{0}; // per LOD, absolute
     glm::uvec4    lodIndexCount{0};
     glm::vec4     lodError{0.0f};   // object space
+    // Morph targets of the mesh: x first delta (geometry pool morphs), y target count (0: none),
+    // z first vertex of the mesh (geometry pool vertices), w vertex count.
+    glm::uvec4    morph{0};
 };
-static_assert(sizeof(GpuSubmesh) == 96);
+static_assert(sizeof(GpuSubmesh) == 112);
 
 inline constexpr std::uint32_t kMaterialAlphaMask   = 1u << 0;
 inline constexpr std::uint32_t kMaterialDoubleSided = 1u << 1;
@@ -211,6 +232,11 @@ struct Model {
     PoolRange                  indices;   // Submesh::firstIndex is relative to indices.offset
     PoolRange                  materials; // Submesh::material is relative to materials.offset
     PoolRange                  submeshes; // GpuSubmesh records of all meshes (Mesh::firstGpuSubmesh)
+    PoolRange                  morphs;    // morph deltas of all meshes (Mesh::morphOffset); the CPU copies are dropped
+    // Animation poses carry morph weights after the nodes, three per entry (Transform::position):
+    // morphPoseFirst[node] is the node's first weight (~0u: its mesh has no targets). Empty: none.
+    std::vector<std::uint32_t> morphPoseFirst;
+    std::uint32_t              morphPoseWeights = 0;
     std::vector<GpuSubmesh>    gpuSubmeshes; // CPU copy of those records (index: firstGpuSubmesh - submeshes.offset)
     std::vector<TextureHandle> textures;  // per ModelData texture; owned (released) by the AssetManager
     std::vector<MaterialData>  previewMaterials; // CPU-side material preview data
@@ -236,6 +262,8 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
 void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> materials,
                          std::span<const std::uint32_t> textureEntries, Model& out, UploadTicket& ticket);
 // Both steps (models without textures, tools, tests).
+// Model::morphPoseFirst / morphPoseWeights from the nodes and meshes (BuildModelGeometry calls it).
+void BuildMorphPoseLayout(Model& model);
 void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket);
 
 // Main thread. Frees the pool ranges once in-flight frames are done (textures are separate

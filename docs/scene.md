@@ -101,7 +101,13 @@ fade-out. Rendering is described in [rendering.md](rendering.md#decals).
   (nearest ancestor with `ModelInstance`) is used instead of stored pointers, so prefab instances and
   rebuilt entities animate too.
 - GPU skinning runs in the mesh, depth and shadow passes (joint palettes ping-pong for motion
-  vectors); per-frame skin bounds feed frustum and occlusion culling.
+  vectors); per-frame skin bounds feed frustum and occlusion culling and the LOD choice.
+- Morph targets (glTF blend shapes): `Mesh::morph` holds per target the position/normal deltas of the
+  mesh's vertex range, names (`extras.targetNames`) and default weights; the `MorphWeights`
+  component of a mesh entity (saved in scene files) overrides the weights. The deltas live in the
+  geometry pool (`GeometryKind::Morphs`, `GpuSubmesh::morph`), the weights ping-pong per frame like
+  the joint palettes, and the vertex shaders add the weighted deltas before skinning. Submesh bounds
+  grow by what the targets can add. The Mesh Renderer inspector has a slider per target.
 - Blueprint nodes: Play/Stop, Set Clip, Set Speed, Looping, Blend, Root Motion, Is Playing.
 - State machines, blend spaces and IK are in [animation.md](animation.md).
 

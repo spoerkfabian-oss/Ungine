@@ -69,6 +69,9 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Fr
     DecalClusterBuffer decalClusters;
     FogVolumeBuffer    fogVolumes;
     MaterialParamBuffer materialParams; // GPU scene: custom material parameter blocks
+    MorphDeltaBuffer   morphDeltas;      // geometry pool: (position, normal) delta pairs
+    MorphWeightBuffer  morphWeights;     // per instance (GpuInstance.morphWeightOffset)
+    MorphWeightBuffer  prevMorphWeights; // last frame's (GpuInstance.prevMorphWeightOffset)
 };
 
 #endif

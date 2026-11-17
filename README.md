@@ -10,9 +10,15 @@ finished games.
 
 ## Install
 
-Every tag `v<version>` (e.g. `v0.37.0`) builds tested packages with GitHub Actions (*Release*
-workflow) and attaches them to a GitHub release. Pushes to `main` and manual runs
-(*Actions → Release → Run workflow*) keep them as workflow artifacts for 14 days.
+Download the files from the repository's **Releases** page. Every push to `main` also builds the
+packages; they stay as workflow artifacts of that *Release* run for 14 days.
+
+**Making a release (one click):** *Actions → Release → Run workflow*, keep "Use workflow from" on
+`main`, enter the version (e.g. `0.40.0`; empty uses the one in `CMakeLists.txt`) and press *Run
+workflow*. It builds and tests the Windows setup (`.exe`), the ZIP and the Linux package, then
+creates the tag `v<version>` and the GitHub release with all files (about 30 minutes). Turn
+"Publish" off to only build and test; "Prerelease" marks it as a test version. A version that is
+already released is refused before anything is built.
 
 | Package | Contents |
 |---|---|

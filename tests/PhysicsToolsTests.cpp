@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -611,4 +612,31 @@ TEST_CASE(Blueprint_PhysicsToolsNodes)
     scripts.End(scene);
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+// Regression (TSan data race): EngineJobSystem::WaitForJobs drains the pool's job queue itself.
+// With every pool worker blocked, steps must still complete (the main thread runs all jobs) and
+// the queued closures must find nothing left to run once they are unblocked.
+TEST_CASE(Physics_StepsWhilePoolIsBusy)
+{
+    World             w;
+    std::atomic<bool> release{false};
+    std::atomic<int>  blocked{0};
+    for (std::uint32_t i = 0; i < w.pool.ThreadCount(); ++i)
+        w.pool.Enqueue([&] {
+            blocked.fetch_add(1);
+            while (!release.load())
+                std::this_thread::yield();
+        });
+    while (blocked.load() != static_cast<int>(w.pool.ThreadCount()))
+        std::this_thread::yield();
+
+    w.Body("Ground", {0, -0.5f, 0}, BodyType::Static, World::Box({20, 0.5f, 20}));
+    const Entity ball = w.Body("Ball", {0, 5, 0}, BodyType::Dynamic, World::Sphere(0.5f));
+    w.Run(2.0f);
+    CHECK(Near(w.Position(ball).y, 0.5f, 0.1f));
+
+    release.store(true);
+    w.Run(0.5f); // the stale closures run now, while the next updates queue new jobs
+    CHECK(Near(w.Position(ball).y, 0.5f, 0.1f));
 }

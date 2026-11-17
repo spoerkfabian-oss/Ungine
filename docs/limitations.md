@@ -46,7 +46,8 @@ These are known, accepted limitations — not regressions. Unverified platforms 
   shadow tiles only frustum-culled, no material/depth sorting in opaque buckets, culling dispatch
   ≤ 4 M records, statistics two frames old, occlusion for the camera (and cascade casters) only;
   `RenderOutput` and swapchain share visibility. LODs are chosen by camera distance only (also for
-  shadows); shadows do not cross-fade LODs; skinned meshes stay on LOD 0.
+  shadows); shadows do not cross-fade LODs; LOD errors of skinned meshes are measured in the bind pose;
+non-indexed glTF meshes (e.g. the Fox) get no LODs (every edge is an open border).
 - TAA: no upscaling, no reactive mask (fast particles/transparents may smear), fixed 8 Halton
   positions; pixel-exact comparisons need TAA off.
 - Decals only on opaque surfaces, 32 per cluster, normal decals replace the normal proportionally, no
@@ -188,10 +189,16 @@ link endpoints; the overlay draws at most 40 000 triangles; the test path covers
 Edit mode does not animate (only Play and the graph preview); linear crossfades (no inertialization);
 unwrapped exit time; triggers stay set until consumed; no sync groups between layers; no blend-space
 smoothing; additive layers relative to the rest pose; masks are whole bones; foot placement needs
-physics (no effect in the preview); no IK gizmo; no per-bone look-at limits; FABRIK without joint
-limits; two-bone without stretching; root motion translation only (horizontal through characters);
-≤ 8 notifies per update, sounds/effects only in Play; no bone overlay, retargeting or morph targets;
-graph hot reload by polling (1 s).
+physics (no effect in the preview); IK target gizmo only while playing (no undo); no per-bone
+look-at limits; FABRIK without joint limits; two-bone without stretching; root motion translation
+only (horizontal through characters); ≤ 8 notifies per update, sounds/effects only in Play; graph hot
+reload by polling (1 s).
+- Retargeting maps bones by name only (no manual map), assumes the same bone axes in both rigs (no
+  T-pose / A-pose correction), translates only mapped root bones, ignores morph weights of the source
+  and does not reload a changed source file until the editor restarts.
+- Morph targets: at most 64 per mesh, position and normal deltas (no tangents), bounds assume weights
+  in [0, 1], evaluated in the vertex shader per draw (no compute pre-pass), not applied to the CPU
+  collision data; animated weights override Blueprint values on the same target.
 
 ## Terrain
 

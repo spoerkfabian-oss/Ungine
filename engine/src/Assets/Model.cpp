@@ -35,6 +35,26 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
     out.indices  = pool.Upload(GeometryKind::Indices, std::span{data.indices}, ticket);
 
     out.meshes = data.meshes;
+    // Morph deltas of every mesh into the pool; the GPU keeps the only copy.
+    std::vector<glm::vec4> morphs;
+    for (Mesh& mesh : out.meshes) {
+        const MeshMorph& morph = mesh.morph;
+        if (morph.TargetCount() == 0)
+            continue;
+        if (morph.TargetCount() > kMaxMorphTargets || morph.defaultWeights.size() != morph.targetNames.size() ||
+            morph.deltas.size() != std::size_t{morph.TargetCount()} * morph.vertexCount * 2 ||
+            std::uint64_t{morph.vertexBase} + morph.vertexCount > data.vertices.size())
+            throw std::runtime_error("BuildModel: '" + data.name + "' has invalid morph targets");
+        mesh.morphOffset = static_cast<std::uint32_t>(morphs.size());
+        morphs.insert(morphs.end(), morph.deltas.begin(), morph.deltas.end());
+    }
+    if (!morphs.empty()) {
+        out.morphs = pool.Upload(GeometryKind::Morphs, std::span<const glm::vec4>{morphs}, ticket);
+        for (Mesh& mesh : out.meshes) {
+            mesh.morphOffset += out.morphs.offset;
+            mesh.morph.deltas = {};
+        }
+    }
     for (Mesh& mesh : out.meshes)
         for (Submesh& sm : mesh.submeshes) {
             if (sm.lodCount <= 1) {
@@ -47,6 +67,7 @@ void BuildModelGeometry(Renderer& renderer, const ModelData& data, Model& out, U
                     throw std::runtime_error("BuildModel: '" + data.name + "' has an index range out of bounds");
         }
     out.nodes      = data.nodes;
+    BuildMorphPoseLayout(out);
     out.skinInfluences = data.skinInfluences;
     out.skins      = data.skins;
     out.animations = data.animations;
@@ -117,6 +138,9 @@ void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> mater
                               .flags        = out.materialFlags[sm.material],
                               .boundsMax    = sm.boundsMax,
                               .lodCount     = sm.lodCount};
+            if (const MeshMorph& morph = mesh.morph; morph.TargetCount() > 0)
+                record.morph = glm::uvec4(mesh.morphOffset, morph.TargetCount(), out.vertices.offset + morph.vertexBase,
+                                          morph.vertexCount);
             for (std::uint32_t l = 0; l < sm.lodCount; ++l) {
                 const auto i = static_cast<glm::length_t>(l);
                 record.lodFirstIndex[i] = out.indices.offset + sm.lods[l].firstIndex;
@@ -134,6 +158,20 @@ void BuildModelMaterials(Renderer& renderer, std::span<const MaterialData> mater
     out.gpuSubmeshes = std::move(records);
 }
 
+void BuildMorphPoseLayout(Model& model)
+{
+    model.morphPoseFirst.assign(model.nodes.size(), ~0u);
+    model.morphPoseWeights = 0;
+    for (std::size_t n = 0; n < model.nodes.size(); ++n)
+        if (const std::int32_t mesh = model.nodes[n].mesh; mesh >= 0 && static_cast<std::size_t>(mesh) < model.meshes.size())
+            if (const std::uint32_t targets = model.meshes[static_cast<std::size_t>(mesh)].morph.TargetCount(); targets > 0) {
+                model.morphPoseFirst[n] = model.morphPoseWeights;
+                model.morphPoseWeights += targets;
+            }
+    if (model.morphPoseWeights == 0)
+        model.morphPoseFirst.clear();
+}
+
 void BuildModel(Renderer& renderer, const ModelData& data, Model& out, UploadTicket& ticket)
 {
     if (!data.textures.empty())
@@ -146,12 +184,13 @@ void ReleaseModel(Renderer& renderer, Model&& model)
 {
     Renderer* r = &renderer;
     renderer.DeferCall([r, vertices = model.vertices, indices = model.indices, materials = model.materials,
-                        submeshes = model.submeshes] {
+                        submeshes = model.submeshes, morphs = model.morphs] {
         GeometryPool& pool = r->Geometry();
         pool.Free(GeometryKind::Vertices, vertices); // empty ranges (failed builds) are ignored
         pool.Free(GeometryKind::Indices, indices);
         pool.Free(GeometryKind::Materials, materials);
         pool.Free(GeometryKind::Submeshes, submeshes);
+        pool.Free(GeometryKind::Morphs, morphs);
     });
     renderer.DeferRelease(std::move(model));
 }
@@ -161,7 +200,8 @@ std::uint64_t ModelGpuBytes(const Model& model)
     return std::uint64_t{model.vertices.count} * GeometryPool::Stride(GeometryKind::Vertices) +
            std::uint64_t{model.indices.count} * GeometryPool::Stride(GeometryKind::Indices) +
            std::uint64_t{model.materials.count} * GeometryPool::Stride(GeometryKind::Materials) +
-           std::uint64_t{model.submeshes.count} * GeometryPool::Stride(GeometryKind::Submeshes);
+           std::uint64_t{model.submeshes.count} * GeometryPool::Stride(GeometryKind::Submeshes) +
+           std::uint64_t{model.morphs.count} * GeometryPool::Stride(GeometryKind::Morphs);
 }
 
 std::uint64_t ModelCpuBytes(const Model& model)

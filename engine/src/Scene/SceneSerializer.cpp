@@ -876,6 +876,8 @@ json EntityToJson(const Registry& r, Entity e, ModelRefs& models)
         if (!model.is_null())
             j["modelInstance"] = {{"model", std::move(model)}};
     }
+    if (const auto* morph = r.TryGet<MorphWeights>(e))
+        j["morphWeights"] = morph->weights;
     if (const auto* animator = r.TryGet<Animator>(e)) {
         j["animator"] = {{"clipIndex", animator->clipIndex},
                           {"blendClipIndex", animator->blendClipIndex},
@@ -1033,6 +1035,14 @@ void ApplyComponents(Scene& scene, Entity e, const json& j, ModelRefs& models)
         r.EmplaceOrReplace<ModelInstance>(e, ModelInstance{.model = models.Read(it->at("model"))});
     else
         r.Remove<ModelInstance>(e);
+    ApplyOptional<MorphWeights>(r, e, j, "morphWeights", [](const json& data) {
+        MorphWeights morph;
+        if (data.is_array())
+            for (const json& w : data)
+                if (morph.weights.size() < kMaxMorphTargets)
+                    morph.weights.push_back(w.is_number() && std::isfinite(w.get<float>()) ? w.get<float>() : 0.0f);
+        return morph;
+    });
     ApplyOptional<Animator>(r, e, j, "animator", [](const json& data) {
         Animator animator;
         Read(data, "clipIndex", animator.clipIndex);

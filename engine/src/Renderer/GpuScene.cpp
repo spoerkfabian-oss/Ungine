@@ -78,7 +78,7 @@ void GpuScene::RebuildPipelines()
 GpuScene::~GpuScene()
 {
     m_Renderer.DeferRelease(std::move(m_Scatter));
-    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices[0], &m_JointMatrices[1],
+    for (Buffer* b : {&m_InstanceBuffer, &m_DrawBuffer, &m_BatchBuffer, &m_Visibility, &m_JointMatrices[0], &m_JointMatrices[1], &m_MorphWeights[0], &m_MorphWeights[1],
                       &m_ParamBuffer, &m_BucketBuffer})
         if (*b)
             m_Renderer.DeferRelease(std::move(*b));
@@ -88,6 +88,12 @@ GpuScene::~GpuScene()
 
 LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera, std::uint32_t forced)
 {
+    return SelectLod(submesh, submesh.boundsMin, submesh.boundsMax, model, lodCamera, forced);
+}
+
+LodChoice SelectLod(const GpuSubmesh& submesh, const glm::vec3& boundsMin, const glm::vec3& boundsMax, const glm::mat4& model,
+                    const glm::vec4& lodCamera, std::uint32_t forced)
+{
     constexpr float kFadeBand = 0.2f; // LOD_FADE_BAND
     if (submesh.lodCount <= 1)
         return {};
@@ -95,8 +101,8 @@ LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm
         return {.lod = std::min(forced - 1, submesh.lodCount - 1), .fade = 0};
     if (lodCamera.w <= 0.0f)
         return {};
-    const glm::vec3 c      = (submesh.boundsMin + submesh.boundsMax) * 0.5f;
-    const glm::vec3 e      = (submesh.boundsMax - submesh.boundsMin) * 0.5f;
+    const glm::vec3 c      = (boundsMin + boundsMax) * 0.5f;
+    const glm::vec3 e      = (boundsMax - boundsMin) * 0.5f;
     const glm::vec3 center = glm::vec3(model * glm::vec4(c, 1.0f));
     const glm::vec3 extent = glm::mat3(glm::abs(glm::vec3(model[0])), glm::abs(glm::vec3(model[1])),
                                        glm::abs(glm::vec3(model[2]))) * e;
@@ -175,6 +181,7 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
         for (const SpatialIndex::MeshProxy& proxy : spatial.Meshes())
             Upsert(scene, assets, proxy.entity);
         UpdateJointPalettes(scene, assets);
+    UpdateMorphWeights(scene, assets);
         return;
     }
     for (const Entity e : spatial.MeshUpdates()) {
@@ -184,6 +191,7 @@ void GpuScene::Update(const Scene& scene, const SpatialIndex& spatial, const Ass
             Remove(e);
     }
     UpdateJointPalettes(scene, assets);
+    UpdateMorphWeights(scene, assets);
 }
 
 void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& assets)
@@ -296,6 +304,39 @@ void GpuScene::UpdateJointPalettes(const Scene& scene, const AssetManager& asset
     }
 }
 
+void GpuScene::UpdateMorphWeights(const Scene& scene, const AssetManager& assets)
+{
+    const Registry& registry = scene.GetRegistry();
+    m_MorphWeightData.clear();
+    for (std::uint32_t i = 0; i < m_Instances.size(); ++i) {
+        GpuInstance&        gpu       = m_InstanceData[i];
+        const std::uint32_t oldOffset = gpu.morphWeightOffset, oldPrev = gpu.prevMorphWeightOffset, oldCount = gpu.morphWeightCount;
+        gpu.morphWeightOffset     = ~0u;
+        gpu.prevMorphWeightOffset = ~0u;
+        gpu.morphWeightCount      = 0;
+        const Entity        entity = m_Instances[i].entity;
+        const MeshRenderer* mr     = entity != NullEntity && registry.Valid(entity) ? registry.TryGet<MeshRenderer>(entity) : nullptr;
+        const Model*        model  = mr ? assets.Get(mr->model) : nullptr;
+        if (model && mr->meshIndex < model->meshes.size() && model->morphs.count > 0) {
+            const MeshMorph& morph = model->meshes[mr->meshIndex].morph;
+            if (const std::uint32_t count = morph.TargetCount(); count > 0) {
+                const MorphWeights* weights = registry.TryGet<MorphWeights>(entity);
+                gpu.morphWeightOffset = static_cast<std::uint32_t>(m_MorphWeightData.size());
+                gpu.morphWeightCount  = count;
+                for (std::uint32_t t = 0; t < count; ++t) {
+                    const float w = weights && t < weights->weights.size() ? weights->weights[t] : morph.defaultWeights[t];
+                    m_MorphWeightData.push_back(std::isfinite(w) ? w : 0.0f);
+                }
+                // Last frame's weights of this instance sit in the other buffer at its old offset.
+                if (oldOffset != ~0u && oldCount == count)
+                    gpu.prevMorphWeightOffset = oldOffset;
+            }
+        }
+        if (gpu.morphWeightOffset != oldOffset || gpu.prevMorphWeightOffset != oldPrev || gpu.morphWeightCount != oldCount)
+            MarkInstance(i);
+    }
+}
+
 void GpuScene::UseModel(const AssetManager& assets, ModelHandle model)
 {
     ModelUse& use = m_ModelUse[model];
@@ -394,6 +435,9 @@ void GpuScene::Upsert(const Scene& scene, const AssetManager& assets, Entity ent
         data.jointOffset     = ~0u;
         data.jointCount      = 0;
         data.prevJointOffset = ~0u;
+        data.morphWeightOffset     = ~0u;
+        data.prevMorphWeightOffset = ~0u;
+        data.morphWeightCount      = 0;
     } else if (index >= m_MovedFlag.size() || !m_MovedFlag[index]) {
         data.prevModel = data.model; // where it was drawn last frame
     }
@@ -778,6 +822,8 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     const bool newVisible   = Ensure(m_Renderer, m_Visibility, m_Draws.size(), sizeof(std::uint32_t), "GpuDrawVisibility");
     m_JointBuffer ^= 1u; // the other buffer keeps last frame's palettes
     const bool newJoints    = Ensure(m_Renderer, m_JointMatrices[m_JointBuffer], m_JointMatrixData.size(), sizeof(glm::mat4), "GpuJointMatrices");
+    m_MorphBuffer ^= 1u; // the other buffer keeps last frame's weights
+    const bool newMorphs    = Ensure(m_Renderer, m_MorphWeights[m_MorphBuffer], m_MorphWeightData.size(), sizeof(float), "GpuMorphWeights");
     const bool newBuckets   = Ensure(m_Renderer, m_BucketBuffer, m_BucketData.size(), sizeof(std::uint32_t), "GpuBuckets");
     const bool newParams    = Ensure(m_Renderer, m_ParamBuffer, m_ParamData.size(), sizeof(glm::vec4), "GpuMaterialParams");
     m_BatchesDirty |= newBatches;
@@ -788,6 +834,7 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     const bool fullDraws     = newDraws && !m_Draws.empty();
     const bool work = newVisible || fullInstances || fullDraws || !m_DirtyInstances.empty() || !m_DirtyDraws.empty() ||
                       (m_BatchesDirty && !m_Batches.empty()) || newJoints || !m_JointMatrixData.empty() || bucketsDirty ||
+                      newMorphs || !m_MorphWeightData.empty() ||
                       (m_ParamsDirty && !m_ParamData.empty());
     if (!work)
         return;
@@ -847,6 +894,9 @@ void GpuScene::Upload(VkCommandBuffer cmd)
     if (!m_JointMatrixData.empty())
         Scatter(cmd, m_JointMatrices[m_JointBuffer].Address(), m_JointMatrixData.data(), sizeof(glm::mat4), {},
                 static_cast<std::uint32_t>(m_JointMatrixData.size()));
+    if (!m_MorphWeightData.empty())
+        Scatter(cmd, m_MorphWeights[m_MorphBuffer].Address(), m_MorphWeightData.data(), sizeof(float), {},
+                static_cast<std::uint32_t>(m_MorphWeightData.size()));
     m_BatchesDirty = false;
 
     Barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,

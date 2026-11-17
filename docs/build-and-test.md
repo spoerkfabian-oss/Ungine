@@ -26,6 +26,17 @@ For sanitizer builds use separate FetchContent binary folders
 (`-DFETCHCONTENT_BASE_DIR=<build>/_deps -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 -DFETCHCONTENT_SOURCE_DIR_<DEP>=.deps/<dep>-src`) and `-fno-sanitize=vptr` (glslang has no RTTI).
 
+Sanitizer runs (debug pass, 2026-11-17; repeat after threading or lifetime changes):
+
+- ASan/UBSan (`-fsanitize=address,undefined -fno-sanitize=vptr`): `EngineTests` with
+  `LSAN_OPTIONS=suppressions=tests/sanitizers/lsan.supp` (PulseAudio and `dlopen` initialisers
+  leak), `EngineGpuTests` and the smokes with `ASAN_OPTIONS=detect_leaks=0` (the Mesa driver leaks
+  from an unloaded module, no engine frames).
+- TSan (`-fsanitize=thread`, CPU suite only): `setarch -R build-tsan/tests/EngineTests` (ASLR off, as in
+  the recorded run).
+- `tests/AllocationProbe.cpp` replaces every `operator new/delete` form; replacing only some of
+  them makes ASan report alloc-dealloc mismatches.
+
 ## Apps
 
 | Command | Purpose |
@@ -90,10 +101,14 @@ frame (hold end positions for two frames). See [folders/tests.md](folders/tests.
   with `/W4 /WX` + `EngineTests` (latest Vulkan SDK only for glslc; version from
   `vulkan.lunarg.com/sdk/latest/windows.txt`, cached per version). FetchContent sources are cached in
   `.deps` (build folders removed before saving).
-- **`.github/workflows/release.yml`**: tag `v<version>` → GitHub release with packages,
-  `SHA256SUMS.txt`, generated notes (prerelease when the version contains `-`); pushes to main,
-  manual runs (input `version`) and PRs touching packaging files → workflow artifacts (14 days).
-  Version: tag without `v` > input > `CMakeLists.txt` + `-dev.<run>`. Linux: Release build,
+- **`.github/workflows/release.yml`**: one-click releases — *Run workflow* on `main` with `version`
+  (empty: `CMakeLists.txt`), `publish` (default on) and `prerelease` builds and tests both platforms,
+  then creates the tag `v<version>` on the tested commit and the GitHub release (packages,
+  `SHA256SUMS.txt`, a download table plus generated notes; prerelease when asked or when the version
+  contains `-`). Publishing refuses other branches and versions that are tagged already. A pushed tag
+  `v<version>` publishes the same way; pushes to main, runs with `publish` off and PRs touching
+  packaging files keep workflow artifacts (14 days). Version: tag > input > `CMakeLists.txt` (+
+  `-dev.<run>` when not publishing). It only names the packages and the installer. Linux: Release build,
   `EngineTests`, `cpack -G TGZ`, unpack, `tests/PackageSmoke.cmake` with `RUN_PLAYER=ON` under Xvfb.
   Windows: VS 2022 Release, glslc from the SDK, NSIS (installed via choco if missing), `EngineTests`,
   `cpack -G "NSIS;ZIP"` (prints the NSIS log on failure), unzip + package smoke without the player (no

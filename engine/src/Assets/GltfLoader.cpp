@@ -201,6 +201,10 @@ private:
             const cgltf_mesh& gm = m_Data.meshes[mi];
             Mesh mesh;
             mesh.name = gm.name ? gm.name : std::format("Mesh{}", mi);
+            // Morph targets: per target the (position, normal) deltas of the mesh's vertices so far.
+            const std::size_t                   meshBase = m_Out->vertices.size();
+            std::vector<std::vector<glm::vec4>> targets;
+            std::vector<std::pair<std::size_t, std::size_t>> primitiveRanges; // per submesh: first vertex, count
 
             for (cgltf_size pi = 0; pi < gm.primitives_count; ++pi) {
                 const cgltf_primitive& prim = gm.primitives[pi];
@@ -324,7 +328,35 @@ private:
                 sm.material     = prim.material ? static_cast<std::uint32_t>(IndexIn(m_Data.materials, prim.material))
                                                 : DefaultMaterial();
                 mesh.submeshes.push_back(sm);
+                primitiveRanges.emplace_back(base, count);
+
+                // Morph targets (every primitive of a glTF mesh has the same number of them).
+                if (targets.empty() && prim.targets_count > 0) {
+                    if (prim.targets_count > kMaxMorphTargets)
+                        ENGINE_WARN("glTF: '{}' has {} morph targets; the first {} are used", mesh.name,
+                                    prim.targets_count, kMaxMorphTargets);
+                    targets.resize(std::min<std::size_t>(prim.targets_count, kMaxMorphTargets));
+                }
+                for (std::size_t t = 0; t < targets.size(); ++t) {
+                    targets[t].resize((base + count - meshBase) * 2, glm::vec4(0.0f));
+                    if (t >= prim.targets_count)
+                        continue;
+                    const cgltf_morph_target& target = prim.targets[t];
+                    for (cgltf_size ai = 0; ai < target.attributes_count; ++ai) {
+                        const cgltf_attribute& a = target.attributes[ai];
+                        const std::size_t slot = a.type == cgltf_attribute_type_position ? 0
+                                               : a.type == cgltf_attribute_type_normal   ? 1
+                                                                                         : 2;
+                        if (slot > 1 || !a.data || a.data->count != count)
+                            continue;
+                        Unpack(*a.data, 3);
+                        for (std::size_t i = 0; i < count; ++i)
+                            targets[t][(base - meshBase + i) * 2 + slot] = glm::vec4(glm::make_vec3(&m_Scratch[i * 3]), 0.0f);
+                    }
+                }
             }
+            if (!targets.empty())
+                FinishMorph(gm, mesh, meshBase, targets, primitiveRanges);
             m_Out->meshes.push_back(std::move(mesh));
         }
 
@@ -332,6 +364,39 @@ private:
             ENGINE_WARN("glTF: {} primitive(s) without normals (flat +Z used)", m_MissingNormals);
         if (m_MissingTangents)
             ENGINE_TRACE("glTF: {} primitive(s) without tangents (derive in shader)", m_MissingTangents);
+    }
+
+    // Packs the targets into the mesh and grows each submesh's bounds by what the targets can add
+    // (weights in [0, 1]).
+    void FinishMorph(const cgltf_mesh& gm, Mesh& mesh, std::size_t meshBase, std::vector<std::vector<glm::vec4>>& targets,
+                     const std::vector<std::pair<std::size_t, std::size_t>>& primitiveRanges)
+    {
+        MeshMorph& morph  = mesh.morph;
+        morph.vertexBase  = static_cast<std::uint32_t>(meshBase);
+        morph.vertexCount = static_cast<std::uint32_t>(m_Out->vertices.size() - meshBase);
+        for (std::size_t t = 0; t < targets.size(); ++t) {
+            morph.targetNames.push_back(t < gm.target_names_count && gm.target_names[t] ? std::string(gm.target_names[t])
+                                                                                         : std::format("Target {}", t));
+            morph.defaultWeights.push_back(t < gm.weights_count && std::isfinite(gm.weights[t]) ? gm.weights[t] : 0.0f);
+            targets[t].resize(std::size_t{morph.vertexCount} * 2, glm::vec4(0.0f));
+            morph.deltas.insert(morph.deltas.end(), targets[t].begin(), targets[t].end());
+        }
+        for (std::size_t s = 0; s < mesh.submeshes.size() && s < primitiveRanges.size(); ++s) {
+            const auto [first, count] = primitiveRanges[s];
+            glm::vec3 grow(0.0f), shrink(0.0f);
+            for (std::size_t t = 0; t < targets.size(); ++t) {
+                glm::vec3 most(0.0f), least(0.0f);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const glm::vec3 d = glm::vec3(targets[t][(first - meshBase + i) * 2]);
+                    most  = glm::max(most, d);
+                    least = glm::min(least, d);
+                }
+                grow += most;
+                shrink += least;
+            }
+            mesh.submeshes[s].boundsMin += shrink;
+            mesh.submeshes[s].boundsMax += grow;
+        }
     }
 
     void ParseNodes()
@@ -445,6 +510,53 @@ private:
         }
     }
 
+    // A weights channel: one track per morph target of the node's mesh (glTF stores the values of
+    // all targets per key; cubic splines as in-tangents, values, out-tangents per key).
+    void ParseWeightChannel(AnimationClip& clip, const cgltf_animation_channel& channel, std::int32_t node, cgltf_size ci)
+    {
+        const cgltf_mesh*              mesh    = channel.target_node->mesh;
+        const cgltf_size               targets = mesh && mesh->primitives_count > 0 ? mesh->primitives[0].targets_count : 0;
+        const cgltf_animation_sampler& sampler = *channel.sampler;
+        const bool                     cubic   = sampler.interpolation == cgltf_interpolation_type_cubic_spline;
+        const cgltf_size               keys    = sampler.input->count;
+        if (targets == 0 || keys == 0 || sampler.input->type != cgltf_type_scalar || cgltf_num_components(sampler.output->type) != 1 ||
+            sampler.output->count != keys * targets * (cubic ? 3 : 1)) {
+            ENGINE_WARN("glTF: animation '{}' channel {} (weights) does not match the mesh's targets - skipped", clip.name, ci);
+            return;
+        }
+        Unpack(*sampler.input, 1);
+        const std::vector<float> times = m_Scratch;
+        if (std::ranges::any_of(times, [](float t) { return !std::isfinite(t); }) ||
+            std::adjacent_find(times.begin(), times.end(), [](float x, float y) { return x >= y; }) != times.end()) {
+            ENGINE_WARN("glTF: animation '{}' channel {} has non-finite or unordered key times - skipped", clip.name, ci);
+            return;
+        }
+        Unpack(*sampler.output, 1);
+        for (cgltf_size t = 0; t < targets && t < kMaxMorphTargets; ++t) {
+            AnimationTrack track;
+            track.node          = static_cast<std::uint32_t>(node);
+            track.path          = AnimationPath::Weights;
+            track.morphTarget   = static_cast<std::uint32_t>(t);
+            track.interpolation = sampler.interpolation == cgltf_interpolation_type_step ? AnimationInterpolation::Step
+                                  : cubic                                                ? AnimationInterpolation::CubicSpline
+                                                                                         : AnimationInterpolation::Linear;
+            track.times = times;
+            const auto at = [&](cgltf_size key, cgltf_size part) {
+                return glm::vec4(m_Scratch[(key * (cubic ? 3 : 1) + part) * targets + t], 0.0f, 0.0f, 0.0f);
+            };
+            for (cgltf_size key = 0; key < keys; ++key) {
+                if (cubic) {
+                    track.inTangents.push_back(at(key, 0));
+                    track.values.push_back(at(key, 1));
+                    track.outTangents.push_back(at(key, 2));
+                } else
+                    track.values.push_back(at(key, 0));
+            }
+            clip.tracks.push_back(std::move(track));
+        }
+        clip.duration = std::max(clip.duration, times.back());
+    }
+
     void ParseAnimations()
     {
         for (cgltf_size ai = 0; ai < m_Data.animations_count; ++ai) {
@@ -471,7 +583,7 @@ private:
                 case cgltf_animation_path_type_rotation: path = AnimationPath::Rotation; components = 4; break;
                 case cgltf_animation_path_type_scale: path = AnimationPath::Scale; break;
                 case cgltf_animation_path_type_weights:
-                    ENGINE_WARN("glTF: animation '{}' morph-weight channel is not supported yet - skipped", clip.name);
+                    ParseWeightChannel(clip, channel, node, ci);
                     continue;
                 default:
                     ENGINE_WARN("glTF: animation '{}' has an unknown target path - skipped", clip.name);

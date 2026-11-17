@@ -1,4 +1,5 @@
 #include "Engine/Animation/AnimGraph.h"
+#include "Engine/Animation/AnimRetarget.h"
 #include "Engine/Assets/Model.h"
 #include "Engine/Core/FileSystem.h"
 #include "Engine/Core/Platform.h"
@@ -280,6 +281,12 @@ std::string AnimGraphToJson(const AnimGraph& graph, const fs::path& folderIn)
         root["rootMotionBone"] = graph.rootMotionBone;
     if (!graph.previewModel.empty())
         root["previewModel"] = StorePath(graph.previewModel, folder);
+    if (!graph.animationSources.empty()) {
+        json sources = json::array();
+        for (const std::string& source : graph.animationSources)
+            sources.push_back(StorePath(source, folder));
+        root["animationSources"] = std::move(sources);
+    }
     return root.dump(2);
 }
 
@@ -411,6 +418,9 @@ std::optional<AnimGraph> ParseAnimGraph(std::string_view text, const fs::path& f
     }
     graph.rootMotionBone = GetString(root, "rootMotionBone");
     graph.previewModel   = LoadPath(GetString(root, "previewModel"), folder);
+    for (const std::string& source : GetStrings(root, "animationSources"))
+        if (!source.empty())
+            graph.animationSources.push_back(LoadPath(source, folder));
     return graph;
 }
 
@@ -451,9 +461,17 @@ bool SaveAnimGraph(const fs::path& file, const AnimGraph& graph, std::string* er
     return !ec;
 }
 
-std::vector<std::string> ValidateAnimGraph(const AnimGraph& graph, const Model* model)
+std::vector<std::string> ValidateAnimGraph(const AnimGraph& graph, const Model* model,
+                                           std::span<const std::shared_ptr<const Model>> sources)
 {
     std::vector<std::string> problems;
+    for (std::size_t i = 0; i < sources.size() && i < graph.animationSources.size(); ++i) {
+        const std::string name = PathToUtf8(PathFromUtf8(graph.animationSources[i]).filename());
+        if (!sources[i])
+            problems.push_back("animation source '" + name + "' cannot be loaded");
+        else if (model && BuildRetarget(*model, *sources[i]).Mapped() == 0)
+            problems.push_back("animation source '" + name + "' shares no bone names with the model");
+    }
     const auto parameter = [&](const std::string& name, const std::string& where, bool numeric) {
         if (name.empty())
             return;
@@ -464,7 +482,9 @@ std::vector<std::string> ValidateAnimGraph(const AnimGraph& graph, const Model* 
             problems.push_back(where + ": parameter '" + name + "' is not a number");
     };
     const auto hasClip = [&](const std::string& clip) {
-        return std::ranges::any_of(model->animations, [&](const AnimationClip& c) { return c.name == clip; });
+        const auto named = [&](const AnimationClip& c) { return c.name == clip; };
+        return std::ranges::any_of(model->animations, named) ||
+               std::ranges::any_of(sources, [&](const auto& s) { return s && std::ranges::any_of(s->animations, named); });
     };
     const auto hasBone = [&](const std::string& bone) {
         return std::ranges::any_of(model->nodes, [&](const ModelNode& n) { return n.name == bone; });

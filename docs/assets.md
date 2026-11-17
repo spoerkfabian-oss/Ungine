@@ -101,6 +101,11 @@ textures → `BuildModelMaterials` (materials and `GpuSubmesh` records; CPU copy
   (`ReadCooked`, `ReadCookedFor(file, category)`). `PakWriter` deletes the file unless `Finish`
   succeeds.
 
+Models: glTF morph targets are read per mesh (≤ 64; position and normal deltas, names, default
+weights) and weight channels become one animation track per target; the optimizer's vertex reorder
+moves the deltas with the vertices. Cooked models are version 2 (morph data, track targets) and
+validate morph sizes and index ranges.
+
 ## Cooker
 
 `CookProjectContent(project, pak, CookOptions)` (`Assets/ContentCooker.h`) packs everything below

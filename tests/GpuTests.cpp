@@ -1,5 +1,7 @@
 // Integration tests on a real Vulkan device (needs a display; CI: Xvfb + lavapipe).
 #include "Test.h"
+#include "BlueprintTestUtil.h"
+#include "MorphTestUtil.h"
 
 #include "Editor/Editor.h"
 #include "Editor/ProjectLauncher.h"
@@ -1382,6 +1384,124 @@ TEST_CASE(Asset_FailedModelPlaceholderAndRetry)
     F().assets->Release(h);
     F().Pump([] { return false; }, 4);
     fs::remove_all(dir);
+}
+
+TEST_CASE(Render_SkinnedMeshLods)
+{
+    // Skinned meshes pick LODs from their pose bounds like static ones (GPU and CPU culling agree).
+    // A capsule skinned to one joint (indexed, so it simplifies; the Fox is not indexed).
+    ModelData data = MakeCapsule("SkinnedBall", 1.0f, 0.0f, MaterialData{.name = "Ball", .metallic = 0.0f, .roughness = 0.5f}, 128, 64);
+    ModelNode bone;
+    bone.name = "Bone";
+    data.nodes.push_back(bone);
+    data.nodes[0].skin   = 0;
+    data.nodes[0].parent = -1;
+    Skin skin;
+    skin.name         = "Skin";
+    skin.skeletonRoot = 1;
+    skin.joints.push_back(SkinJoint{.node = 1, .inverseBindMatrix = glm::mat4(1.0f)});
+    data.skins.push_back(skin);
+    data.skinInfluences.assign(data.vertices.size(), VertexSkinInfluence{.joints = glm::u16vec4(0), .weights = {1.0f, 0.0f, 0.0f, 0.0f}});
+    const ModelHandle h = F().assets->CreateModel(std::move(data));
+    CHECK(F().Pump([&] { return Settled(h); }));
+    const Model* model = F().assets->Get(h);
+    CHECK(model && !model->skins.empty() && model->meshes.at(0).submeshes.at(0).lodCount > 1);
+    if (!model) {
+        F().assets->Release(h);
+        return;
+    }
+    const Submesh& sm = model->meshes[0].submeshes[0];
+    Scene          scene;
+    (void)InstantiateModel(scene, h, *model);
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure  = false;
+    renderer.shadows.resolution = 512;
+    const auto measure = [&](bool gpu, float distance) { // GPU counters: two frames old
+        renderer.culling.gpuDriven = gpu;
+        (void)RenderImage(renderer, scene, FrontCamera(distance), gpu ? 5 : 2);
+        return std::pair{renderer.Stats().lodDraws, renderer.Stats().triangles};
+    };
+    const std::uint64_t full = sm.indexCount / 3, coarsest = sm.lods[sm.lodCount - 1].indexCount / 3;
+    const auto [nearGpuLods, nearGpu] = measure(true, 1.75f);
+    const auto [farGpuLods, farGpu]   = measure(true, 400.0f);
+    const auto [nearCpuLods, nearCpu] = measure(false, 1.75f);
+    const auto [farCpuLods, farCpu]   = measure(false, 400.0f);
+    CHECK(nearGpuLods == 0 && nearGpu == full && nearCpuLods == 0 && nearCpu == full);
+    CHECK(farGpuLods == 1 && farCpuLods == 1 && farGpu == coarsest && farCpu == coarsest);
+    F().assets->Release(h);
+    F().Pump([] { return false; }, 4);
+}
+
+TEST_CASE(Render_MorphTargets)
+{
+    // The Face quad: "Raise" lifts its top edge by 0.5. A pixel just above the edge is sky with the
+    // default weights (0.25 -> +0.125) and covered with Raise = 1, on the GPU and the CPU path.
+    const fs::path dir = fs::temp_directory_path() / std::format("ungine_gpu_morph_{}", std::random_device{}());
+    fs::create_directories(dir);
+    std::ofstream(dir / "Face.gltf") << MorphTest::FaceGltf();
+    const ModelHandle face = F().assets->LoadModel(dir / "Face.gltf");
+    CHECK(F().Pump([&] { return Settled(face); }));
+    const Model* model = F().assets->Get(face);
+    CHECK(model && model->meshes.size() == 1 && model->meshes[0].morph.TargetCount() == 2 && model->morphs.count == 16 &&
+          model->meshes[0].morph.deltas.empty()); // the GPU keeps the only copy
+    if (!model) {
+        F().assets->Release(face);
+        return;
+    }
+    Scene        scene;
+    const Entity root = InstantiateModel(scene, face, *model);
+    Entity       mesh = NullEntity;
+    scene.GetRegistry().ViewOf<MeshRenderer>().Each([&](Entity e, MeshRenderer&) { mesh = e; });
+    CHECK(mesh != NullEntity && root != NullEntity);
+    scene.UpdateTransforms();
+    SceneRenderer renderer(*F().renderer, *F().context, *F().assets);
+    renderer.post.autoExposure  = false;
+    renderer.shadows.resolution = 512;
+    renderer.taa.enabled        = false;
+    // World y = 1.25 at distance 4: NDC 1.25 / 4 / tan(30 deg) -> row (0.5 - ndc / 2) * 120.
+    const int  row   = static_cast<int>((0.5f - 0.5f * 1.25f / 4.0f / std::tan(glm::radians(30.0f))) * 120.0f);
+    const auto pixel = [&](bool gpu) {
+        renderer.culling.gpuDriven = gpu;
+        const std::vector<std::uint8_t> image = RenderImage(renderer, scene, FrontCamera(4.0f), 4);
+        const std::size_t               i     = (static_cast<std::size_t>(row) * 160 + 80) * 4;
+        return glm::ivec3(image[i], image[i + 1], image[i + 2]);
+    };
+    const auto distance = [](glm::ivec3 a, glm::ivec3 b) { return std::abs(a.r - b.r) + std::abs(a.g - b.g) + std::abs(a.b - b.b); };
+    const glm::ivec3 sky = pixel(true);
+    scene.GetRegistry().Emplace<MorphWeights>(mesh, MorphWeights{.weights = {1.0f, 0.0f}});
+    const glm::ivec3 raisedGpu = pixel(true), raisedCpu = pixel(false);
+    CHECK(distance(sky, raisedGpu) > 60 && distance(raisedGpu, raisedCpu) < 6);
+    scene.GetRegistry().Get<MorphWeights>(mesh).weights = {0.0f, 0.0f};
+    CHECK(distance(sky, pixel(true)) < 6 && distance(sky, pixel(false)) < 6);
+
+    // Blueprint nodes: by target name on the meshes below the target; unknown names are errors.
+    scene.GetRegistry().Remove<MorphWeights>(mesh);
+    {
+        BlueprintTest::Graph b;
+        const auto begin = b.Node("Event.BeginPlay");
+        const auto set   = b.Node("Morph.SetWeight");
+        b.Set(set, "Morph Target", std::string("Push"));
+        b.Set(set, "Weight", 0.75f);
+        const auto wrong = b.Node("Morph.SetWeight");
+        b.Set(wrong, "Morph Target", std::string("Smile"));
+        b.Link(begin, "Out", set, "In");
+        b.Link(set, "Then", wrong, "In");
+        CHECK(b.Valid());
+        ScriptSystem scripts(F().events, nullptr, nullptr, F().assets.get());
+        scene.GetRegistry().Emplace<ScriptComponent>(root, ScriptComponent{"morph.ugraph"});
+        scripts.Provide("morph.ugraph", b.g);
+        scripts.Begin(scene);
+        scripts.Update(scene, 0.1f);
+        const MorphWeights* weights = scene.GetRegistry().TryGet<MorphWeights>(mesh);
+        CHECK(weights && (weights->weights == std::vector<float>{0.25f, 0.75f})); // Raise keeps its default
+        CHECK(scripts.Stats().errors >= 1);
+        scripts.End(scene);
+    }
+    F().assets->Release(face);
+    F().Pump([] { return false; }, 4);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 TEST_CASE(Render_MeshLodSelection)

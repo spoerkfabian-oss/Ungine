@@ -240,7 +240,9 @@ void main()
             const bool inside = (skinned && !skinBoundsValid) || InFrustum(view, center, extent);
             const bool occlusion = (!skinned || skinBoundsValid) && (view.flags & VIEW_OCCLUSION) != 0u;
             const float scale = max(max(length(inst.model[0].xyz), length(inst.model[1].xyz)), length(inst.model[2].xyz));
-            const uvec2 lod   = skinned ? uvec2(0u) : SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
+            // Skinned meshes pick their LOD from the pose bounds (LOD 0 until those are known).
+            const uvec2 lod   = skinned && !skinBoundsValid ? uvec2(0u)
+                                                            : SelectLod(sm, center, extent, scale, data.lodCamera, data.lodInfo.x);
 
             if (late && shadowOcclusion && skinned && !skinBoundsValid) {
                 Emit(view, draw, index, uvec2(0u));

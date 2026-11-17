@@ -35,12 +35,15 @@ struct GpuInstance {
     std::uint32_t jointOffset = ~0u;
     std::uint32_t jointCount = 0;
     std::uint32_t prevJointOffset = ~0u; // last frame's palette (PrevJointMatrixAddress), ~0u: none
-    std::uint32_t pad1 = 0;
+    std::uint32_t morphWeightOffset = ~0u; // MorphWeightAddress, ~0u: no morph targets
     glm::vec4 skinnedBoundsMin{0.0f};
     glm::vec4 skinnedBoundsMax{0.0f};
     glm::mat4 prevModel{1.0f}; // last frame's model matrix (motion vectors)
+    std::uint32_t prevMorphWeightOffset = ~0u; // PrevMorphWeightAddress, ~0u: none
+    std::uint32_t morphWeightCount = 0;
+    std::uint32_t pad2 = 0, pad3 = 0;
 };
-static_assert(sizeof(GpuInstance) == 240);
+static_assert(sizeof(GpuInstance) == 256);
 inline constexpr std::uint32_t kInstanceMirrored = 1;
 inline constexpr std::uint32_t kInstanceSkinned = 2;
 inline constexpr std::uint32_t kInstanceSkinBoundsValid = 4;
@@ -91,6 +94,9 @@ struct LodChoice {
 // Mirrors SelectLod in scene_common.glsl (the CPU path must pick the same geometry).
 [[nodiscard]] LodChoice SelectLod(const GpuSubmesh& submesh, const glm::mat4& model, const glm::vec4& lodCamera,
                                   std::uint32_t forced);
+// The same with other object-space bounds (skinned instances: the pose bounds).
+[[nodiscard]] LodChoice SelectLod(const GpuSubmesh& submesh, const glm::vec3& boundsMin, const glm::vec3& boundsMax,
+                                  const glm::mat4& model, const glm::vec4& lodCamera, std::uint32_t forced);
 
 // Persistent GPU copy of the scene's mesh instances for GPU-driven rendering (and the CPU path,
 // which draws the same records directly). Update() applies the spatial index's mesh changes on
@@ -157,6 +163,12 @@ public:
     // GPU buffers (valid after Upload).
     [[nodiscard]] VkDeviceAddress InstanceAddress() const { return m_InstanceBuffer.Address(); }
     [[nodiscard]] VkDeviceAddress JointMatrixAddress() const { return m_JointMatrices[m_JointBuffer].Address(); }
+    [[nodiscard]] VkDeviceAddress MorphWeightAddress() const { return m_MorphWeights[m_MorphBuffer].Address(); }
+    [[nodiscard]] VkDeviceAddress PrevMorphWeightAddress() const
+    {
+        const Buffer& b = m_MorphWeights[m_MorphBuffer ^ 1u];
+        return b ? b.Address() : 0;
+    }
     // Last frame's skin palettes (motion vectors; 0 before the second frame).
     [[nodiscard]] VkDeviceAddress PrevJointMatrixAddress() const
     {
@@ -179,6 +191,7 @@ private:
     [[nodiscard]] std::uint32_t AcquireMaterialSlot(MaterialHandle handle, const MaterialAsset& material);
     void ReleaseMaterialSlot(std::uint32_t slot);
     void UpdateJointPalettes(const Scene& scene, const AssetManager& assets);
+    void UpdateMorphWeights(const Scene& scene, const AssetManager& assets);
     void UseModel(const AssetManager& assets, ModelHandle model);
     void UnuseModel(ModelHandle model);
     void Remove(Entity entity);
@@ -256,6 +269,10 @@ private:
     std::array<Buffer, 2>  m_JointMatrices;
     std::uint32_t          m_JointBuffer = 0;
     std::vector<glm::mat4> m_JointMatrixData;
+    // Morph weights, ping-pong like the palettes (prevMorphWeightOffset indexes the other buffer).
+    std::array<Buffer, 2> m_MorphWeights;
+    std::uint32_t         m_MorphBuffer = 0;
+    std::vector<float>    m_MorphWeightData;
 };
 
 } // namespace Engine

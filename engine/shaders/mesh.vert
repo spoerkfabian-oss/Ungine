@@ -29,13 +29,20 @@ void main()
     const GpuDraw     draw  = frame.draws.d[entry & VISIBLE_RECORD_MASK];
     const GpuInstance inst  = frame.instances.i[draw.instance];
     const Vertex      v     = frame.vertices.v[gl_VertexIndex]; // vertexOffset (pool) applied by the draw
+    // Morph targets first (object space), then skinning.
+    vec3 position = v.position, normal = v.normal, previousPosition = v.position, previousNormal = v.normal;
+    if (inst.morphWeightOffset != 0xFFFFFFFFu) {
+        const GpuSubmesh sm = frame.submeshes.s[draw.submesh];
+        ApplyMorph(inst, sm, gl_VertexIndex, false, position, normal);
+        ApplyMorph(inst, sm, gl_VertexIndex, true, previousPosition, previousNormal);
+    }
     const mat4        skin  = SkinMatrix(inst, v);
-    const vec4        local = skin * vec4(v.position, 1.0);
+    const vec4        local = skin * vec4(position, 1.0);
     vec4              world = inst.model * local;
 
-    outNormal   = NormalMatrix(inst) * mat3(skin) * v.normal;
-    // Last frame's position: previous model matrix and skin palette, previous camera.
-    vec4 previousWorld = inst.prevModel * (PrevSkinMatrix(inst, v, skin) * vec4(v.position, 1.0));
+    outNormal   = NormalMatrix(inst) * mat3(skin) * normal;
+    // Last frame's position: previous model matrix, skin palette and morph weights, previous camera.
+    vec4 previousWorld = inst.prevModel * (PrevSkinMatrix(inst, v, skin) * vec4(previousPosition, 1.0));
 #ifdef CUSTOM_MATERIAL
     outObjectPosition = inst.model[3].xyz;
 #ifdef MATERIAL_HAS_WPO
